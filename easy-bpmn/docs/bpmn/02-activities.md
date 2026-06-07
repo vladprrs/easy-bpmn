@@ -31,17 +31,23 @@ Work performed by software. In execution engines this is the integration point w
 - **Camunda 8 / Zeebe**: `zeebe:taskDefinition type="..."` — a **job worker** subscribes to that type.
 - **`easy-bpmn`**: a Service Task calls a **remote service worker** over an RPC-like contract; the
   worker returns output variables, which are **persisted before the instance advances** (constitution,
-  Principle III). This is `easy-bpmn`'s core automation primitive.
+  Principle III). This is `easy-bpmn`'s core automation primitive. The worker is bound by a stable
+  **`taskType`** declared in standard `<extensionElements>` under the `easy-bpmn` namespace
+  (`<easy-bpmn:taskDefinition type="…" retries="…"/>`) — **not** by the element `id`/`name`, which tools
+  regenerate. See [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
 
 ### Receive Task
 Waits for an incoming **message** before completing — a durable **wait state**.
 
 - Carries a `messageRef` pointing to a `<message>` root element.
-- `instantiate="true"` can make a receive task *start* a process (out of scope for us).
+- `instantiate="true"` can make a receive task *start* a process — **rejected** in the MVP (instances
+  start via the API only).
 - **`easy-bpmn`**: the Receive Task is the MVP's wait point. An external system (admin UI, bot, CRM)
   posts a message; the runtime **correlates** it to the one waiting instance by
-  **`messageName` + `correlationKey`** and resumes (constitution, Principle IV). Human decisions enter
-  the process *only* as such messages — there is no in-platform human task.
+  **`messageName` + `correlationKey`** and resumes (constitution, Principle IV). The `correlationKey` is
+  supplied via the **API** at instance start (MVP) — the `<message>` carries only its name, and the key
+  is not read from a model-level subscription expression. Human decisions enter the process *only* as
+  such messages — there is no in-platform human task.
 
 ### Why no User Task?
 `easy-bpmn` deliberately keeps humans **outside** the platform. A person acts in their own system; the
@@ -93,12 +99,14 @@ Any activity (task or sub-process) can have **boundary events** attached to its 
 ## `easy-bpmn` scope
 
 **In scope:** exactly two task types — **Service Task** (`serviceTask`) and **Receive Task**
-(`receiveTask`).
+(`receiveTask`). The Service Task's worker `taskType` and retry policy ride in standard
+`<extensionElements>` under the `easy-bpmn` namespace (additive, ignorable — not custom notation; see
+[`09`](./09-easy-bpmn-profile.md)).
 
 **Out of scope (reject before publish):** the abstract `task`, `userTask`, `sendTask`, `manualTask`,
 `scriptTask`, `businessRuleTask`, **all** sub-process types (`subProcess`, `transaction`,
-`adHocSubProcess`), `callActivity`, and **all** markers (loop, multi-instance, compensation) — per the
-constitution's MVP scope.
+`adHocSubProcess`), `callActivity`, **all** markers (loop, multi-instance, compensation), and any task
+with `instantiate="true"` (instances start via the API) — per the constitution's MVP scope.
 
 The MVP's entire activity vocabulary is: *call a worker* (service task) and *wait for a message*
 (receive task). See [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).

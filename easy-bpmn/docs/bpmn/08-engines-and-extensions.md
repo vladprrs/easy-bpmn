@@ -128,10 +128,15 @@ build:
 
 `easy-bpmn` is **not** aiming for Camunda/Zeebe compatibility (the constitution explicitly excludes
 "full Zeebe/Camunda compatibility" from the MVP). It defines its *own* minimal service-worker contract
-and message-correlation API.
+and message-correlation API. Concretely, the worker binding is an **`easy-bpmn:taskDefinition`** (a
+`type` topic + `retries`) inside standard `<extensionElements>` — modeled on the external-task pattern
+but under `easy-bpmn`'s **own** namespace (`http://easy-bpmn/schema/1.0`). Reusing `camunda:`/`zeebe:`
+vocabulary verbatim was rejected: it would make files *look* compatible while not honoring their
+semantics (FEEL, ioMapping). See [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md) and
+[`research.md`](../../specs/001-bpmn-lite-orchestrator-mvp/research.md).
 
 What to borrow now: **`bpmn-moddle`** for parsing; the **external-task / job-worker** mental model
 (Operaton/Zeebe) for the service-task ↔ remote-worker contract; and **`bpmn-engine`/`SpiffWorkflow`** as
-semantic references. What to ignore for now: `camunda:`/`zeebe:` extension attributes, FEEL, and any
-multi-engine portability. See [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md) and
-[`resources.md`](./resources.md).
+semantic references. What to ignore for now: `camunda:`/`zeebe:` extension attributes (tolerated but
+never required), FEEL, and any multi-engine portability. See
+[`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md) and [`resources.md`](./resources.md).

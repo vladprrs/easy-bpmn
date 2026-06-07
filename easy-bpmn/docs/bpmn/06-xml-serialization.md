@@ -206,6 +206,7 @@ correlation on the receive task. This is the kind of file the parser should **ac
     xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
     xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
     xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
     id="Definitions_demo" targetNamespace="http://easy-bpmn/demo">
 
   <bpmn:message id="Msg_Approval" name="ApprovalReceived" />
@@ -219,6 +220,9 @@ correlation on the receive task. This is the kind of file the parser should **ac
     <bpmn:sequenceFlow id="Flow_s_check" sourceRef="Start_1" targetRef="Task_check" />
 
     <bpmn:serviceTask id="Task_check" name="Run external check">
+      <bpmn:extensionElements>
+        <easy-bpmn:taskDefinition type="external-check" retries="3" />
+      </bpmn:extensionElements>
       <bpmn:incoming>Flow_s_check</bpmn:incoming>
       <bpmn:outgoing>Flow_check_wait</bpmn:outgoing>
     </bpmn:serviceTask>
@@ -266,8 +270,10 @@ correlation on the receive task. This is the kind of file the parser should **ac
 </bpmn:definitions>
 ```
 
-> The Service Task above has no `camunda:`/`zeebe:` worker binding — `easy-bpmn` decides *how* a service
-> task maps to a remote worker (by task name/type or an `easy-bpmn:` extension TBD). See
+> The Service Task above binds its worker with `easy-bpmn:taskDefinition type="external-check"` inside the
+> standard `<extensionElements>` — under `easy-bpmn`'s **own** namespace, not `camunda:`/`zeebe:`. Workers
+> are routed by `type` (the element `id` is audit-only). The file still round-trips in any standard
+> modeler that ignores the `easy-bpmn` namespace. See
 > [`08-engines-and-extensions.md`](./08-engines-and-extensions.md) and
 > [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
 
@@ -283,8 +289,11 @@ correlation on the receive task. This is the kind of file the parser should **ac
 - [ ] **Multiple `<process>`** elements can exist in one file (e.g. a collaboration). Pick the
       executable one(s).
 - [ ] **XML-escaping** in expressions (`&gt;`, `&lt;`, `&amp;`).
-- [ ] **Unsupported elements** must be *detected and rejected with a reason*, not silently skipped
-      (constitution, Principle I). Whitelist the supported tags; reject anything else. See
+- [ ] **Unsupported flow nodes** must be *detected and rejected with a reason*, not silently skipped
+      (constitution, Principle I): whitelist the supported standard-namespace flow nodes and reject any
+      other. But **tolerate and ignore** foreign-namespace `<extensionElements>` (`camunda:`/`zeebe:`/…),
+      DI, and `documentation` — BPMN requires conformant tools to ignore unknown extensions, so rejecting
+      a file merely for carrying them would be non-canonical. See
       [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
 
 > **Don't write your own XML→model mapper from scratch.** `bpmn-moddle` already turns this XML into a

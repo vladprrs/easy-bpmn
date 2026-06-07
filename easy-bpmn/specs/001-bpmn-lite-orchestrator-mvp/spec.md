@@ -15,8 +15,20 @@ workflow-engine-grade runtime constraints."
 
 **BPMN Profile Impact**: The feature is the MVP profile itself. It supports only
 standard BPMN 2.0-compatible Start Event, Service Task, Receive Task, End Event,
-Sequence Flow, and Message correlation. Unsupported BPMN elements are rejected
+Sequence Flow, and Message correlation. Unsupported BPMN flow nodes are rejected
 before publish with element-level reasons.
+
+"No custom notation" is defined precisely so the constraint is testable: the system
+MUST NOT (a) introduce new element or shape types in the BPMN MODEL namespace,
+(b) redefine the runtime meaning of a standard element, or (c) require any
+non-standard attribute on a standard element for a file to parse. Worker binding and
+retry metadata are carried only in the standard `<bpmn:extensionElements>` escape
+hatch under a dedicated `easy-bpmn` namespace; they are additive and ignorable. The
+operative test: every accepted file MUST remain valid against the BPMN 2.0 XSD and
+round-trip through a standard modeler (bpmn-js / Camunda Modeler) unchanged even when
+easy-bpmn extensions and Diagram Interchange are ignored. Foreign-namespace extension
+elements (`camunda:`, `zeebe:`, ...), Diagram Interchange, and `documentation` are
+tolerated and ignored, never required for execution and never a reason to reject.
 
 **Definition Versioning Impact**: BPMN XML can be edited as a draft. Publishing
 creates an immutable executable definition version. Every process instance starts
@@ -174,6 +186,11 @@ payload context, and history.
 - BPMN XML containing gateways, timers, boundary events, subprocesses,
   multi-instance, compensation, User Task, or other unsupported elements is
   rejected before publish.
+- A Receive Task (or any task) with `instantiate="true"`, or any non-none
+  instantiation path, is rejected before publish; instances start only via the API.
+- BPMN XML that is well-formed and inside the profile but also carries
+  foreign-namespace extension elements, Diagram Interchange, or `documentation` is
+  accepted; the ignorable content does not cause rejection.
 - A process cannot start from an unpublished draft or from a deleted or unknown
   published version.
 - Draft edits after publish do not mutate any published version or running
@@ -202,9 +219,17 @@ payload context, and history.
 
 - **FR-001**: Users MUST be able to upload BPMN XML as an editable draft.
 - **FR-002**: The system MUST validate BPMN XML against the MVP BPMN profile
-  before publishing.
-- **FR-003**: The system MUST reject unsupported BPMN elements before publish
-  with user-visible element names and reasons.
+  before publishing, parsing it namespace-aware (matched by `{MODEL-ns}localName`,
+  never by element prefix) and rejecting input that is not valid BPMN 2.0 XML.
+- **FR-003**: The system MUST reject unsupported BPMN flow nodes (any flow node
+  outside none Start Event, Service Task, Receive Task, none End Event) and
+  unsupported standard-namespace constructs before publish with user-visible
+  element names and reasons. It MUST NOT silently skip them.
+- **FR-003a**: The system MUST tolerate (accept and ignore, not reject)
+  foreign-namespace `<extensionElements>`, Diagram Interchange (`bpmndi:*`), and
+  `documentation`, because the BPMN standard requires conformant tools to ignore
+  unknown extension content. The "no silent skips" rule applies to standard-namespace
+  flow nodes and structures outside the profile, not to ignorable extension content.
 - **FR-004**: The system MUST allow valid drafts to be published as immutable
   executable definition versions.
 - **FR-005**: The system MUST keep running process instances bound to exactly one
@@ -221,13 +246,23 @@ payload context, and history.
 - **FR-010**: Service Task worker delivery and callbacks MUST be treated as
   at-least-once inputs; duplicate completion or failure callbacks MUST be
   idempotent.
-- **FR-011**: Service Task retry policy MUST be configurable per Service Task
-  through BPMN-compatible task metadata that does not introduce custom diagram
-  notation.
+- **FR-011**: Service Task worker binding and retry policy MUST be declared in
+  standard `<bpmn:extensionElements>` under the `easy-bpmn` namespace — additive and
+  ignorable, introducing no new MODEL-namespace notation and no non-standard
+  attribute on a standard element.
+- **FR-011a**: The Service Task worker MUST be routed by a stable, author-defined
+  task type carried in the extension metadata, NOT by the BPMN element `id` or
+  `name`. Element ids are tool-generated and change when a task is re-drawn, so
+  routing on them would be brittle and non-portable.
 - **FR-012**: Service Task failures MUST retry automatically while retry attempts
   remain and MUST create an incident-style state when retries are exhausted.
-- **FR-013**: A Receive Task MUST create a durable message subscription derived
-  from the expected message name and the instance correlation key.
+- **FR-013**: A Receive Task MUST create a durable message subscription from the
+  Receive Task `messageRef` (the declared message name) and the instance
+  correlation key. In the MVP the correlation key is supplied via the API at
+  instance start and is NOT derived from a model-level subscription expression; the
+  `<message>` element carries only its name. Declaring the key in the model (e.g. a
+  `subscription`/FEEL-style binding) is deferred and recorded as a known divergence
+  from canonical model-level correlation, not silently implied.
 - **FR-014**: The runtime MUST enforce at most one active eligible subscription
   for a given `messageName + correlationKey` within a project/workspace.
 - **FR-015**: External messages MUST include `messageName`, `correlationKey`,

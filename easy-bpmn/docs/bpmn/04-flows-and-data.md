@@ -89,8 +89,10 @@ These are *referenced* by events/tasks but *declared* as top-level elements unde
 
 **In scope:**
 - **Sequence Flow** (`sequenceFlow`) — plain, no conditions.
-- **Message** (`<message>`) + a **correlation key** — to drive the Receive Task
-  (constitution, Principle IV).
+- **Message** (`<message>`) — declares the message **name** a Receive Task waits for. The
+  **correlation key** is supplied via the **API** at instance start in the MVP (constitution,
+  Principle IV), *not* derived from a model-level subscription expression; model-level correlation is
+  deferred. See [`09`](./09-easy-bpmn-profile.md).
 - **Process variables** — initial variables at start; output variables persisted from service-task
   workers; payload applied on message correlation.
 

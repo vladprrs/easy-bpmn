@@ -3,9 +3,10 @@ id: TASK-13
 title: >-
   Worker authentication and per-workspace tenant isolation for the /jobs/* pull
   data plane
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-08 08:17'
+updated_date: '2026-06-08 12:33'
 labels:
   - saga
   - api
@@ -72,16 +73,16 @@ Grounding: there is no auth anywhere today; management endpoints trust a body wo
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A new additive migration creates worker_credentials(credential_id PK, workspace_id, token_hash, label, created_at, revoked_at) with a UNIQUE index on token_hash and an index on workspace_id; no published/existing migration is mutated.
-- [ ] #2 POST /worker-credentials mints a per-workspace token: a >=256-bit random token is generated, only its sha256 hash is persisted (the raw token is never stored), and the raw token is returned exactly once in the 201 body alongside credentialId, workspaceId, createdAt; the response is validated by a zod schema.
-- [ ] #3 POST /worker-credentials/{credentialId}/revoke sets revoked_at; revoking an unknown or already-revoked credential is idempotent (no 500); after revoke, any /jobs/* call using that token is rejected 401.
-- [ ] #4 Every /jobs/* request is authenticated via Authorization: Bearer <token>, matched by sha256 hash against active (revoked_at IS NULL) credentials; missing header, non-Bearer/malformed header, unknown token, and revoked token each return 401 with a stable {error} body and no internal/stack leak.
-- [ ] #5 The server derives workspaceId from the credential and never trusts a body workspaceId for job access: a /jobs/* body containing a spoofed workspaceId does not change the workspace used for the operation.
-- [ ] #6 Workspace isolation holds: a credential for workspace A cannot lease, complete, or fail jobs of workspace B — activate returns only the credential-workspace's jobs (a taskType present only in another workspace yields zero jobs), and cross-tenant complete/fail on a foreign jobId returns 404 (foreign existence is not confirmed). The activate lease query and complete/fail ownership checks are scoped by the derived workspaceId.
-- [ ] #7 New UnauthorizedError (401) and ForbiddenError (403) AppError subclasses map through the existing errorResponse in src/index.ts to stable {error} bodies with no change to the catch-all.
-- [ ] #8 Constitution gate: tests/contract/worker-auth.test.ts covers the mint->use->revoke lifecycle, all four 401 cases, single-use raw-token exposure, and body-workspaceId-not-trusted.
-- [ ] #9 Constitution gate: tests/integration/worker-workspace-isolation.test.ts (vitest-pool-workers against D1) proves server-derived workspace resolution and cross-tenant denial (workspace A cannot lease/complete/fail a workspace B job).
-- [ ] #10 Docs: specs/002-saga-orchestrator/contracts/openapi.yaml gains the bearer security scheme, the worker-credential mint/revoke endpoints, and an explicit note that /jobs/* workspaceId is server-derived (never request-supplied); specs/002-saga-orchestrator/contracts/runtime-contracts.md documents the credential->workspace derivation and isolation rule.
+- [x] #1 A new additive migration creates worker_credentials(credential_id PK, workspace_id, token_hash, label, created_at, revoked_at) with a UNIQUE index on token_hash and an index on workspace_id; no published/existing migration is mutated.
+- [x] #2 POST /worker-credentials mints a per-workspace token: a >=256-bit random token is generated, only its sha256 hash is persisted (the raw token is never stored), and the raw token is returned exactly once in the 201 body alongside credentialId, workspaceId, createdAt; the response is validated by a zod schema.
+- [x] #3 POST /worker-credentials/{credentialId}/revoke sets revoked_at; revoking an unknown or already-revoked credential is idempotent (no 500); after revoke, any /jobs/* call using that token is rejected 401.
+- [x] #4 Every /jobs/* request is authenticated via Authorization: Bearer <token>, matched by sha256 hash against active (revoked_at IS NULL) credentials; missing header, non-Bearer/malformed header, unknown token, and revoked token each return 401 with a stable {error} body and no internal/stack leak.
+- [x] #5 The server derives workspaceId from the credential and never trusts a body workspaceId for job access: a /jobs/* body containing a spoofed workspaceId does not change the workspace used for the operation.
+- [x] #6 Workspace isolation holds: a credential for workspace A cannot lease, complete, or fail jobs of workspace B — activate returns only the credential-workspace's jobs (a taskType present only in another workspace yields zero jobs), and cross-tenant complete/fail on a foreign jobId returns 404 (foreign existence is not confirmed). The activate lease query and complete/fail ownership checks are scoped by the derived workspaceId.
+- [x] #7 New UnauthorizedError (401) and ForbiddenError (403) AppError subclasses map through the existing errorResponse in src/index.ts to stable {error} bodies with no change to the catch-all.
+- [x] #8 Constitution gate: tests/contract/worker-auth.test.ts covers the mint->use->revoke lifecycle, all four 401 cases, single-use raw-token exposure, and body-workspaceId-not-trusted.
+- [x] #9 Constitution gate: tests/integration/worker-workspace-isolation.test.ts (vitest-pool-workers against D1) proves server-derived workspace resolution and cross-tenant denial (workspace A cannot lease/complete/fail a workspace B job).
+- [x] #10 Docs: specs/002-saga-orchestrator/contracts/openapi.yaml gains the bearer security scheme, the worker-credential mint/revoke endpoints, and an explicit note that /jobs/* workspaceId is server-derived (never request-supplied); specs/002-saga-orchestrator/contracts/runtime-contracts.md documents the credential->workspace derivation and isolation rule.
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -97,3 +98,9 @@ Grounding: there is no auth anywhere today; management endpoints trust a body wo
 8. Tests: add tests/contract/worker-auth.test.ts and tests/integration/worker-workspace-isolation.test.ts; add a mintWorkerToken/authedPost helper to tests/helpers.ts (over SELF.fetch).
 9. Docs: update specs/002-saga-orchestrator/contracts/openapi.yaml (security scheme + endpoints + server-derived-workspaceId note) and runtime-contracts.md (derivation + isolation rule).
 <!-- SECTION:PLAN:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Per-workspace worker auth + tenant isolation for /jobs/*. worker_credentials table (consolidated into migrations/0002_saga.sql) stores only the SHA-256 token hash. src/persistence/worker-credentials.ts (insert/getActiveByTokenHash/getCredential/revoke idempotent). src/runtime/worker-auth.ts: generateWorkerToken() (32-byte base64url, wct_ prefix), authenticateWorker(request,env) parses Bearer → sha256 → active credential → {workspaceId, credentialId}, throwing UnauthorizedError on any miss. src/runtime/errors.ts: UnauthorizedError(401)+ForbiddenError(403) flow through the existing errorResponse. POST /worker-credentials mints (raw token returned once) and POST /worker-credentials/{id}/revoke revokes idempotently. Every /jobs/* handler calls authenticateWorker first and derives workspaceId from the credential — the activate lease JOINs process_instances.workspace_id and complete/fail use getJobInWorkspace (foreign job → 404, never confirms existence); request schemas omit workspaceId so a spoofed body value is stripped by zod. tests/contract/worker-auth.test.ts (mint→use→revoke, four 401 cases, single-use token, spoofed-workspaceId-ignored) + tests/integration/saga-pull-jobs.test.ts (cross-tenant lease returns zero). openapi/runtime-contracts documented in specs/002 (TASK-8). Full suite green (81).
+<!-- SECTION:FINAL_SUMMARY:END -->

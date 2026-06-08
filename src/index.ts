@@ -7,9 +7,17 @@ import type { Env } from "./env";
 import { z } from "zod";
 
 import {
+  activateJobsRequestSchema,
+  activateJobsResponseSchema,
+  completeJobRequestSchema,
   createDraftRequestSchema,
+  failJobRequestSchema,
+  mintWorkerCredentialRequestSchema,
   publishMessageRequestSchema,
   startInstanceRequestSchema,
+  type JobCallbackAck,
+  type LeasedJob,
+  type MintWorkerCredentialResponse,
   type ProcessInstanceInspection,
   type PublishMessageResponse,
   type ValidationIssue,
@@ -18,9 +26,30 @@ import { parseAndValidate } from "./bpmn/validator";
 import { AppError, BadRequestError, ConflictError, NotFoundError, PublishRejectedError } from "./runtime/errors";
 import { assertPayloadWithinLimit } from "./runtime/payload";
 import { getExecutor } from "./runtime/executor";
+import { authenticateWorker, generateWorkerToken } from "./runtime/worker-auth";
 import { brokerKeyOf, type BrokerPublishResult } from "./runtime/broker-types";
-import { newId, nowIso, parseJson, sha256Hex, type JsonObject } from "./util";
+import {
+  isTerminalInstanceStatus,
+  isoPlusMs,
+  newId,
+  nowIso,
+  parseJson,
+  sha256Hex,
+  traceIdFor,
+  type JsonObject,
+} from "./util";
 import { ensureWorkspace } from "./persistence/db";
+import {
+  insertWorkerCredential,
+  revokeCredential,
+} from "./persistence/worker-credentials";
+import {
+  completeJobConditional,
+  failJobConditional,
+  getJobInWorkspace,
+  leaseJobs,
+} from "./persistence/jobs";
+import { getSagaStep } from "./persistence/saga";
 import {
   createDraft,
   createVersion,
@@ -36,10 +65,29 @@ import {
   createInstance,
   getIncidentForInstance,
   getInstance,
+  getInstanceRow,
+  listInstances,
+  mergeInstanceVariables,
+  setIncidentResolution,
+  transitionStatusGuarded,
 } from "./persistence/instances";
 import { getExternalMessage, insertExternalMessage } from "./persistence/messages";
 import { listInstanceHistory, recordHistory } from "./persistence/history";
 import { getIdempotentResult, putIdempotentResult } from "./persistence/idempotency";
+import { resumeInline } from "./runtime/engine";
+import { abandonActiveForwardJobs, resetJobForRetry } from "./persistence/jobs";
+import {
+  countPendingSteps,
+  getFailedStep,
+  getSagaStepsForInstance,
+  updateCompensationStatusStmt,
+} from "./persistence/saga";
+import {
+  cancelInstanceRequestSchema,
+  retryInstanceRequestSchema,
+  type InstanceListResponse,
+  type SagaInspection,
+} from "./contracts/api";
 
 export { ProcessWorkflow } from "./workflows/process-workflow";
 export { CorrelationBroker } from "./durable-objects/correlation-broker";
@@ -204,7 +252,32 @@ async function handleGetInstance(env: Env, instanceId: string): Promise<Response
   const instance = await getInstance(env.DB, instanceId);
   if (!instance) throw new NotFoundError(`Process instance ${instanceId} not found.`);
   const history = await listInstanceHistory(env.DB, instanceId);
-  const incident = instance.status === "incident" ? await getIncidentForInstance(env.DB, instanceId) : null;
+  const incident =
+    instance.status === "incident" || instance.status === "compensationFailed"
+      ? await getIncidentForInstance(env.DB, instanceId)
+      : null;
+
+  // Saga view — present once the instance has a transaction ledger.
+  const steps = await getSagaStepsForInstance(env.DB, instanceId);
+  let saga: SagaInspection | null = null;
+  if (steps.length > 0) {
+    const phase =
+      instance.status === "compensating" || instance.status === "compensated" || instance.status === "compensationFailed"
+        ? instance.status
+        : "forward";
+    saga = {
+      phase,
+      traceId: traceIdFor(instanceId),
+      steps: steps.map((s) => ({
+        elementId: s.elementId,
+        seq: s.seq,
+        compensationStatus: s.compensationStatus,
+        compensationElementId: s.compensationElementId,
+        compensationTaskType: s.compensationTaskType,
+      })),
+    };
+  }
+
   const inspection: ProcessInstanceInspection = {
     ...instance,
     historySummary: history,
@@ -212,8 +285,10 @@ async function handleGetInstance(env: Env, instanceId: string): Promise<Response
       workflowInstanceId: instance.workflowInstanceId,
       executionMode: env.EXECUTION_MODE,
       historyCount: history.length,
+      traceId: traceIdFor(instanceId),
     },
     incident,
+    saga,
   };
   return json(inspection, 200);
 }
@@ -223,6 +298,98 @@ async function handleGetInstanceHistory(env: Env, instanceId: string): Promise<R
   if (!instance) throw new NotFoundError(`Process instance ${instanceId} not found.`);
   const events = await listInstanceHistory(env.DB, instanceId);
   return json({ events }, 200);
+}
+
+async function handleListInstances(env: Env, url: URL): Promise<Response> {
+  const workspaceId = url.searchParams.get("workspaceId");
+  if (!workspaceId) throw new BadRequestError("workspaceId query parameter is required.");
+  const status = url.searchParams.get("status") ?? undefined;
+  const limit = Math.min(Math.max(1, parseInt(url.searchParams.get("limit") ?? "50", 10) || 50), 200);
+  const cursorRaw = url.searchParams.get("cursor");
+  const cursor = cursorRaw ? parseInt(cursorRaw, 10) : undefined;
+  const { items, nextCursor } = await listInstances(env.DB, { workspaceId, status, limit, cursor });
+  const response: InstanceListResponse = { instances: items, nextCursor };
+  return json(response, 200);
+}
+
+// ---------------------------------------------------------------------------
+// Operator remediation verbs (cancel / retry) — status-guarded
+// ---------------------------------------------------------------------------
+
+// Cancellable from running/waiting (active) OR from an in-transaction Hazard
+// 'incident' (design §4.2/§4.5: operators may /cancel a Hazard to force the
+// reverse compensation of already-completed steps).
+const CANCELLABLE_FROM = ["running", "waiting", "incident"] as const;
+
+async function handleCancelInstance(env: Env, instanceId: string, request: Request): Promise<Response> {
+  await parseBody(cancelInstanceRequestSchema, request).catch(() => ({}));
+  const inst = await getInstance(env.DB, instanceId);
+  if (!inst) throw new NotFoundError(`Process instance ${instanceId} not found.`);
+  if (!(CANCELLABLE_FROM as readonly string[]).includes(inst.status)) {
+    throw new ConflictError(`Instance ${instanceId} cannot be cancelled from status '${inst.status}'.`);
+  }
+  const now = nowIso();
+  // Abandon in-flight forward work so a late worker callback no-ops, and end the
+  // suspended Workflow (if any) so subsequent job callbacks drive compensation
+  // inline rather than sendEvent-ing a Workflow that is waiting on the wrong job.
+  await abandonActiveForwardJobs(env.DB, instanceId, now);
+  await getExecutor(env).terminate(instanceId);
+
+  const pending = await countPendingSteps(env.DB, instanceId);
+  if (pending === 0) {
+    const changed = await transitionStatusGuarded(env.DB, instanceId, [...CANCELLABLE_FROM], "cancelled", now);
+    if (changed > 0) {
+      await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, type: "instanceCancelled", diagnostics: { by: "operator", emptyLedger: true } });
+    }
+    return json(await getInstance(env.DB, instanceId), 200);
+  }
+
+  // Status-conditional → only the first cancel initiates one reverse pass.
+  const changed = await transitionStatusGuarded(env.DB, instanceId, [...CANCELLABLE_FROM], "compensating", now);
+  if (changed > 0) {
+    if (inst.status === "incident") await setIncidentResolution(env.DB, instanceId, "compensating", now);
+    await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, type: "transactionCancelled", diagnostics: { by: "operator", fromHazard: inst.status === "incident" } });
+    await resumeInline(env, instanceId);
+  }
+  return handleGetInstance(env, instanceId);
+}
+
+async function handleRetryInstance(env: Env, instanceId: string, request: Request): Promise<Response> {
+  const body = await parseBody(retryInstanceRequestSchema, request).catch(() => ({}) as { variables?: JsonObject });
+  const inst = await getInstance(env.DB, instanceId);
+  if (!inst) throw new NotFoundError(`Process instance ${instanceId} not found.`);
+  const now = nowIso();
+  if (body.variables) await mergeInstanceVariables(env.DB, instanceId, body.variables as JsonObject, now);
+  const fresh = await getInstanceRow(env.DB, instanceId);
+  const variablesJson = fresh?.variables ?? "{}";
+
+  if (inst.status === "compensationFailed") {
+    const failed = await getFailedStep(env.DB, instanceId);
+    if (!failed) throw new ConflictError(`Instance ${instanceId} has no failed compensation step to retry.`);
+    await resetJobForRetry(env.DB, { instanceId, elementId: failed.elementId, isCompensation: true, inputVariables: variablesJson, now });
+    await updateCompensationStatusStmt(env.DB, { stepId: failed.stepId, status: "pending", now }).run();
+    await setIncidentResolution(env.DB, instanceId, "operatorResolved", now);
+    const changed = await transitionStatusGuarded(env.DB, instanceId, ["compensationFailed"], "compensating", now);
+    if (changed === 0) throw new ConflictError(`Instance ${instanceId} is no longer retryable.`);
+    await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, elementId: failed.elementId, type: "operatorRetry", diagnostics: { target: "compensation" } });
+    await resumeInline(env, instanceId);
+    return handleGetInstance(env, instanceId);
+  }
+
+  if (inst.status === "incident") {
+    const incident = await getIncidentForInstance(env.DB, instanceId);
+    const elementId = incident?.elementId;
+    if (!elementId) throw new ConflictError(`Instance ${instanceId} has no incident element to retry.`);
+    await resetJobForRetry(env.DB, { instanceId, elementId, isCompensation: false, inputVariables: variablesJson, now });
+    await setIncidentResolution(env.DB, instanceId, "operatorResolved", now);
+    const changed = await transitionStatusGuarded(env.DB, instanceId, ["incident"], "running", now);
+    if (changed === 0) throw new ConflictError(`Instance ${instanceId} is no longer retryable.`);
+    await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, elementId, type: "operatorRetry", diagnostics: { target: "forward" } });
+    await resumeInline(env, instanceId, elementId);
+    return handleGetInstance(env, instanceId);
+  }
+
+  throw new ConflictError(`Instance ${instanceId} has nothing to retry from status '${inst.status}'.`);
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +546,240 @@ async function handleGetMessage(env: Env, externalMessageId: string): Promise<Re
 }
 
 // ---------------------------------------------------------------------------
+// Worker credentials (pull data plane auth)
+// ---------------------------------------------------------------------------
+
+async function handleMintWorkerCredential(env: Env, request: Request): Promise<Response> {
+  const body = await parseBody(mintWorkerCredentialRequestSchema, request);
+  const now = nowIso();
+  await ensureWorkspace(env.DB, body.workspaceId, now);
+  const token = generateWorkerToken();
+  const tokenHash = await sha256Hex(token);
+  const credentialId = newId("wcred");
+  await insertWorkerCredential(env.DB, {
+    credentialId,
+    workspaceId: body.workspaceId,
+    tokenHash,
+    label: body.label ?? null,
+    now,
+  });
+  const response: MintWorkerCredentialResponse = {
+    credentialId,
+    workspaceId: body.workspaceId,
+    token, // shown exactly once — never retrievable again
+    label: body.label ?? null,
+    createdAt: now,
+  };
+  return json(response, 201);
+}
+
+async function handleRevokeWorkerCredential(env: Env, credentialId: string): Promise<Response> {
+  // Idempotent: revoking an unknown / already-revoked credential is a no-op 200.
+  await revokeCredential(env.DB, credentialId, nowIso());
+  return json({ credentialId, revoked: true }, 200);
+}
+
+// ---------------------------------------------------------------------------
+// Pull worker jobs (workspaceId derived from the credential, never the body)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_LEASE_MS = 30_000;
+const MAX_LEASE_MS = 5 * 60_000;
+const MAX_JOBS_PER_ACTIVATE = 50;
+const MAX_WAIT_MS = 25_000;
+
+async function handleActivateJobs(env: Env, request: Request): Promise<Response> {
+  const { workspaceId } = await authenticateWorker(request, env);
+  const body = await parseBody(activateJobsRequestSchema, request);
+
+  const maxJobs = Math.min(Math.max(1, body.maxJobs ?? 1), MAX_JOBS_PER_ACTIVATE);
+  const leaseMs = Math.min(body.leaseMs ?? DEFAULT_LEASE_MS, MAX_LEASE_MS);
+  const waitMs = Math.min(body.waitMs ?? 0, MAX_WAIT_MS);
+  const deadline = Date.now() + waitMs;
+
+  let leased = await leaseOnce(env, workspaceId, body.taskType, body.workerId, leaseMs, maxJobs);
+  // Bounded long-poll: re-claim until something appears or waitMs elapses.
+  while (leased.length === 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 250));
+    leased = await leaseOnce(env, workspaceId, body.taskType, body.workerId, leaseMs, maxJobs);
+  }
+
+  const response = activateJobsResponseSchema.parse({ jobs: leased });
+  return json(response, 200);
+}
+
+async function leaseOnce(
+  env: Env,
+  workspaceId: string,
+  taskType: string,
+  workerId: string,
+  leaseMs: number,
+  limit: number,
+): Promise<LeasedJob[]> {
+  const now = nowIso();
+  const leaseUntil = isoPlusMs(now, leaseMs);
+  const lockToken = newId("lock");
+  const rows = await leaseJobs(env.DB, {
+    workspaceId,
+    taskType,
+    workerId,
+    lockToken,
+    leaseUntil,
+    now,
+    limit,
+  });
+  const jobs: LeasedJob[] = [];
+  for (const r of rows) {
+    const traceId = traceIdFor(r.instance_id);
+    const job: LeasedJob = {
+      jobId: r.job_id,
+      instanceId: r.instance_id,
+      elementId: r.element_id,
+      taskType: r.task_type,
+      isCompensation: r.is_compensation === 1,
+      attempt: r.attempt_count,
+      lockToken: r.lock_token,
+      traceId,
+      variables: parseJson<JsonObject>(r.input_variables, {}),
+    };
+    if (r.is_compensation === 1) {
+      // A compensation job is seeded with the compensated forward step's captured
+      // input + output from the ledger (design §4.4 / §4.3).
+      const step = await getSagaStep(env.DB, r.instance_id, r.compensates_element_id ?? r.element_id);
+      if (step) {
+        job.originalInput = step.capturedInput;
+        job.capturedOutput = step.capturedOutput;
+      }
+    }
+    jobs.push(job);
+    await recordHistory(env.DB, {
+      workspaceId,
+      instanceId: r.instance_id,
+      elementId: r.element_id,
+      type: "jobActivated",
+      diagnostics: { jobId: r.job_id, workerId, attempt: r.attempt_count, traceId, isCompensation: r.is_compensation === 1 },
+    });
+  }
+  return jobs;
+}
+
+async function handleCompleteJob(env: Env, jobId: string, request: Request): Promise<Response> {
+  const { workspaceId } = await authenticateWorker(request, env);
+  const body = await parseBody(completeJobRequestSchema, request);
+  const output = (body.outputVariables ?? {}) as JsonObject;
+  // Payload limit BEFORE any delivery (never call sendEvent with an oversized event).
+  assertPayloadWithinLimit(output, `job '${jobId}' output`);
+
+  const idemKey = `${jobId}:${body.lockToken}`;
+  const prior = await getIdempotentResult<JobCallbackAck>(env.DB, "workerCallback", idemKey);
+  if (prior) return json(prior, 200);
+
+  const job = await getJobInWorkspace(env.DB, jobId, workspaceId);
+  if (!job) throw new NotFoundError(`Job ${jobId} not found.`);
+
+  const now = nowIso();
+  // Terminal job / instance → 200 no-op ack (never permastuck an at-least-once worker).
+  if (job.status === "completed" || job.status === "failed" || isTerminalInstanceStatus(job.instance_status)) {
+    const ack: JobCallbackAck = { jobId, outcome: "noop", disposition: "ignored" };
+    await putIdempotentResult(env.DB, "workerCallback", idemKey, ack, now);
+    return json(ack, 200);
+  }
+
+  const changes = await completeJobConditional(env.DB, { jobId, lockToken: body.lockToken, output, now });
+  if (changes === 0) {
+    // A concurrent duplicate (same jobId+lockToken) may have committed first —
+    // return its stable prior outcome rather than a spurious 409. A genuinely
+    // stale token has no record under this key and still 409s.
+    const raced = await getIdempotentResult<JobCallbackAck>(env.DB, "workerCallback", idemKey);
+    if (raced) return json(raced, 200);
+    throw new ConflictError(`Job ${jobId} could not be completed: the lock token is stale or the job is not currently leased.`);
+  }
+
+  const ack: JobCallbackAck = { jobId, outcome: "completed", disposition: "applied" };
+  await putIdempotentResult(env.DB, "workerCallback", idemKey, ack, now);
+  await recordHistory(env.DB, {
+    workspaceId,
+    instanceId: job.instance_id,
+    elementId: job.element_id,
+    type: "jobCompleted",
+    diagnostics: { jobId },
+    payloadSnapshot: output,
+  });
+
+  await getExecutor(env).deliverJobResult({
+    workflowInstanceId: job.instance_id,
+    instanceId: job.instance_id,
+    elementId: job.element_id,
+    event: { outcome: "completed", jobId, output },
+  });
+  return json(ack, 200);
+}
+
+async function handleFailJob(env: Env, jobId: string, request: Request): Promise<Response> {
+  const { workspaceId } = await authenticateWorker(request, env);
+  const body = await parseBody(failJobRequestSchema, request);
+
+  const idemKey = `${jobId}:${body.lockToken}`;
+  const prior = await getIdempotentResult<JobCallbackAck>(env.DB, "workerCallback", idemKey);
+  if (prior) return json(prior, 200);
+
+  const job = await getJobInWorkspace(env.DB, jobId, workspaceId);
+  if (!job) throw new NotFoundError(`Job ${jobId} not found.`);
+
+  const now = nowIso();
+  if (job.status === "completed" || job.status === "failed" || isTerminalInstanceStatus(job.instance_status)) {
+    const ack: JobCallbackAck = { jobId, outcome: "noop", disposition: "ignored" };
+    await putIdempotentResult(env.DB, "workerCallback", idemKey, ack, now);
+    return json(ack, 200);
+  }
+
+  // Business error (errorCode set) → terminal-for-the-step, the engine raises the
+  // BPMN error → compensation. Technical → re-leasable unless retries exhausted.
+  const isBusiness = !!body.errorCode;
+  const targetStatus: "created" | "failed" = isBusiness
+    ? "failed"
+    : job.attempt_count < job.retry_limit
+      ? "created"
+      : "failed";
+
+  const changes = await failJobConditional(env.DB, {
+    jobId,
+    lockToken: body.lockToken,
+    targetStatus,
+    errorCode: body.errorCode ?? null,
+    now,
+  });
+  if (changes === 0) {
+    const raced = await getIdempotentResult<JobCallbackAck>(env.DB, "workerCallback", idemKey);
+    if (raced) return json(raced, 200);
+    throw new ConflictError(`Job ${jobId} could not be failed: the lock token is stale or the job is not currently leased.`);
+  }
+
+  const ack: JobCallbackAck = { jobId, outcome: "failed", disposition: "applied" };
+  await putIdempotentResult(env.DB, "workerCallback", idemKey, ack, now);
+  await recordHistory(env.DB, {
+    workspaceId,
+    instanceId: job.instance_id,
+    elementId: job.element_id,
+    type: "jobFailed",
+    diagnostics: { jobId, errorCode: body.errorCode ?? null, retryable: !isBusiness, targetStatus, reason: body.reason },
+  });
+
+  // Only deliver when the step has reached a terminal-for-the-step state the
+  // engine must act on. A technical retry (targetStatus 'created') stays parked
+  // and is re-handed by the next activate — no event is sent.
+  if (targetStatus === "failed") {
+    await getExecutor(env).deliverJobResult({
+      workflowInstanceId: job.instance_id,
+      instanceId: job.instance_id,
+      elementId: job.element_id,
+      event: { outcome: "failed", jobId, retryable: !isBusiness, errorCode: body.errorCode ?? null, reason: body.reason },
+    });
+  }
+  return json(ack, 200);
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -403,14 +804,30 @@ async function route(request: Request, env: Env): Promise<Response> {
     }
   }
 
-  if (seg[0] === "instances" && seg[1]) {
-    if (seg.length === 2 && method === "GET") return handleGetInstance(env, seg[1]);
-    if (seg.length === 3 && seg[2] === "history" && method === "GET") return handleGetInstanceHistory(env, seg[1]);
+  if (seg[0] === "instances") {
+    if (seg.length === 1 && method === "GET") return handleListInstances(env, url);
+    if (seg[1]) {
+      if (seg.length === 2 && method === "GET") return handleGetInstance(env, seg[1]);
+      if (seg.length === 3 && seg[2] === "history" && method === "GET") return handleGetInstanceHistory(env, seg[1]);
+      if (seg.length === 3 && seg[2] === "cancel" && method === "POST") return handleCancelInstance(env, seg[1], request);
+      if (seg.length === 3 && seg[2] === "retry" && method === "POST") return handleRetryInstance(env, seg[1], request);
+    }
   }
 
   if (seg[0] === "messages") {
     if (seg.length === 1 && method === "POST") return handlePublishMessage(env, request);
     if (seg.length === 2 && method === "GET") return handleGetMessage(env, seg[1]!);
+  }
+
+  if (seg[0] === "worker-credentials") {
+    if (seg.length === 1 && method === "POST") return handleMintWorkerCredential(env, request);
+    if (seg.length === 3 && seg[2] === "revoke" && method === "POST") return handleRevokeWorkerCredential(env, seg[1]!);
+  }
+
+  if (seg[0] === "jobs") {
+    if (seg.length === 2 && seg[1] === "activate" && method === "POST") return handleActivateJobs(env, request);
+    if (seg.length === 3 && seg[2] === "complete" && method === "POST") return handleCompleteJob(env, seg[1]!, request);
+    if (seg.length === 3 && seg[2] === "fail" && method === "POST") return handleFailJob(env, seg[1]!, request);
   }
 
   throw new NotFoundError(`No route for ${method} ${url.pathname}.`);

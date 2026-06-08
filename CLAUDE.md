@@ -30,15 +30,16 @@ Several overlapping document sets exist. When they conflict, this order wins:
    scenarios). **This directory wins over the design doc and the `docs/bpmn/` reference.**
 3. **`docs/superpowers/specs/2026-06-07-bpmn-lite-orchestrator-mvp-design.md`** — implementation bridge
    (module seams, decomposition, risk map). Distills #2; does not replace it.
-4. **`docs/bpmn/`** — a general BPMN 2.0 reference + the `easy-bpmn` profile (`09-easy-bpmn-profile.md`).
-   Useful for the validator, but see the drift warning below.
+4. **`docs/bpmn/`** — a general BPMN 2.0 reference + the `easy-bpmn` profile (`09-easy-bpmn-profile.md`,
+   now the **canonical transaction-saga** profile, in lockstep with constitution v2.0.0).
 
-### ⚠️ Known doc drift — do not copy it
+### Architecture is Workflow-per-instance + DO-broker (not DO-per-instance)
 
-`docs/bpmn/09-easy-bpmn-profile.md` still says "**one Durable Object per instance**." That is stale. The
-authoritative MVP architecture (per the design doc and `plan.md`) is **one Cloudflare Workflow per process
-instance**, plus a **single Durable Object correlation broker** keyed by
-`workspaceId + messageName + correlationKey`. Implement Workflow-per-instance + DO-broker, not DO-per-instance.
+The authoritative architecture is **one Cloudflare Workflow per process instance**, plus a **single
+Durable Object correlation broker** keyed by `workspaceId + messageName + correlationKey`. (The old
+"one Durable Object per instance" drift in `docs/bpmn/09`/`08` was corrected in M0 — those docs now state
+the correct mapping; a CI guard, `npm run check:docs`, fails if the stale phrasing reappears under
+`docs/bpmn/`.)
 
 ## Architecture (the big picture)
 

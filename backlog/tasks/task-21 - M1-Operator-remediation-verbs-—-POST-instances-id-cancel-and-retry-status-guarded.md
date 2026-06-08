@@ -3,9 +3,10 @@ id: TASK-21
 title: >-
   M1: Operator remediation verbs — POST /instances/{id}/cancel and /retry
   (status-guarded)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-08 08:18'
+updated_date: '2026-06-08 13:03'
 labels:
   - saga
   - api
@@ -106,3 +107,9 @@ Both verbs get zod request+response schemas (§6) and must not leak Workflow int
 8. Tests: tests/contract/operator-verbs.test.ts + tests/integration/operator-remediation.test.ts (pattern: tests/contract/service-task-incident.test.ts; vitest-pool-workers).
 9. Docs: add both endpoints to specs/002-saga-orchestrator/contracts/openapi.yaml; note FR-025 relaxation in spec/profile.
 <!-- SECTION:PLAN:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Operator verbs in index.ts (status-guarded via transitionStatusGuarded). POST /instances/{id}/cancel: abandons in-flight forward jobs (late callbacks no-op), then either running|waiting→cancelled (empty ledger) or →compensating + resumeInline to drive the reverse pass; only the first call initiates one pass. POST /instances/{id}/retry: accepts an optional variables patch (operator fixes the downstream condition); for compensationFailed it resets the failed step (→pending) + re-snapshots/re-leases its comp job + resolves the incident + compensationFailed→compensating + resume; for incident it resets the forward job + incident→running + resume from the element. Verified by saga-operator.test.ts (cancel mid-saga→compensated, cancel empty→cancelled, retry compensationFailed+fix→compensated, cancel-terminal→409).
+<!-- SECTION:FINAL_SUMMARY:END -->

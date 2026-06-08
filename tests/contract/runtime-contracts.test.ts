@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { messageEventPayloadSchema } from "../../src/contracts/workflow-events";
 import { workflowEventTypeFor } from "../../src/bpmn/profile";
-import { DEMO_BPMN, createDraft, get, post, publishDraft, startInstance } from "../helpers";
+import { DEMO_BPMN, createDraft, drainSampleWorkers, get, post, publishDraft, startInstance } from "../helpers";
 
 // Cloudflare Workflows reject event types that don't match this pattern
 // (sendEvent throws `workflow.invalid_event_type`). Must hold for every name.
@@ -31,20 +31,27 @@ describe("Runtime contracts", () => {
     expect(bad.success).toBe(false);
   });
 
-  it("emits Service Task worker-contract diagnostics in history", async () => {
+  it("emits pull Service Task worker-contract diagnostics in history", async () => {
     const draft = await createDraft(DEMO_BPMN);
     const version = await publishDraft(draft.body.draftId);
     const inst = await startInstance(version.body.definitionVersionId, {
       correlationKey: "rc-1",
       variables: { amount: 7 },
     });
-    const history = await get(`/instances/${inst.body.instanceId}/history`);
-    const started = history.body.events.find((e: any) => e.type === "workerAttemptStarted");
-    expect(started).toBeTruthy();
-    // The worker request snapshot carries taskType + attempt + elementId (audit only).
-    expect(started.payloadSnapshot.taskType).toBe("external-check");
-    expect(started.payloadSnapshot.attempt).toBe(1);
-    expect(started.payloadSnapshot.elementId).toBe("Task_check");
+    // The leasable job is created (persist-before-advance) with its routing key.
+    const h1 = await get(`/instances/${inst.body.instanceId}/history`);
+    const created = h1.body.events.find((e: any) => e.type === "serviceTaskJobCreated");
+    expect(created).toBeTruthy();
+    expect(created.elementId).toBe("Task_check");
+    expect(created.diagnostics.taskType).toBe("external-check");
+
+    // A worker leasing the job records a jobActivated event carrying the attempt.
+    await drainSampleWorkers({ taskTypes: ["external-check"] });
+    const h2 = await get(`/instances/${inst.body.instanceId}/history`);
+    const activated = h2.body.events.find((e: any) => e.type === "jobActivated");
+    expect(activated).toBeTruthy();
+    expect(activated.elementId).toBe("Task_check");
+    expect(activated.diagnostics.attempt).toBe(1);
   });
 
   it("records the correlated message payload snapshot atomically with the transition", async () => {
@@ -54,6 +61,7 @@ describe("Runtime contracts", () => {
       correlationKey: "rc-2",
       variables: { amount: 7 },
     });
+    await drainSampleWorkers({ taskTypes: ["external-check"] });
     await post("/messages", {
       workspaceId: "default",
       messageName: "ApprovalReceived",

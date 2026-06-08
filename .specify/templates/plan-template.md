@@ -43,9 +43,19 @@
 For each gate, mark PASS, FAIL, or N/A with rationale. Any FAIL requires an
 entry in Complexity Tracking before implementation planning may continue.
 
-- **BPMN-lite profile**: Feature uses only standard BPMN 2.0-compatible elements
-  within the supported MVP profile, or rejects unsupported elements before
-  publish with user-visible reasons.
+- **BPMN profile**: Feature uses only standard BPMN 2.0-compatible elements within
+  the supported profile (the linear core plus the canonical transaction-saga set:
+  `bpmn:transaction`, compensation/error/cancel boundary events, `isForCompensation`
+  handler, `bpmn:association`, cancel end event, root `bpmn:error`), introduces no
+  custom notation, stays XSD-valid and modeler-round-trippable when easy-bpmn
+  extensions + DI are ignored, and rejects unsupported standard-namespace flow
+  nodes before publish with the element id + a user-visible reason.
+- **SAGA / Compensation integrity**: If the feature touches sagas, compensation
+  runs in reverse completion order, scoped to its transaction, idempotent +
+  at-least-once; compensation is triggered only by transaction Cancel (never by an
+  uncaught Error/Hazard); a compensator that exhausts retries settles to
+  `compensationFailed` with operator remediation, never blocking forever. N/A only
+  with a one-sentence rationale.
 - **Immutable version binding**: Published process definitions are immutable, and
   running instances bind to exactly one definition version for their lifetime.
 - **Durable idempotency**: Runtime transitions, Service Task calls, callbacks,

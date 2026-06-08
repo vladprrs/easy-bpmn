@@ -16,8 +16,16 @@
   a one-sentence rationale.
 -->
 
-**BPMN Profile Impact**: [Supported BPMN elements touched, unsupported elements
-that must be rejected, or N/A with rationale]
+**BPMN Profile Impact**: [Supported BPMN elements touched — including any saga
+constructs (`bpmn:transaction`, compensation/error/cancel boundary events,
+`isForCompensation` handler, `bpmn:association`, cancel end event, `bpmn:error`) —
+unsupported elements that must be rejected before publish with element id + reason,
+or N/A with rationale]
+
+**SAGA / Compensation Impact**: [If sagas/compensation are touched: reverse-order
+compensation, transaction scoping, idempotent + at-least-once compensators,
+Cancel-not-Error trigger (Hazard terminates), and the `compensationFailed` +
+operator-remediation outcome; or N/A with rationale]
 
 **Definition Versioning Impact**: [How immutable published definitions and
 version-bound running instances are preserved, or N/A with rationale]

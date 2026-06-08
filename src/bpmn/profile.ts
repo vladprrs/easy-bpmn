@@ -9,9 +9,19 @@ export const SUPPORTED_NODE_TYPES: Record<string, NodeType> = {
   "bpmn:ServiceTask": "serviceTask",
   "bpmn:ReceiveTask": "receiveTask",
   "bpmn:EndEvent": "endEvent",
+  // SAGA (M0): the transaction scope and its boundary events.
+  "bpmn:Transaction": "transaction",
+  "bpmn:BoundaryEvent": "boundaryEvent",
 };
 
 export const SEQUENCE_FLOW_TYPE = "bpmn:SequenceFlow";
+export const ASSOCIATION_TYPE = "bpmn:Association";
+export const ERROR_TYPE = "bpmn:Error";
+
+/** Event-definition $types we classify (start/end/boundary discriminators). */
+export const COMPENSATE_EVENT_DEFINITION = "bpmn:CompensateEventDefinition";
+export const ERROR_EVENT_DEFINITION = "bpmn:ErrorEventDefinition";
+export const CANCEL_EVENT_DEFINITION = "bpmn:CancelEventDefinition";
 
 /** Human-friendly element type name, e.g. "bpmn:UserTask" → "userTask". */
 export function localTypeName($type: string): string {
@@ -37,4 +47,14 @@ export const DEFAULT_SERVICE_TASK_ATTEMPTS = 1;
 export function workflowEventTypeFor(messageName: string): string {
   const safe = messageName.replace(/[^A-Za-z0-9_-]/g, "_");
   return `bpmn_message_${safe}`.slice(0, 100);
+}
+
+/**
+ * Workflow event type a Service-Task-as-wait waits on, one per logical job.
+ * Same Cloudflare constraints as message events (dot-free, ≤100 chars); jobIds
+ * are already `job_<uuid>` so sanitizing is defensive.
+ */
+export function workflowJobEventTypeFor(jobId: string): string {
+  const safe = jobId.replace(/[^A-Za-z0-9_-]/g, "_");
+  return `bpmn_job_${safe}`.slice(0, 100);
 }

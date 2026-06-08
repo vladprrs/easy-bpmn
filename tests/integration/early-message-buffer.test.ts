@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   DEMO_BPMN,
   createDraft,
+  drainSampleWorkers,
   get,
   publishDraft,
   publishMessage,
@@ -26,8 +27,13 @@ describe("Scenario 4: early message buffering", () => {
       correlationKey: "buf-1",
       variables: { amount: 10 },
     });
-    expect(started.body.status).toBe("completed");
-    expect(started.body.variables.approvedBy).toBe("early");
+    // Parks at the pull Service Task; once driven, the Receive Task registration
+    // consumes the already-buffered message and the instance completes.
+    expect(started.body.status).toBe("waiting");
+    await drainSampleWorkers({ taskTypes: ["external-check"] });
+    const afterWork = await get(`/instances/${started.body.instanceId}`);
+    expect(afterWork.body.status).toBe("completed");
+    expect(afterWork.body.variables.approvedBy).toBe("early");
 
     // Repeating the same publish returns the original (buffered) outcome as duplicate.
     const repeat = await publishMessage({

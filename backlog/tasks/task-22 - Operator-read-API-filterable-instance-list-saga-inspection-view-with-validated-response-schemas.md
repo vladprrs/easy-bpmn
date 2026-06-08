@@ -3,9 +3,10 @@ id: TASK-22
 title: >-
   Operator read API: filterable instance list + saga inspection view with
   validated response schemas
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-08 08:18'
+updated_date: '2026-06-08 13:03'
 labels:
   - api
   - saga
@@ -105,3 +106,9 @@ Scope: read-only. No engine, broker, or write-path changes. Consumes the widened
 8. Tests: add tests/contract/instances-read.test.ts and tests/integration/saga-inspection.test.ts, reusing tests/helpers.ts + tests/apply-migrations.ts; seed saga_steps directly via env.DB for the integration case.
 9. Docs: update specs/002-saga-orchestrator/contracts/openapi.yaml for both endpoints.
 <!-- SECTION:PLAN:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Operator read API. GET /instances?workspaceId=&status=&limit=&cursor= → filterable, rowid-cursor-paginated list (listInstances, backed by idx_instances_workspace_status). GET /instances/{id} extended with a `saga` block (phase forward|compensating|compensated|compensationFailed, traceId, per-step compensationStatus + handler wiring from the ledger) and now surfaces the incident for compensationFailed too. Response types added to contracts/api.ts (SagaInspection, InstanceListResponse). Verified by saga-operator.test.ts (saga view + list filter).
+<!-- SECTION:FINAL_SUMMARY:END -->

@@ -1,9 +1,10 @@
 ---
 id: TASK-19
 title: 'Engine: error/cancel boundary execution and Cancel-vs-Hazard failure routing'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-08 08:18'
+updated_date: '2026-06-08 13:03'
 labels:
   - saga
   - engine
@@ -109,3 +110,9 @@ This is the canonicity crux: cancellation triggers compensation automatically (n
 9. Tests: add tests/integration/saga-business-error-compensate.test.ts and tests/integration/saga-hazard-terminal.test.ts using the DirectExecutor harness (src/runtime/executor.ts:40-57); extend tests/contract/runtime-contracts.test.ts for job-result classification.
 10. Update docs/bpmn/09-easy-bpmn-profile.md per §7 alignment.
 <!-- SECTION:PLAN:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Error/cancel boundary execution + Cancel-vs-Hazard in engine.ts. A forward job failing with a business errorCode → errorBoundaryTarget(elementId, errorCode) routes the single token to the matching error boundary's cancel end → the endEvent cancel branch → beginCompensating → reverse compensation → cancelBoundaryTarget settles the saga-failed path. An uncaught business error (no matching boundary) OR a technical exhaustion OR a job timeout is a HAZARD → terminal incident (createIncident), NEVER auto-compensation. Verified by saga-orchestration (business error → compensation) + service-task-incident (technical exhaustion → incident, not compensation).
+<!-- SECTION:FINAL_SUMMARY:END -->

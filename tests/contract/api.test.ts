@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  CALL_ACTIVITY_BPMN,
   createDraft,
+  drainSampleWorkers,
   get,
   GATEWAY_BPMN,
   DEMO_BPMN,
   post,
   publishDraft,
+  SAGA_BPMN,
   startInstance,
 } from "../helpers";
 
@@ -30,6 +33,38 @@ describe("Public API contract (openapi.yaml)", () => {
     expect(pub.body.error).toBeTruthy();
     expect(Array.isArray(pub.body.validationIssues)).toBe(true);
     expect(pub.body.validationIssues.length).toBeGreaterThan(0);
+  });
+
+  it("publishes the canonical transaction-saga (§3) into an immutable version (201)", async () => {
+    const draft = await createDraft(SAGA_BPMN, "order-saga");
+    expect(draft.status).toBe(201);
+    expect(draft.body.status).toBe("valid");
+    expect(draft.body.validationIssues).toEqual([]);
+
+    const pub = await publishDraft(draft.body.draftId);
+    expect(pub.status).toBe(201);
+    expect(pub.body.definitionVersionId).toMatch(/^pdv_/);
+    expect(pub.body.status).toBe("published");
+    // saga elements survive into the published version's element list
+    const types = pub.body.elements.map((e: any) => e.type);
+    expect(types).toContain("transaction");
+    expect(types).toContain("boundaryEvent");
+    const reserve = pub.body.elements.find((e: any) => e.elementId === "reserveStock");
+    expect(reserve.taskType).toBe("reserve-stock");
+  });
+
+  it("blocks publishing a deferred-construct draft (409) with element id + reason recorded", async () => {
+    const draft = await createDraft(CALL_ACTIVITY_BPMN, "deferred");
+    expect(draft.status).toBe(201);
+    expect(draft.body.status).toBe("invalid");
+    const issue = draft.body.validationIssues.find((i: any) => i.elementId === "CA");
+    expect(issue).toBeTruthy();
+    expect(issue.reason).toMatch(/callActivity/);
+
+    const pub = await publishDraft(draft.body.draftId);
+    expect(pub.status).toBe(409);
+    expect(Array.isArray(pub.body.validationIssues)).toBe(true);
+    expect(pub.body.validationIssues.some((i: any) => i.elementId === "CA")).toBe(true);
   });
 
   it("404s an unknown draft", async () => {
@@ -98,6 +133,8 @@ describe("Public API contract (openapi.yaml)", () => {
       correlationKey: "approval-9",
       variables: { amount: 1 },
     });
+    // Drive the pull Service Task so the Receive Task subscription is active.
+    await drainSampleWorkers({ taskTypes: ["external-check"] });
     const msg = await post("/messages", {
       workspaceId: "default",
       messageName: "ApprovalReceived",

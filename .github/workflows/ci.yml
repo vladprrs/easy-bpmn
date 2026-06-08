@@ -27,6 +27,8 @@ jobs:
       - run: npm ci
       - name: Typecheck
         run: npm run typecheck
+      - name: Docs consistency (canonical-saga profile, no stale DO-per-instance)
+        run: npm run check:docs
       - name: Test (unit + contract + integration)
         run: npm test
       - name: Build validation (wrangler dry-run — offline, no deploy)

@@ -1,9 +1,10 @@
 ---
 id: TASK-9
 title: 'Validator + profile: accept-and-validate the M1 canonical-saga construct set'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-08 08:17'
+updated_date: '2026-06-08 12:15'
 labels:
   - saga
   - bpmn
@@ -65,17 +66,17 @@ The current validator only walks proc.flowElements (validator.ts:116) and reject
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The design §3 canonical order-saga example validates (parseAndValidate returns ok:true with zero error-severity issues) and publishes through the API (POST /definitions/drafts then /publish returns the published version, 201), proving accept-and-validate.
-- [ ] #2 A compensation boundaryEvent (compensateEventDefinition) is accepted only with zero outgoing sequenceFlow AND exactly one outgoing bpmn:association to an isForCompensation activity in the same transaction scope; each violation (any outgoing sequenceFlow; zero or multiple associations; association target not isForCompensation; association target in a different transaction scope) is rejected with the offending element id + reason (one unit test per case).
-- [ ] #3 An error boundaryEvent on a serviceTask is accepted only when its errorRef resolves to a declared root bpmn:error; a missing/unresolved errorRef is rejected with element id + reason (unit test).
-- [ ] #4 A cancelEventDefinition is accepted only in transaction context: a cancel end event only inside a transaction and a cancel boundaryEvent only when attachedToRef is the transaction; a cancel end event outside any transaction and a cancel boundaryEvent on a non-transaction activity are each rejected with element id + reason (unit tests).
-- [ ] #5 All deferred constructs remain rejected with element id + reason: exclusiveGateway/parallelGateway, conditionExpression/default flow, timer + intermediateCatchEvent, callActivity, non-transaction subProcess, multiInstance/loop characteristics, receiveTask instantiate="true", and pools/lanes/collaboration (existing tests/unit/bpmn-validator.test.ts cases stay green; new saga-adjacent negatives added).
-- [ ] #6 Ignorable content stays tolerated: the §3 example augmented with foreign-namespace extensionElements (camunda:/zeebe:), Diagram Interchange, and documentation still validates and publishes (unit + contract test).
-- [ ] #7 CONSTITUTION GATE — a contract/integration test (tests/contract/api.test.ts plus tests/unit/bpmn-validator.test.ts) proves the publish gate end-to-end: the saga example publishes (201) and a deferred-construct draft is blocked at publish (409) with the element id + reason recorded on the draft's validation issues.
-- [ ] #8 A semantic round-trip test confirms the §3 example re-serializes via bpmn-moddle toXML and re-parses with no loss of standard elements when the easy-bpmn namespace and DI are ignored (design §3 note R3); bpmn-js manual round-trip noted as the operative human check.
-- [ ] #9 .specify/memory/constitution.md is bumped 1.0.0 -> 2.0.0 with a Sync Impact Report: Principle I rewritten to widen the profile while preserving the no-custom-notation / XSD-valid / round-trippable clause, the MVP Scope exclusion list trimmed to remove only the M1-shipped constructs (transaction, compensation, boundary error/cancel events), and a new 'SAGA / Compensation Integrity' principle added (design §7).
-- [ ] #10 docs/bpmn/09-easy-bpmn-profile.md is updated to the widened profile AND the stale 'one Durable Object per instance' line (09:154) corrected to one Cloudflare Workflow per instance + single DO correlation broker.
-- [ ] #11 npm run test:unit and npm run test:contract both pass.
+- [x] #1 The design §3 canonical order-saga example validates (parseAndValidate returns ok:true with zero error-severity issues) and publishes through the API (POST /definitions/drafts then /publish returns the published version, 201), proving accept-and-validate.
+- [x] #2 A compensation boundaryEvent (compensateEventDefinition) is accepted only with zero outgoing sequenceFlow AND exactly one outgoing bpmn:association to an isForCompensation activity in the same transaction scope; each violation (any outgoing sequenceFlow; zero or multiple associations; association target not isForCompensation; association target in a different transaction scope) is rejected with the offending element id + reason (one unit test per case).
+- [x] #3 An error boundaryEvent on a serviceTask is accepted only when its errorRef resolves to a declared root bpmn:error; a missing/unresolved errorRef is rejected with element id + reason (unit test).
+- [x] #4 A cancelEventDefinition is accepted only in transaction context: a cancel end event only inside a transaction and a cancel boundaryEvent only when attachedToRef is the transaction; a cancel end event outside any transaction and a cancel boundaryEvent on a non-transaction activity are each rejected with element id + reason (unit tests).
+- [x] #5 All deferred constructs remain rejected with element id + reason: exclusiveGateway/parallelGateway, conditionExpression/default flow, timer + intermediateCatchEvent, callActivity, non-transaction subProcess, multiInstance/loop characteristics, receiveTask instantiate="true", and pools/lanes/collaboration (existing tests/unit/bpmn-validator.test.ts cases stay green; new saga-adjacent negatives added).
+- [x] #6 Ignorable content stays tolerated: the §3 example augmented with foreign-namespace extensionElements (camunda:/zeebe:), Diagram Interchange, and documentation still validates and publishes (unit + contract test).
+- [x] #7 CONSTITUTION GATE — a contract/integration test (tests/contract/api.test.ts plus tests/unit/bpmn-validator.test.ts) proves the publish gate end-to-end: the saga example publishes (201) and a deferred-construct draft is blocked at publish (409) with the element id + reason recorded on the draft's validation issues.
+- [x] #8 A semantic round-trip test confirms the §3 example re-serializes via bpmn-moddle toXML and re-parses with no loss of standard elements when the easy-bpmn namespace and DI are ignored (design §3 note R3); bpmn-js manual round-trip noted as the operative human check.
+- [x] #9 .specify/memory/constitution.md is bumped 1.0.0 -> 2.0.0 with a Sync Impact Report: Principle I rewritten to widen the profile while preserving the no-custom-notation / XSD-valid / round-trippable clause, the MVP Scope exclusion list trimmed to remove only the M1-shipped constructs (transaction, compensation, boundary error/cancel events), and a new 'SAGA / Compensation Integrity' principle added (design §7).
+- [x] #10 docs/bpmn/09-easy-bpmn-profile.md is updated to the widened profile AND the stale 'one Durable Object per instance' line (09:154) corrected to one Cloudflare Workflow per instance + single DO correlation broker.
+- [x] #11 npm run test:unit and npm run test:contract both pass.
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -93,3 +94,9 @@ The current validator only walks proc.flowElements (validator.ts:116) and reject
 10. Extend tests/unit/bpmn-validator.test.ts (accept + each negative) and tests/contract/api.test.ts (publish 201 saga, 409 + recorded issue for deferred) per the 409/201 pattern at api.test.ts:22,41; add the bpmn-moddle round-trip test.
 11. Amend .specify/memory/constitution.md -> 2.0.0 and docs/bpmn/09-easy-bpmn-profile.md (profile widening + fix :154). Run npm run test:unit and npm run test:contract.
 <!-- SECTION:PLAN:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Flipped the publish-time profile gate from reject to accept-and-validate for the canonical-saga set, with no engine/runtime change. `src/bpmn/graph.ts`: widened ElementType/NodeType to transaction/boundaryEvent/association/error + added minimal saga snapshot fields (scopeId, isForCompensation, endKind, boundaryKind, attachedToRef, errorRef/errorCode, compensationHandlerId) and ExecutionGraph.transactions/associations/errors. `src/bpmn/profile.ts`: added bpmn:Transaction/bpmn:BoundaryEvent to SUPPORTED_NODE_TYPES + saga type constants. `src/bpmn/parser.ts`: added roundTripBpmnXml() for the semantic round-trip test. `src/bpmn/validator.ts`: rewritten scope-aware — recurses into transaction scopes, parses root bpmn:error + bpmn:association artifacts, classifies boundary events by their single event definition, validates per-scope (one none start, ≥1 none commit end, linearity, BFS reachability over flow+attachment+association edges), and enforces saga structure (compensation boundary = 0 outgoing flow + exactly 1 in-scope association to an isForCompensation handler; error boundary attached to a serviceTask + resolved errorRef + routes to a cancel end; cancel boundary only on the transaction; cancel end only inside a transaction; handlers must live in a transaction). Linear MVP graphs are emitted identically (engine unaffected — full suite still green). `src/contracts/api.ts`: widened BpmnElement.type for the saga element types. Tests: SAGA fixtures + a parametric `sagaBpmn()` builder in tests/helpers.ts; 12 new validator unit tests (accept §3, tolerate ignorable, semantic round-trip, builder accept, + 8 negatives: comp-boundary outgoing/no-assoc/multi-assoc/target-not-handler, cross-scope assoc, unresolved errorRef, cancel-end-outside-tx, cancel-boundary-on-task) and a callActivity reject; 2 new contract tests (saga publishes 201 with transaction/boundaryEvent elements; deferred construct → draft invalid with element id + 409 on publish). Governance shipped in lockstep (constitution 2.0.0 via TASK-7; docs/bpmn/09 via TASK-10). `npm run typecheck`, `test:unit`, `test:contract`, and full suite all green (57/57).
+<!-- SECTION:FINAL_SUMMARY:END -->

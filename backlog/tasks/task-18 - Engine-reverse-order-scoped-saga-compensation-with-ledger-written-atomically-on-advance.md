@@ -3,9 +3,10 @@ id: TASK-18
 title: >-
   Engine: reverse-order scoped saga compensation with ledger written atomically
   on advance
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-08 08:18'
+updated_date: '2026-06-08 13:03'
 labels:
   - saga
   - compensation
@@ -99,3 +100,9 @@ Depends on: saga_steps migration + comp-job columns/index, Service-Task-as-wait 
 7. Tests: tests/integration/saga-compensation.test.ts (vitest-pool-workers) — happy reverse compensation, duplicate callback no-double-advance, compensator-exhaustion→compensationFailed, mid-compensation replay re-attach; tests/unit/compensation.test.ts via DirectExecutor (executor.ts:40-57) — INSERT OR IGNORE no-op + re-attach.
 8. Update specs/002 runtime-contracts/data-model docs + keep docs/bpmn/09-easy-bpmn-profile.md aligned.
 <!-- SECTION:PLAN:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Reverse-order scoped compensation in engine.ts (runCompensation, createCompensationJob, markStepCompensated/Failed). On forward completion of a compensatable step, applyForwardCompletion writes the saga_steps ledger row INSERT-OR-IGNORE atomically with advance (captured input+output, compensation wiring, status 'pending'/'notRequired'). On cancel, runCompensation selects the scope's steps seq DESC and compensates each via a pull comp job (is_compensation=1, seeded with originalInput+capturedOutput from the ledger), sequentially in reverse; a replay re-attaches to the existing comp job (getCompensationJobByElement) — no second comp job. On a compensator's retry-exhaustion the pass STOPS (status compensationFailed); the compensated suffix stays compensated. Verified by saga-orchestration.test.ts (reverse order chargeCard→reserveStock) + saga-operator (operator-driven).
+<!-- SECTION:FINAL_SUMMARY:END -->

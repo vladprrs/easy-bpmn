@@ -37,3 +37,16 @@ export async function parseBpmnXml(xml: string): Promise<ParseOutcome> {
     return { ok: false, error: `BPMN XML is not well-formed or parseable: ${message}` };
   }
 }
+
+/**
+ * Parse → re-serialize → return the round-tripped XML. Used by the canonicity
+ * test (SAGA design §3, note R3): an accepted file must re-serialize through a
+ * standard moddle without losing standard elements. `bpmn-js` is the operative
+ * human round-trip check; this is the automated semantic round-trip.
+ */
+export async function roundTripBpmnXml(xml: string): Promise<string> {
+  const moddle = new BpmnModdle({ "easy-bpmn": easyBpmnModdle });
+  const { rootElement } = await moddle.fromXML(xml, "bpmn:Definitions");
+  const { xml: out } = await moddle.toXML(rootElement, { format: false });
+  return out;
+}

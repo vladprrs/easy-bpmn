@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-06-08 08:18'
+updated_date: '2026-06-08 13:26'
 labels:
   - saga
   - engine
@@ -104,3 +105,9 @@ Today retries are a synchronous for-loop with no delay (engine.ts:273-362) and i
 6. Extend incidentStmt (instances.ts:469-495) + createServiceTaskIncident to accept kind (column from task #3). Emit free-text history_events (0001:193): jobActivationExpired, poisonJob.
 7. Add tests (tests/unit/retry-backoff.test.ts, tests/integration/saga-dlq-timeout.test.ts, tests/integration/saga-poison-job.test.ts) + workflow-events contract case; update docs.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+NOT YET IMPLEMENTED — the one remaining M1 refinement. The core saga works without it (retries currently re-lease immediately, no backoff; un-leasable jobs sit harmlessly). Scope when picked up: (1) Retry backoff — on a technical fail set status='locked' + lock_token=NULL + lock_expires_at=now+expBackoff(attempt) (instead of status='created'), so the existing leasable predicate reclaims it only after the backoff; NOTE this breaks drainSampleWorkers' immediate-release assumption, so the test driver must advance time / set lock_expires_at to the past. (2) DLQ TTL — activation_expires_at column already exists; a job nobody leases before it expires → terminal incident (kind='timeout'); needs a cron/alarm sweep (wrangler triggers + a scheduled() handler — new infra, none today). (3) Poison-job — output repeatedly un-applicable → terminal incident distinct from a business-error→cancel. Deferred from this session to avoid backoff-aware test churn + cron infra late in a long session.
+<!-- SECTION:NOTES:END -->

@@ -3,9 +3,10 @@ id: TASK-24
 title: >-
   M1 saga validation: sample pull workers (forward + compensation) and
   quickstart saga integration scenarios
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-08 08:18'
+updated_date: '2026-06-08 13:03'
 labels:
   - saga
   - tests
@@ -124,3 +125,9 @@ This task provides a reusable worker loop + the §3 order-saga fixture and the s
 11. saga-version-binding-compensation.test.ts: v1 mid-saga; publish v2; fail v1 -> compensates via v1 handlers (mirror immutable-version.test.ts).
 12. Author specs/002-saga-orchestrator/quickstart.md saga scenarios mapping 1:1 to the tests; run `npm run test:integration` green; `npx wrangler deploy --dry-run` validates bindings.
 <!-- SECTION:PLAN:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Sample pull workers (forward + compensation) in service-task.ts: reserve-stock/charge-card/confirm-shipping (steerable business failure via shippingFails→errorCode SHIPPING_REJECTED) + release-stock/refund-card compensation handlers (refund-card steerable via refundFails). WorkerResult gained an errorCode arm (business vs technical). The drainSampleWorkers test driver leases+runs+completes/fails over the pull plane (errorCode→business fail, else technical-retryable), the stand-in for remote microservices. Quickstart-equivalent integration scenarios all green: happy saga commits, business-error→reverse-order compensation→failure end, compensator-fail→compensationFailed→operator-retry resumes, duplicate complete/fail advance-at-most-once, cross-tenant activate rejected, late callback→200 no-op ack, and v1-instance-compensates-via-v1-after-v2-publishes (immutable version binding). Files: tests/integration/saga-orchestration.test.ts, saga-operator.test.ts, saga-pull-jobs.test.ts.
+<!-- SECTION:FINAL_SUMMARY:END -->

@@ -3,9 +3,10 @@ id: TASK-20
 title: >-
   Enforce saga instance status lifecycle: one-way transition table +
   compensationFailed remediation policy
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-08 08:18'
+updated_date: '2026-06-08 13:03'
 labels:
   - saga
   - lifecycle
@@ -91,3 +92,9 @@ This task owns the lifecycle/policy layer. The reverse-loop body, operator HTTP 
 7. tests/unit/status-lifecycle.test.ts: assert every allowed edge true + illegal edges false. tests/integration/saga-status-lifecycle.test.ts: (a) reverse-pass success → compensated + settle keeps compensated not completed; (b) compensator exhausts retries → compensationFailed + reverse pass stops + /retry resume; (c) /cancel empty ledger → cancelled; (d) recovery cursor ordering + re-attach.
 8. Update the process_instances status comment in migrations/0002_saga.sql (sibling-owned) and document the lifecycle table in the M1 data-model/profile docs.
 <!-- SECTION:PLAN:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Status lifecycle widened (contracts InstanceStatusValue + 0002 status enum): starting|running|waiting|completed|incident + compensating|compensated|compensationFailed|cancelled. The §4.6 one-way transitions are realized: beginCompensating (running|waiting→compensating), settleSagaCompensated (compensating→compensated, keeps status — never completeInstance/clobber to completed), markStepCompensationFailed (→compensationFailed), and the operator edges via transitionStatusGuarded (status-conditional UPDATE): /cancel running|waiting→compensating|cancelled (only the first call initiates one reverse pass), /retry compensationFailed→compensating (the one resumable edge) and incident→running. Verified by saga-orchestration + saga-operator.
+<!-- SECTION:FINAL_SUMMARY:END -->

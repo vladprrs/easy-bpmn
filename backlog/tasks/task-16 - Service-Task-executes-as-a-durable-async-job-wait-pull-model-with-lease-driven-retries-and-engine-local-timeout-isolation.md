@@ -3,9 +3,10 @@ id: TASK-16
 title: >-
   Service Task executes as a durable async job wait (pull model) with
   lease-driven retries and engine-local timeout isolation
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-08 08:18'
+updated_date: '2026-06-08 13:02'
 labels:
   - saga
   - engine
@@ -115,3 +116,9 @@ Engine subset of M1 task (6); depends on the lease-column migration (task 3) + a
 8. Add tests: unit (sanitizer + timeout calc) under tests/unit; contract (job-result schema) under tests/contract; integration (completed, duplicate-completed, technical-incident, local-timeout isolation, business-vs-technical) under tests/integration.
 9. Docs: document forward-worker idempotency-on-jobId in contracts/runtime-contracts.md and align the §4.3 wait semantics.
 <!-- SECTION:PLAN:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Service Task is now a durable async pull wait. engine.ts driveForwardServiceTask: persist-before-advance creates a leasable job (status 'created', no outbound call), then either parks (direct mode, status 'waiting') or one step.waitForEvent on bpmn_job_<jobId> (workflow mode). Retries are driven by re-lease (a technical fail makes the job re-leasable; the single waitForEvent persists across attempts) — flat one-wait-per-task budget. On resume the engine re-reads the terminal job from D1 (completed→apply+advance; failed+errorCode→business; failed→technical-exhaustion incident). The per-job timeout is caught inside the engine (process-workflow.ts waitFor returns {kind:'timeout'}) and routed to the technical/DLQ branch, NOT the workflow catch-all. Output ledger write is atomic with advance. Existing linear integration tests migrated to drive the sample worker over the pull plane (drainSampleWorkers helper). Full suite green (91).
+<!-- SECTION:FINAL_SUMMARY:END -->

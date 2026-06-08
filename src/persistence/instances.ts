@@ -147,6 +147,75 @@ export async function applyTransition(
   await applyTransitionStmt(db, input).run();
 }
 
+/** Status-conditional transition: applies only when current status is in `from`. Returns rows changed. */
+export async function transitionStatusGuarded(
+  db: D1Database,
+  instanceId: string,
+  from: InstanceStatus[],
+  to: InstanceStatus,
+  now: string,
+): Promise<number> {
+  const placeholders = from.map(() => "?").join(", ");
+  const res = await stmt(
+    db,
+    `UPDATE process_instances SET status = ?, updated_at = ? WHERE instance_id = ? AND status IN (${placeholders})`,
+    [to, now, instanceId, ...from],
+  ).run();
+  return res.meta?.changes ?? 0;
+}
+
+/** Merge a variables patch into the instance (operator remediation). */
+export async function mergeInstanceVariables(
+  db: D1Database,
+  instanceId: string,
+  patch: JsonObject,
+  now: string,
+): Promise<void> {
+  const row = await getInstanceRow(db, instanceId);
+  if (!row) return;
+  const merged = { ...parseJson<JsonObject>(row.variables, {}), ...patch };
+  await dbRun(db, `UPDATE process_instances SET variables = ?, updated_at = ? WHERE instance_id = ?`, [toJson(merged), now, instanceId]);
+}
+
+export interface InstanceListItem {
+  instanceId: string;
+  status: string;
+  currentElementId: string | null;
+  correlationKey: string;
+  businessKey: string | null;
+  startedAt: string;
+  updatedAt: string;
+}
+
+/** Filterable operator list (rowid-cursor pagination, newest first). */
+export async function listInstances(
+  db: D1Database,
+  input: { workspaceId: string; status?: string; limit: number; cursor?: number },
+): Promise<{ items: InstanceListItem[]; nextCursor: number | null }> {
+  const where: string[] = ["workspace_id = ?"];
+  const params: unknown[] = [input.workspaceId];
+  if (input.status) {
+    where.push("status = ?");
+    params.push(input.status);
+  }
+  if (input.cursor != null) {
+    where.push("rowid < ?");
+    params.push(input.cursor);
+  }
+  params.push(input.limit + 1);
+  const rows = await dbAll<InstanceListItem & { rowid: number }>(
+    db,
+    `SELECT rowid, instance_id AS instanceId, status, current_element_id AS currentElementId,
+            correlation_key AS correlationKey, business_key AS businessKey, started_at AS startedAt, updated_at AS updatedAt
+       FROM process_instances WHERE ${where.join(" AND ")} ORDER BY rowid DESC LIMIT ?`,
+    params,
+  );
+  const hasMore = rows.length > input.limit;
+  const items = rows.slice(0, input.limit);
+  const nextCursor = hasMore ? items[items.length - 1]!.rowid : null;
+  return { items: items.map(({ rowid, ...rest }) => rest), nextCursor };
+}
+
 export async function setWorkflowStatus(
   db: D1Database,
   instanceId: string,
@@ -200,6 +269,15 @@ export interface JobRow {
   created_at: string;
   updated_at: string;
   completed_at: string | null;
+  // SAGA (0002) — pull lease + compensation lane + DLQ + workspace scoping.
+  workspace_id: string | null;
+  is_compensation: number;
+  compensates_element_id: string | null;
+  worker_id: string | null;
+  lock_token: string | null;
+  lock_expires_at: string | null;
+  activation_expires_at: string | null;
+  error_code: string | null;
 }
 
 export async function getJobByElement(
@@ -214,7 +292,33 @@ export async function getJobByElement(
   );
 }
 
-export async function createJob(
+/** The FORWARD job for an element (is_compensation = 0). */
+export async function getForwardJobByElement(
+  db: D1Database,
+  instanceId: string,
+  elementId: string,
+): Promise<JobRow | null> {
+  return dbFirst<JobRow>(
+    db,
+    `SELECT * FROM service_task_jobs WHERE instance_id = ? AND element_id = ? AND is_compensation = 0`,
+    [instanceId, elementId],
+  );
+}
+
+/** The COMPENSATION job for a forward element (is_compensation = 1). */
+export async function getCompensationJobByElement(
+  db: D1Database,
+  instanceId: string,
+  elementId: string,
+): Promise<JobRow | null> {
+  return dbFirst<JobRow>(
+    db,
+    `SELECT * FROM service_task_jobs WHERE instance_id = ? AND element_id = ? AND is_compensation = 1`,
+    [instanceId, elementId],
+  );
+}
+
+export function createJobStmt(
   db: D1Database,
   input: {
     jobId: string;
@@ -225,13 +329,19 @@ export async function createJob(
     idempotencyKey: string;
     inputVariables: JsonObject;
     now: string;
+    // SAGA (0002) — optional; forward jobs default is_compensation=0.
+    workspaceId?: string | null;
+    isCompensation?: boolean;
+    compensatesElementId?: string | null;
+    activationExpiresAt?: string | null;
   },
-): Promise<void> {
-  await dbRun(
+): D1PreparedStatement {
+  return stmt(
     db,
     `INSERT INTO service_task_jobs
-       (job_id, instance_id, element_id, task_type, status, retry_limit, attempt_count, idempotency_key, input_variables, output_variables, created_at, updated_at, completed_at)
-     VALUES (?, ?, ?, ?, 'created', ?, 0, ?, ?, NULL, ?, ?, NULL)`,
+       (job_id, instance_id, element_id, task_type, status, retry_limit, attempt_count, idempotency_key, input_variables, output_variables, created_at, updated_at, completed_at,
+        workspace_id, is_compensation, compensates_element_id, activation_expires_at)
+     VALUES (?, ?, ?, ?, 'created', ?, 0, ?, ?, NULL, ?, ?, NULL, ?, ?, ?, ?)`,
     [
       input.jobId,
       input.instanceId,
@@ -242,8 +352,19 @@ export async function createJob(
       toJson(input.inputVariables),
       input.now,
       input.now,
+      input.workspaceId ?? null,
+      input.isCompensation ? 1 : 0,
+      input.compensatesElementId ?? null,
+      input.activationExpiresAt ?? null,
     ],
   );
+}
+
+export async function createJob(
+  db: D1Database,
+  input: Parameters<typeof createJobStmt>[1],
+): Promise<void> {
+  await createJobStmt(db, input).run();
 }
 
 export async function setJobStatus(
@@ -466,6 +587,9 @@ export async function markSubscriptionExpired(
 // Incidents
 // ---------------------------------------------------------------------------
 
+export type IncidentKind = "serviceTaskFailure" | "compensationFailure" | "timeout";
+export type IncidentResolution = "open" | "compensating" | "compensated" | "operatorResolved";
+
 export function incidentStmt(
   db: D1Database,
   input: {
@@ -475,13 +599,15 @@ export function incidentStmt(
     reason: string;
     retryCount: number;
     payloadContext?: JsonObject | null;
+    kind?: IncidentKind;
+    resolution?: IncidentResolution;
     now: string;
   },
 ): D1PreparedStatement {
   return stmt(
     db,
-    `INSERT INTO incidents (incident_id, instance_id, element_id, reason, status, retry_count, payload_context, created_at)
-     VALUES (?, ?, ?, ?, 'open', ?, ?, ?)`,
+    `INSERT INTO incidents (incident_id, instance_id, element_id, reason, status, retry_count, payload_context, kind, resolution, created_at)
+     VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)`,
     [
       input.incidentId,
       input.instanceId,
@@ -489,8 +615,24 @@ export function incidentStmt(
       input.reason,
       input.retryCount,
       input.payloadContext ? toJson(input.payloadContext) : null,
+      input.kind ?? "serviceTaskFailure",
+      input.resolution ?? "open",
       input.now,
     ],
+  );
+}
+
+/** Set an incident's remediation resolution (operator retry / compensation). */
+export async function setIncidentResolution(
+  db: D1Database,
+  instanceId: string,
+  resolution: IncidentResolution,
+  now: string,
+): Promise<void> {
+  await dbRun(
+    db,
+    `UPDATE incidents SET resolution = ? WHERE instance_id = ? AND resolution != 'operatorResolved'`,
+    [resolution, instanceId],
   );
 }
 
@@ -506,6 +648,8 @@ export async function getIncidentForInstance(
     status: string;
     retry_count: number;
     payload_context: string | null;
+    kind: string | null;
+    resolution: string | null;
     created_at: string;
   }>(
     db,
@@ -521,6 +665,8 @@ export async function getIncidentForInstance(
     status: "open",
     retryCount: row.retry_count,
     payloadContext: row.payload_context ? parseJson(row.payload_context, {}) : undefined,
+    kind: (row.kind as IncidentKind | null) ?? "serviceTaskFailure",
+    resolution: (row.resolution as IncidentResolution | null) ?? "open",
     createdAt: row.created_at,
   };
 }

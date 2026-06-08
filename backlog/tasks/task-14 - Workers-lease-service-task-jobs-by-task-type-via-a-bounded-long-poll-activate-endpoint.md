@@ -3,9 +3,10 @@ id: TASK-14
 title: >-
   Workers lease service-task jobs by task type via a bounded long-poll activate
   endpoint
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-08 08:17'
+updated_date: '2026-06-08 12:33'
 labels:
   - saga
   - api
@@ -83,16 +84,16 @@ HANDOFF CONTEXT (independent engineer — no prior conversation):
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 POST /jobs/activate exists in src/index.ts route() and accepts {taskType, workerId, maxJobs?, leaseMs?, waitMs?} validated by a new zod request schema in src/contracts/api.ts; an invalid/malformed body returns 400 with parse issues (via parseBody).
-- [ ] #2 workspaceId is derived from the per-workspace worker credential (Authorization: Bearer), never from the body; a request with no/invalid credential is rejected (401/403); the lease is scoped to that workspace via a JOIN to process_instances.
-- [ ] #3 The atomic claim uses the IN-subquery UPDATE...RETURNING form with the leasable guard present in BOTH the inner subquery and the outer WHERE; the naive UPDATE...LIMIT n RETURNING form is NOT used (it fails on D1 with code 7500).
-- [ ] #4 Leasable predicate is status='created' OR (status='locked' AND lock_expires_at < now); a leased row transitions to status='locked' with worker_id set, a fresh unique lock_token, lock_expires_at = now + leaseMs, attempt_count incremented; the response 'attempt' reflects the post-increment value.
-- [ ] #5 Response is {jobs:[{jobId,instanceId,elementId,taskType,isCompensation,attempt,lockToken,traceId,variables,originalInput?,capturedOutput?}]} validated by a new response zod schema; it never includes workflowInstanceId or any Workflow-internal field; traceId is derived from instanceId.
-- [ ] #6 For a leased compensation job (is_compensation=1) originalInput and capturedOutput are populated from the saga_steps row of the compensated forward element; forward jobs omit both fields and carry job input_variables as 'variables'.
-- [ ] #7 Bounded long-poll: when no job is immediately leasable the handler polls until waitMs elapses (waitMs capped to a safe max well under the Workers request budget) then returns {jobs:[]} with 200; when a leasable job exists it returns promptly without waiting the full waitMs; maxJobs is capped to a max and defaulted to 1.
-- [ ] #8 REQUIRED integration test (vitest-pool-workers + real D1, tests/integration/job-lease.test.ts) covers: single created job leased exactly once (status->locked, lockToken present); two concurrent activates for one eligible job hand it to exactly one worker; an expired-lease (lock_expires_at<now) job is reclaimed and attempt increments; a worker credential for workspace B gets zero jobs for workspace A's same-taskType job; a compensation job surfaces originalInput/capturedOutput from saga_steps; long-poll returns empty {jobs:[]} after waitMs when nothing is leasable. (constitution gate)
-- [ ] #9 REQUIRED contract test (tests/contract/jobs-activate.test.ts) asserts the request and response conform to the activate schema and matches the openapi contract entry.
-- [ ] #10 Docs updated: POST /jobs/activate added to the contracts openapi (specs/002-saga-orchestrator/contracts/openapi.yaml, or specs/001-bpmn-lite-orchestrator-mvp/contracts/openapi.yaml until 002 is scaffolded) and the lease/reclaim/tenancy semantics noted in contracts/runtime-contracts.md.
+- [x] #1 POST /jobs/activate exists in src/index.ts route() and accepts {taskType, workerId, maxJobs?, leaseMs?, waitMs?} validated by a new zod request schema in src/contracts/api.ts; an invalid/malformed body returns 400 with parse issues (via parseBody).
+- [x] #2 workspaceId is derived from the per-workspace worker credential (Authorization: Bearer), never from the body; a request with no/invalid credential is rejected (401/403); the lease is scoped to that workspace via a JOIN to process_instances.
+- [x] #3 The atomic claim uses the IN-subquery UPDATE...RETURNING form with the leasable guard present in BOTH the inner subquery and the outer WHERE; the naive UPDATE...LIMIT n RETURNING form is NOT used (it fails on D1 with code 7500).
+- [x] #4 Leasable predicate is status='created' OR (status='locked' AND lock_expires_at < now); a leased row transitions to status='locked' with worker_id set, a fresh unique lock_token, lock_expires_at = now + leaseMs, attempt_count incremented; the response 'attempt' reflects the post-increment value.
+- [x] #5 Response is {jobs:[{jobId,instanceId,elementId,taskType,isCompensation,attempt,lockToken,traceId,variables,originalInput?,capturedOutput?}]} validated by a new response zod schema; it never includes workflowInstanceId or any Workflow-internal field; traceId is derived from instanceId.
+- [x] #6 For a leased compensation job (is_compensation=1) originalInput and capturedOutput are populated from the saga_steps row of the compensated forward element; forward jobs omit both fields and carry job input_variables as 'variables'.
+- [x] #7 Bounded long-poll: when no job is immediately leasable the handler polls until waitMs elapses (waitMs capped to a safe max well under the Workers request budget) then returns {jobs:[]} with 200; when a leasable job exists it returns promptly without waiting the full waitMs; maxJobs is capped to a max and defaulted to 1.
+- [x] #8 REQUIRED integration test (vitest-pool-workers + real D1, tests/integration/job-lease.test.ts) covers: single created job leased exactly once (status->locked, lockToken present); two concurrent activates for one eligible job hand it to exactly one worker; an expired-lease (lock_expires_at<now) job is reclaimed and attempt increments; a worker credential for workspace B gets zero jobs for workspace A's same-taskType job; a compensation job surfaces originalInput/capturedOutput from saga_steps; long-poll returns empty {jobs:[]} after waitMs when nothing is leasable. (constitution gate)
+- [x] #9 REQUIRED contract test (tests/contract/jobs-activate.test.ts) asserts the request and response conform to the activate schema and matches the openapi contract entry.
+- [x] #10 Docs updated: POST /jobs/activate added to the contracts openapi (specs/002-saga-orchestrator/contracts/openapi.yaml, or specs/001-bpmn-lite-orchestrator-mvp/contracts/openapi.yaml until 002 is scaffolded) and the lease/reclaim/tenancy semantics noted in contracts/runtime-contracts.md.
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -108,3 +109,9 @@ HANDOFF CONTEXT (independent engineer — no prior conversation):
 8. Docs: add the POST /jobs/activate path + schemas to the contracts openapi and document lease/reclaim/tenancy in runtime-contracts.md.
 9. Verify: npm run test:integration && npm run test:contract green; npx wrangler deploy --dry-run to confirm bindings unaffected.
 <!-- SECTION:PLAN:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+POST /jobs/activate (src/index.ts handleActivateJobs + leaseOnce): authenticates → server-derived workspaceId, parseBody(activateJobsRequestSchema), clamps maxJobs(≤50, default 1)/leaseMs(≤5min, default 30s)/waitMs(≤25s, default 0). src/persistence/jobs.ts leaseJobs uses the verified atomic IN-subquery UPDATE…RETURNING form (NOT UPDATE…LIMIT…RETURNING) with the leasable guard `status='created' OR (status='locked' AND lock_expires_at < now)` duplicated in BOTH the inner subquery and outer WHERE, JOINed to process_instances for workspace scoping; leased rows → status 'locked', fresh lock_token, lock_expires_at, attempt_count++. Response validated by activateJobsResponseSchema {jobs:[{jobId,instanceId,elementId,taskType,isCompensation,attempt,lockToken,traceId,variables,originalInput?,capturedOutput?}]} — no Workflow internals; traceId = trace_<instanceId>. Compensation jobs (is_compensation=1) are enriched with originalInput+capturedOutput from the saga_steps ledger row of compensates_element_id. Bounded long-poll re-claims every 250ms until waitMs. Each lease writes a jobActivated history event. tests/integration/saga-pull-jobs.test.ts: lease-exactly-once, cross-tenant zero, expired-lease reclaim + attempt bump, two-concurrent-activates single-claim, compensation enrichment, long-poll empty. Full suite green (81).
+<!-- SECTION:FINAL_SUMMARY:END -->

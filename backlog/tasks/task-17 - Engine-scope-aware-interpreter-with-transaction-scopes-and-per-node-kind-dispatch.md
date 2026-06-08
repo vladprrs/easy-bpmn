@@ -3,9 +3,10 @@ id: TASK-17
 title: >-
   Engine: scope-aware interpreter with transaction scopes and per-node-kind
   dispatch
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-08 08:18'
+updated_date: '2026-06-08 13:02'
 labels:
   - saga
   - engine
@@ -75,3 +76,9 @@ Hard constraint (R1): keep the runStep/waitFor ports (engine.ts:50-55) and the D
 7. Tests: tests/unit/engine-interpreter.test.ts (registry dispatch + scope push/pop via DirectExecutor); tests/integration/transaction-scope.test.ts (commit path); run `npm run test` for regression.
 8. Update engine.ts module doc (lines 1-11) and design §4.2 to match the final handler-outcome contract.
 <!-- SECTION:PLAN:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+engine.ts rewritten from the scalar-cursor linear loop into a scope-aware interpreter. The loop dispatches per node kind (startEvent/serviceTask/receiveTask/transaction/endEvent/boundaryEvent); a transaction is entered (token → inner start), an inner none end commits (→ the transaction's outer flow), an inner cancel end cancels (→ compensation). node.scopeId (from the M0 graph snapshot) drives scope membership; isTransactionScope/errorBoundaryTarget/cancelBoundaryTarget resolve the graph topology. Single-token in M1. runInstance branches on instance status so a 'compensating' instance resumes the reverse pass (crash-safe re-derivation from the ledger + current element). Linear MVP behavior preserved.
+<!-- SECTION:FINAL_SUMMARY:END -->

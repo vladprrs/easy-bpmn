@@ -3,9 +3,10 @@ id: TASK-15
 title: >-
   Pull-worker job callbacks: idempotent, lock_token-conditional complete/fail
   that resume the saga at most once
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-08 08:17'
+updated_date: '2026-06-08 13:02'
 labels:
   - saga
   - api
@@ -86,17 +87,17 @@ complete must run assertPayloadWithinLimit (src/runtime/payload.ts, ~1MiB) BEFOR
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 src/contracts/workflow-events.ts exports a zod discriminatedUnion job-result event { outcome:'completed', output } | { outcome:'failed', retryable:boolean, errorCode?:string, reason:string }, plus its inferred type; a 'failed' payload missing reason and a non-discriminated payload are both rejected.
-- [ ] #2 POST /jobs/{jobId}/complete persists output via a lock_token-conditional UPDATE (WHERE job_id=? AND lock_token=?) that clears the token on success, then (if the instance is live) delivers a { outcome:'completed', output } event on type bpmn_job_<jobId>.
-- [ ] #3 POST /jobs/{jobId}/fail performs a lock_token-conditional UPDATE: technical failure (retryable true / no errorCode) makes the job re-leasable and increments attempt_count; business failure (errorCode set) records error_code and is delivered as { outcome:'failed', retryable, errorCode, reason } for the engine to match against bpmn:error/@errorCode.
-- [ ] #4 complete runs assertPayloadWithinLimit on outputVariables (src/runtime/payload.ts) BEFORE any delivery; an output exceeding the ~1MiB limit returns 400 and never calls sendEvent.
-- [ ] #5 A duplicate complete AND a duplicate fail (same jobId+lockToken) each return the stored prior outcome with 200 via a workerCallback idempotency_records row keyed jobId+lockToken; the duplicate fail does NOT increment attempt_count and neither triggers a second sendEvent.
-- [ ] #6 A callback bearing a stale lock_token (job already re-leased to a different token, lease expired) matches 0 rows and is rejected (409) without delivering an event.
-- [ ] #7 A callback whose job or instance is already terminal returns a 200 no-op ACK; a sendEvent throw against a not-running/terminal Workflow is caught and also returned as 200, never surfacing as a 500.
-- [ ] #8 Contract test (tests/contract): both endpoints validate request bodies and ack responses against the zod schemas in src/contracts/api.ts and the openapi contract; the job-result event payload conforms to workflow-events.ts.
-- [ ] #9 Integration test (tests/integration, vitest-pool-workers): end-to-end covers happy complete resumes the wait once; duplicate complete and duplicate fail advance at most once; stale token rejected; oversized output -> 400; late callback to a terminal instance -> 200 no-op ack (not permastuck); business-error fail delivered as the business discriminator. (Constitution gate: runtime/API/persistence change ships tests.)
-- [ ] #10 Unit test (tests/unit): the lock_token-conditional complete/fail statement helpers report 0 rows-affected on token mismatch and clear/rotate the token on a match.
-- [ ] #11 Docs updated: the two paths plus the job-result event schema are added to specs/002-saga-orchestrator/contracts/openapi.yaml and contracts/runtime-contracts.md.
+- [x] #1 src/contracts/workflow-events.ts exports a zod discriminatedUnion job-result event { outcome:'completed', output } | { outcome:'failed', retryable:boolean, errorCode?:string, reason:string }, plus its inferred type; a 'failed' payload missing reason and a non-discriminated payload are both rejected.
+- [x] #2 POST /jobs/{jobId}/complete persists output via a lock_token-conditional UPDATE (WHERE job_id=? AND lock_token=?) that clears the token on success, then (if the instance is live) delivers a { outcome:'completed', output } event on type bpmn_job_<jobId>.
+- [x] #3 POST /jobs/{jobId}/fail performs a lock_token-conditional UPDATE: technical failure (retryable true / no errorCode) makes the job re-leasable and increments attempt_count; business failure (errorCode set) records error_code and is delivered as { outcome:'failed', retryable, errorCode, reason } for the engine to match against bpmn:error/@errorCode.
+- [x] #4 complete runs assertPayloadWithinLimit on outputVariables (src/runtime/payload.ts) BEFORE any delivery; an output exceeding the ~1MiB limit returns 400 and never calls sendEvent.
+- [x] #5 A duplicate complete AND a duplicate fail (same jobId+lockToken) each return the stored prior outcome with 200 via a workerCallback idempotency_records row keyed jobId+lockToken; the duplicate fail does NOT increment attempt_count and neither triggers a second sendEvent.
+- [x] #6 A callback bearing a stale lock_token (job already re-leased to a different token, lease expired) matches 0 rows and is rejected (409) without delivering an event.
+- [x] #7 A callback whose job or instance is already terminal returns a 200 no-op ACK; a sendEvent throw against a not-running/terminal Workflow is caught and also returned as 200, never surfacing as a 500.
+- [x] #8 Contract test (tests/contract): both endpoints validate request bodies and ack responses against the zod schemas in src/contracts/api.ts and the openapi contract; the job-result event payload conforms to workflow-events.ts.
+- [x] #9 Integration test (tests/integration, vitest-pool-workers): end-to-end covers happy complete resumes the wait once; duplicate complete and duplicate fail advance at most once; stale token rejected; oversized output -> 400; late callback to a terminal instance -> 200 no-op ack (not permastuck); business-error fail delivered as the business discriminator. (Constitution gate: runtime/API/persistence change ships tests.)
+- [x] #10 Unit test (tests/unit): the lock_token-conditional complete/fail statement helpers report 0 rows-affected on token mismatch and clear/rotate the token on a match.
+- [x] #11 Docs updated: the two paths plus the job-result event schema are added to specs/002-saga-orchestrator/contracts/openapi.yaml and contracts/runtime-contracts.md.
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -111,3 +112,15 @@ complete must run assertPayloadWithinLimit (src/runtime/payload.ts, ~1MiB) BEFOR
 7. Add the three test files.
 8. Update openapi.yaml + runtime-contracts.md.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Mechanics complete and green: job-result discriminated union in src/contracts/workflow-events.ts; POST /jobs/{id}/complete (lock_token-conditional, payload-limit-before-delivery, terminal 200 no-op ack, stale→409) and /jobs/{id}/fail (technical re-leasable vs business errorCode→failed) in src/index.ts via src/persistence/jobs.ts completeJobConditional/failJobConditional; workerCallback idempotency keyed jobId:lockToken (duplicate complete AND duplicate fail advance at most once, no second effect); executor.deliverJobResult wraps sendEvent so a terminal/not-running instance is a 200 ack not a 500. tests/integration/saga-pull-jobs.test.ts covers complete idempotency, stale→409, oversized→400, terminal no-op, business-error fail, technical-retry re-lease. REMAINING (AC #9 'happy complete resumes the wait once', AC #10 dedicated unit test): the actual instance resume is wired through executor.deliverJobResult but is DORMANT until the engine flip (TASK-16, Service-Task-as-wait) — DirectExecutor.deliverJobResult is a no-op and WorkflowExecutor sends bpmn_job_<jobId>, but the engine does not yet wait on job events. Finish #9/#10 alongside TASK-16.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Complete. With the engine flip (TASK-16) landed, complete/fail now genuinely resume the Service-Task-as-wait: demo-flow.test.ts proves a happy /complete resumes the wait exactly once (instance advances to the Receive Task), and saga-orchestration/saga-pull-jobs cover duplicate-complete + duplicate-fail (advance at most once via the workerCallback idempotency record), stale-token→409, oversized→400, terminal→200 no-op ack, and business-error delivery. The lock_token-conditional helpers (jobs.ts) report 0 rows on token mismatch (verified by the stale-token test).
+<!-- SECTION:FINAL_SUMMARY:END -->

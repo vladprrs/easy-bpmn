@@ -1,0 +1,27 @@
+{
+  "name": "easy-bpmn",
+  "version": "0.1.0",
+  "private": true,
+  "description": "BPMN-lite Orchestrator MVP — make a standard subset of BPMN 2.0 executable on Cloudflare Workers without Camunda/Zeebe.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:contract": "vitest run tests/contract",
+    "test:integration": "vitest run tests/integration"
+  },
+  "dependencies": {
+    "bpmn-moddle": "^10.0.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.16.13",
+    "@cloudflare/workers-types": "^4.20260607.1",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.8",
+    "wrangler": "^4.98.0"
+  }
+}

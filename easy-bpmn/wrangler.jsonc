@@ -1,0 +1,53 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "easy-bpmn",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  },
+  // Production custom domain. Wrangler provisions the DNS record + edge cert for
+  // bpmn.rntme.com on deploy (the rntme.com zone is on this Cloudflare account).
+  "routes": [
+    {
+      "pattern": "bpmn.rntme.com",
+      "custom_domain": true
+    }
+  ],
+  "vars": {
+    // Execution driver: "workflow" uses real Cloudflare Workflows per instance
+    // (production / `wrangler dev`); the test suite overrides this to "direct"
+    // for deterministic, replay-free engine execution. See src/runtime/executor.ts.
+    "EXECUTION_MODE": "workflow"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "easy_bpmn",
+      "database_id": "c08a7ae9-272b-4d7a-8bb7-5926c72ad102",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CORRELATION_BROKER",
+        "class_name": "CorrelationBroker"
+      }
+    ]
+  },
+  "workflows": [
+    {
+      "name": "easy-bpmn-process",
+      "binding": "PROCESS_WORKFLOW",
+      "class_name": "ProcessWorkflow"
+    }
+  ],
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["CorrelationBroker"]
+    }
+  ]
+}

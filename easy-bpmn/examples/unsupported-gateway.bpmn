@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions
+    xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+    id="Definitions_bad" targetNamespace="http://easy-bpmn/demo">
+
+  <bpmn:process id="Process_bad" name="Has a gateway" isExecutable="true">
+    <bpmn:startEvent id="Start_1">
+      <bpmn:outgoing>Flow_1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="Gateway_1" />
+
+    <!-- Unsupported: gateways are out of the BPMN-lite profile. -->
+    <bpmn:exclusiveGateway id="Gateway_1" name="Approved?">
+      <bpmn:incoming>Flow_1</bpmn:incoming>
+      <bpmn:outgoing>Flow_2</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <bpmn:sequenceFlow id="Flow_2" sourceRef="Gateway_1" targetRef="End_1" />
+    <bpmn:endEvent id="End_1">
+      <bpmn:incoming>Flow_2</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

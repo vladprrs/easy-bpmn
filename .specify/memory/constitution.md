@@ -1,44 +1,73 @@
 <!--
 Sync Impact Report
-Version change: template -> 1.0.0
+Version change: 1.0.0 -> 2.0.0
+Rationale (MAJOR): expands product scope from the linear MVP profile to the
+canonical BPMN transaction-saga, in a way that invalidates the prior governance
+(the old MVP Scope list forbade compensation, transaction subprocess, and the
+saga boundary events). Per the versioning policy ("MAJOR = expand product scope
+in a way that invalidates existing governance"). Source: SAGA orchestrator design
+(docs/superpowers/specs/2026-06-08-saga-orchestrator-design.md §7, §2 decision #7).
 Modified principles:
-- Placeholder Principle 1 -> I. Standard BPMN-Lite Profile Only
-- Placeholder Principle 2 -> II. Immutable Definitions and Version-Bound Instances
-- Placeholder Principle 3 -> III. Durable, Idempotent Execution
-- Placeholder Principle 4 -> IV. Correlation and Receive Task Integrity
-- Placeholder Principle 5 -> V. Auditability and Operator Clarity
-Added sections:
-- MVP Scope and Platform Constraints
-- Development Workflow and Quality Gates
-Removed sections:
-- Placeholder Section 2
-- Placeholder Section 3
+- I. Standard BPMN-Lite Profile Only -> I. Standard BPMN Profile Only (widened to
+  the canonical-saga construct set; the no-custom-notation / XSD-valid /
+  round-trippable / reject-unsupported-flow-node-with-element-id-and-reason clause
+  is preserved verbatim in intent)
+Added principles:
+- VI. SAGA / Compensation Integrity
+Modified sections:
+- MVP Scope and Platform Constraints (exclusion list trimmed to remove only the
+  M1-shipped constructs: transaction subprocess, compensation, saga boundary
+  events; gateways/timers/non-transaction subprocess/multi-instance/user-task/
+  forms/migration/full-Camunda-Zeebe-compat/visual-modeler remain excluded)
 Templates requiring updates:
-- updated: .specify/templates/plan-template.md
-- updated: .specify/templates/spec-template.md
-- updated: .specify/templates/tasks-template.md
-- checked: .specify/templates/commands/*.md (directory not present)
+- updated: .specify/templates/plan-template.md (Constitution Check: widened BPMN
+  profile gate + new SAGA/Compensation-integrity gate)
+- updated: .specify/templates/spec-template.md (BPMN Profile Impact prompt covers
+  saga/compensation constructs)
+- updated: .specify/templates/tasks-template.md (constitution-critical test list
+  adds compensation ordering, saga state transitions, worker auth/workspace
+  isolation, operator remediation)
 - checked: AGENTS.md
-- checked: CLAUDE.md
+- checked: CLAUDE.md (Known doc drift note resolved separately)
 Follow-up TODOs:
-- None
+- M2-M5 each still require their own amendment before adding gateways, timers,
+  parallelism, or composition.
 -->
 
 # easy-bpmn Constitution
 
 ## Core Principles
 
-### I. Standard BPMN-Lite Profile Only
+### I. Standard BPMN Profile Only
 
-The MVP MUST execute only standard BPMN 2.0-compatible elements in this profile:
-Start Event, Service Task, Receive Task, End Event, Sequence Flow, and Message
-correlation. The supported happy path is Start Event -> Service Task ->
-Receive Task -> End Event. Features MUST NOT introduce custom notation,
-platform-only BPMN semantics, or unsupported runtime behavior. Unsupported BPMN
-elements MUST be rejected before publish with a user-visible reason.
+The platform MUST execute only standard BPMN 2.0-compatible elements in this
+profile. The currently accepted construct set is:
+
+- the linear core — None Start Event, Service Task, Receive Task, None End Event,
+  Sequence Flow, and Message correlation; and
+- the canonical transaction-saga set — `bpmn:transaction` (the saga scope), the
+  compensation / error / cancel `boundaryEvent`, an `isForCompensation` Service
+  Task (compensation handler), `bpmn:association` (compensation wiring), a cancel
+  `endEvent` (only inside a transaction), and a root `bpmn:error`.
+
+A saga is modeled in **canonical BPMN**: the only additive binding is
+`easy-bpmn:taskDefinition` carried inside the standard `<bpmn:extensionElements>`
+escape hatch. Features MUST NOT introduce custom notation (no new MODEL-namespace
+tags, no redefining a standard element's runtime meaning, no non-standard
+attribute required to parse), platform-only BPMN semantics, or unsupported
+runtime behavior. Every accepted file MUST stay XSD-valid and round-trip through a
+standard modeler (bpmn-js / Camunda Modeler) when the `easy-bpmn` extensions and
+Diagram Interchange are ignored. Unsupported standard-namespace **flow nodes**
+MUST be rejected before publish with the offending element id and a user-visible
+reason; ignorable extension content (foreign-namespace `<extensionElements>`,
+Diagram Interchange, `documentation`, text annotations) MUST be tolerated and
+ignored, never rejected.
+
+Each later milestone (gateways/conditions, timers, parallelism, composition)
+widens this profile only by amending this constitution first.
 
 Rationale: the product promise depends on making standard BPMN executable without
-pretending to support the full BPMN ecosystem in the first slice.
+inventing a notation or pretending to support the full BPMN ecosystem at once.
 
 ### II. Immutable Definitions and Version-Bound Instances
 
@@ -87,6 +116,28 @@ what action is available next.
 Rationale: the MVP is successful only when users can prove what happened during
 execution without deploying a separate observability stack.
 
+### VI. SAGA / Compensation Integrity
+
+When a transaction-saga is cancelled, the orchestrator MUST compensate the
+transaction's successfully completed activities **in reverse completion order**,
+scoped to that transaction. Each compensating action MUST be **idempotent** and
+safe under **at-least-once** delivery (duplicate compensation callbacks MUST NOT
+compensate twice), and MUST receive both the original step input and the captured
+step output. Compensation MUST be triggered **only** by a transaction Cancel (an
+error boundary event routing to a cancel end event, or an operator cancel), and
+MUST NOT be triggered by an uncaught Error — an Error that reaches the transaction
+boundary uncaught is a **Hazard** that terminates the instance and propagates, it
+does not auto-compensate. A compensator that exhausts its own retries MUST settle
+the instance into a deterministic, operator-visible terminal state
+(`compensationFailed`) with operator-resumable remediation; it MUST NOT silently
+block forever. Each meaningful saga transition (transaction entered/cancelled,
+compensation started/completed/failed) MUST be written to D1 audit history.
+
+Rationale: a saga's correctness is its rollback behavior; weak ordering,
+non-idempotent compensators, or an ambiguous compensator-failure outcome would
+make the orchestrator unsafe for the multi-microservice transactions it exists to
+coordinate.
+
 ## MVP Scope and Platform Constraints
 
 The first release MUST deliver the vertical demo flow: upload BPMN XML, validate
@@ -99,10 +150,19 @@ MUST own durable execution, process state storage, remote service worker
 invocation, external event waiting, event correlation, and basic execution
 history.
 
-The MVP MUST NOT include built-in tasklists, BPMN User Task, forms, assignment,
-gateways, timers, boundary events, subprocesses, multi-instance, compensation,
+The platform MUST NOT include built-in tasklists, BPMN User Task, forms,
+assignment, gateways and conditional/default sequence flows, timer / signal /
+escalation / conditional / message events, non-transaction subprocesses,
+`callActivity`, ad-hoc subprocesses, multi-instance / loop characteristics,
 process migration, full Zeebe/Camunda compatibility, a visual BPMN modeler, or
-advanced Operate-style UI unless this constitution is amended first.
+advanced Operate-style UI unless this constitution is amended first. (Each of
+these is added only by its own later milestone amendment — M2 gateways/conditions,
+M3 timers/event taxonomy, M4 parallelism, M5 composition.)
+
+The accepted saga set — the `bpmn:transaction` scope, compensation / error /
+cancel boundary events, the `isForCompensation` handler, `bpmn:association`, the
+cancel end event, and root `bpmn:error` — is in scope (Principle I); only those
+specific constructs were removed from this exclusion list.
 
 The first demo flow MUST run without requiring users to deploy their own workflow
 cluster, broker, BPMN engine, or dedicated operations stack.
@@ -147,4 +207,4 @@ Plans with unresolved constitution violations MUST NOT proceed to implementation
 until the violation is either removed or explicitly accepted through the
 Complexity Tracking section.
 
-**Version**: 1.0.0 | **Ratified**: 2026-06-07 | **Last Amended**: 2026-06-07
+**Version**: 2.0.0 | **Ratified**: 2026-06-07 | **Last Amended**: 2026-06-08

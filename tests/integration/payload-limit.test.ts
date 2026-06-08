@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   DEMO_BPMN,
   createDraft,
+  drainSampleWorkers,
   get,
   publishAndStart,
   publishDraft,
@@ -25,6 +26,8 @@ describe("Scenario: payload limit rejection", () => {
     });
     const instanceId = instance.body.instanceId;
     expect(instance.body.status).toBe("waiting");
+    // Reach the Receive Task so the oversized message targets a live subscription.
+    await drainSampleWorkers({ taskTypes: ["external-check"] });
 
     const r = await publishMessage({
       messageName: "ApprovalReceived",

@@ -8,9 +8,8 @@
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import type { Env } from "../env";
-import type { MessageEventPayload, ProcessWorkflowParams } from "../contracts/workflow-events";
-import { messageEventPayloadSchema } from "../contracts/workflow-events";
-import { recordTerminalIncident, runInstance } from "../runtime/engine";
+import type { ProcessWorkflowParams } from "../contracts/workflow-events";
+import { recordTerminalIncident, runInstance, type WaitOutcome } from "../runtime/engine";
 
 export class ProcessWorkflow extends WorkflowEntrypoint<Env, ProcessWorkflowParams> {
   override async run(event: WorkflowEvent<ProcessWorkflowParams>, step: WorkflowStep): Promise<void> {
@@ -26,16 +25,21 @@ export class ProcessWorkflow extends WorkflowEntrypoint<Env, ProcessWorkflowPara
       opts: { type: string; timeout: string },
     ) => Promise<{ payload: unknown }>;
 
+    // A Receive Task message OR a Service-Task-as-wait job result. A timeout
+    // (or any waitForEvent error) is surfaced to the engine, NOT this catch-all,
+    // so a per-step timeout routes to the technical-failure / DLQ branch rather
+    // than terminating the whole instance.
     const waitFor = async (sub: {
-      elementId: string;
+      name: string;
       workflowEventType: string;
-      subscriptionId: string;
-    }): Promise<MessageEventPayload> => {
-      const received = await waitForEvent(`wait:${sub.elementId}`, {
-        type: sub.workflowEventType,
-        timeout: "1 hour",
-      });
-      return messageEventPayloadSchema.parse(received.payload);
+      timeout: string;
+    }): Promise<WaitOutcome> => {
+      try {
+        const received = await waitForEvent(sub.name, { type: sub.workflowEventType, timeout: sub.timeout });
+        return { kind: "event", payload: received.payload };
+      } catch {
+        return { kind: "timeout" };
+      }
     };
 
     try {

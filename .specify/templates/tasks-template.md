@@ -12,9 +12,11 @@ description: "Task list template for feature implementation"
 **Tests**: Contract or integration tests are REQUIRED for constitution-critical
 behavior: BPMN subset validation, immutable version binding, Service Task worker
 contracts, Receive Task correlation, idempotency/retry handling, audit history,
-and operator-visible errors. Tests may be omitted only for work that does not
-touch runtime, API, persistence, or state-transition behavior, and the plan must
-state why.
+operator-visible errors, and — for sagas — reverse-order compensation, saga state
+transitions (the one-way status table), remote worker auth / per-workspace
+isolation, and operator remediation (`cancel`/`retry`). Tests may be omitted only
+for work that does not touch runtime, API, persistence, or state-transition
+behavior, and the plan must state why.
 
 **Organization**: Tasks are grouped by user story to enable independent implementation and testing of each story.
 

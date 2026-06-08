@@ -36,6 +36,22 @@ export class ConflictError extends AppError {
   }
 }
 
+/** Missing / malformed / unknown / revoked worker credential (HTTP 401). */
+export class UnauthorizedError extends AppError {
+  constructor(message = "Unauthorized", details?: Record<string, unknown>) {
+    super(401, message, details);
+    this.name = "UnauthorizedError";
+  }
+}
+
+/** Authenticated but not permitted for this workspace/resource (HTTP 403). */
+export class ForbiddenError extends AppError {
+  constructor(message = "Forbidden", details?: Record<string, unknown>) {
+    super(403, message, details);
+    this.name = "ForbiddenError";
+  }
+}
+
 /** Publish-time rejection carrying element-level validation issues (HTTP 409). */
 export class PublishRejectedError extends AppError {
   readonly validationIssues: ValidationIssueData[];

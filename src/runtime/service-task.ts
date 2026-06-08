@@ -17,7 +17,9 @@ export interface WorkerRequest {
 
 export type WorkerResult =
   | { status: "completed"; outputVariables: JsonObject }
-  | { status: "failed"; reason: string; diagnostics?: JsonObject };
+  // `errorCode` set ⇒ a BUSINESS error (matches a model bpmn:error/@errorCode);
+  // absent ⇒ a technical failure (retryable via re-lease).
+  | { status: "failed"; reason: string; diagnostics?: JsonObject; errorCode?: string };
 
 type SampleWorker = (req: WorkerRequest) => Promise<WorkerResult> | WorkerResult;
 
@@ -51,6 +53,31 @@ const SAMPLE_WORKERS: Record<string, SampleWorker> = {
     diagnostics: { attempt: req.attempt },
   }),
   echo: (req) => ({ status: "completed", outputVariables: { echoed: req.variables } }),
+
+  // --- Sample order-saga workers (forward + compensation) ---
+  "reserve-stock": (req) => ({
+    status: "completed",
+    outputVariables: { reservationId: `res-${req.instanceId.slice(-6)}`, reservedQty: req.variables.qty ?? 1 },
+  }),
+  // Compensation handler for reserve-stock.
+  "release-stock": () => ({ status: "completed", outputVariables: { released: true } }),
+  // Steerable: chargeFails → a TECHNICAL failure (no errorCode) so it exhausts
+  // retries → Hazard incident inside the transaction (no auto-compensation).
+  "charge-card": (req) =>
+    req.variables.chargeFails === true
+      ? { status: "failed", reason: "card processor unavailable", diagnostics: { attempt: req.attempt } }
+      : { status: "completed", outputVariables: { chargeId: `chg-${req.instanceId.slice(-6)}`, amount: req.variables.amount ?? 0 } },
+  // Compensation handler for charge-card — steerable so the compensator-failure
+  // scenario can drive it to retry-exhaustion.
+  "refund-card": (req) =>
+    req.variables.refundFails === true
+      ? { status: "failed", reason: "refund declined by PSP", diagnostics: { attempt: req.attempt } }
+      : { status: "completed", outputVariables: { refunded: true } },
+  // Forward step whose business failure cancels the transaction → compensation.
+  "confirm-shipping": (req) =>
+    req.variables.shippingFails === true
+      ? { status: "failed", reason: "carrier rejected the shipment", errorCode: "SHIPPING_REJECTED" }
+      : { status: "completed", outputVariables: { shipmentId: `shp-${req.instanceId.slice(-6)}` } },
 };
 
 export function hasSampleWorker(taskType: string): boolean {

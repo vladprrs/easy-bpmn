@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEMO_BPMN, get, publishAndStart, publishMessage } from "../helpers";
+import { DEMO_BPMN, drainSampleWorkers, get, publishAndStart, publishMessage } from "../helpers";
 
 // runtime-contracts.md: "A different messageId after an instance already advanced
 // is recorded as `late` or `rejected`." spec edge case + FR-020. The message
@@ -13,6 +13,7 @@ describe("Scenario: late message after the instance advanced", () => {
     });
     const instanceId = instance.body.instanceId;
     expect(instance.body.status).toBe("waiting");
+    await drainSampleWorkers({ taskTypes: ["external-check"] });
 
     const first = await publishMessage({
       messageName: "ApprovalReceived",

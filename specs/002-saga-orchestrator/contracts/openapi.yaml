@@ -1,0 +1,999 @@
+openapi: 3.1.0
+info:
+  title: easy-bpmn SAGA Orchestrator API (M1 — Canonical transaction-saga)
+  version: 0.2.0
+  description: >
+    Product-facing API for the canonical-BPMN transaction-saga orchestrator. Retains the
+    MVP surface (drafts, immutable versions, instances, external messages, history) and
+    adds the pull / external-task worker contract (activate/complete/fail), operator verbs
+    (cancel/retry/list), and the saga inspection block. Every /jobs/* call carries a
+    per-workspace worker credential; the server derives workspaceId from the credential and
+    never trusts a body workspaceId for job access. The API does not leak Cloudflare
+    Workflow internals (no workflowInstanceId is required from worker or operator callers).
+servers:
+  - url: http://localhost:8787
+    description: Local Wrangler development server
+paths:
+  /definitions/drafts:
+    post:
+      summary: Upload BPMN XML as an editable draft
+      operationId: createDefinitionDraft
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDraftRequest"
+      responses:
+        "201":
+          description: Draft created and validation attempted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Draft"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /definitions/drafts/{draftId}:
+    get:
+      summary: Inspect a BPMN draft and its validation status
+      operationId: getDefinitionDraft
+      parameters:
+        - $ref: "#/components/parameters/DraftId"
+      responses:
+        "200":
+          description: Draft details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Draft"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /definitions/drafts/{draftId}/publish:
+    post:
+      summary: Publish a valid draft as an immutable executable version
+      operationId: publishDefinitionDraft
+      parameters:
+        - $ref: "#/components/parameters/DraftId"
+      responses:
+        "201":
+          description: Immutable version created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DefinitionVersion"
+        "409":
+          description: Draft contains publish-blocking validation issues
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublishRejected"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /definitions/versions/{definitionVersionId}:
+    get:
+      summary: Inspect an immutable published definition version
+      operationId: getDefinitionVersion
+      parameters:
+        - $ref: "#/components/parameters/DefinitionVersionId"
+      responses:
+        "200":
+          description: Published version details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DefinitionVersion"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /definitions/versions/{definitionVersionId}/instances:
+    post:
+      summary: Start a process instance from a published definition version
+      operationId: startProcessInstance
+      parameters:
+        - $ref: "#/components/parameters/DefinitionVersionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartInstanceRequest"
+      responses:
+        "201":
+          description: Process instance started and bound to a Workflow instance
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProcessInstance"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Instance could not be started from this version
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /instances:
+    get:
+      summary: List process instances (filter by workspace and status; cursor-paged)
+      operationId: listProcessInstances
+      description: >
+        Operator discovery for stuck/compensating/compensationFailed/incident sagas. Backed
+        by the (workspace_id, status) index.
+      parameters:
+        - name: workspaceId
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/InstanceStatus"
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: A page of process instances
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstanceList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /instances/{instanceId}:
+    get:
+      summary: Inspect instance status, current element, variables, diagnostics, and saga view
+      operationId: getProcessInstance
+      parameters:
+        - $ref: "#/components/parameters/InstanceId"
+      responses:
+        "200":
+          description: Process instance inspection view (includes the saga block)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProcessInstanceInspection"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /instances/{instanceId}/history:
+    get:
+      summary: Inspect business timeline and technical diagnostic history
+      operationId: getProcessInstanceHistory
+      parameters:
+        - $ref: "#/components/parameters/InstanceId"
+      responses:
+        "200":
+          description: History events
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events]
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/HistoryEvent"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /instances/{instanceId}/cancel:
+    post:
+      summary: Operator-triggered transaction cancellation (initiates reverse-order compensation)
+      operationId: cancelProcessInstance
+      description: >
+        Status-conditional: only the first call on a running/waiting instance initiates one
+        reverse pass. An instance with an empty saga ledger goes straight to cancelled
+        (nothing to compensate).
+      parameters:
+        - $ref: "#/components/parameters/InstanceId"
+      responses:
+        "202":
+          description: Cancellation accepted; instance is compensating or cancelled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProcessInstance"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Instance is not in a cancellable state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /instances/{instanceId}/retry:
+    post:
+      summary: Retry a failed forward step (incident) or resume a compensationFailed reverse pass
+      operationId: retryProcessInstance
+      description: >
+        Status-conditional; resets the existing job row rather than inserting. The single
+        resumable transition is compensationFailed -> compensating.
+      parameters:
+        - $ref: "#/components/parameters/InstanceId"
+      responses:
+        "202":
+          description: Retry accepted; instance resumed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProcessInstance"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Instance is not in a retryable state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /jobs/activate:
+    post:
+      summary: Lease pull-worker jobs by taskType (bounded long-poll)
+      operationId: activateJobs
+      security:
+        - workerCredential: []
+      description: >
+        The server derives workspaceId from the worker credential and rejects taskType claims
+        outside that workspace; a body workspaceId is never trusted for job access. Atomic
+        IN-subquery lease (D1 does not parse UPDATE...LIMIT...RETURNING).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ActivateJobsRequest"
+      responses:
+        "200":
+          description: Zero or more leased jobs (forward and/or compensation)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActivateJobsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /jobs/{jobId}/complete:
+    post:
+      summary: Complete a leased job with output variables
+      operationId: completeJob
+      security:
+        - workerCredential: []
+      description: >
+        lock_token-conditional. A stale/duplicate worker matches zero rows (rejected or stable
+        prior outcome). If the instance is terminal/not-running, returns a 200 no-op ack rather
+        than a 500. Output is payload-limit checked before event delivery.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompleteJobRequest"
+      responses:
+        "200":
+          description: Completion acknowledged (advanced, duplicate stable outcome, or terminal no-op)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobCallbackResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Stale or invalid lock token (matched zero rows)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobCallbackResponse"
+        "413":
+          description: Output payload exceeds the Workflows event limit
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /jobs/{jobId}/fail:
+    post:
+      summary: Fail a leased job (technical retry-via-release, or business error -> cancel)
+      operationId: failJob
+      security:
+        - workerCredential: []
+      description: >
+        lock_token-conditional and idempotent via the workerCallback record (a duplicate fail
+        returns the prior outcome and does not re-count an attempt). retryable=true / no
+        errorCode is a technical failure (re-lease); an errorCode matching a model
+        bpmn:error/@errorCode raises that BPMN error -> error boundary -> cancel.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FailJobRequest"
+      responses:
+        "200":
+          description: Failure acknowledged (retry scheduled, business error raised, or terminal no-op)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobCallbackResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Stale or invalid lock token (matched zero rows)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobCallbackResponse"
+  /messages:
+    post:
+      summary: Publish an external business message for Receive Task correlation
+      operationId: publishMessage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PublishMessageRequest"
+      responses:
+        "202":
+          description: Message accepted as correlated, buffered, or duplicate
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublishMessageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Message rejected because correlation would violate invariants
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublishMessageResponse"
+  /messages/{externalMessageId}:
+    get:
+      summary: Inspect an accepted external message and its final outcome
+      operationId: getMessage
+      parameters:
+        - name: externalMessageId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Message details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExternalMessage"
+        "404":
+          $ref: "#/components/responses/NotFound"
+components:
+  securitySchemes:
+    workerCredential:
+      type: http
+      scheme: bearer
+      description: >
+        Per-workspace worker credential. The server resolves it to a workspace and derives
+        workspaceId from it; the request body never carries a trusted workspaceId for job
+        access. A missing or revoked credential is rejected as unauthorized.
+  parameters:
+    DraftId:
+      name: draftId
+      in: path
+      required: true
+      schema:
+        type: string
+    DefinitionVersionId:
+      name: definitionVersionId
+      in: path
+      required: true
+      schema:
+        type: string
+    InstanceId:
+      name: instanceId
+      in: path
+      required: true
+      schema:
+        type: string
+    JobId:
+      name: jobId
+      in: path
+      required: true
+      schema:
+        type: string
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unauthorized:
+      description: Missing, revoked, or invalid worker credential
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+  schemas:
+    InstanceStatus:
+      type: string
+      enum:
+        - starting
+        - running
+        - waiting
+        - completed
+        - incident
+        - compensating
+        - compensated
+        - compensationFailed
+        - cancelled
+    CreateDraftRequest:
+      type: object
+      required: [workspaceId, name, bpmnXml]
+      properties:
+        workspaceId:
+          type: string
+        name:
+          type: string
+        bpmnXml:
+          type: string
+    Draft:
+      type: object
+      required: [draftId, workspaceId, name, status, validationIssues, createdAt, updatedAt]
+      properties:
+        draftId:
+          type: string
+        workspaceId:
+          type: string
+        name:
+          type: string
+        status:
+          enum: [draft, valid, invalid]
+        validationIssues:
+          type: array
+          items:
+            $ref: "#/components/schemas/ValidationIssue"
+        latestPublishedVersionId:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    ValidationIssue:
+      type: object
+      required: [severity, elementName, reason]
+      properties:
+        severity:
+          enum: [error, warning]
+        elementId:
+          type: string
+          nullable: true
+        elementName:
+          type: string
+        location:
+          type: string
+          nullable: true
+        reason:
+          type: string
+    DefinitionVersion:
+      type: object
+      required:
+        - definitionVersionId
+        - draftId
+        - workspaceId
+        - versionNumber
+        - status
+        - bpmnXmlHash
+        - elements
+        - publishedAt
+      properties:
+        definitionVersionId:
+          type: string
+        draftId:
+          type: string
+        workspaceId:
+          type: string
+        versionNumber:
+          type: integer
+          minimum: 1
+        status:
+          const: published
+        bpmnXmlHash:
+          type: string
+        elements:
+          type: array
+          items:
+            $ref: "#/components/schemas/BpmnElement"
+        publishedAt:
+          type: string
+          format: date-time
+    BpmnElement:
+      type: object
+      required: [elementId, type]
+      properties:
+        elementId:
+          type: string
+          description: >
+            BPMN XML id. Used for audit and inspection only; never the worker routing key
+            (tool-generated ids change when an element is re-drawn).
+        type:
+          enum:
+            - startEvent
+            - serviceTask
+            - receiveTask
+            - endEvent
+            - sequenceFlow
+            - message
+            - transaction
+            - boundaryEvent
+            - association
+            - error
+        name:
+          type: string
+          nullable: true
+        taskType:
+          type: string
+          nullable: true
+          description: >
+            Service Task worker routing key, read from <extensionElements> under the easy-bpmn
+            namespace. Stable and author-defined; this is the worker handle, not elementId or
+            name.
+        isForCompensation:
+          type: boolean
+          nullable: true
+          description: True for a Service Task that is a compensation handler (off the normal token path).
+        attachedToRef:
+          type: string
+          nullable: true
+          description: For a boundaryEvent, the activity/transaction it is attached to.
+        boundaryKind:
+          type: string
+          nullable: true
+          enum: [error, cancel, compensate]
+          description: Event-definition kind for a boundaryEvent.
+        endKind:
+          type: string
+          nullable: true
+          enum: [none, cancel, compensate]
+          description: Event-definition kind for an endEvent.
+        scopeId:
+          type: string
+          nullable: true
+          description: For a child node, the enclosing bpmn:transaction element id.
+        messageName:
+          type: string
+          nullable: true
+          description: Receive Task / message — resolved name of the referenced <message>.
+    StartInstanceRequest:
+      type: object
+      required: [workspaceId, correlationKey, variables]
+      properties:
+        workspaceId:
+          type: string
+        businessKey:
+          type: string
+          nullable: true
+        correlationKey:
+          type: string
+          description: >
+            Correlation key for this instance's Receive Task subscriptions. Supplied via the
+            API (not derived from a model-level subscription expression).
+        variables:
+          type: object
+          additionalProperties: true
+        idempotencyKey:
+          type: string
+          nullable: true
+    ProcessInstance:
+      type: object
+      required:
+        - instanceId
+        - workspaceId
+        - definitionVersionId
+        - workflowInstanceId
+        - correlationKey
+        - status
+        - currentElementId
+        - variables
+        - startedAt
+      properties:
+        instanceId:
+          type: string
+        workspaceId:
+          type: string
+        definitionVersionId:
+          type: string
+        workflowInstanceId:
+          type: string
+        businessKey:
+          type: string
+          nullable: true
+        correlationKey:
+          type: string
+        status:
+          $ref: "#/components/schemas/InstanceStatus"
+        currentElementId:
+          type: string
+          nullable: true
+        traceId:
+          type: string
+          nullable: true
+        variables:
+          type: object
+          additionalProperties: true
+        startedAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+          nullable: true
+    InstanceList:
+      type: object
+      required: [instances]
+      properties:
+        instances:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProcessInstance"
+        nextCursor:
+          type: string
+          nullable: true
+    SagaStepView:
+      type: object
+      required: [elementId, seq, compensationStatus]
+      properties:
+        elementId:
+          type: string
+          description: The forward activity element id.
+        seq:
+          type: integer
+          description: Monotonic completion order within the transaction scope.
+        compensationStatus:
+          type: string
+          enum: [pending, notRequired, compensating, compensated, failed]
+        compensationElementId:
+          type: string
+          nullable: true
+          description: The isForCompensation handler element id, or null if no compensator.
+        compensated:
+          type: boolean
+          description: True when this step's compensation completed.
+        traceId:
+          type: string
+          nullable: true
+    SagaView:
+      type: object
+      required: [phase, steps]
+      properties:
+        phase:
+          type: string
+          enum: [forward, compensating, compensated, compensationFailed]
+        scopeId:
+          type: string
+          nullable: true
+          description: The bpmn:transaction element id for the active saga scope.
+        traceId:
+          type: string
+          nullable: true
+        steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/SagaStepView"
+    ProcessInstanceInspection:
+      allOf:
+        - $ref: "#/components/schemas/ProcessInstance"
+        - type: object
+          required: [historySummary, diagnostics]
+          properties:
+            historySummary:
+              type: array
+              items:
+                $ref: "#/components/schemas/HistoryEvent"
+            diagnostics:
+              type: object
+              additionalProperties: true
+            saga:
+              $ref: "#/components/schemas/SagaView"
+              nullable: true
+            incident:
+              $ref: "#/components/schemas/Incident"
+              nullable: true
+    ActivateJobsRequest:
+      type: object
+      required: [taskType, workerId]
+      properties:
+        taskType:
+          type: string
+          description: The pull topic (easy-bpmn:taskDefinition type). Forward and compensation jobs share the lane.
+        workerId:
+          type: string
+        maxJobs:
+          type: integer
+          minimum: 1
+          default: 1
+        leaseMs:
+          type: integer
+          minimum: 1
+          description: Lease duration; on expiry the job becomes re-leasable (attempt++).
+        waitMs:
+          type: integer
+          minimum: 0
+          description: Bounded long-poll window.
+      additionalProperties: false
+    ActivateJobsResponse:
+      type: object
+      required: [jobs]
+      properties:
+        jobs:
+          type: array
+          items:
+            $ref: "#/components/schemas/Job"
+    Job:
+      type: object
+      required:
+        - jobId
+        - instanceId
+        - elementId
+        - taskType
+        - isCompensation
+        - attempt
+        - lockToken
+        - traceId
+        - variables
+      properties:
+        jobId:
+          type: string
+        instanceId:
+          type: string
+        elementId:
+          type: string
+          description: >
+            The forward activity element id. For a compensation job this is the forward
+            (compensated) element id, with isCompensation=true.
+        taskType:
+          type: string
+        isCompensation:
+          type: boolean
+        attempt:
+          type: integer
+          minimum: 1
+        lockToken:
+          type: string
+          description: Required on complete/fail; rotated/cleared by a successful callback.
+        traceId:
+          type: string
+        variables:
+          type: object
+          additionalProperties: true
+        originalInput:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: Compensation jobs only — the forward step's captured input.
+        capturedOutput:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: Compensation jobs only — the forward step's captured output.
+    CompleteJobRequest:
+      type: object
+      required: [lockToken, outputVariables]
+      properties:
+        lockToken:
+          type: string
+        outputVariables:
+          type: object
+          additionalProperties: true
+      additionalProperties: false
+    FailJobRequest:
+      type: object
+      required: [lockToken, reason]
+      properties:
+        lockToken:
+          type: string
+        reason:
+          type: string
+        errorCode:
+          type: string
+          nullable: true
+          description: When it matches a model bpmn:error/@errorCode, raises that BPMN error (business failure).
+        retryable:
+          type: boolean
+          nullable: true
+          description: true / unset with no errorCode = technical failure (re-lease).
+      additionalProperties: false
+    JobCallbackResponse:
+      type: object
+      required: [status, jobId]
+      properties:
+        status:
+          type: string
+          enum: [advanced, retryScheduled, businessErrorRaised, duplicate, rejected, noop]
+          description: >
+            advanced/retryScheduled/businessErrorRaised on a fresh valid callback; duplicate =
+            stable prior outcome; rejected = stale/invalid lock token (0 rows); noop = the
+            instance was terminal/not-running (200 no-op ack, never a 500).
+        jobId:
+          type: string
+        instanceId:
+          type: string
+          nullable: true
+        isCompensation:
+          type: boolean
+          nullable: true
+        reason:
+          type: string
+          nullable: true
+    PublishMessageRequest:
+      type: object
+      required: [workspaceId, messageName, correlationKey, messageId, payload]
+      properties:
+        workspaceId:
+          type: string
+        messageName:
+          type: string
+        correlationKey:
+          type: string
+        messageId:
+          type: string
+        payload:
+          type: object
+          additionalProperties: true
+    PublishMessageResponse:
+      type: object
+      required: [outcome, messageName, correlationKey, messageId, externalMessageId]
+      properties:
+        outcome:
+          enum: [correlated, buffered, duplicate, rejected]
+        messageName:
+          type: string
+        correlationKey:
+          type: string
+        messageId:
+          type: string
+        externalMessageId:
+          type: string
+        instanceId:
+          type: string
+          nullable: true
+        duplicateOf:
+          type: string
+          nullable: true
+        reason:
+          type: string
+          nullable: true
+    ExternalMessage:
+      allOf:
+        - $ref: "#/components/schemas/PublishMessageResponse"
+        - type: object
+          required: [receivedAt]
+          properties:
+            finalOutcome:
+              enum: [correlated, buffered, duplicate, expired, late, rejected, invariantViolation]
+            receivedAt:
+              type: string
+              format: date-time
+            correlatedAt:
+              type: string
+              format: date-time
+              nullable: true
+            expiresAt:
+              type: string
+              format: date-time
+              nullable: true
+    HistoryEvent:
+      type: object
+      required: [historyEventId, type, businessTime, technicalTime]
+      properties:
+        historyEventId:
+          type: string
+        type:
+          type: string
+          description: >
+            Free-text category, including saga events: transactionEntered, transactionCancelled,
+            compensationStarted, compensationCompleted, compensationFailed, jobActivated,
+            jobCompleted, jobFailed.
+        instanceId:
+          type: string
+          nullable: true
+        elementId:
+          type: string
+          nullable: true
+        externalMessageId:
+          type: string
+          nullable: true
+        businessTime:
+          type: string
+          format: date-time
+        technicalTime:
+          type: string
+          format: date-time
+        payloadSnapshot:
+          type: object
+          additionalProperties: true
+          nullable: true
+        diagnostics:
+          type: object
+          additionalProperties: true
+          description: Includes the traceId.
+    Incident:
+      type: object
+      required: [incidentId, instanceId, elementId, reason, status, createdAt]
+      properties:
+        incidentId:
+          type: string
+        instanceId:
+          type: string
+        elementId:
+          type: string
+        reason:
+          type: string
+        status:
+          type: string
+          enum: [open]
+        kind:
+          type: string
+          nullable: true
+          enum: [serviceTaskFailure, compensationFailure, timeout]
+        resolution:
+          type: string
+          nullable: true
+          enum: [open, compensating, compensated, operatorResolved]
+        retryCount:
+          type: integer
+        payloadContext:
+          type: object
+          additionalProperties: true
+        createdAt:
+          type: string
+          format: date-time
+    PublishRejected:
+      type: object
+      required: [error, validationIssues]
+      properties:
+        error:
+          type: string
+        validationIssues:
+          type: array
+          items:
+            $ref: "#/components/schemas/ValidationIssue"
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        details:
+          type: object
+          additionalProperties: true

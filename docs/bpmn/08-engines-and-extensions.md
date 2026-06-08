@@ -109,9 +109,10 @@ build:
 
 > **Recommended split for `easy-bpmn`:** use **`bpmn-moddle`** for parsing (it solves namespaces,
 > prefixes, refs, and DI for free), then implement our *own* (a) **whitelist validator** that rejects
-> anything outside the supported profile with a user-visible reason, and (b) **durable executor** over a
-> Durable Object per instance. The executor semantics can be cross-checked against `bpmn-engine` /
-> `SpiffWorkflow`.
+> anything outside the supported profile with a user-visible reason, and (b) **durable executor** as one
+> Cloudflare Workflow per process instance, plus a single Durable Object correlation broker (keyed by
+> `workspaceId + messageName + correlationKey`) for message correlation. The executor semantics can be
+> cross-checked against `bpmn-engine` / `SpiffWorkflow`.
 
 ## FEEL & expression languages (context)
 

@@ -1,28 +1,29 @@
 name: CI
 
 # Typecheck + full test suite (Vitest workers pool) + offline build validation.
-# The project lives in the easy-bpmn/ subdirectory of this repo. No secrets needed.
+# Continuous deployment is handled by Cloudflare Workers Builds (native auth, on
+# push to main), so GitHub Actions runs tests only — no Cloudflare secrets needed.
 on:
-  pull_request:
   push:
-    branches-ignore: [main]
+    branches: [main]
+  pull_request:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: easy-bpmn
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version-file: .node-version
           cache: npm
-          cache-dependency-path: easy-bpmn/package-lock.json
       - run: npm ci
       - name: Typecheck
         run: npm run typecheck

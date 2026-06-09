@@ -48,7 +48,11 @@ import {
   failJobConditional,
   getJobInWorkspace,
   leaseJobs,
+  parkExpiredLease,
+  parkJobForBackoffConditional,
+  selectExpiredInFlightLeases,
 } from "./persistence/jobs";
+import { computeBackoffMs } from "./runtime/retry-policy";
 import { getSagaStep } from "./persistence/saga";
 import {
   createDraft,
@@ -91,6 +95,7 @@ import {
 
 export { ProcessWorkflow } from "./workflows/process-workflow";
 export { CorrelationBroker } from "./durable-objects/correlation-broker";
+export { JobScheduler } from "./durable-objects/job-scheduler";
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -617,6 +622,15 @@ async function leaseOnce(
   limit: number,
 ): Promise<LeasedJob[]> {
   const now = nowIso();
+  // Reclaim pre-pass (design §4.1 reclaim leg): an EXPIRED in-flight lease (a
+  // crashed/slow worker's lapsed lock) is parked behind backoff before it can be
+  // re-leased, so a reclaim is spaced like a retryable fail rather than re-handed
+  // instantly. (Terminating a reclaim once retries are exhausted is a per-step
+  // timeout — deferred to M3; backoff just spaces the attempts here.)
+  for (const j of await selectExpiredInFlightLeases(env.DB, workspaceId, taskType, now)) {
+    await parkExpiredLease(env.DB, j.job_id, isoPlusMs(now, computeBackoffMs(j.attempt_count)), now);
+  }
+
   const leaseUntil = isoPlusMs(now, leaseMs);
   const lockToken = newId("lock");
   const rows = await leaseJobs(env.DB, {
@@ -734,21 +748,28 @@ async function handleFailJob(env: Env, jobId: string, request: Request): Promise
   }
 
   // Business error (errorCode set) → terminal-for-the-step, the engine raises the
-  // BPMN error → compensation. Technical → re-leasable unless retries exhausted.
+  // BPMN error → compensation. Technical → re-leasable unless retries exhausted,
+  // and then only AFTER an exponential backoff park (design §4.1): the job stays
+  // 'locked' with no lock_token and lock_expires_at = now + backoff, so the
+  // activate gate re-leases it only once the delay has elapsed.
   const isBusiness = !!body.errorCode;
-  const targetStatus: "created" | "failed" = isBusiness
-    ? "failed"
-    : job.attempt_count < job.retry_limit
-      ? "created"
-      : "failed";
+  const willRetry = !isBusiness && job.attempt_count < job.retry_limit;
+  const targetStatus: "created" | "failed" = isBusiness ? "failed" : willRetry ? "created" : "failed";
 
-  const changes = await failJobConditional(env.DB, {
-    jobId,
-    lockToken: body.lockToken,
-    targetStatus,
-    errorCode: body.errorCode ?? null,
-    now,
-  });
+  let parkUntil: string | null = null;
+  let changes: number;
+  if (willRetry) {
+    parkUntil = isoPlusMs(now, computeBackoffMs(job.attempt_count));
+    changes = await parkJobForBackoffConditional(env.DB, { jobId, lockToken: body.lockToken, parkUntil, now });
+  } else {
+    changes = await failJobConditional(env.DB, {
+      jobId,
+      lockToken: body.lockToken,
+      targetStatus,
+      errorCode: body.errorCode ?? null,
+      now,
+    });
+  }
   if (changes === 0) {
     const raced = await getIdempotentResult<JobCallbackAck>(env.DB, "workerCallback", idemKey);
     if (raced) return json(raced, 200);
@@ -762,12 +783,12 @@ async function handleFailJob(env: Env, jobId: string, request: Request): Promise
     instanceId: job.instance_id,
     elementId: job.element_id,
     type: "jobFailed",
-    diagnostics: { jobId, errorCode: body.errorCode ?? null, retryable: !isBusiness, targetStatus, reason: body.reason },
+    diagnostics: { jobId, errorCode: body.errorCode ?? null, retryable: !isBusiness, targetStatus, reason: body.reason, ...(parkUntil ? { backoffUntil: parkUntil } : {}) },
   });
 
   // Only deliver when the step has reached a terminal-for-the-step state the
-  // engine must act on. A technical retry (targetStatus 'created') stays parked
-  // and is re-handed by the next activate — no event is sent.
+  // engine must act on. A technical retry stays parked (backoff) and is re-handed
+  // by the next activate once the delay elapses — no event is sent.
   if (targetStatus === "failed") {
     await getExecutor(env).deliverJobResult({
       workflowInstanceId: job.instance_id,

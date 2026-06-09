@@ -34,6 +34,11 @@
       {
         "name": "CORRELATION_BROKER",
         "class_name": "CorrelationBroker"
+      },
+      {
+        // Per-job un-leasable-job DLQ timer (one DO per service_task_job).
+        "name": "JOB_SCHEDULER",
+        "class_name": "JobScheduler"
       }
     ]
   },
@@ -48,6 +53,10 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["CorrelationBroker"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["JobScheduler"]
     }
   ]
 }

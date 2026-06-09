@@ -108,7 +108,7 @@ describe("pull data plane: lease + isolation + reclaim", () => {
     expect(r.body.jobs).toHaveLength(0);
   });
 
-  it("reclaims an expired lease and increments the attempt", async () => {
+  it("parks an expired in-flight lease behind backoff, then reclaims it (attempt incremented)", async () => {
     const inst = await seedInstance("ws-reclaim");
     const jobId = await seedJob({
       instanceId: inst,
@@ -116,11 +116,21 @@ describe("pull data plane: lease + isolation + reclaim", () => {
       elementId: "reserveStock",
       taskType: "reclaim-task",
       status: "locked",
-      lockToken: "lock_old",
+      lockToken: "lock_old", // a HELD in-flight lease that lapsed (crashed worker)
       lockExpiresAt: "2000-01-01T00:00:00Z",
       attempt: 1,
     });
     const token = await mintWorkerToken("ws-reclaim");
+    // TASK-23 §4.1 reclaim leg: the lapsed in-flight lease is parked behind backoff
+    // first (not instantly re-handed).
+    const parkPass = await authedPost("/jobs/activate", token, { taskType: "reclaim-task", workerId: "w-new" });
+    expect(parkPass.body.jobs).toHaveLength(0);
+    const parked = await jobRow(jobId);
+    expect(parked.status).toBe("locked");
+    expect(parked.lock_token).toBeNull(); // cleared → now a backoff park
+
+    // Elapse the backoff → the next activate reclaims it at attempt 2.
+    await env.DB.prepare(`UPDATE service_task_jobs SET lock_expires_at = '2000-01-01T00:00:00Z' WHERE job_id = ?`).bind(jobId).run();
     const r = await authedPost("/jobs/activate", token, { taskType: "reclaim-task", workerId: "w-new" });
     expect(r.body.jobs).toHaveLength(1);
     expect(r.body.jobs[0].jobId).toBe(jobId);
@@ -222,12 +232,19 @@ describe("pull data plane: complete / fail callbacks", () => {
     expect(r2.status).toBe(200); // idempotent
   });
 
-  it("makes a technical failure re-leasable (retry via re-lease)", async () => {
+  it("makes a technical failure re-leasable after backoff (retry via re-lease)", async () => {
     const { jobId, token, lockToken } = await leaseOne("ws-techfail", "tf-task");
     const r = await authedPost(`/jobs/${jobId}/fail`, token, { lockToken, reason: "timeout", retryable: true });
     expect(r.status).toBe(200);
-    expect((await jobRow(jobId)).status).toBe("created"); // re-leasable
+    // TASK-23 §4.1: parked behind backoff (locked, no token, future expiry) —
+    // NOT instantly re-leasable.
+    const parked = await jobRow(jobId);
+    expect(parked.status).toBe("locked");
+    expect(parked.lock_token).toBeNull();
+    expect(parked.lock_expires_at).not.toBeNull();
 
+    // Elapse the backoff (set lock_expires_at into the past), then it re-leases.
+    await env.DB.prepare(`UPDATE service_task_jobs SET lock_expires_at = '2000-01-01T00:00:00Z' WHERE job_id = ?`).bind(jobId).run();
     const again = await authedPost("/jobs/activate", token, { taskType: "tf-task", workerId: "w2" });
     expect(again.body.jobs).toHaveLength(1);
     expect(again.body.jobs[0].attempt).toBe(2); // re-lease bumped the attempt

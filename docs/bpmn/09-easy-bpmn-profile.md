@@ -19,7 +19,12 @@ The profile grows one milestone at a time, each guarded by a constitution amendm
 - **M2 → conditional sagas** (`exclusiveGateway` + conditional/default flows): target semantics in
   [`03-gateways.md`](./03-gateways.md).
 - **M3 → time & failure taxonomy** (timers, per-step timeouts, error catalog):
-  [`01-events.md`](./01-events.md).
+  [`01-events.md`](./01-events.md). **One M1 exception:** a single **job-level activation TTL**
+  (`service_task_jobs.activation_expires_at`, default 15 min) backs the un-leasable-job DLQ — a job
+  nobody leases in time settles to a terminal incident `kind=timeout` via a per-job `JobScheduler`
+  Durable Object alarm. It is *not* a model-level timer (no BPMN timer event); general timers remain
+  M3. Retry backoff (exponential + jitter, base 1s / factor 2 / cap 30s) and poison-job termination
+  (`kind=poison`, no compensation) ship in M1 too.
 - **M4 → concurrency** (`parallelGateway`, token set, AND-join):
   [`07-execution-semantics.md`](./07-execution-semantics.md).
 - **M5 → composition** (`callActivity`, non-transaction `subProcess`, `multiInstance`,
@@ -51,6 +56,11 @@ Diagram Interchange are ignored. If a modeler can open, render, and re-save the 
 the compensation handlers, boundary events, and associations) without losing the diagram, we did not
 invent a notation. The automated semantic round-trip lives in the validator's unit tests
 (`tests/unit/bpmn-validator.test.ts`); bpmn-js is the operative human check.
+
+**Persisted topology.** At publish, sequence-flow `sourceRef`/`targetRef` and compensation-`association`
+`sourceRef`/`targetRef` are **retained**, not dropped — stored in the parsed-profile graph
+(`GraphNode.outgoing: Flow[]`, `next` derived) and as queryable `bpmn_elements.source_ref`/`target_ref`
+rows (migration `0003_topology.sql`). Topology is therefore queryable and replay-deterministic.
 
 ## The supported execution shapes
 

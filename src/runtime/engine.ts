@@ -24,6 +24,7 @@ import { brokerKeyOf, type RegisterSubscriptionResult } from "./broker-types";
 import { MAX_EVENT_PAYLOAD_BYTES, payloadByteSize } from "./payload";
 import {
   ONE_HOUR_MS,
+  isoIsBefore,
   isoPlusMs,
   isTerminalInstanceStatus,
   mergeVariables,
@@ -33,9 +34,11 @@ import {
   traceIdFor,
   type JsonObject,
 } from "../util";
+import { ACTIVATION_TTL_MS, POISON_THRESHOLD } from "./retry-policy";
+import { failUnleasableJobConditional, getJobRowById, reopenJobKeepAttemptStmt } from "../persistence/jobs";
 import { getVersionGraph } from "../persistence/definitions";
 import { dbBatch } from "../persistence/db";
-import { historyStmt } from "../persistence/history";
+import { countHistoryEventsOfType, historyStmt } from "../persistence/history";
 import {
   applyTransition,
   applyTransitionStmt,
@@ -50,6 +53,7 @@ import {
   type JobRow,
   createSubscription,
   subscriptionConsumedStmt,
+  transitionStatusGuardedStmt,
   variableSnapshotStmt,
 } from "../persistence/instances";
 import {
@@ -292,6 +296,10 @@ async function createForwardJob(env: Env, instanceId: string, elementId: string,
   }
   const jobId = newId("job");
   const taskType = node.taskType ?? "";
+  const now = nowIso();
+  // Un-leasable-job DLQ (§4.2): a forward job nobody leases within ACTIVATION_TTL_MS
+  // is parked in a DLQ via a per-job JobScheduler alarm armed below.
+  const activationExpiresAt = isoPlusMs(now, ACTIVATION_TTL_MS);
   await dbBatch(env.DB, [
     historyStmt(env.DB, {
       workspaceId: inst.workspace_id,
@@ -310,17 +318,82 @@ async function createForwardJob(env: Env, instanceId: string, elementId: string,
       inputVariables: variables,
       workspaceId: inst.workspace_id,
       isCompensation: false,
-      now: nowIso(),
+      activationExpiresAt,
+      now,
     }),
     historyStmt(env.DB, {
       workspaceId: inst.workspace_id,
       instanceId,
       elementId,
       type: "serviceTaskJobCreated",
-      diagnostics: { jobId, taskType, retryLimit: Math.max(1, node.retries ?? 1) },
+      diagnostics: { jobId, taskType, retryLimit: Math.max(1, node.retries ?? 1), activationExpiresAt },
     }),
   ]);
+  await armJobScheduler(env, jobId, activationExpiresAt);
   return getForwardJobByElement(env.DB, instanceId, elementId);
+}
+
+/**
+ * Arm the per-job DLQ alarm (§4.2). Best-effort + non-fatal: the DLQ is a safety
+ * net, never on the job-creation critical path, so a DO hiccup must not fail
+ * job creation (it just leaves that job without a timeout, as M0 did for all jobs).
+ */
+async function armJobScheduler(env: Env, jobId: string, activationExpiresAt: string): Promise<void> {
+  try {
+    const stub = env.JOB_SCHEDULER.get(env.JOB_SCHEDULER.idFromName(jobId));
+    await stub.arm(jobId, activationExpiresAt);
+  } catch (err) {
+    console.error(JSON.stringify({ level: "warn", message: "JobScheduler arm failed", jobId, error: err instanceof Error ? err.message : String(err) }));
+  }
+}
+
+/**
+ * DLQ termination (§4.2), invoked by the JobScheduler alarm at activation_expires_at.
+ * D1 is canonical — the DO holds no authoritative state — so this re-reads the job
+ * and only acts if it is STILL an un-leased, expired forward job on a non-terminal
+ * instance. Otherwise (progressed / already settled / late-or-duplicate alarm) it
+ * is an idempotent no-op. The terminal incident kind='timeout' is written directly
+ * (never falling through to the process-workflow.ts catch-all), so the DLQ outcome
+ * is assertable in direct mode without a live Workflow.
+ */
+export async function terminateUnleasableJob(env: Env, jobId: string): Promise<void> {
+  const job = await getJobRowById(env.DB, jobId);
+  if (!job || job.is_compensation === 1) return;
+  if (!(job.status === "created" && job.attempt_count === 0)) return; // leased/completed/failed → no-op
+  const now = nowIso();
+  if (!job.activation_expires_at || isoIsBefore(now, job.activation_expires_at)) return; // not yet expired (early/spurious alarm)
+
+  const inst = await getInstanceRow(env.DB, job.instance_id);
+  if (!inst || isTerminalInstanceStatus(inst.status) || inst.status === "compensating") return;
+
+  // Atomic claim: only ONE of {this DLQ pass, a concurrent /jobs/activate, a worker
+  // completing} can flip created→failed. If the job was leased/advanced in the
+  // window since our re-read, this matches 0 rows and we no-op — never clobbering
+  // an in-flight or already-advanced job (the TOCTOU). This is the race gate; its
+  // result must be checked, so it is the one write outside the settle batch.
+  const claimed = await failUnleasableJobConditional(env.DB, jobId, now);
+  if (claimed === 0) return;
+
+  // Settle the instance ATOMICALLY: the guarded transition + incident + history go
+  // in ONE dbBatch, so an 'incident' status can never exist without its incident
+  // row (chosen over a non-atomic transition-then-incident, which could strand a
+  // terminal 'incident' with no incident row on a partial failure). The transition
+  // is GUARDED (only running/waiting → incident) so a concurrent cancel that already
+  // moved the instance is never regressed (one-way status table). Tradeoff: a 0-row
+  // guarded UPDATE is not a batch error, so in that rare lost-cancel race the
+  // incident + history rows still commit — the incident OBJECT stays hidden
+  // (inspection fetches it only when status='incident') but the jobActivationExpired
+  // / incidentCreated HISTORY events remain visible. Accepted as minor audit noise
+  // (no state/remediation impact) over the worse corrupt-terminal alternative.
+  const incidentId = newId("inc");
+  const reason = "Service Task job expired before any worker leased it (un-leasable taskType).";
+  const payloadContext: JsonObject = { reason, jobId, taskType: job.task_type, activationExpiresAt: job.activation_expires_at, dlq: "un-leasable" };
+  await dbBatch(env.DB, [
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId: inst.instance_id, elementId: job.element_id, type: "jobActivationExpired", diagnostics: { jobId, taskType: job.task_type, activationExpiresAt: job.activation_expires_at } }),
+    incidentStmt(env.DB, { incidentId, instanceId: inst.instance_id, elementId: job.element_id, reason, retryCount: 0, kind: "timeout", resolution: "open", payloadContext, now }),
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId: inst.instance_id, elementId: job.element_id, type: "incidentCreated", diagnostics: { incidentId, reason, kind: "timeout", retryCount: 0 }, payloadSnapshot: payloadContext }),
+    transitionStatusGuardedStmt(env.DB, inst.instance_id, ["running", "waiting"], "incident", now),
+  ]);
 }
 
 async function applyForwardCompletion(
@@ -337,6 +410,49 @@ async function applyForwardCompletion(
   const output = parseJson<JsonObject>(job.output_variables, {});
   const merged = mergeVariables(parseJson<JsonObject>(inst.variables, {}), output);
   const now = nowIso();
+
+  // Poison detection (§4.3): the per-call output already passed the payload limit
+  // at /jobs/complete, but the MERGE into instance variables may still breach it —
+  // an un-applicable completion. Re-open the job up to POISON_THRESHOLD strikes,
+  // then terminate with a DISTINCT kind='poison'. The strike counter is the number
+  // of un-applicable COMPLETIONS (counted from the serviceTaskOutputRejected
+  // history), NOT the lease attempt_count — a technical retry must not consume the
+  // poison budget. Poison NEVER compensates (only a business error → cancel does).
+  if (payloadByteSize(merged) > MAX_EVENT_PAYLOAD_BYTES) {
+    const priorRejections = await countHistoryEventsOfType(env.DB, instanceId, elementId, "serviceTaskOutputRejected");
+    const strike = priorRejections + 1;
+    if (strike >= POISON_THRESHOLD) {
+      await historyStmt(env.DB, {
+        workspaceId: inst.workspace_id,
+        instanceId,
+        elementId,
+        type: "poisonJob",
+        diagnostics: { jobId: job.job_id, strikes: strike, mergedSize: payloadByteSize(merged) },
+      }).run();
+      return createIncident(
+        env,
+        instanceId,
+        elementId,
+        strike,
+        `Service Task completed with un-applicable output ${strike} times (merged variables exceed the event payload limit).`,
+        { jobId: job.job_id, mergedSize: payloadByteSize(merged) },
+        "poison",
+      );
+    }
+    // Below threshold → re-open for another attempt and stay parked.
+    await dbBatch(env.DB, [
+      reopenJobKeepAttemptStmt(env.DB, job.job_id, now),
+      historyStmt(env.DB, {
+        workspaceId: inst.workspace_id,
+        instanceId,
+        elementId,
+        type: "serviceTaskOutputRejected",
+        diagnostics: { jobId: job.job_id, strike, mergedSize: payloadByteSize(merged), reason: "merged variables exceed the event payload limit" },
+      }),
+      applyTransitionStmt(env.DB, { instanceId, currentElementId: elementId, status: "waiting", now }),
+    ]);
+    return { kind: "waiting" };
+  }
 
   const statements: D1PreparedStatement[] = [
     variableSnapshotStmt(env.DB, { instanceId, source: "serviceTask", sourceId: job.job_id, variables: output, now }),

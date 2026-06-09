@@ -38,8 +38,12 @@ The resume payload delivered to the Workflow `waitForEvent` is a discriminated u
 ```ts
 type JobResult =
   | { outcome: "completed"; output: Record<string, unknown> }
-  | { outcome: "failed"; retryable: boolean; errorCode?: string; reason: string };
+  | { outcome: "failed"; retryable: boolean; errorCode?: string; kind?: "timeout" | "poison"; reason: string };
 ```
+
+`kind` classifies a runtime-synthesized failure edge: `timeout` = un-leasable-job DLQ (§Failure
+Taxonomy), `poison` = un-applicable output. Both terminate with the matching incident kind and
+**never compensate** (only a matching `errorCode` does).
 
 ### Per-job Workflow event type
 
@@ -128,12 +132,36 @@ rotate/clear the token:
 
 ## Failure Taxonomy
 
-- **Technical failure** — `fail retryable=true` / no `errorCode`, or a lease/timeout expiry: the job
-  becomes re-leasable; another `activate` hands it out (`attempt++`). Counts against `retries`.
-  Default retry backoff is exponential with jitter (`base`, `factor`, `maxBackoff`), **distinct from
-  the lease duration**. Exhaustion **inside** a transaction is a **Hazard** → terminal incident
-  (`kind=serviceTaskFailure`); an operator may `POST /instances/{id}/cancel` to force compensation.
-  Outside a transaction, exhaustion → terminal incident (MVP behavior).
+- **Technical failure** — `fail retryable=true` / no `errorCode`, or a lease-expiry reclaim: the job
+  is **parked behind an exponential-with-full-jitter backoff** (`status='locked'`, `lock_token=NULL`,
+  `lock_expires_at = now + computeBackoffMs(attempt)`), so the activate gate re-leases it only after
+  the delay — reusing the lease gate without a new column, and **distinct from the lease duration**
+  (`leaseMs` bounds one in-flight attempt; backoff spaces attempts apart). A **lease-expiry reclaim**
+  (a held lock that lapsed, i.e. a crashed/slow worker) is parked the same way by the activate
+  reclaim pre-pass before it can be re-handed (so reclaims are spaced, not instant). Counts against
+  `retries` via the explicit `/jobs/fail` path. (Terminating a job that exhausts its budget purely
+  through repeated lease-expiry — never an explicit `/jobs/fail` — is a per-step timeout, deferred to
+  **M3**; M1 only spaces such reclaims.)
+  Defaults (`src/runtime/retry-policy.ts`): **`baseMs=1000`, `factor=2`, `maxBackoffMs=30_000`**;
+  `computeBackoffMs(n) = round(rand() · min(maxBackoffMs, baseMs·factor^(n-1)))`. Exhaustion
+  **inside** a transaction is a **Hazard** → terminal incident (`kind=serviceTaskFailure`); an
+  operator may `POST /instances/{id}/cancel` to force compensation. Outside a transaction, exhaustion
+  → terminal incident (MVP behavior).
+- **Un-leasable job (DLQ)** — a forward job nobody leases within **`ACTIVATION_TTL_MS = 15 min`**
+  (`activation_expires_at = created_at + ACTIVATION_TTL_MS`, the lone M1 job-level timer). A per-job
+  `JobScheduler` Durable Object alarm armed at job creation fires at expiry, re-reads D1, and if the
+  job is still un-leased (`status='created' AND attempt_count=0`) routes a synthetic
+  `{ outcome:'failed', retryable:false, kind:'timeout', reason:'un-leasable' }` → terminal incident
+  `kind=timeout` + a `jobActivationExpired` history event. A progressed/late/duplicate alarm is an
+  idempotent no-op. **Never** compensates.
+- **Poison job** — a worker that **completes** with output that cannot be applied (the MERGE into
+  instance variables would breach the ~1 MiB event-payload limit) is re-opened up to
+  **`POISON_THRESHOLD = 3`** strikes, then terminates with a **distinct** `kind=poison` + a
+  `poisonJob` history event. The strike counter is the number of un-applicable **completions**
+  (counted from `serviceTaskOutputRejected` history), **not** `attempt_count` — a technical retry
+  does not consume the poison budget. (Those strike rows persist across an operator `/retry`, so a
+  retry does not grant a fresh poison budget.) The instance does **NOT** enter `compensating` and
+  **no** compensation jobs are created.
 - **Business error** — `fail` with an `errorCode` matching a model `bpmn:error/@errorCode`: not
   retried; raises that BPMN error → caught by the matching error boundary (`errorRef →
   bpmn:error/@id`) → routed to the cancel end event → transaction cancels → compensation.

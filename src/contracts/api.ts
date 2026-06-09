@@ -133,6 +133,9 @@ export interface BpmnElement {
   name?: string | null;
   taskType?: string | null;
   messageName?: string | null;
+  /** sequenceFlow / association only — persisted wiring endpoints (topology). */
+  sourceRef?: string | null;
+  targetRef?: string | null;
 }
 
 export interface DefinitionVersion {
@@ -193,7 +196,7 @@ export interface Incident {
   retryCount: number;
   payloadContext?: Record<string, unknown>;
   /** SAGA (M1) — incident taxonomy + remediation linkage. */
-  kind?: "serviceTaskFailure" | "compensationFailure" | "timeout";
+  kind?: "serviceTaskFailure" | "compensationFailure" | "timeout" | "poison";
   resolution?: "open" | "compensating" | "compensated" | "operatorResolved";
   createdAt: string;
 }

@@ -594,6 +594,18 @@ components:
           type: string
           nullable: true
           description: Receive Task / message — resolved name of the referenced <message>.
+        sourceRef:
+          type: string
+          nullable: true
+          description: >
+            For a sequenceFlow / association element, the source endpoint id (persisted topology,
+            TASK-11). Null for non-wiring elements.
+        targetRef:
+          type: string
+          nullable: true
+          description: >
+            For a sequenceFlow / association element, the target endpoint id (persisted topology,
+            TASK-11). Null for non-wiring elements.
     StartInstanceRequest:
       type: object
       required: [workspaceId, correlationKey, variables]
@@ -965,7 +977,7 @@ components:
         kind:
           type: string
           nullable: true
-          enum: [serviceTaskFailure, compensationFailure, timeout]
+          enum: [serviceTaskFailure, compensationFailure, timeout, poison]
         resolution:
           type: string
           nullable: true

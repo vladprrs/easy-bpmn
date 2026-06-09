@@ -181,12 +181,38 @@ Expected outcome:
 - The reverse pass uses **v1's** compensation handlers and `taskType`s.
 - History and the saga view reference only the v1 definition version.
 
+## Scenario 8: Un-leasable Job → DLQ Timeout (gate: unleasable-job-dlq-timeout)
+
+Start an instance whose first Service Task `taskType` no worker ever polls. The job is created with
+`activation_expires_at = created_at + 15 min` and a per-job `JobScheduler` Durable Object alarm is
+armed. At expiry the alarm re-reads D1 and, the job still un-leased, terminates it.
+
+Expected outcome:
+
+- The instance settles to a **terminal incident** with `kind=timeout`; a `jobActivationExpired`
+  history event is written and the reason is specific (`un-leasable`), **not** the
+  `process-workflow` catch-all `Workflow terminated:`.
+- A job that was **leased before** `activation_expires_at` is **not** timed out (the alarm no-ops).
+- The DLQ never compensates.
+
+## Scenario 9: Poison Job → Terminal `kind=poison` (no compensation) (gate: poison-job-termination)
+
+A worker repeatedly **completes** with output that cannot be applied — here a ~0.6 MiB output that,
+merged with ~0.6 MiB of instance variables, breaches the ~1 MiB event-payload limit.
+
+Expected outcome:
+
+- The job is re-opened up to `POISON_THRESHOLD = 3` strikes, then terminates with a **distinct**
+  `kind=poison` + a `poisonJob` history event.
+- The instance does **NOT** enter `compensating` and **no** compensation jobs are created (poison is
+  distinct from a business-error → cancel, the only compensating path).
+
 ## Validation Commands
 
 ```bash
-npm run test:unit          # bpmn validator (saga accept/reject), graph scope, reverse-order ledger
-npm run test:contract      # /jobs/* + operator verbs + list + saga view vs contracts/openapi.yaml; job-result union; lease SQL
-npm run test:integration   # the seven saga gates above (D1 + DO + Workflow + pull workers)
+npm run test:unit          # bpmn validator (saga accept/reject), graph scope, reverse-order ledger, retry backoff curve
+npm run test:contract      # /jobs/* + operator verbs + list + saga view vs contracts/openapi.yaml; job-result union (incl. timeout/poison kind); lease SQL
+npm run test:integration   # the nine saga gates above (D1 + DO + Workflow + pull workers)
 npx wrangler deploy --dry-run
 ```
 
@@ -194,7 +220,8 @@ Expected validation outcome:
 
 - The §3 canonical order-saga publishes; each still-unsupported construct is rejected with element
   id + reason; foreign-ns / DI / `documentation` are tolerated.
-- The seven integration gates pass: happy commit; business-error reverse compensation;
+- The nine integration gates pass: happy commit; business-error reverse compensation;
   compensator-fail remediation; duplicate complete/fail idempotency; terminal-instance no-op ack;
-  cross-tenant activate reject; version binding through compensation.
+  cross-tenant activate reject; version binding through compensation; un-leasable-job DLQ timeout;
+  poison-job termination.
 - No external workflow infrastructure (Camunda/Zeebe/broker/cluster) is deployed.

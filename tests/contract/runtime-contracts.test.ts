@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { messageEventPayloadSchema } from "../../src/contracts/workflow-events";
+import { jobResultEventSchema, messageEventPayloadSchema } from "../../src/contracts/workflow-events";
+import { activateJobsResponseSchema } from "../../src/contracts/api";
 import { workflowEventTypeFor } from "../../src/bpmn/profile";
 import { DEMO_BPMN, createDraft, drainSampleWorkers, get, post, publishDraft, startInstance } from "../helpers";
 
@@ -29,6 +30,23 @@ describe("Runtime contracts", () => {
     expect(ok.success).toBe(true);
     const bad = messageEventPayloadSchema.safeParse({ messageName: "X" });
     expect(bad.success).toBe(false);
+  });
+
+  it("job-result discriminator carries the timeout/poison failure classification (TASK-23 §4.2/§4.3)", () => {
+    // un-leasable DLQ synthetic result
+    const dlq = jobResultEventSchema.safeParse({ outcome: "failed", jobId: "job_1", retryable: false, kind: "timeout", reason: "un-leasable" });
+    expect(dlq.success).toBe(true);
+    // poison classification
+    const poison = jobResultEventSchema.safeParse({ outcome: "failed", jobId: "job_2", retryable: false, kind: "poison", reason: "un-applicable output" });
+    expect(poison.success).toBe(true);
+    // a business/technical failure may omit kind; a bogus classification is rejected
+    expect(jobResultEventSchema.safeParse({ outcome: "failed", jobId: "job_3", retryable: true, reason: "retry" }).success).toBe(true);
+    expect(jobResultEventSchema.safeParse({ outcome: "failed", jobId: "job_4", retryable: false, kind: "weird", reason: "x" }).success).toBe(false);
+  });
+
+  it("activate-response schema validates the backoff-gated empty result (TASK-23 §4.1)", () => {
+    // While every job of a taskType is parked behind backoff, activate returns {jobs:[]}.
+    expect(activateJobsResponseSchema.safeParse({ jobs: [] }).success).toBe(true);
   });
 
   it("emits pull Service Task worker-contract diagnostics in history", async () => {

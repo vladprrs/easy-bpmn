@@ -18,7 +18,10 @@ export type MessageEventPayload = z.infer<typeof messageEventPayloadSchema>;
  * Service-Task-as-wait engine (event type `bpmn_job_<jobId>`, see
  * workflowJobEventTypeFor). `completed` advances; `failed` carries the
  * technical-vs-business distinction (retryable vs an errorCode matching a model
- * bpmn:error/@errorCode → raises that BPMN error → compensation).
+ * bpmn:error/@errorCode → raises that BPMN error → compensation). A non-retryable
+ * failure may additionally carry a `kind` classifying a runtime-synthesized
+ * failure edge (`timeout` = un-leasable DLQ §4.2; `poison` = un-applicable output
+ * §4.3) — these terminate with the matching incident kind and NEVER compensate.
  */
 export const jobResultEventSchema = z.discriminatedUnion("outcome", [
   z.object({
@@ -31,6 +34,7 @@ export const jobResultEventSchema = z.discriminatedUnion("outcome", [
     jobId: z.string(),
     retryable: z.boolean(),
     errorCode: z.string().nullish(),
+    kind: z.enum(["timeout", "poison"]).nullish(),
     reason: z.string(),
   }),
 ]);

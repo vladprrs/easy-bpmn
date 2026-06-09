@@ -16,6 +16,11 @@
 - Each flow node also lists its connections via child `<incoming>` / `<outgoing>` elements (the flow
   ids). Both representations appear in the XML; keep them consistent. See
   [`06-xml-serialization.md`](./06-xml-serialization.md).
+- In `easy-bpmn`, sequence-flow `sourceRef`/`targetRef` and compensation-`association`
+  `sourceRef`/`targetRef` are **retained** at publish — persisted both in the parsed-profile graph
+  (`GraphNode.outgoing: Flow[]`, with `next` derived as `outgoing[0].targetId`) and as queryable
+  `bpmn_elements.source_ref`/`target_ref` rows (migration `0003_topology.sql`). The pre-saga MVP
+  dropped these refs; topology is now queryable and replay-deterministic.
 
 ### Conditional & default flow
 A `conditionExpression` guards a flow:

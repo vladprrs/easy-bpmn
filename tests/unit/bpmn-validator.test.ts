@@ -248,3 +248,57 @@ describe("Canonical transaction-saga profile (SAGA design §3)", () => {
     expect(r.issues.some((i) => i.elementId === "bad_cancel" && /attached to a <transaction>/.test(i.reason))).toBe(true);
   });
 });
+
+describe("Multi-edge IR: outgoing[] (TASK-11 closeout, design §3.1)", () => {
+  // The engine-facing multi-edge shape: GraphNode.outgoing carries the full
+  // Flow[] (flowId + targetId), with `next` derived as outgoing[0].targetId so
+  // the single-token engine is unchanged. conditionExpression/isDefault are the
+  // M2 hook — always null/false in M1 (the validator still rejects them).
+  it("exposes every forward node's outgoing[] with the right flowId + targetId", async () => {
+    const r = await parseAndValidate(SAGA_BPMN);
+    expect(r.ok).toBe(true);
+    const n = r.graph!.nodes;
+
+    // process-level edges
+    expect(n["Start"]!.outgoing).toEqual([{ flowId: "g1", targetId: "Tx_order", conditionExpression: null, isDefault: false }]);
+    expect(n["Tx_order"]!.outgoing).toEqual([{ flowId: "g2", targetId: "SagaDone", conditionExpression: null, isDefault: false }]);
+    // boundary events DO carry their single routing flow on the token path
+    expect(n["Tx_cancelled"]!.outgoing).toEqual([{ flowId: "g3", targetId: "SagaFailed", conditionExpression: null, isDefault: false }]);
+    expect(n["shipping_err"]!.outgoing).toEqual([{ flowId: "f5", targetId: "Tx_cancel", conditionExpression: null, isDefault: false }]);
+
+    // inner transaction forward chain f1..f4
+    expect(n["Tx_start"]!.outgoing.map((f) => [f.flowId, f.targetId])).toEqual([["f1", "reserveStock"]]);
+    expect(n["reserveStock"]!.outgoing.map((f) => [f.flowId, f.targetId])).toEqual([["f2", "chargeCard"]]);
+    expect(n["chargeCard"]!.outgoing.map((f) => [f.flowId, f.targetId])).toEqual([["f3", "confirmShipping"]]);
+    expect(n["confirmShipping"]!.outgoing.map((f) => [f.flowId, f.targetId])).toEqual([["f4", "Tx_ok"]]);
+  });
+
+  it("keeps `next` derived as outgoing[0]?.targetId for every node", async () => {
+    const r = await parseAndValidate(SAGA_BPMN);
+    const n = r.graph!.nodes;
+    for (const node of Object.values(n)) {
+      expect(node.next).toBe(node.outgoing[0]?.targetId ?? null);
+    }
+    // ends have no successor
+    expect(n["Tx_ok"]!.next).toBeNull();
+    expect(n["SagaDone"]!.outgoing).toEqual([]);
+  });
+
+  it("places compensation boundaries and isForCompensation handlers OFF every token-path outgoing[]", async () => {
+    const r = await parseAndValidate(SAGA_BPMN);
+    expect(r.ok).toBe(true); // not flagged unreachable despite no incoming sequence flow
+    const n = r.graph!.nodes;
+
+    // comp boundaries have zero outgoing; handlers have zero outgoing
+    for (const offPath of ["reserveStock_comp", "chargeCard_comp", "releaseStock", "refundCard"]) {
+      expect(n[offPath]!.outgoing).toEqual([]);
+    }
+    // no token-path node lists a comp boundary or handler as a successor
+    const offPath = new Set(["reserveStock_comp", "chargeCard_comp", "releaseStock", "refundCard"]);
+    for (const node of Object.values(n)) {
+      for (const flow of node.outgoing) {
+        expect(offPath.has(flow.targetId)).toBe(false);
+      }
+    }
+  });
+});

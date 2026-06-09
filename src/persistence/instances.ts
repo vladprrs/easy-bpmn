@@ -147,6 +147,22 @@ export async function applyTransition(
   await applyTransitionStmt(db, input).run();
 }
 
+/** Status-conditional transition statement (only when current status is in `from`). */
+export function transitionStatusGuardedStmt(
+  db: D1Database,
+  instanceId: string,
+  from: InstanceStatus[],
+  to: InstanceStatus,
+  now: string,
+): D1PreparedStatement {
+  const placeholders = from.map(() => "?").join(", ");
+  return stmt(
+    db,
+    `UPDATE process_instances SET status = ?, updated_at = ? WHERE instance_id = ? AND status IN (${placeholders})`,
+    [to, now, instanceId, ...from],
+  );
+}
+
 /** Status-conditional transition: applies only when current status is in `from`. Returns rows changed. */
 export async function transitionStatusGuarded(
   db: D1Database,
@@ -155,12 +171,7 @@ export async function transitionStatusGuarded(
   to: InstanceStatus,
   now: string,
 ): Promise<number> {
-  const placeholders = from.map(() => "?").join(", ");
-  const res = await stmt(
-    db,
-    `UPDATE process_instances SET status = ?, updated_at = ? WHERE instance_id = ? AND status IN (${placeholders})`,
-    [to, now, instanceId, ...from],
-  ).run();
+  const res = await transitionStatusGuardedStmt(db, instanceId, from, to, now).run();
   return res.meta?.changes ?? 0;
 }
 
@@ -587,7 +598,7 @@ export async function markSubscriptionExpired(
 // Incidents
 // ---------------------------------------------------------------------------
 
-export type IncidentKind = "serviceTaskFailure" | "compensationFailure" | "timeout";
+export type IncidentKind = "serviceTaskFailure" | "compensationFailure" | "timeout" | "poison";
 export type IncidentResolution = "open" | "compensating" | "compensated" | "operatorResolved";
 
 export function incidentStmt(

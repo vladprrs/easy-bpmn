@@ -29,6 +29,7 @@ import type {
   EndKind,
   ErrorDeclaration,
   ExecutionGraph,
+  Flow,
   GraphElement,
   GraphNode,
   NodeType,
@@ -666,15 +667,29 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
   const processStart = nodes.find((n) => n.type === "startEvent" && n.scopeId === processId)!;
   const processEnds = nodes.filter((n) => n.type === "endEvent" && n.scopeId === processId);
 
+  // Multi-edge IR (design §4.1): each node's full outgoing Flow[] in document
+  // order. `next` stays derived (outgoing[0]?.targetId) so the single-token
+  // engine is untouched. conditionExpression/isDefault are the M2 hook —
+  // always null/false in M1 (conditional + default flows are still rejected).
+  const outgoingFlows = new Map<string, Flow[]>();
+  for (const f of flows) {
+    if (!f.source || !f.target) continue;
+    const arr = outgoingFlows.get(f.source) ?? [];
+    arr.push({ flowId: f.id, targetId: f.target, conditionExpression: null, isDefault: false });
+    outgoingFlows.set(f.source, arr);
+  }
+
   const graphNodes: Record<string, GraphNode> = {};
   for (const n of nodes) {
+    const nodeOutgoing = outgoingFlows.get(n.id) ?? [];
     const node: GraphNode = {
       type: n.type,
       name: n.name ?? null,
       taskType: n.taskType ?? null,
       retries: n.attempts ?? null,
       messageName: n.messageName ?? null,
-      next: (outgoing.get(n.id) ?? [])[0] ?? null,
+      outgoing: nodeOutgoing,
+      next: nodeOutgoing[0]?.targetId ?? null,
       scopeId: n.scopeId === processId ? null : n.scopeId,
     };
     if (n.type === "serviceTask") node.isForCompensation = n.isForCompensation === true;
@@ -726,9 +741,16 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       messageName: n.messageName ?? null,
     });
   }
-  for (const f of flows) elements.push({ elementId: f.id, type: "sequenceFlow" });
+  // Persist sequence-flow + association wiring (design §3.2): topology is
+  // queryable, not just embedded in the parsed_profile. Validation has passed,
+  // so every flow/association has resolved, in-scope endpoints.
+  for (const f of flows) {
+    elements.push({ elementId: f.id, type: "sequenceFlow", sourceRef: f.source ?? null, targetRef: f.target ?? null });
+  }
   for (const m of messageElements) elements.push({ elementId: m.id, type: "message", name: m.name, messageName: m.name });
-  for (const a of associations) elements.push({ elementId: a.id, type: "association" });
+  for (const a of associations) {
+    elements.push({ elementId: a.id, type: "association", sourceRef: a.source ?? null, targetRef: a.target ?? null });
+  }
   for (const e of errorsById.values()) elements.push({ elementId: e.id, type: "error", name: e.name ?? null });
 
   const associationLinks: AssociationLink[] = associations.map((a) => ({

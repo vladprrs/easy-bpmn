@@ -33,7 +33,10 @@ A `bpmn:transaction` node in the parsed graph IR (`src/bpmn/graph.ts`); the boun
   one outgoing `<association>` to an `isForCompensation` activity **in the same scope**.
 - A `cancelEventDefinition` is valid only inside / attached to a transaction.
 - Sequence-flow source/target, associations, and the scope tree are **persisted** (the MVP dropped
-  flows at parse time) so topology is queryable and replay-deterministic.
+  flows at parse time) so topology is queryable and replay-deterministic. As built (TASK-11
+  closeout): the parsed-profile graph carries `GraphNode.outgoing: Flow[]`, and `bpmn_elements`
+  rows for `sequenceFlow`/`association` carry `source_ref`/`target_ref` (additive migration
+  `0003_topology.sql`).
 
 ## Entity: Graph Node (graph IR delta)
 
@@ -41,7 +44,10 @@ Delta to the parsed-node IR consumed by the scope-aware engine.
 
 **Fields**:
 - `outgoing`: `Flow[]` where `Flow = { flowId, targetId, conditionExpression?, isDefault? }`
-  (M1: at most one token-path entry; conditions land in M2).
+  (M1: at most one token-path entry; `conditionExpression`/`isDefault` always `null`/`false` until
+  M2). `GraphNode.next` is kept as the derived convenience `outgoing[0]?.targetId` so the
+  single-token engine is unchanged (M1 reads `.next`; the M2 migration is to *select* among
+  `outgoing[]`). Compensation boundaries + `isForCompensation` handlers carry `outgoing: []`.
 - `kind`: Node kind, now including `transaction` and `boundaryEvent`.
 - `endEvent.kind`: `none | cancel | compensate`.
 - `boundaryEvent.kind`: `error | cancel | compensate | timer` (only `error`/`cancel`/`compensate`

@@ -36,6 +36,21 @@ export type EndKind = "none" | "cancel";
 /** Discriminator for a boundary event, by its single event definition. */
 export type BoundaryKind = "error" | "cancel" | "compensate";
 
+/**
+ * One outgoing sequence-flow edge of a node (design §4.1 multi-edge IR).
+ * M1 is single-token, so a token-path node carries at most one Flow and the
+ * derived `GraphNode.next` is `outgoing[0]?.targetId`. `conditionExpression` /
+ * `isDefault` are the M2 branch-selection hook — always `null` / `false` in M1
+ * (the validator still rejects conditional + default flows), present now so the
+ * persisted shape is stable across the M1→M2 boundary.
+ */
+export interface Flow {
+  flowId: string;
+  targetId: string;
+  conditionExpression?: string | null;
+  isDefault?: boolean;
+}
+
 export interface GraphElement {
   elementId: string;
   type: ElementType;
@@ -46,6 +61,9 @@ export interface GraphElement {
   retries?: number | null;
   /** receiveTask / message only — resolved name of the referenced <message>. */
   messageName?: string | null;
+  /** sequenceFlow / association only — the wiring endpoints (persisted topology). */
+  sourceRef?: string | null;
+  targetRef?: string | null;
 }
 
 export interface GraphNode {
@@ -54,7 +72,17 @@ export interface GraphNode {
   taskType?: string | null;
   retries?: number | null;
   messageName?: string | null;
-  /** Successor node id following the single outgoing sequence flow (null at end / off-path). */
+  /**
+   * All outgoing sequence-flow edges (design §4.1). M1 keeps ≤1 token-path
+   * successor; compensation boundaries + isForCompensation handlers carry `[]`
+   * (they are reached via attachment/association, never the token path).
+   */
+  outgoing: Flow[];
+  /**
+   * Derived convenience: the first outgoing edge's target (null at end / off
+   * path). The single-token engine reads `.next`; the M2 migration is to
+   * *select* among `outgoing[]` by condition.
+   */
   next: string | null;
   // --- SAGA M0 snapshot fields (optional; absent on linear MVP graphs) ---
   /** Enclosing <transaction> element id, or null at process level. */

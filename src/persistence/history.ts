@@ -69,6 +69,21 @@ export async function recordHistory(db: D1Database, input: HistoryInput): Promis
   await historyStmt(db, input).run();
 }
 
+/** Count history events of a given type for an instance element (e.g. poison strikes). */
+export async function countHistoryEventsOfType(
+  db: D1Database,
+  instanceId: string,
+  elementId: string,
+  type: string,
+): Promise<number> {
+  const row = await stmt(
+    db,
+    `SELECT COUNT(*) AS n FROM history_events WHERE instance_id = ? AND element_id = ? AND type = ?`,
+    [instanceId, elementId, type],
+  ).first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
 export async function listInstanceHistory(
   db: D1Database,
   instanceId: string,

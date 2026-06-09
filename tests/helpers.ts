@@ -1,6 +1,6 @@
 // Shared test helpers: HTTP client over the Worker (SELF) + BPMN fixtures.
 
-import { SELF } from "cloudflare:test";
+import { SELF, env } from "cloudflare:test";
 import { invokeSampleWorker } from "../src/runtime/service-task";
 
 const BASE = "https://easy-bpmn.test";
@@ -112,10 +112,26 @@ export async function drainSampleWorkers(opts: {
           // Business error → carries the model errorCode (not retryable).
           await authedPost(`/jobs/${job.jobId}/fail`, token, { lockToken: job.lockToken, reason: result.reason, errorCode: result.errorCode });
         } else {
-          // Technical failure → re-leasable retry.
+          // Technical failure → re-leasable retry (now parked behind backoff).
           await authedPost(`/jobs/${job.jobId}/fail`, token, { lockToken: job.lockToken, reason: result.reason, retryable: true });
         }
       }
+    }
+    // A retryable fail now PARKS the job behind an exponential backoff (TASK-23
+    // §4.1: status='locked', lock_token=NULL, future lock_expires_at) instead of
+    // re-leasing instantly. This driver is the test stand-in for elapsed
+    // wall-clock, so fast-forward any backoff-parked job of the polled task types
+    // and keep draining (the design's "advance time" wrinkle).
+    if (!didWork) {
+      const ph = opts.taskTypes.map(() => "?").join(", ");
+      const res = await env.DB.prepare(
+        `UPDATE service_task_jobs SET lock_expires_at = '2000-01-01T00:00:00Z'
+           WHERE status = 'locked' AND lock_token IS NULL AND lock_expires_at > ?
+             AND task_type IN (${ph})`,
+      )
+        .bind(new Date().toISOString(), ...opts.taskTypes)
+        .run();
+      if ((res.meta?.changes ?? 0) > 0) didWork = true; // re-drain the freed jobs
     }
   }
   return ran;

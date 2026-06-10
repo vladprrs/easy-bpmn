@@ -5,22 +5,28 @@
 // annotations), and extracts an immutable execution graph snapshot — always for
 // accepted documents, and best-effort for rejected ones (see ValidationResult).
 //
-// M2 (conditional sagas) makes the multi-edge IR conditional: exclusiveGateway
-// becomes a node kind and Flow.conditionExpression/isDefault go live, while the
-// publish gate still rejects those constructs until TASK-33 widens the accept
-// matrix.
+// M2 (conditional sagas, TASK-33) opens the accept matrix for data-driven XOR
+// branching (M2 design §3): exclusiveGateway is accepted-and-validated (split
+// rules: every non-default outgoing flow carries a publish-time-FEEL-parsed
+// condition; the gateway-owned `default` carries none and must reference one of
+// the gateway's own outgoing flows), and cycles on the token path are legal.
+// Conditions anywhere else, defaults on non-gateways, implicit multi-out
+// splits, boundary events on gateways, and the other gateway types
+// (parallel/inclusive/eventBased/complex) stay rejected with element id +
+// reason.
 
 import type { ModdleElement } from "bpmn-moddle";
 import { parseBpmnXml } from "./parser";
 import { TASK_DEFINITION_TYPE } from "./moddle-extension";
+import { parseCondition } from "../runtime/expressions";
 import {
   ASSOCIATION_TYPE,
   CANCEL_EVENT_DEFINITION,
   COMPENSATE_EVENT_DEFINITION,
   DEFAULT_SERVICE_TASK_ATTEMPTS,
+  DEFERRED_GATEWAY_REASONS,
   ERROR_EVENT_DEFINITION,
   ERROR_TYPE,
-  EXCLUSIVE_GATEWAY_TYPE,
   SEQUENCE_FLOW_TYPE,
   SUPPORTED_NODE_TYPES,
   localTypeName,
@@ -97,8 +103,21 @@ interface FlowInfo {
   source?: string;
   target?: string;
   scopeId: string;
-  /** Raw FEEL body of the flow's <conditionExpression> (tFormalExpression text). */
+  /**
+   * Raw FEEL body of the flow's <conditionExpression> (tFormalExpression text,
+   * trimmed; empty/whitespace-only bodies normalize to undefined — see the
+   * capture site).
+   */
   conditionExpression?: string;
+  /**
+   * True when the flow carries a <conditionExpression> ELEMENT at all, even an
+   * empty one. The conditions-only-on-gateway-flows rule rejects on element
+   * presence (M1 strictness); the gateway split rules work on the normalized
+   * body above (empty == condition-less).
+   */
+  hasConditionElement: boolean;
+  /** The condition's `language` attribute, when set (must be unset or FEEL). */
+  conditionLanguage?: string;
 }
 
 interface AssocInfo {
@@ -115,7 +134,7 @@ interface ScopeInfo {
 
 const SUPPORTED_HINT =
   "Supported flow nodes: start event, service task, receive task, end event, " +
-  "transaction (saga scope), and compensation/error/cancel boundary events.";
+  "exclusive gateway, transaction (saga scope), and compensation/error/cancel boundary events.";
 
 export async function parseAndValidate(xml: string): Promise<ValidationResult> {
   const parsed = await parseBpmnXml(xml);
@@ -138,6 +157,26 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       elementId: elementId ?? null,
       elementName: elementName ?? "element",
     });
+
+  // A `default` attribute naming a flow that does not EXIST never reaches the
+  // moddle tree — bpmn-moddle drops the reference and records an "unresolved
+  // reference" warning instead. Surface those as publish errors here; a default
+  // that resolves but names a flow not leaving its own gateway is caught by the
+  // gateway rules below.
+  for (const w of parsed.warnings as Array<{
+    property?: string;
+    value?: unknown;
+    element?: { id?: string; $type?: string };
+  }>) {
+    if (w?.property === "bpmn:default") {
+      const elId = w.element?.id ?? null;
+      err(
+        `Element '${elId ?? "(no id)"}' declares default flow '${String(w.value)}', which does not exist in the model.`,
+        elId,
+        w.element?.$type ? localTypeName(w.element.$type) : "element",
+      );
+    }
+  }
 
   const definitions = parsed.definitions;
   const rootElements = asArray<ModdleElement>(definitions.rootElements);
@@ -246,55 +285,44 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       if ($type === SEQUENCE_FLOW_TYPE) {
         // M2 graph IR: capture the FEEL condition body (tFormalExpression
         // text, TRIMMED — pretty-printed XML carries leading newlines/indent)
-        // so the builder can emit live conditional edges. The publish gate
-        // below still REJECTS conditional flows until TASK-33 widens the
-        // accept matrix.
+        // so the builder can emit live conditional edges.
         //
-        // NOTE (for TASK-33): an empty/whitespace-only <conditionExpression>
-        // is normalized to null here — downstream it is indistinguishable
-        // from "no condition at all". TASK-33's accept matrix rejects
-        // non-default condition-less gateway flows, so both shapes fall into
-        // the same (rejected) bucket; if that ever changes, the distinction
-        // must be re-captured at this site.
+        // NOTE: an empty/whitespace-only <conditionExpression> body is
+        // normalized to undefined here — for the gateway split rules it is
+        // indistinguishable from "no condition at all" and lands in the
+        // non-default-condition-less reject bucket (the message covers both
+        // shapes). `hasConditionElement` keeps the raw element presence for
+        // the conditions-only-on-gateway-flows rule.
         const cond = el.conditionExpression as ModdleElement | undefined | null;
         const condBody =
           cond != null && typeof cond.body === "string" && cond.body.trim() !== ""
             ? cond.body.trim()
             : undefined;
-        if (cond != null) {
-          err(
-            "Conditional sequence flows are not supported (deferred to conditional sagas). Use plain sequence flows only.",
-            id,
-            "sequenceFlow",
-          );
-        }
         flows.push({
           id: id ?? "",
           source: refId(el.sourceRef),
           target: refId(el.targetRef),
           scopeId,
           conditionExpression: condBody,
+          hasConditionElement: cond != null,
+          conditionLanguage:
+            cond != null && typeof cond.language === "string" && cond.language.trim() !== ""
+              ? cond.language.trim()
+              : undefined,
         });
         continue;
       }
 
-      // exclusiveGateway (M2 graph IR): classify it as a real node so the
-      // builder emits the gateway + its conditional edges (split AND join),
-      // but KEEP the M1 publish-time rejection until TASK-33 flips the accept
-      // matrix — the reject message is unchanged.
-      if ($type === EXCLUSIVE_GATEWAY_TYPE) {
+      // Gateway types outside the M2 profile reject with a roadmap pointer
+      // (parallel/inclusive → concurrency M4, eventBased → timers/events M3,
+      // complex → not on the roadmap) instead of the generic unsupported hint.
+      const deferredGateway = DEFERRED_GATEWAY_REASONS[$type];
+      if (deferredGateway) {
         err(
-          `Element '${id ?? "(no id)"}' (${localTypeName($type)}) is not supported in this profile. ${SUPPORTED_HINT}`,
+          `Element '${id ?? "(no id)"}' (${localTypeName($type)}) is not supported in this profile. ${deferredGateway}`,
           id,
           localTypeName($type),
         );
-        nodes.push({
-          id: id ?? "",
-          type: "exclusiveGateway",
-          name: (el.name as string) ?? undefined,
-          scopeId,
-          defaultFlowId: refId(el.default),
-        });
         continue;
       }
 
@@ -357,9 +385,16 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         continue;
       }
 
-      // `default` flow (gateway/activity default) is not supported (deferred to M2).
-      if (el.default != null) {
-        err("Default sequence flows are not supported (deferred to conditional sagas).", id, localTypeName($type));
+      // A `default` flow is gateway-owned branch selection (M2 design §2
+      // decision 3): valid ONLY on an exclusiveGateway. On any other node it
+      // stays rejected (an activity default is implicit-split semantics).
+      if (el.default != null && nodeType !== "exclusiveGateway") {
+        err(
+          `Element '${id ?? "(no id)"}' (${localTypeName($type)}) declares a default sequence flow. ` +
+            "A default flow is only supported on an exclusiveGateway.",
+          id,
+          localTypeName($type),
+        );
       }
 
       // Multi-instance / loop characteristics on an activity are out of profile.
@@ -377,6 +412,10 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         name: (el.name as string) ?? undefined,
         scopeId,
       };
+
+      if (nodeType === "exclusiveGateway") {
+        info.defaultFlowId = refId(el.default);
+      }
 
       if (nodeType === "startEvent") {
         if (asArray<ModdleElement>(el.eventDefinitions).length > 0) {
@@ -478,6 +517,18 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       err(`Sequence flow '${f.id}' has an unresolved or unsupported sourceRef.`, f.id, "sequenceFlow");
       continue;
     }
+    // Conditions live ONLY on outgoing flows of an exclusiveGateway (M2 design
+    // §2 decision 3). A conditional flow leaving anything else is an implicit
+    // inclusive-split (M4) and stays rejected — on ELEMENT presence, even when
+    // the condition body is empty.
+    if (f.hasConditionElement && src.type !== "exclusiveGateway") {
+      err(
+        `Sequence flow '${f.id}' carries a conditionExpression but does not leave an exclusiveGateway. ` +
+          "Conditions are only supported on outgoing flows of an exclusive gateway.",
+        f.id,
+        "sequenceFlow",
+      );
+    }
     if (!tgt) {
       err(`Sequence flow '${f.id}' has an unresolved or unsupported targetRef.`, f.id, "sequenceFlow");
       continue;
@@ -537,9 +588,12 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       if (n.type === "endEvent") {
         if (out.length > 0) err(`End event '${n.id}' must not have outgoing sequence flows.`, n.id, "endEvent");
       } else {
-        if (out.length > 1) {
+        // Only an exclusiveGateway may split the token (M2); cycles are legal,
+        // so this is a degree check, not an acyclicity check.
+        if (out.length > 1 && n.type !== "exclusiveGateway") {
           err(
-            `Element '${n.id}' has ${out.length} outgoing sequence flows. Implicit splits are not supported (gateways/parallelism are deferred).`,
+            `Element '${n.id}' has ${out.length} outgoing sequence flows. ` +
+              "Implicit splits are not supported — route branching through an exclusiveGateway.",
             n.id,
             n.type,
           );
@@ -548,6 +602,86 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       }
       if (n.type !== "startEvent" && inc.length === 0) {
         err(`Element '${n.id}' is not reachable: it has no incoming sequence flow.`, n.id, n.type);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Exclusive-gateway split/default/condition rules (M2 design §3, TASK-33).
+  //
+  // A 1-out gateway is a pass-through/merge and needs no conditions. On a
+  // split (>1 out — including the outgoing side of a mixed N-in/N-out
+  // gateway): every non-default outgoing flow MUST carry a (non-empty) FEEL
+  // condition, the gateway's `default` flow MUST NOT, and the `default` MUST
+  // reference one of the gateway's OWN outgoing flows. Every condition leaving
+  // a gateway is FEEL-parsed at publish (runtime has no second parse chance).
+  // -------------------------------------------------------------------------
+  const flowsBySource = new Map<string, FlowInfo[]>();
+  for (const f of flows) {
+    if (!f.source) continue;
+    const arr = flowsBySource.get(f.source);
+    if (arr) arr.push(f);
+    else flowsBySource.set(f.source, [f]);
+  }
+  for (const n of nodes) {
+    if (n.type !== "exclusiveGateway") continue;
+    const gwFlows = flowsBySource.get(n.id) ?? [];
+
+    let defaultFlow: FlowInfo | undefined;
+    if (n.defaultFlowId) {
+      defaultFlow = gwFlows.find((f) => f.id === n.defaultFlowId);
+      if (!defaultFlow) {
+        // The ref RESOLVED (unresolved ones never reach the tree and are
+        // reported from parser warnings above) but names a flow leaving a
+        // different node — default ownership is per gateway.
+        err(
+          `Exclusive gateway '${n.id}' declares default flow '${n.defaultFlowId}', ` +
+            "which is not one of its own outgoing sequence flows.",
+          n.id,
+          "exclusiveGateway",
+        );
+      } else if (defaultFlow.conditionExpression != null) {
+        err(
+          `Sequence flow '${defaultFlow.id}' is the default flow of exclusive gateway '${n.id}' and must not ` +
+            "carry a conditionExpression — the default is taken only when no condition matches.",
+          defaultFlow.id,
+          "sequenceFlow",
+        );
+      }
+    }
+
+    for (const f of gwFlows) {
+      if (f === defaultFlow) continue;
+      // Split rule: a non-default flow of a >1-out gateway needs a condition.
+      // An empty/whitespace-only <conditionExpression> normalized to null at
+      // the capture site lands here too — the message covers both shapes.
+      if (gwFlows.length > 1 && f.conditionExpression == null) {
+        err(
+          `Sequence flow '${f.id}' leaving exclusive gateway '${n.id}' has no (or an empty) conditionExpression ` +
+            "and is not the gateway's default flow. Every non-default flow of a split must carry a FEEL condition.",
+          f.id,
+          "sequenceFlow",
+        );
+      }
+      // Conditions are FEEL (M2 design §3: language unset or a FEEL
+      // identifier). A declared non-FEEL language gets a clear reject instead
+      // of a confusing FEEL syntax error from mis-parsing it.
+      if (f.conditionLanguage != null && !/feel/i.test(f.conditionLanguage)) {
+        err(
+          `Sequence flow '${f.id}' declares condition language '${f.conditionLanguage}'. ` +
+            "Conditions must be FEEL — leave the language attribute unset or set a FEEL identifier.",
+          f.id,
+          "sequenceFlow",
+        );
+      } else if (f.conditionExpression != null) {
+        const parsed = parseCondition(f.conditionExpression);
+        if (!parsed.ok) {
+          err(
+            `Sequence flow '${f.id}' leaving exclusive gateway '${n.id}': ${parsed.reason}`,
+            f.id,
+            "sequenceFlow",
+          );
+        }
       }
     }
   }
@@ -564,6 +698,18 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
 
     if (!attached) {
       err(`Boundary event '${n.id}' has an unresolved attachedToRef.`, n.id, "boundaryEvent");
+      continue;
+    }
+    // Gateways are not activities — attaching a boundary event to one is
+    // invalid BPMN regardless of the event kind (skip kind checks: they would
+    // only cascade noise onto the same broken attachment).
+    if (attached.type === "exclusiveGateway") {
+      err(
+        `Boundary event '${n.id}' is attached to exclusive gateway '${attached.id}'. ` +
+          "Boundary events cannot be attached to gateways (invalid BPMN); attach them to an activity.",
+        n.id,
+        "boundaryEvent",
+      );
       continue;
     }
     if (attached.scopeId !== n.scopeId) {
@@ -712,10 +858,8 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
   // Build the immutable execution-graph snapshot.
   //
   // Built BEST-EFFORT even when validation failed, anchored on a process-level
-  // start event: M2 lands graph-IR constructs (exclusiveGateway nodes, live
-  // conditional edges) before TASK-33 widens the publish accept matrix, so the
-  // builder must stay observable on documents the gate still rejects. `ok` —
-  // never `graph` presence — is the publish gate.
+  // start event, so the IR stays observable (tests, diagnostics) on documents
+  // the gate rejects. `ok` — never `graph` presence — is the publish gate.
   // -------------------------------------------------------------------------
   const buildGraph = (processStart: NodeInfo): ExecutionGraph => {
     const processEnds = nodes.filter((n) => n.type === "endEvent" && n.scopeId === processId);

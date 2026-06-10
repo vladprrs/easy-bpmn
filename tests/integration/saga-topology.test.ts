@@ -90,14 +90,15 @@ describe("Saga topology persistence (TASK-11 closeout)", () => {
 });
 
 // TASK-31 (M2 design §4): conditional topology persists into bpmn_elements
-// (condition_expression / is_default) and parsed_profile. The publish HTTP gate
-// still REJECTS XOR models until TASK-33 widens the accept matrix, so these
-// tests insert the version DIRECTLY via createVersion with the builder's graph.
+// (condition_expression / is_default) and parsed_profile. These tests insert
+// the version DIRECTLY via createVersion to pin the persistence layer in
+// isolation (the HTTP publish path accepts XOR models since TASK-33 and is
+// covered by tests/contract/api.test.ts).
 describe("Conditional topology persistence (TASK-31)", () => {
   async function createConditionalVersion() {
     const r = await parseAndValidate(XOR_BPMN);
-    expect(r.ok).toBe(false); // gate stays shut until TASK-33
-    expect(r.graph).toBeDefined(); // ...but the builder produced the full IR
+    expect(r.ok).toBe(true); // TASK-33 opened the publish gate for XOR models
+    expect(r.graph).toBeDefined();
     const versionId = `pdv_xor_${crypto.randomUUID()}`;
     await createVersion(env.DB, {
       definitionVersionId: versionId,
@@ -180,7 +181,7 @@ describe("Conditional topology persistence (TASK-31)", () => {
     // The gateway-inside-transaction fixture must survive the same persistence
     // round-trip as the flat XOR model above.
     const r = await parseAndValidate(XOR_IN_TX_BPMN);
-    expect(r.ok).toBe(false); // gate stays shut until TASK-33
+    expect(r.ok).toBe(true); // TASK-33 opened the publish gate for XOR models
     expect(r.graph).toBeDefined();
     const versionId = `pdv_xortx_${crypto.randomUUID()}`;
     await createVersion(env.DB, {

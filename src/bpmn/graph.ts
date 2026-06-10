@@ -189,9 +189,7 @@ export interface ValidationResult {
   /**
    * The execution-graph snapshot. On `ok: true` it is always present. On
    * `ok: false` it is attached BEST-EFFORT (whenever a process-level start
-   * event anchors it): M2 lands graph-IR constructs (exclusiveGateway,
-   * conditional edges) before TASK-33 widens the publish accept matrix, so the
-   * builder must stay observable on documents the gate still rejects. `ok` —
+   * event anchors it) so the IR stays observable on rejected documents. `ok` —
    * never `graph` presence — is the publish gate.
    */
   graph?: ExecutionGraph;

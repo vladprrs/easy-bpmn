@@ -5,18 +5,21 @@ import {
   CALL_ACTIVITY_BPMN,
   CONDITIONAL_FLOW_BPMN,
   DEMO_BPMN,
+  deferredGatewayBpmn,
   EMPTY_MESSAGE_NAME_BPMN,
-  GATEWAY_BPMN,
   INSTANTIATE_RECEIVE_BPMN,
   INTERMEDIATE_CATCH_BPMN,
+  LOOP_XOR_BPMN,
   MALFORMED_XML,
   MULTI_INSTANCE_BPMN,
   NO_TASKTYPE_BPMN,
+  PASSTHROUGH_GATEWAY_BPMN,
   SAGA_BPMN,
   SAGA_CANCEL_BOUNDARY_ON_TASK_BPMN,
   SAGA_CANCEL_END_OUTSIDE_TX_BPMN,
   SAGA_CROSS_SCOPE_ASSOC_BPMN,
   SAGA_TOLERANT_BPMN,
+  SAGA_XOR_BPMN,
   SEND_TASK_BPMN,
   SUBPROCESS_BPMN,
   sagaBpmn,
@@ -25,6 +28,7 @@ import {
   USERTASK_BPMN,
   XOR_BPMN,
   XOR_IN_TX_BPMN,
+  XOR_TOLERANT_BPMN,
 } from "../helpers";
 
 function reasons(issues: { reason: string }[]): string {
@@ -58,10 +62,14 @@ describe("BPMN-lite profile validator", () => {
     expect(r.graph!.nodes["Task_check"]?.retries).toBe(2);
   });
 
-  it("rejects an exclusive gateway with the offending element id", async () => {
-    const r = await parseAndValidate(GATEWAY_BPMN);
-    expect(r.ok).toBe(false);
-    expect(r.issues.some((i) => i.elementId === "G" && /exclusiveGateway/.test(i.reason))).toBe(true);
+  // TASK-33 (M2): exclusiveGateway flipped reject→accept. The deferred gateway
+  // TYPES (parallel/inclusive/eventBased/complex) keep the reject contract —
+  // covered in the TASK-33 describe block below.
+  it("accepts a 1-in/1-out pass-through exclusive gateway (no conditions needed)", async () => {
+    const r = await parseAndValidate(PASSTHROUGH_GATEWAY_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    expect(r.graph!.nodes["G"]?.type).toBe("exclusiveGateway");
   });
 
   it("rejects a user task", async () => {
@@ -88,10 +96,15 @@ describe("BPMN-lite profile validator", () => {
     expect(reasons(r.issues)).toMatch(/instantiate/);
   });
 
-  it("rejects a conditional sequence flow", async () => {
+  // TASK-33 (M2): conditions are now legal on exclusiveGateway outgoing flows,
+  // so the M1 blanket reject narrows to "not leaving an exclusive gateway"
+  // (CONDITIONAL_FLOW_BPMN's condition is on a start-event outgoing flow).
+  it("rejects a conditionExpression on a flow not leaving an exclusive gateway", async () => {
     const r = await parseAndValidate(CONDITIONAL_FLOW_BPMN);
     expect(r.ok).toBe(false);
-    expect(reasons(r.issues)).toMatch(/[Cc]onditional sequence flow/);
+    expect(
+      r.issues.some((i) => i.elementId === "f1" && /not leave an exclusiveGateway|only supported on outgoing flows of an exclusive/i.test(i.reason)),
+    ).toBe(true);
   });
 
   it("rejects a Service Task with multi-instance loop characteristics", async () => {
@@ -306,22 +319,16 @@ describe("Multi-edge IR: outgoing[] (TASK-11 closeout, design §3.1)", () => {
 });
 
 describe("Conditional graph IR: exclusiveGateway + live conditional edges (TASK-31, M2 design §4)", () => {
-  // The graph BUILDER constructs the full conditional IR even though the
-  // publish gate still rejects these models (the accept matrix flips in
-  // TASK-33). parseAndValidate therefore attaches the best-effort graph
-  // alongside the rejection issues.
-  it("still REJECTS the XOR model at publish time (gate unchanged until TASK-33)", async () => {
+  // TASK-31 landed the conditional IR behind a closed publish gate; TASK-33
+  // opened the gate, so the XOR fixtures now validate ok with the SAME graph.
+  it("ACCEPTS the XOR model at publish time (TASK-33 opened the gate)", async () => {
     const r = await parseAndValidate(XOR_BPMN);
-    expect(r.ok).toBe(false);
-    // the existing M1 reject reasons all still fire
-    expect(r.issues.some((i) => i.elementId === "GW_split" && /exclusiveGateway.*not supported/.test(i.reason))).toBe(true);
-    expect(r.issues.some((i) => i.elementId === "f_gold" && /[Cc]onditional sequence flow/.test(i.reason))).toBe(true);
-    expect(r.issues.some((i) => i.elementId === "GW_split" && /Implicit splits are not supported/.test(i.reason))).toBe(true);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
   });
 
   it("builds an exclusiveGateway node whose outgoing[] carries conditions + default in DOCUMENT order", async () => {
     const r = await parseAndValidate(XOR_BPMN);
-    expect(r.ok).toBe(false);
     const g = r.graph!;
     expect(g).toBeDefined();
 
@@ -409,8 +416,10 @@ describe("Conditional graph IR: exclusiveGateway + live conditional edges (TASK-
     // GA declares default="fb1", but fb1's SOURCE is GB — default ownership is
     // per gateway (Flow doc: "isDefault is true exactly for the flow referenced
     // by its gateway's default attribute"), so fb1 must stay isDefault:false
-    // everywhere. The model is rejected by the publish gate, but the builder
-    // runs best-effort on invalid models, so the IR stays observable.
+    // everywhere. The model is REJECTED (TASK-33: a default must reference one
+    // of the gateway's own outgoing flows, and fa2 is then a condition-less
+    // non-default split flow), but the builder runs best-effort on invalid
+    // models, so the IR stays observable.
     const CROSS_GATEWAY_DEFAULT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_xdef" targetNamespace="x">
   <bpmn:process id="P_xdef" isExecutable="true">
@@ -471,5 +480,282 @@ describe("Conditional graph IR: exclusiveGateway + live conditional edges (TASK-
         expect(el.isDefault).toBe(false);
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TASK-33 (M2 design §3): the validator accepts-and-validates exclusiveGateway,
+// FEEL conditions, default flows, and cycles. Reject matrix per AC#2.
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal 2-out XOR split with injectable mutations so each negative variant
+ * breaks exactly one rule. Valid by default: f_a carries a FEEL condition,
+ * f_b is the gateway's default.
+ */
+function xorSplitBpmn(o: {
+  /** The gateway's default attribute; null removes it. */
+  defaultAttr?: string | null;
+  /** <conditionExpression> body on f_a; null removes the element entirely. */
+  condA?: string | null;
+  /** <conditionExpression> body on f_b (the default flow); null = none. */
+  condB?: string | null;
+  /** Extra process-level elements (e.g. a boundary event on the gateway). */
+  extra?: string;
+} = {}): string {
+  const defaultAttr = o.defaultAttr === null ? "" : ` default="${o.defaultAttr ?? "f_b"}"`;
+  const condA = o.condA === null
+    ? ""
+    : `<bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${o.condA ?? "amount &gt; 100"}</bpmn:conditionExpression>`;
+  const condB = o.condB == null
+    ? ""
+    : `<bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${o.condB}</bpmn:conditionExpression>`;
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_split" targetNamespace="x">
+  <bpmn:process id="P_split" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="S" targetRef="GW"/>
+    <bpmn:exclusiveGateway id="GW" name="Split"${defaultAttr}>
+      <bpmn:incoming>f0</bpmn:incoming>
+      <bpmn:outgoing>f_a</bpmn:outgoing>
+      <bpmn:outgoing>f_b</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="f_a" sourceRef="GW" targetRef="TA">${condA}</bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_b" sourceRef="GW" targetRef="TB">${condB}</bpmn:sequenceFlow>
+    <bpmn:serviceTask id="TA"><bpmn:extensionElements><easy-bpmn:taskDefinition type="a"/></bpmn:extensionElements><bpmn:incoming>f_a</bpmn:incoming><bpmn:outgoing>f_a2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:serviceTask id="TB"><bpmn:extensionElements><easy-bpmn:taskDefinition type="b"/></bpmn:extensionElements><bpmn:incoming>f_b</bpmn:incoming><bpmn:outgoing>f_b2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f_a2" sourceRef="TA" targetRef="EA"/>
+    <bpmn:sequenceFlow id="f_b2" sourceRef="TB" targetRef="EB"/>
+    <bpmn:endEvent id="EA"><bpmn:incoming>f_a2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="EB"><bpmn:incoming>f_b2</bpmn:incoming></bpmn:endEvent>
+    ${o.extra ?? ""}
+  </bpmn:process>
+</bpmn:definitions>`;
+}
+
+describe("Exclusive-gateway accept matrix (TASK-33, M2 design §3)", () => {
+  it("accepts the process-level XOR split (FEEL conditions + default) + join", async () => {
+    const r = await parseAndValidate(XOR_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    expect(r.graph!.nodes["GW_split"]?.type).toBe("exclusiveGateway");
+    expect(r.graph!.nodes["GW_join"]?.type).toBe("exclusiveGateway");
+  });
+
+  it("accepts an XOR split + default inside a <transaction>", async () => {
+    const r = await parseAndValidate(XOR_IN_TX_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    expect(r.graph!.nodes["GW"]?.scopeId).toBe("Tx");
+  });
+
+  it("accepts the full conditional saga (compensation + error/cancel + XOR split/join in the transaction)", async () => {
+    const r = await parseAndValidate(SAGA_XOR_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    const g = r.graph!;
+    expect(g.nodes["GW_method"]?.type).toBe("exclusiveGateway");
+    expect(g.nodes["GW_method"]?.scopeId).toBe("Tx_pay");
+    expect(g.nodes["GW_method"]?.outgoing).toEqual([
+      { flowId: "f_card", targetId: "payCard", conditionExpression: 'method = "card"', isDefault: false },
+      { flowId: "f_wire", targetId: "payWire", conditionExpression: null, isDefault: true },
+    ]);
+    // the saga wiring is intact alongside the gateway
+    expect(g.transactions?.["Tx_pay"]?.compensations["reserveFunds"]?.handlerId).toBe("releaseFunds");
+    expect(g.nodes["pay_err"]?.boundaryKind).toBe("error");
+  });
+
+  it("accepts the valid 2-out split builder baseline", async () => {
+    const r = await parseAndValidate(xorSplitBpmn());
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+  });
+
+  it("accepts a split WITHOUT a default flow (all outgoing conditional)", async () => {
+    // Standard BPMN: a default is optional; no-flow-taken is a RUNTIME incident
+    // (TASK-34), not a publish-time error.
+    const r = await parseAndValidate(xorSplitBpmn({ defaultAttr: null, condB: "amount &lt;= 100" }));
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+  });
+
+  it("accepts a cyclic token path looping back through a mixed 2-in/2-out XOR gateway", async () => {
+    const r = await parseAndValidate(LOOP_XOR_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    const g = r.graph!;
+    // back-edge is live in the IR: T_switch loops to the gateway
+    expect(g.nodes["T_switch"]?.outgoing).toEqual([
+      { flowId: "f_back", targetId: "GW_retry", conditionExpression: null, isDefault: false },
+    ]);
+    expect(g.nodes["GW_retry"]?.outgoing).toEqual([
+      {
+        flowId: "f_retry",
+        targetId: "T_switch",
+        conditionExpression: 'chargeResult = "declined" and attemptsLeft > 0',
+        isDefault: false,
+      },
+      { flowId: "f_done", targetId: "E", conditionExpression: null, isDefault: true },
+    ]);
+  });
+
+  it("tolerates ignorable content on a conditional model (foreign extensions, DI, documentation)", async () => {
+    const r = await parseAndValidate(XOR_TOLERANT_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    // the conditional IR is intact despite the ignorable content
+    expect(r.graph!.nodes["GW"]?.outgoing).toEqual([
+      { flowId: "f_a", targetId: "TA", conditionExpression: "amount > 100", isDefault: false },
+      { flowId: "f_b", targetId: "TB", conditionExpression: null, isDefault: true },
+    ]);
+  });
+
+  it("semantically round-trips the conditional saga through bpmn-moddle (canonicity R3)", async () => {
+    const out = await roundTripBpmnXml(SAGA_XOR_BPMN);
+    // gateway, conditions, and the default attribute survive re-serialization
+    expect(out).toMatch(/bpmn:exclusiveGateway/i);
+    expect(out).toMatch(/conditionExpression/);
+    expect(out).toMatch(/default="f_wire"/);
+    expect(out).toMatch(/method = "card"/);
+    // and the re-serialized file still validates
+    const r = await parseAndValidate(out);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+  });
+});
+
+describe("Exclusive-gateway reject matrix (TASK-33, M2 design §3)", () => {
+  it("rejects an invalid FEEL condition with the flow's element id + parse reason", async () => {
+    const r = await parseAndValidate(xorSplitBpmn({ condA: "amount &gt;" }));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "f_a" && /Invalid FEEL/i.test(i.reason))).toBe(true);
+  });
+
+  it("rejects FEEL unary-test syntax (parses, but can never be boolean true)", async () => {
+    // `> 100` is a FEEL *unary test* — valid syntax, but as a flow condition it
+    // evaluates to a range, never boolean true: a modeler footgun caught at publish.
+    const r = await parseAndValidate(xorSplitBpmn({ condA: "&gt; 100" }));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "f_a" && /unary-test/i.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a conditionExpression on a flow not leaving an exclusive gateway", async () => {
+    const r = await parseAndValidate(CONDITIONAL_FLOW_BPMN);
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "f1" && /exclusiveGateway|exclusive gateway/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a declared non-FEEL condition language (design §3: language unset or FEEL)", async () => {
+    // Mis-parsing a JUEL/groovy expression as FEEL would yield a confusing
+    // syntax error; the language attribute gets its own clear reject.
+    const xml = xorSplitBpmn().replace(
+      '<bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">',
+      '<bpmn:conditionExpression xsi:type="bpmn:tFormalExpression" language="juel">',
+    );
+    const r = await parseAndValidate(xml);
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "f_a" && /language 'juel'/.test(i.reason) && /FEEL/.test(i.reason))).toBe(true);
+  });
+
+  it("accepts an explicit FEEL language identifier (the DMN FEEL URN)", async () => {
+    const xml = xorSplitBpmn().replace(
+      '<bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">',
+      '<bpmn:conditionExpression xsi:type="bpmn:tFormalExpression" language="https://www.omg.org/spec/DMN/20191111/FEEL/">',
+    );
+    const r = await parseAndValidate(xml);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+  });
+
+  it("rejects a default referencing a MISSING flow", async () => {
+    const r = await parseAndValidate(xorSplitBpmn({ defaultAttr: "f_nope", condB: "amount &lt;= 100" }));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "GW" && /default/.test(i.reason) && /f_nope/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a default referencing a FOREIGN flow (not leaving that gateway)", async () => {
+    // f0 exists but leaves the start event, not GW.
+    const r = await parseAndValidate(xorSplitBpmn({ defaultAttr: "f0", condB: "amount &lt;= 100" }));
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some((i) => i.elementId === "GW" && /default/.test(i.reason) && /own outgoing/.test(i.reason)),
+    ).toBe(true);
+  });
+
+  it("rejects a non-default condition-less split flow", async () => {
+    const r = await parseAndValidate(xorSplitBpmn({ defaultAttr: null }));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "f_b" && /no .*condition|condition-less|default/i.test(i.reason))).toBe(true);
+  });
+
+  it("treats an empty/whitespace conditionExpression as condition-less (same reject bucket)", async () => {
+    // The builder normalizes empty bodies to null (see the validator capture
+    // site), so an empty condition on a non-default split flow lands in the
+    // missing-condition bucket; the message covers both shapes.
+    const r = await parseAndValidate(xorSplitBpmn({ defaultAttr: null, condB: "   " }));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "f_b" && /no .*condition|missing|empty/i.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a conditionExpression on the gateway's default flow", async () => {
+    const r = await parseAndValidate(xorSplitBpmn({ condB: "amount &lt;= 100" }));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "f_b" && /default flow/.test(i.reason) && /condition/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a boundary event attached to a gateway (invalid BPMN)", async () => {
+    const r = await parseAndValidate(
+      xorSplitBpmn({
+        extra: `<bpmn:boundaryEvent id="bad_b" attachedToRef="GW"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="f_bad" sourceRef="bad_b" targetRef="EB"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "bad_b" && /gateway/i.test(i.reason))).toBe(true);
+  });
+
+  it.each([
+    ["parallelGateway", /concurrency \(M4\)/],
+    ["inclusiveGateway", /concurrency \(M4\)/],
+    ["eventBasedGateway", /timers & events \(M3\)/],
+    ["complexGateway", /later milestone/],
+  ] as const)("rejects %s with a milestone pointer", async (tag, pointer) => {
+    const r = await parseAndValidate(deferredGatewayBpmn(tag));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "G" && pointer.test(i.reason))).toBe(true);
+  });
+
+  it("still rejects >1 outgoing flow on a non-gateway node", async () => {
+    const MULTI_OUT_TASK_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="S" targetRef="T"/>
+    <bpmn:serviceTask id="T"><bpmn:extensionElements><easy-bpmn:taskDefinition type="x"/></bpmn:extensionElements><bpmn:incoming>f0</bpmn:incoming><bpmn:outgoing>f1</bpmn:outgoing><bpmn:outgoing>f2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f1" sourceRef="T" targetRef="E1"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="E2"/>
+    <bpmn:endEvent id="E1"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="E2"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const r = await parseAndValidate(MULTI_OUT_TASK_BPMN);
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "T" && /Implicit splits/.test(i.reason))).toBe(true);
+  });
+
+  it("still rejects a `default` attribute on a non-gateway activity", async () => {
+    const DEFAULT_ON_TASK_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="S" targetRef="T"/>
+    <bpmn:serviceTask id="T" default="f1"><bpmn:extensionElements><easy-bpmn:taskDefinition type="x"/></bpmn:extensionElements><bpmn:incoming>f0</bpmn:incoming><bpmn:outgoing>f1</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f1" sourceRef="T" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const r = await parseAndValidate(DEFAULT_ON_TASK_BPMN);
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "T" && /default/.test(i.reason) && /exclusiveGateway/.test(i.reason))).toBe(true);
   });
 });

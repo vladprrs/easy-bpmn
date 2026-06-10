@@ -68,6 +68,28 @@ describe("parseCondition (publish-time syntax check)", () => {
     // runtime must parse cleanly.
     expect(parseCondition("totallyUnknownVariable > someOtherUnknown")).toEqual({ ok: true });
   });
+
+  // TASK-33 semantic lint: FEEL *unary-test* syntax ("> 100", '= "x"',
+  // "[1..10]") parses fine as an expression but evaluates to a range/test —
+  // never boolean `true` — so as a flow condition it can never be taken.
+  // A classic modeler footgun (DMN habits); reject it at publish with a hint.
+  it("rejects unary-test syntax that can never evaluate to boolean true", () => {
+    for (const expr of ["> 100", ">= 10", '= "x"', '!= "x"', "< 5", "[1..10]"]) {
+      const result = parseCondition(expr);
+      expect(result.ok, expr).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toMatch(/unary-test/i);
+        // the hint shows how to fix it
+        expect(result.reason).toMatch(/amount > 100|full comparison/i);
+      }
+    }
+  });
+
+  it("does not flag full expressions that merely CONTAIN comparison operators or ranges", () => {
+    for (const expr of ["amount > 100", "amount in [1..10]", "x = 1 or y = 2", "true"]) {
+      expect(parseCondition(expr), expr).toEqual({ ok: true });
+    }
+  });
 });
 
 describe("evaluateCondition (strict boolean-true contract)", () => {

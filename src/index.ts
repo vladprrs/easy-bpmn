@@ -25,7 +25,6 @@ import {
 import { parseAndValidate } from "./bpmn/validator";
 import { AppError, BadRequestError, ConflictError, NotFoundError, PublishRejectedError } from "./runtime/errors";
 import { assertPayloadWithinLimit } from "./runtime/payload";
-import { parseCondition } from "./runtime/expressions";
 import { getExecutor } from "./runtime/executor";
 import { authenticateWorker, generateWorkerToken } from "./runtime/worker-auth";
 import { brokerKeyOf, type BrokerPublishResult } from "./runtime/broker-types";
@@ -811,12 +810,7 @@ async function route(request: Request, env: Env): Promise<Response> {
   const method = request.method.toUpperCase();
 
   if (seg.length === 0) {
-    // `feel` is a live self-check of the FEEL condition engine AND the TASK-30
-    // bundle canary (risk R-M2-2): feelin declares sideEffects:false, so until
-    // the validator (TASK-33) and gateway dispatch (TASK-34) call it on real
-    // code paths, this is what keeps feelin+luxon in the shipped bundle
-    // (size verified via `wrangler deploy --dry-run`).
-    return json({ service: "easy-bpmn", status: "ok", feel: parseCondition("true").ok }, 200);
+    return json({ service: "easy-bpmn", status: "ok" }, 200);
   }
 
   if (seg[0] === "definitions") {

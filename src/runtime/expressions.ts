@@ -66,6 +66,14 @@ export class ExpressionEvaluationError extends Error {
  * variable context); it parses with the lezer FEEL grammar and scans the tree
  * for error nodes. On failure, `reason` is ready-made ValidationIssueData
  * material — the caller attaches the element id.
+ *
+ * Semantic lint (TASK-33): an expression whose TOP node is a FEEL *unary test*
+ * ("> 100", '= "x"', "[1..10]" — DMN decision-table habits) parses fine but
+ * evaluates to a range/test object, never boolean `true`, so as a flow
+ * condition it can never be taken. Reject it with a how-to-fix hint. The check
+ * is top-node only: comparisons/ranges INSIDE a full expression ("amount in
+ * [1..10]") have a different top node and pass; a parenthesized unary test
+ * escapes the lint and surfaces at runtime as a not-taken/diagnostic instead.
  */
 export function parseCondition(expression: string): ParseConditionResult {
   if (expression.trim() === "") {
@@ -87,6 +95,15 @@ export function parseCondition(expression: string): ParseConditionResult {
         reason:
           `Invalid FEEL condition: syntax error at position ${errorAt} ` +
           `in ${JSON.stringify(snippet(expression))}.`,
+      };
+    }
+    if (tree.topNode.firstChild?.type.name === "SimplePositiveUnaryTest") {
+      return {
+        ok: false,
+        reason:
+          `Condition ${JSON.stringify(snippet(expression))} is FEEL unary-test syntax, ` +
+          "which never evaluates to boolean true on a sequence flow. " +
+          'Write a full comparison instead (e.g. "amount > 100").',
       };
     }
     return { ok: true };

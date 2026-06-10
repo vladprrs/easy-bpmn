@@ -264,7 +264,9 @@ export const TOLERANT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
   </bpmndi:BPMNDiagram>
 </bpmn:definitions>`;
 
-export const GATEWAY_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+/** A 1-in/1-out exclusiveGateway — a pass-through needing no conditions.
+ *  REJECTED through M1; ACCEPTED from TASK-33 (M2 conditional sagas). */
+export const PASSTHROUGH_GATEWAY_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D" targetNamespace="x">
   <bpmn:process id="P" isExecutable="true">
     <bpmn:startEvent id="S"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
@@ -274,6 +276,25 @@ export const GATEWAY_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
     <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
   </bpmn:process>
 </bpmn:definitions>`;
+
+/**
+ * Minimal model carrying one still-deferred gateway type (parallel/inclusive/
+ * eventBased/complex) — must reject with element id + a milestone pointer.
+ */
+export function deferredGatewayBpmn(
+  tag: "parallelGateway" | "inclusiveGateway" | "eventBasedGateway" | "complexGateway",
+): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="G" />
+    <bpmn:${tag} id="G" name="Deferred"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing></bpmn:${tag}>
+    <bpmn:sequenceFlow id="f2" sourceRef="G" targetRef="E" />
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+}
 
 export const USERTASK_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D" targetNamespace="x">
@@ -338,8 +359,7 @@ export const CONDITIONAL_FLOW_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
  * refs inside GW_split are deliberately listed in a DIFFERENT order than the
  * <sequenceFlow> elements appear, pinning the IR's document-order guarantee to
  * flowElements order (= condition evaluation order, M2 design §2 decision 5).
- * Publish still REJECTS this model until TASK-33 widens the accept matrix; the
- * graph BUILDER must nevertheless produce the full conditional IR.
+ * ACCEPTED (publishes) from TASK-33 — the M2 process-level accept fixture.
  */
 export const XOR_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_xor" targetNamespace="x">
@@ -377,7 +397,8 @@ export const XOR_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 </bpmn:definitions>`;
 
 /** XOR gateway INSIDE a <transaction> scope — the gateway node must carry the
- *  enclosing transaction's scopeId like every other scoped node. */
+ *  enclosing transaction's scopeId like every other scoped node. ACCEPTED
+ *  (publishes) from TASK-33. */
 export const XOR_IN_TX_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_xortx" targetNamespace="x">
   <bpmn:process id="P_xortx" isExecutable="true">
@@ -404,6 +425,167 @@ export const XOR_IN_TX_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
     <bpmn:sequenceFlow id="g2" sourceRef="Tx" targetRef="PE" />
     <bpmn:endEvent id="PE"><bpmn:incoming>g2</bpmn:incoming></bpmn:endEvent>
   </bpmn:process>
+</bpmn:definitions>`;
+
+/**
+ * The M2 conditional-SAGA fixture: a full transaction saga (compensation pair +
+ * error boundary + cancel wiring) whose forward path branches through an XOR
+ * split (FEEL condition + default) and re-merges through an XOR join — all
+ * INSIDE the transaction. The canonical accept fixture for TASK-33 (publishes)
+ * and the round-trip (R3) conditional model.
+ */
+export const SAGA_XOR_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+                  id="D_xorsaga" targetNamespace="http://easy-bpmn/example/payment-saga">
+  <bpmn:error id="Err_pay" name="Payment failed" errorCode="PAY_FAILED"/>
+  <bpmn:process id="PaymentSaga" isExecutable="true">
+    <bpmn:startEvent id="Start"/>
+    <bpmn:transaction id="Tx_pay" name="Take payment">
+      <bpmn:startEvent id="Tx_start"/>
+      <bpmn:serviceTask id="reserveFunds" name="Reserve funds">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="reserve-funds" retries="3"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="reserveFunds_comp" attachedToRef="reserveFunds">
+        <bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="releaseFunds" name="Release funds" isForCompensation="true">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="release-funds" retries="5"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:association id="a1" associationDirection="One" sourceRef="reserveFunds_comp" targetRef="releaseFunds"/>
+      <bpmn:exclusiveGateway id="GW_method" name="Payment method?" default="f_wire">
+        <bpmn:incoming>t2</bpmn:incoming>
+        <bpmn:outgoing>f_card</bpmn:outgoing>
+        <bpmn:outgoing>f_wire</bpmn:outgoing>
+      </bpmn:exclusiveGateway>
+      <bpmn:sequenceFlow id="f_card" sourceRef="GW_method" targetRef="payCard">
+        <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">method = "card"</bpmn:conditionExpression>
+      </bpmn:sequenceFlow>
+      <bpmn:sequenceFlow id="f_wire" sourceRef="GW_method" targetRef="payWire"/>
+      <bpmn:serviceTask id="payCard" name="Pay by card">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="pay-card" retries="2"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="pay_err" attachedToRef="payCard">
+        <bpmn:errorEventDefinition errorRef="Err_pay"/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="payWire" name="Pay by wire">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="pay-wire" retries="2"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:exclusiveGateway id="GW_merge" name="Paid">
+        <bpmn:incoming>t3</bpmn:incoming>
+        <bpmn:incoming>t4</bpmn:incoming>
+        <bpmn:outgoing>t5</bpmn:outgoing>
+      </bpmn:exclusiveGateway>
+      <bpmn:endEvent id="Tx_ok"/>
+      <bpmn:endEvent id="Tx_cancel"><bpmn:cancelEventDefinition/></bpmn:endEvent>
+      <bpmn:sequenceFlow id="t1" sourceRef="Tx_start"     targetRef="reserveFunds"/>
+      <bpmn:sequenceFlow id="t2" sourceRef="reserveFunds" targetRef="GW_method"/>
+      <bpmn:sequenceFlow id="t3" sourceRef="payCard"      targetRef="GW_merge"/>
+      <bpmn:sequenceFlow id="t4" sourceRef="payWire"      targetRef="GW_merge"/>
+      <bpmn:sequenceFlow id="t5" sourceRef="GW_merge"     targetRef="Tx_ok"/>
+      <bpmn:sequenceFlow id="fe" sourceRef="pay_err"      targetRef="Tx_cancel"/>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="Tx_cancelled" attachedToRef="Tx_pay">
+      <bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:endEvent id="Done"/>
+    <bpmn:endEvent id="Failed"/>
+    <bpmn:sequenceFlow id="g1" sourceRef="Start"        targetRef="Tx_pay"/>
+    <bpmn:sequenceFlow id="g2" sourceRef="Tx_pay"       targetRef="Done"/>
+    <bpmn:sequenceFlow id="g3" sourceRef="Tx_cancelled" targetRef="Failed"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
+ * A cyclic token path through a mixed (2-in/2-out) XOR gateway — the
+ * retry-with-changed-input pattern: charge the card; if it was declined and
+ * budget remains, switch the payment method and loop back to the gateway for
+ * another charge attempt; otherwise take the default flow out. Legal from
+ * TASK-33 (cycles on the token path); reused by TASK-32/35/36 (occurrence
+ * counters + loop execution).
+ */
+export const LOOP_XOR_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+                  id="D_loop" targetNamespace="x">
+  <bpmn:process id="P_loop" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="S" targetRef="T_charge"/>
+    <bpmn:serviceTask id="T_charge" name="Charge card">
+      <bpmn:extensionElements><easy-bpmn:taskDefinition type="charge-card" retries="2"/></bpmn:extensionElements>
+      <bpmn:incoming>f0</bpmn:incoming>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f1" sourceRef="T_charge" targetRef="GW_retry"/>
+    <bpmn:exclusiveGateway id="GW_retry" name="Declined?" default="f_done">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:incoming>f_back</bpmn:incoming>
+      <bpmn:outgoing>f_retry</bpmn:outgoing>
+      <bpmn:outgoing>f_done</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="f_retry" sourceRef="GW_retry" targetRef="T_switch">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">chargeResult = "declined" and attemptsLeft &gt; 0</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:serviceTask id="T_switch" name="Switch payment method">
+      <bpmn:extensionElements><easy-bpmn:taskDefinition type="switch-payment-method" retries="2"/></bpmn:extensionElements>
+      <bpmn:incoming>f_retry</bpmn:incoming>
+      <bpmn:outgoing>f_back</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f_back" sourceRef="T_switch" targetRef="GW_retry"/>
+    <bpmn:sequenceFlow id="f_done" sourceRef="GW_retry" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>f_done</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/** XOR model that ALSO carries ignorable content (foreign-namespace extension
+ *  on the gateway + a task, documentation, Diagram Interchange) — must be
+ *  accepted with the conditional IR intact (constitution tolerate-and-ignore). */
+export const XOR_TOLERANT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:camunda="http://camunda.org/schema/1.0/bpmn"
+                  xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+                  id="D_xortol" targetNamespace="x">
+  <bpmn:process id="P_xortol" isExecutable="true">
+    <bpmn:documentation>Conditional model carrying ignorable content.</bpmn:documentation>
+    <bpmn:startEvent id="S"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="S" targetRef="GW"/>
+    <bpmn:exclusiveGateway id="GW" name="Route" default="f_b">
+      <bpmn:extensionElements>
+        <camunda:properties><camunda:property name="ignored" value="true"/></camunda:properties>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f0</bpmn:incoming>
+      <bpmn:outgoing>f_a</bpmn:outgoing>
+      <bpmn:outgoing>f_b</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="f_a" sourceRef="GW" targetRef="TA">
+      <bpmn:documentation>High-value branch.</bpmn:documentation>
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">amount &gt; 100</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_b" sourceRef="GW" targetRef="TB"/>
+    <bpmn:serviceTask id="TA" name="A">
+      <bpmn:extensionElements>
+        <easy-bpmn:taskDefinition type="handler-a"/>
+        <camunda:properties><camunda:property name="ignored" value="true"/></camunda:properties>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f_a</bpmn:incoming><bpmn:outgoing>f_a2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="TB" name="B">
+      <bpmn:extensionElements><easy-bpmn:taskDefinition type="handler-b"/></bpmn:extensionElements>
+      <bpmn:incoming>f_b</bpmn:incoming><bpmn:outgoing>f_b2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f_a2" sourceRef="TA" targetRef="E"/>
+    <bpmn:sequenceFlow id="f_b2" sourceRef="TB" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>f_a2</bpmn:incoming><bpmn:incoming>f_b2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="D1">
+    <bpmndi:BPMNPlane id="P1" bpmnElement="P_xortol">
+      <bpmndi:BPMNShape id="GW_di" bpmnElement="GW" isMarkerVisible="true">
+        <dc:Bounds x="300" y="100" width="50" height="50"/>
+      </bpmndi:BPMNShape>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
 </bpmn:definitions>`;
 
 export const MALFORMED_XML = `<bpmn:definitions><bpmn:process id="P"></bpmn:definitions>`;

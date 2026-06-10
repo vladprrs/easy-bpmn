@@ -2,12 +2,13 @@
 // canonical-saga construct set (SAGA design §3), rejects unsupported
 // standard-namespace flow nodes/structures with element-level reasons, tolerates
 // ignorable extension content (foreign extensions / DI / documentation / text
-// annotations), and extracts an immutable execution graph snapshot for accepted
-// documents.
+// annotations), and extracts an immutable execution graph snapshot — always for
+// accepted documents, and best-effort for rejected ones (see ValidationResult).
 //
-// M0 widens the *publish-time* profile only. The graph it emits keeps the linear
-// `next` cursor so the existing engine is unaffected; the scope-aware multi-edge
-// IR + reverse-order compensation are M1.
+// M2 (conditional sagas) makes the multi-edge IR conditional: exclusiveGateway
+// becomes a node kind and Flow.conditionExpression/isDefault go live, while the
+// publish gate still rejects those constructs until TASK-33 widens the accept
+// matrix.
 
 import type { ModdleElement } from "bpmn-moddle";
 import { parseBpmnXml } from "./parser";
@@ -19,6 +20,7 @@ import {
   DEFAULT_SERVICE_TASK_ATTEMPTS,
   ERROR_EVENT_DEFINITION,
   ERROR_TYPE,
+  EXCLUSIVE_GATEWAY_TYPE,
   SEQUENCE_FLOW_TYPE,
   SUPPORTED_NODE_TYPES,
   localTypeName,
@@ -86,6 +88,8 @@ interface NodeInfo {
   attachedToRef?: string;
   errorRef?: string;
   errorCode?: string;
+  /** exclusiveGateway only — the sequence-flow id named by the `default` attribute. */
+  defaultFlowId?: string;
 }
 
 interface FlowInfo {
@@ -93,6 +97,8 @@ interface FlowInfo {
   source?: string;
   target?: string;
   scopeId: string;
+  /** Raw FEEL body of the flow's <conditionExpression> (tFormalExpression text). */
+  conditionExpression?: string;
 }
 
 interface AssocInfo {
@@ -238,14 +244,49 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       const $type = el.$type;
 
       if ($type === SEQUENCE_FLOW_TYPE) {
-        if (el.conditionExpression != null) {
+        // M2 graph IR: capture the raw FEEL condition body (tFormalExpression
+        // text) so the builder can emit live conditional edges. The publish
+        // gate below still REJECTS conditional flows until TASK-33 widens the
+        // accept matrix.
+        const cond = el.conditionExpression as ModdleElement | undefined | null;
+        const condBody =
+          cond != null && typeof cond.body === "string" && cond.body.trim() !== ""
+            ? (cond.body as string)
+            : undefined;
+        if (cond != null) {
           err(
             "Conditional sequence flows are not supported (deferred to conditional sagas). Use plain sequence flows only.",
             id,
             "sequenceFlow",
           );
         }
-        flows.push({ id: id ?? "", source: refId(el.sourceRef), target: refId(el.targetRef), scopeId });
+        flows.push({
+          id: id ?? "",
+          source: refId(el.sourceRef),
+          target: refId(el.targetRef),
+          scopeId,
+          conditionExpression: condBody,
+        });
+        continue;
+      }
+
+      // exclusiveGateway (M2 graph IR): classify it as a real node so the
+      // builder emits the gateway + its conditional edges (split AND join),
+      // but KEEP the M1 publish-time rejection until TASK-33 flips the accept
+      // matrix — the reject message is unchanged.
+      if ($type === EXCLUSIVE_GATEWAY_TYPE) {
+        err(
+          `Element '${id ?? "(no id)"}' (${localTypeName($type)}) is not supported in this profile. ${SUPPORTED_HINT}`,
+          id,
+          localTypeName($type),
+        );
+        nodes.push({
+          id: id ?? "",
+          type: "exclusiveGateway",
+          name: (el.name as string) ?? undefined,
+          scopeId,
+          defaultFlowId: refId(el.default),
+        });
         continue;
       }
 
@@ -657,120 +698,155 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     }
   }
 
-  if (issues.some((i) => i.severity === "error")) {
-    return { ok: false, issues: dedupeIssues(issues) };
-  }
+  const hasErrors = issues.some((i) => i.severity === "error");
 
   // -------------------------------------------------------------------------
   // Build the immutable execution-graph snapshot.
+  //
+  // Built BEST-EFFORT even when validation failed, anchored on a process-level
+  // start event: M2 lands graph-IR constructs (exclusiveGateway nodes, live
+  // conditional edges) before TASK-33 widens the publish accept matrix, so the
+  // builder must stay observable on documents the gate still rejects. `ok` —
+  // never `graph` presence — is the publish gate.
   // -------------------------------------------------------------------------
-  const processStart = nodes.find((n) => n.type === "startEvent" && n.scopeId === processId)!;
-  const processEnds = nodes.filter((n) => n.type === "endEvent" && n.scopeId === processId);
+  const buildGraph = (processStart: NodeInfo): ExecutionGraph => {
+    const processEnds = nodes.filter((n) => n.type === "endEvent" && n.scopeId === processId);
 
-  // Multi-edge IR (design §4.1): each node's full outgoing Flow[] in document
-  // order. `next` stays derived (outgoing[0]?.targetId) so the single-token
-  // engine is untouched. conditionExpression/isDefault are the M2 hook —
-  // always null/false in M1 (conditional + default flows are still rejected).
-  const outgoingFlows = new Map<string, Flow[]>();
-  for (const f of flows) {
-    if (!f.source || !f.target) continue;
-    const arr = outgoingFlows.get(f.source) ?? [];
-    arr.push({ flowId: f.id, targetId: f.target, conditionExpression: null, isDefault: false });
-    outgoingFlows.set(f.source, arr);
-  }
-
-  const graphNodes: Record<string, GraphNode> = {};
-  for (const n of nodes) {
-    const nodeOutgoing = outgoingFlows.get(n.id) ?? [];
-    const node: GraphNode = {
-      type: n.type,
-      name: n.name ?? null,
-      taskType: n.taskType ?? null,
-      retries: n.attempts ?? null,
-      messageName: n.messageName ?? null,
-      outgoing: nodeOutgoing,
-      next: nodeOutgoing[0]?.targetId ?? null,
-      scopeId: n.scopeId === processId ? null : n.scopeId,
-    };
-    if (n.type === "serviceTask") node.isForCompensation = n.isForCompensation === true;
-    if (n.type === "endEvent") node.endKind = n.endKind ?? "none";
-    if (n.type === "boundaryEvent") {
-      node.boundaryKind = n.boundaryKind ?? null;
-      node.attachedToRef = n.attachedToRef ?? null;
-      if (n.boundaryKind === "error") {
-        node.errorRef = n.errorRef ?? null;
-        node.errorCode = n.errorCode ?? null;
-      }
-      if (n.boundaryKind === "compensate") {
-        const assoc = associations.find((a) => a.source === n.id);
-        node.compensationHandlerId = assoc?.target ?? null;
-      }
+    // Flows marked default by their gateway's `default` attribute (M2). A
+    // `default` on a non-gateway activity does NOT mark its flow — conditions
+    // and defaults live only on exclusiveGateway outgoing flows (design §2
+    // decision 3); the activity case is rejected above.
+    const defaultFlowIds = new Set<string>();
+    for (const n of nodes) {
+      if (n.type === "exclusiveGateway" && n.defaultFlowId) defaultFlowIds.add(n.defaultFlowId);
     }
-    graphNodes[n.id] = node;
-  }
 
-  // Transaction scopes.
-  const transactionNodes = nodes.filter((n) => n.type === "transaction");
-  const transactions: Record<string, TransactionScope> = {};
-  for (const tx of transactionNodes) {
-    const members = nodes.filter((n) => n.scopeId === tx.id);
-    const innerStart = members.find((n) => n.type === "startEvent");
-    const innerEnds = members.filter((n) => n.type === "endEvent");
-    const compensations: Record<string, { handlerId: string; boundaryId: string }> = {};
-    for (const [fwd, wiring] of compensationOf) {
-      if (nodeById.get(fwd)?.scopeId === tx.id) compensations[fwd] = wiring;
+    // Multi-edge IR (design §4.1): each node's full outgoing Flow[] in DOCUMENT
+    // order — `flows` was collected by iterating `flowElements` in XML order,
+    // and that order is the condition evaluation order (see the Flow doc).
+    // `next` stays derived (outgoing[0]?.targetId) for non-gateway nodes;
+    // gateway nodes carry next: null — branch selection (TASK-34) owns the
+    // successor choice, the IR makes no `.next` promise for gateways.
+    const outgoingFlows = new Map<string, Flow[]>();
+    for (const f of flows) {
+      if (!f.source || !f.target) continue;
+      const arr = outgoingFlows.get(f.source) ?? [];
+      arr.push({
+        flowId: f.id,
+        targetId: f.target,
+        conditionExpression: f.conditionExpression ?? null,
+        isDefault: defaultFlowIds.has(f.id),
+      });
+      outgoingFlows.set(f.source, arr);
     }
-    transactions[tx.id] = {
-      transactionId: tx.id,
-      startId: innerStart?.id ?? "",
-      childIds: members.map((m) => m.id),
-      endIds: innerEnds.map((e) => e.id),
-      compensations,
+
+    const graphNodes: Record<string, GraphNode> = {};
+    for (const n of nodes) {
+      const nodeOutgoing = outgoingFlows.get(n.id) ?? [];
+      const node: GraphNode = {
+        type: n.type,
+        name: n.name ?? null,
+        taskType: n.taskType ?? null,
+        retries: n.attempts ?? null,
+        messageName: n.messageName ?? null,
+        outgoing: nodeOutgoing,
+        next: n.type === "exclusiveGateway" ? null : nodeOutgoing[0]?.targetId ?? null,
+        scopeId: n.scopeId === processId ? null : n.scopeId,
+      };
+      if (n.type === "serviceTask") node.isForCompensation = n.isForCompensation === true;
+      if (n.type === "endEvent") node.endKind = n.endKind ?? "none";
+      if (n.type === "boundaryEvent") {
+        node.boundaryKind = n.boundaryKind ?? null;
+        node.attachedToRef = n.attachedToRef ?? null;
+        if (n.boundaryKind === "error") {
+          node.errorRef = n.errorRef ?? null;
+          node.errorCode = n.errorCode ?? null;
+        }
+        if (n.boundaryKind === "compensate") {
+          const assoc = associations.find((a) => a.source === n.id);
+          node.compensationHandlerId = assoc?.target ?? null;
+        }
+      }
+      graphNodes[n.id] = node;
+    }
+
+    // Transaction scopes.
+    const transactionNodes = nodes.filter((n) => n.type === "transaction");
+    const transactions: Record<string, TransactionScope> = {};
+    for (const tx of transactionNodes) {
+      const members = nodes.filter((n) => n.scopeId === tx.id);
+      const innerStart = members.find((n) => n.type === "startEvent");
+      const innerEnds = members.filter((n) => n.type === "endEvent");
+      const compensations: Record<string, { handlerId: string; boundaryId: string }> = {};
+      for (const [fwd, wiring] of compensationOf) {
+        if (nodeById.get(fwd)?.scopeId === tx.id) compensations[fwd] = wiring;
+      }
+      transactions[tx.id] = {
+        transactionId: tx.id,
+        startId: innerStart?.id ?? "",
+        childIds: members.map((m) => m.id),
+        endIds: innerEnds.map((e) => e.id),
+        compensations,
+      };
+    }
+
+    // Elements list (drives bpmn_elements rows + the version API response).
+    const elements: GraphElement[] = [];
+    for (const n of nodes) {
+      elements.push({
+        elementId: n.id,
+        type: n.type === "transaction" ? "transaction" : n.type === "boundaryEvent" ? "boundaryEvent" : n.type,
+        name: n.name ?? null,
+        taskType: n.taskType ?? null,
+        retries: n.attempts ?? null,
+        messageName: n.messageName ?? null,
+      });
+    }
+    // Persist sequence-flow + association wiring (design §3.2) including the
+    // conditional topology (M2 design §4: condition_expression / is_default).
+    // On an ok graph every flow/association has resolved, in-scope endpoints;
+    // a best-effort graph may carry nulls for unresolved refs.
+    for (const f of flows) {
+      elements.push({
+        elementId: f.id,
+        type: "sequenceFlow",
+        sourceRef: f.source ?? null,
+        targetRef: f.target ?? null,
+        conditionExpression: f.conditionExpression ?? null,
+        isDefault: defaultFlowIds.has(f.id),
+      });
+    }
+    for (const m of messageElements) elements.push({ elementId: m.id, type: "message", name: m.name, messageName: m.name });
+    for (const a of associations) {
+      elements.push({ elementId: a.id, type: "association", sourceRef: a.source ?? null, targetRef: a.target ?? null });
+    }
+    for (const e of errorsById.values()) elements.push({ elementId: e.id, type: "error", name: e.name ?? null });
+
+    const associationLinks: AssociationLink[] = associations.map((a) => ({
+      id: a.id,
+      sourceRef: a.source ?? "",
+      targetRef: a.target ?? "",
+    }));
+    const errorDecls: ErrorDeclaration[] = Array.from(errorsById.values());
+
+    return {
+      processId,
+      startElementId: processStart.id,
+      endElementIds: processEnds.map((e) => e.id),
+      elements,
+      nodes: graphNodes,
+      ...(transactionNodes.length > 0 ? { transactions } : {}),
+      ...(associationLinks.length > 0 ? { associations: associationLinks } : {}),
+      ...(errorDecls.length > 0 ? { errors: errorDecls } : {}),
     };
-  }
-
-  // Elements list (drives bpmn_elements rows + the version API response).
-  const elements: GraphElement[] = [];
-  for (const n of nodes) {
-    elements.push({
-      elementId: n.id,
-      type: n.type === "transaction" ? "transaction" : n.type === "boundaryEvent" ? "boundaryEvent" : n.type,
-      name: n.name ?? null,
-      taskType: n.taskType ?? null,
-      retries: n.attempts ?? null,
-      messageName: n.messageName ?? null,
-    });
-  }
-  // Persist sequence-flow + association wiring (design §3.2): topology is
-  // queryable, not just embedded in the parsed_profile. Validation has passed,
-  // so every flow/association has resolved, in-scope endpoints.
-  for (const f of flows) {
-    elements.push({ elementId: f.id, type: "sequenceFlow", sourceRef: f.source ?? null, targetRef: f.target ?? null });
-  }
-  for (const m of messageElements) elements.push({ elementId: m.id, type: "message", name: m.name, messageName: m.name });
-  for (const a of associations) {
-    elements.push({ elementId: a.id, type: "association", sourceRef: a.source ?? null, targetRef: a.target ?? null });
-  }
-  for (const e of errorsById.values()) elements.push({ elementId: e.id, type: "error", name: e.name ?? null });
-
-  const associationLinks: AssociationLink[] = associations.map((a) => ({
-    id: a.id,
-    sourceRef: a.source ?? "",
-    targetRef: a.target ?? "",
-  }));
-  const errorDecls: ErrorDeclaration[] = Array.from(errorsById.values());
-
-  const graph: ExecutionGraph = {
-    processId,
-    startElementId: processStart.id,
-    endElementIds: processEnds.map((e) => e.id),
-    elements,
-    nodes: graphNodes,
-    ...(transactionNodes.length > 0 ? { transactions } : {}),
-    ...(associationLinks.length > 0 ? { associations: associationLinks } : {}),
-    ...(errorDecls.length > 0 ? { errors: errorDecls } : {}),
   };
 
+  const processStart = nodes.find((n) => n.type === "startEvent" && n.scopeId === processId);
+  const graph = processStart ? buildGraph(processStart) : undefined;
+
+  if (hasErrors) {
+    return { ok: false, issues: dedupeIssues(issues), ...(graph ? { graph } : {}) };
+  }
   return { ok: true, issues: [], graph };
 }
 

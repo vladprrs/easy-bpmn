@@ -129,7 +129,9 @@ export interface BpmnElement {
     | "transaction"
     | "boundaryEvent"
     | "association"
-    | "error";
+    | "error"
+    // M2 conditional sagas:
+    | "exclusiveGateway";
   name?: string | null;
   taskType?: string | null;
   messageName?: string | null;

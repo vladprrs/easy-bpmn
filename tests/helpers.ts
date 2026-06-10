@@ -332,6 +332,80 @@ export const CONDITIONAL_FLOW_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
   </bpmn:process>
 </bpmn:definitions>`;
 
+/**
+ * M2 conditional XOR (TASK-31 graph IR): split gateway with two FEEL-conditional
+ * flows + a default, three branches, then a join gateway. The <bpmn:outgoing>
+ * refs inside GW_split are deliberately listed in a DIFFERENT order than the
+ * <sequenceFlow> elements appear, pinning the IR's document-order guarantee to
+ * flowElements order (= condition evaluation order, M2 design §2 decision 5).
+ * Publish still REJECTS this model until TASK-33 widens the accept matrix; the
+ * graph BUILDER must nevertheless produce the full conditional IR.
+ */
+export const XOR_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_xor" targetNamespace="x">
+  <bpmn:process id="P_xor" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="S" targetRef="GW_split" />
+    <bpmn:exclusiveGateway id="GW_split" name="Route by amount" default="f_def">
+      <bpmn:incoming>f0</bpmn:incoming>
+      <bpmn:outgoing>f_def</bpmn:outgoing>
+      <bpmn:outgoing>f_silver</bpmn:outgoing>
+      <bpmn:outgoing>f_gold</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="f_gold" sourceRef="GW_split" targetRef="T_gold">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">amount &gt; 100</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_silver" sourceRef="GW_split" targetRef="T_silver">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">amount &gt; 10</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_def" sourceRef="GW_split" targetRef="T_basic" />
+    <bpmn:serviceTask id="T_gold" name="Gold"><bpmn:extensionElements><easy-bpmn:taskDefinition type="gold-handler" /></bpmn:extensionElements><bpmn:incoming>f_gold</bpmn:incoming><bpmn:outgoing>f_g2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:serviceTask id="T_silver" name="Silver"><bpmn:extensionElements><easy-bpmn:taskDefinition type="silver-handler" /></bpmn:extensionElements><bpmn:incoming>f_silver</bpmn:incoming><bpmn:outgoing>f_s2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:serviceTask id="T_basic" name="Basic"><bpmn:extensionElements><easy-bpmn:taskDefinition type="basic-handler" /></bpmn:extensionElements><bpmn:incoming>f_def</bpmn:incoming><bpmn:outgoing>f_b2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f_g2" sourceRef="T_gold" targetRef="GW_join" />
+    <bpmn:sequenceFlow id="f_s2" sourceRef="T_silver" targetRef="GW_join" />
+    <bpmn:sequenceFlow id="f_b2" sourceRef="T_basic" targetRef="GW_join" />
+    <bpmn:exclusiveGateway id="GW_join" name="Merge">
+      <bpmn:incoming>f_g2</bpmn:incoming>
+      <bpmn:incoming>f_s2</bpmn:incoming>
+      <bpmn:incoming>f_b2</bpmn:incoming>
+      <bpmn:outgoing>f_end</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="f_end" sourceRef="GW_join" targetRef="E" />
+    <bpmn:endEvent id="E"><bpmn:incoming>f_end</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/** XOR gateway INSIDE a <transaction> scope — the gateway node must carry the
+ *  enclosing transaction's scopeId like every other scoped node. */
+export const XOR_IN_TX_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_xortx" targetNamespace="x">
+  <bpmn:process id="P_xortx" isExecutable="true">
+    <bpmn:startEvent id="PS"><bpmn:outgoing>g1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="g1" sourceRef="PS" targetRef="Tx" />
+    <bpmn:transaction id="Tx" name="Scoped">
+      <bpmn:startEvent id="TxS"><bpmn:outgoing>t1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:sequenceFlow id="t1" sourceRef="TxS" targetRef="GW" />
+      <bpmn:exclusiveGateway id="GW" default="t_b">
+        <bpmn:incoming>t1</bpmn:incoming>
+        <bpmn:outgoing>t_a</bpmn:outgoing>
+        <bpmn:outgoing>t_b</bpmn:outgoing>
+      </bpmn:exclusiveGateway>
+      <bpmn:sequenceFlow id="t_a" sourceRef="GW" targetRef="A">
+        <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">ok</bpmn:conditionExpression>
+      </bpmn:sequenceFlow>
+      <bpmn:sequenceFlow id="t_b" sourceRef="GW" targetRef="B" />
+      <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="a" /></bpmn:extensionElements><bpmn:incoming>t_a</bpmn:incoming><bpmn:outgoing>t2</bpmn:outgoing></bpmn:serviceTask>
+      <bpmn:serviceTask id="B"><bpmn:extensionElements><easy-bpmn:taskDefinition type="b" /></bpmn:extensionElements><bpmn:incoming>t_b</bpmn:incoming><bpmn:outgoing>t3</bpmn:outgoing></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="t2" sourceRef="A" targetRef="TxE" />
+      <bpmn:sequenceFlow id="t3" sourceRef="B" targetRef="TxE" />
+      <bpmn:endEvent id="TxE"><bpmn:incoming>t2</bpmn:incoming><bpmn:incoming>t3</bpmn:incoming></bpmn:endEvent>
+    </bpmn:transaction>
+    <bpmn:sequenceFlow id="g2" sourceRef="Tx" targetRef="PE" />
+    <bpmn:endEvent id="PE"><bpmn:incoming>g2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
 export const MALFORMED_XML = `<bpmn:definitions><bpmn:process id="P"></bpmn:definitions>`;
 
 /** A Service Task carrying multi-instance loop characteristics — out of profile. */

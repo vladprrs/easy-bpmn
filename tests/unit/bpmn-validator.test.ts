@@ -23,6 +23,8 @@ import {
   TIMER_START_BPMN,
   TOLERANT_BPMN,
   USERTASK_BPMN,
+  XOR_BPMN,
+  XOR_IN_TX_BPMN,
 } from "../helpers";
 
 function reasons(issues: { reason: string }[]): string {
@@ -298,6 +300,127 @@ describe("Multi-edge IR: outgoing[] (TASK-11 closeout, design §3.1)", () => {
     for (const node of Object.values(n)) {
       for (const flow of node.outgoing) {
         expect(offPath.has(flow.targetId)).toBe(false);
+      }
+    }
+  });
+});
+
+describe("Conditional graph IR: exclusiveGateway + live conditional edges (TASK-31, M2 design §4)", () => {
+  // The graph BUILDER constructs the full conditional IR even though the
+  // publish gate still rejects these models (the accept matrix flips in
+  // TASK-33). parseAndValidate therefore attaches the best-effort graph
+  // alongside the rejection issues.
+  it("still REJECTS the XOR model at publish time (gate unchanged until TASK-33)", async () => {
+    const r = await parseAndValidate(XOR_BPMN);
+    expect(r.ok).toBe(false);
+    // the existing M1 reject reasons all still fire
+    expect(r.issues.some((i) => i.elementId === "GW_split" && /exclusiveGateway.*not supported/.test(i.reason))).toBe(true);
+    expect(r.issues.some((i) => i.elementId === "f_gold" && /[Cc]onditional sequence flow/.test(i.reason))).toBe(true);
+    expect(r.issues.some((i) => i.elementId === "GW_split" && /Implicit splits are not supported/.test(i.reason))).toBe(true);
+  });
+
+  it("builds an exclusiveGateway node whose outgoing[] carries conditions + default in DOCUMENT order", async () => {
+    const r = await parseAndValidate(XOR_BPMN);
+    expect(r.ok).toBe(false);
+    const g = r.graph!;
+    expect(g).toBeDefined();
+
+    const split = g.nodes["GW_split"]!;
+    expect(split.type).toBe("exclusiveGateway");
+    expect(split.name).toBe("Route by amount");
+    // document order of the <sequenceFlow> elements (f_gold, f_silver, f_def),
+    // NOT the scrambled <bpmn:outgoing> ref order inside the gateway
+    expect(split.outgoing).toEqual([
+      { flowId: "f_gold", targetId: "T_gold", conditionExpression: "amount > 100", isDefault: false },
+      { flowId: "f_silver", targetId: "T_silver", conditionExpression: "amount > 10", isDefault: false },
+      { flowId: "f_def", targetId: "T_basic", conditionExpression: null, isDefault: true },
+    ]);
+  });
+
+  it("marks isDefault true EXACTLY for the flow named by the gateway's default attribute", async () => {
+    const r = await parseAndValidate(XOR_BPMN);
+    const g = r.graph!;
+    const defaults = g.elements
+      .filter((e) => e.type === "sequenceFlow" && e.isDefault)
+      .map((e) => e.elementId);
+    expect(defaults).toEqual(["f_def"]);
+    for (const node of Object.values(g.nodes)) {
+      for (const flow of node.outgoing) {
+        expect(flow.isDefault).toBe(flow.flowId === "f_def");
+      }
+    }
+  });
+
+  it("builds the join gateway as a pass-through node and makes no .next promise on gateways", async () => {
+    const r = await parseAndValidate(XOR_BPMN);
+    const g = r.graph!;
+    const join = g.nodes["GW_join"]!;
+    expect(join.type).toBe("exclusiveGateway");
+    expect(join.outgoing).toEqual([
+      { flowId: "f_end", targetId: "E", conditionExpression: null, isDefault: false },
+    ]);
+    // gateway nodes carry next: null — branch selection (TASK-34) owns the
+    // successor choice; the IR makes no .next promise for gateways
+    expect(g.nodes["GW_split"]!.next).toBeNull();
+    expect(join.next).toBeNull();
+    // non-gateway nodes keep next derived as outgoing[0]?.targetId
+    expect(g.nodes["S"]!.next).toBe("GW_split");
+    expect(g.nodes["T_gold"]!.next).toBe("GW_join");
+    expect(g.nodes["E"]!.next).toBeNull();
+  });
+
+  it("exposes sequenceFlow GraphElements carrying conditionExpression/isDefault (persisted topology shape)", async () => {
+    const r = await parseAndValidate(XOR_BPMN);
+    const g = r.graph!;
+    const byId = Object.fromEntries(g.elements.map((e) => [e.elementId, e]));
+    expect(byId["GW_split"]).toMatchObject({ type: "exclusiveGateway", name: "Route by amount" });
+    expect(byId["f_gold"]).toMatchObject({
+      type: "sequenceFlow",
+      sourceRef: "GW_split",
+      targetRef: "T_gold",
+      conditionExpression: "amount > 100",
+      isDefault: false,
+    });
+    expect(byId["f_def"]).toMatchObject({
+      type: "sequenceFlow",
+      sourceRef: "GW_split",
+      targetRef: "T_basic",
+      conditionExpression: null,
+      isDefault: true,
+    });
+    // non-gateway flows stay unconditional
+    expect(byId["f0"]).toMatchObject({ conditionExpression: null, isDefault: false });
+    expect(byId["f_end"]).toMatchObject({ conditionExpression: null, isDefault: false });
+  });
+
+  it("scopes a gateway inside a <transaction> like every other scoped node", async () => {
+    const r = await parseAndValidate(XOR_IN_TX_BPMN);
+    const g = r.graph!;
+    expect(g.nodes["GW"]!.type).toBe("exclusiveGateway");
+    expect(g.nodes["GW"]!.scopeId).toBe("Tx");
+    expect(g.transactions!["Tx"]!.childIds).toContain("GW");
+    expect(g.nodes["GW"]!.outgoing).toEqual([
+      { flowId: "t_a", targetId: "A", conditionExpression: "ok", isDefault: false },
+      { flowId: "t_b", targetId: "B", conditionExpression: null, isDefault: true },
+    ]);
+  });
+
+  it("regression: linear MVP + M1 saga graphs keep conditionExpression null / isDefault false everywhere", async () => {
+    for (const xml of [DEMO_BPMN, SAGA_BPMN]) {
+      const r = await parseAndValidate(xml);
+      expect(r.ok).toBe(true);
+      const g = r.graph!;
+      for (const node of Object.values(g.nodes)) {
+        expect(node.type).not.toBe("exclusiveGateway");
+        for (const flow of node.outgoing) {
+          expect(flow.conditionExpression).toBeNull();
+          expect(flow.isDefault).toBe(false);
+        }
+      }
+      for (const el of g.elements) {
+        if (el.type !== "sequenceFlow") continue;
+        expect(el.conditionExpression).toBeNull();
+        expect(el.isDefault).toBe(false);
       }
     }
   });

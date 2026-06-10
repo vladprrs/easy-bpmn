@@ -1,7 +1,11 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { createDraft, publishDraft, SAGA_BPMN } from "../helpers";
-import { getVersionGraph } from "../../src/persistence/definitions";
+import { createDraft, publishDraft, SAGA_BPMN, XOR_BPMN } from "../helpers";
+import {
+  createVersion,
+  getVersionElements,
+  getVersionGraph,
+} from "../../src/persistence/definitions";
 import { parseAndValidate } from "../../src/bpmn/validator";
 
 // TASK-11 closeout (design §3.2): topology is persisted BOTH as the parsed_profile
@@ -82,5 +86,92 @@ describe("Saga topology persistence (TASK-11 closeout)", () => {
       handlerId: "refundCard",
       boundaryId: "chargeCard_comp",
     });
+  });
+});
+
+// TASK-31 (M2 design §4): conditional topology persists into bpmn_elements
+// (condition_expression / is_default) and parsed_profile. The publish HTTP gate
+// still REJECTS XOR models until TASK-33 widens the accept matrix, so these
+// tests insert the version DIRECTLY via createVersion with the builder's graph.
+describe("Conditional topology persistence (TASK-31)", () => {
+  async function createConditionalVersion() {
+    const r = await parseAndValidate(XOR_BPMN);
+    expect(r.ok).toBe(false); // gate stays shut until TASK-33
+    expect(r.graph).toBeDefined(); // ...but the builder produced the full IR
+    const versionId = `pdv_xor_${crypto.randomUUID()}`;
+    await createVersion(env.DB, {
+      definitionVersionId: versionId,
+      draftId: `draft_xor_${crypto.randomUUID()}`,
+      workspaceId: "default",
+      versionNumber: 1,
+      bpmnXml: XOR_BPMN,
+      bpmnXmlHash: "test-hash-xor",
+      graph: r.graph!,
+      now: new Date().toISOString(),
+    });
+    return versionId;
+  }
+
+  it("persists condition_expression/is_default on sequenceFlow bpmn_elements rows", async () => {
+    const versionId = await createConditionalVersion();
+    const rows = await env.DB.prepare(
+      `SELECT element_id, type, source_ref, target_ref, condition_expression, is_default
+         FROM bpmn_elements WHERE definition_version_id = ? ORDER BY element_id`,
+    )
+      .bind(versionId)
+      .all<{
+        element_id: string;
+        type: string;
+        source_ref: string | null;
+        target_ref: string | null;
+        condition_expression: string | null;
+        is_default: number;
+      }>();
+    const byId = Object.fromEntries((rows.results ?? []).map((row) => [row.element_id, row]));
+
+    expect(byId["GW_split"]).toMatchObject({ type: "exclusiveGateway" });
+    expect(byId["GW_join"]).toMatchObject({ type: "exclusiveGateway" });
+    expect(byId["f_gold"]).toMatchObject({
+      type: "sequenceFlow",
+      source_ref: "GW_split",
+      target_ref: "T_gold",
+      condition_expression: "amount > 100",
+      is_default: 0,
+    });
+    expect(byId["f_silver"]).toMatchObject({ condition_expression: "amount > 10", is_default: 0 });
+    expect(byId["f_def"]).toMatchObject({ condition_expression: null, is_default: 1 });
+    // unconditional flows stay null/0
+    expect(byId["f0"]).toMatchObject({ condition_expression: null, is_default: 0 });
+    expect(byId["f_end"]).toMatchObject({ condition_expression: null, is_default: 0 });
+  });
+
+  it("getVersionElements returns conditionExpression/isDefault", async () => {
+    const versionId = await createConditionalVersion();
+    const elements = await getVersionElements(env.DB, versionId);
+    const byId = Object.fromEntries(elements.map((e) => [e.elementId, e]));
+    expect(byId["f_gold"]).toMatchObject({ conditionExpression: "amount > 100", isDefault: false });
+    expect(byId["f_silver"]).toMatchObject({ conditionExpression: "amount > 10", isDefault: false });
+    expect(byId["f_def"]).toMatchObject({ conditionExpression: null, isDefault: true });
+    expect(byId["GW_split"]).toMatchObject({ type: "exclusiveGateway" });
+    const defaults = elements.filter((e) => e.isDefault).map((e) => e.elementId);
+    expect(defaults).toEqual(["f_def"]);
+  });
+
+  it("getVersionGraph round-trips deep-equal to a fresh parse, conditions + outgoing order included", async () => {
+    const versionId = await createConditionalVersion();
+    const stored = await getVersionGraph(env.DB, versionId);
+    const fresh = (await parseAndValidate(XOR_BPMN)).graph;
+    expect(stored).toEqual(fresh);
+    // the conditional multi-edge IR survives the parsed_profile round-trip,
+    // in document order (= condition evaluation order, design §2 decision 5)
+    expect(stored!.nodes["GW_split"]!.outgoing).toEqual([
+      { flowId: "f_gold", targetId: "T_gold", conditionExpression: "amount > 100", isDefault: false },
+      { flowId: "f_silver", targetId: "T_silver", conditionExpression: "amount > 10", isDefault: false },
+      { flowId: "f_def", targetId: "T_basic", conditionExpression: null, isDefault: true },
+    ]);
+    expect(stored!.nodes["GW_split"]!.next).toBeNull();
+    expect(stored!.nodes["GW_join"]!.outgoing).toEqual([
+      { flowId: "f_end", targetId: "E", conditionExpression: null, isDefault: false },
+    ]);
   });
 });

@@ -3,9 +3,11 @@ id: TASK-31
 title: >-
   Graph IR: exclusiveGateway node kind + live document-order conditional edges
   persisted in topology
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - Claude
 created_date: '2026-06-09 20:29'
+updated_date: '2026-06-10 17:23'
 labels:
   - saga
   - bpmn
@@ -42,3 +44,15 @@ The M1 closeout (TASK-11, commit b6ba5fb) shipped GraphNode.outgoing: Flow[] wit
 - [ ] #4 The getVersionGraph deep-equal-vs-fresh-parse replay test is green for a published conditional model, covering conditions and outgoing-edge order.
 - [ ] #5 Constitution gate: unit + integration coverage of the above; npm run test green; linear MVP and M1 saga fixtures parse unchanged (regression).
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+Execution: subagent-driven (implementer + spec review + quality review) on branch m2-conditional-sagas.
+
+1. src/bpmn/graph.ts: add "exclusiveGateway" to NodeType + ElementType; document on Flow that outgoing[] order = document order = condition evaluation order; document that .next is meaningless for gateway nodes (branch selection owns it).
+2. src/bpmn/validator.ts (builder part only — accept/reject matrix is TASK-33): populate Flow.conditionExpression from the sequenceFlow tFormalExpression body and Flow.isDefault from the gateway's `default` attribute when building the graph + GraphElement rows; preserve document order in outgoing[].
+3. Persistence already landed in TASK-29 (bpmn_elements condition_expression/is_default columns + definitions.ts read/write). Wire validator-produced values into createVersion rows and parsed_profile.
+4. Tests: parse a model with XOR split/join -> gateway node with ordered conditional Flows; default-attribute resolution exact; bpmn_elements rows persist conditions; getVersionElements returns them; getVersionGraph deep-equal-vs-fresh-parse replay test extended to conditions + edge order; regression: linear MVP + M1 saga fixtures parse unchanged.
+NOTE: at this point the validator still REJECTS gateways/conditions at publish (untouched reject matrix) — tests exercise the parser/builder directly (parseAndValidate internals or graph-construction unit level), full publish-path acceptance lands in TASK-33.
+<!-- SECTION:PLAN:END -->

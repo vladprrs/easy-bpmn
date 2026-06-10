@@ -17,6 +17,12 @@ export const SUPPORTED_NODE_TYPES: Record<string, NodeType> = {
 export const SEQUENCE_FLOW_TYPE = "bpmn:SequenceFlow";
 export const ASSOCIATION_TYPE = "bpmn:Association";
 export const ERROR_TYPE = "bpmn:Error";
+/**
+ * M2 conditional sagas: the graph BUILDER constructs exclusiveGateway nodes +
+ * conditional edges, but the type stays OUT of SUPPORTED_NODE_TYPES until
+ * TASK-33 widens the publish accept matrix (the validator still rejects it).
+ */
+export const EXCLUSIVE_GATEWAY_TYPE = "bpmn:ExclusiveGateway";
 
 /** Event-definition $types we classify (start/end/boundary discriminators). */
 export const COMPENSATE_EVENT_DEFINITION = "bpmn:CompensateEventDefinition";

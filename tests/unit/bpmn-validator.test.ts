@@ -97,15 +97,9 @@ describe("BPMN-lite profile validator", () => {
   });
 
   // TASK-33 (M2): conditions are now legal on exclusiveGateway outgoing flows,
-  // so the M1 blanket reject narrows to "not leaving an exclusive gateway"
-  // (CONDITIONAL_FLOW_BPMN's condition is on a start-event outgoing flow).
-  it("rejects a conditionExpression on a flow not leaving an exclusive gateway", async () => {
-    const r = await parseAndValidate(CONDITIONAL_FLOW_BPMN);
-    expect(r.ok).toBe(false);
-    expect(
-      r.issues.some((i) => i.elementId === "f1" && /not leave an exclusiveGateway|only supported on outgoing flows of an exclusive/i.test(i.reason)),
-    ).toBe(true);
-  });
+  // so the M1 blanket conditional-flow reject narrowed to "not leaving an
+  // exclusive gateway" — covered by CONDITIONAL_FLOW_BPMN in the
+  // "Exclusive-gateway reject matrix" describe below.
 
   it("rejects a Service Task with multi-instance loop characteristics", async () => {
     const r = await parseAndValidate(MULTI_INSTANCE_BPMN);
@@ -699,6 +693,15 @@ describe("Exclusive-gateway reject matrix (TASK-33, M2 design §3)", () => {
 
   it("rejects a conditionExpression on the gateway's default flow", async () => {
     const r = await parseAndValidate(xorSplitBpmn({ condB: "amount &lt;= 100" }));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "f_b" && /default flow/.test(i.reason) && /condition/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects an EMPTY <conditionExpression/> element on the default flow (presence, not body)", async () => {
+    // The default-flow rule keys on element PRESENCE: an empty body is
+    // normalized to null elsewhere, but "must not carry a conditionExpression"
+    // covers the empty element too (same bit as the non-gateway-flow rule).
+    const r = await parseAndValidate(xorSplitBpmn({ condB: "   " }));
     expect(r.ok).toBe(false);
     expect(r.issues.some((i) => i.elementId === "f_b" && /default flow/.test(i.reason) && /condition/.test(i.reason))).toBe(true);
   });

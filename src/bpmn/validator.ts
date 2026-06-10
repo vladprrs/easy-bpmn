@@ -163,12 +163,26 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
   // reference" warning instead. Surface those as publish errors here; a default
   // that resolves but names a flow not leaving its own gateway is caught by the
   // gateway rules below.
+  //
+  // CAUTION: the warning shape (`property: "bpmn:default"`, `message:
+  // "unresolved reference <id>"`) is moddle-INTERNAL and version-coupled, not
+  // a public contract — it is pinned by the "rejects a default referencing a
+  // MISSING flow" unit test, which must break loudly on a bpmn-moddle upgrade
+  // that reshapes it. We require BOTH the property name and a loose
+  // unresolved-reference message match so an unrelated future warning that
+  // happens to carry `property: "bpmn:default"` does not false-positive.
+  //
+  // NOTE: this loop runs over warnings for the WHOLE definitions tree, before
+  // the executable process is selected below — a dangling default in a
+  // non-selected process also rejects. That is deliberately conservative: a
+  // broken reference anywhere in the file is modeler error, not noise.
   for (const w of parsed.warnings as Array<{
+    message?: string;
     property?: string;
     value?: unknown;
     element?: { id?: string; $type?: string };
   }>) {
-    if (w?.property === "bpmn:default") {
+    if (w?.property === "bpmn:default" && typeof w.message === "string" && /unresolved reference/i.test(w.message)) {
       const elId = w.element?.id ?? null;
       err(
         `Element '${elId ?? "(no id)"}' declares default flow '${String(w.value)}', which does not exist in the model.`,
@@ -640,7 +654,11 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
           n.id,
           "exclusiveGateway",
         );
-      } else if (defaultFlow.conditionExpression != null) {
+      } else if (defaultFlow.hasConditionElement) {
+        // Element PRESENCE, not the normalized (trimmed→null) body: an empty
+        // <conditionExpression/> on the default flow must reject exactly like
+        // a non-empty one — the message says "must not carry", and a flow not
+        // leaving a gateway already rejects on the same presence bit.
         err(
           `Sequence flow '${defaultFlow.id}' is the default flow of exclusive gateway '${n.id}' and must not ` +
             "carry a conditionExpression — the default is taken only when no condition matches.",

@@ -495,12 +495,13 @@ export const SAGA_XOR_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 </bpmn:definitions>`;
 
 /**
- * A cyclic token path through a mixed (2-in/2-out) XOR gateway — the
- * retry-with-changed-input pattern: charge the card; if it was declined and
- * budget remains, switch the payment method and loop back to the gateway for
- * another charge attempt; otherwise take the default flow out. Legal from
- * TASK-33 (cycles on the token path); reused by TASK-32/35/36 (occurrence
- * counters + loop execution).
+ * A cyclic token path through a mixed (2-in/2-out) XOR gateway with
+ * FEEL-actionable variables. T_charge runs once, BEFORE the cycle; the
+ * back-edge returns from T_switch to GW_retry (nothing "re-charges").
+ * Legal from TASK-33 (cycles on the token path); reusable for TASK-32
+ * (occurrence-counter rewalk) and TASK-35 (loop-guard shapes). A saga-loop
+ * fixture — a compensatable step inside a <transaction> inside the cycle —
+ * is still owed to TASK-35-AC#2/TASK-36.
  */
 export const LOOP_XOR_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"

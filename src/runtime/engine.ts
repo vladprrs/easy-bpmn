@@ -204,6 +204,26 @@ async function loop(
       continue;
     }
 
+    if (node.type === "exclusiveGateway") {
+      // TASK-34 replaces this guard with real XOR branch dispatch. Until then
+      // a token reaching a published gateway (TASK-33 opened the publish gate)
+      // must NOT fall through and zombify in 'running' with no D1 write —
+      // settle the M1 terminal-incident path (incident row + incidentCreated
+      // history + status transition in one batch) so the operator sees it.
+      await runStep(`gw-guard:${cur}`, () =>
+        createIncident(
+          env,
+          instanceId,
+          cur,
+          0,
+          "exclusiveGateway dispatch is not yet supported by the engine (lands in TASK-34).",
+          {},
+          "serviceTaskFailure",
+        ),
+      );
+      return { status: "incident" };
+    }
+
     if (node.type === "endEvent") {
       if (node.endKind === "cancel" && isTransactionScope(graph, node.scopeId)) {
         await runStep(`cancel:${cur}`, () => beginCompensating(env, instanceId, node.scopeId!, cur));

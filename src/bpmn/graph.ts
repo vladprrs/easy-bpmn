@@ -64,6 +64,15 @@ export interface GraphElement {
   /** sequenceFlow / association only — the wiring endpoints (persisted topology). */
   sourceRef?: string | null;
   targetRef?: string | null;
+  /**
+   * sequenceFlow only (M2 conditional topology) — the FEEL condition on a flow
+   * leaving an exclusiveGateway, and the gateway's `default` marker. Always
+   * null/false until the M2 validator populates them (it rejects conditional +
+   * default flows today); persisted now so the bpmn_elements shape is stable
+   * across the M1→M2 boundary.
+   */
+  conditionExpression?: string | null;
+  isDefault?: boolean;
 }
 
 export interface GraphNode {

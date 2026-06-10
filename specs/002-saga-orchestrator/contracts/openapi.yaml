@@ -606,6 +606,18 @@ components:
           description: >
             For a sequenceFlow / association element, the target endpoint id (persisted topology,
             TASK-11). Null for non-wiring elements.
+        conditionExpression:
+          type: string
+          nullable: true
+          description: >
+            For a sequenceFlow leaving an exclusiveGateway (M2 conditional sagas), the FEEL
+            condition that selects the flow. Null on every other element.
+        isDefault:
+          type: boolean
+          nullable: true
+          description: >
+            True for the exclusiveGateway's `default` outgoing sequenceFlow (taken when no
+            condition matches; carries no conditionExpression).
     StartInstanceRequest:
       type: object
       required: [workspaceId, correlationKey, variables]
@@ -977,7 +989,7 @@ components:
         kind:
           type: string
           nullable: true
-          enum: [serviceTaskFailure, compensationFailure, timeout, poison]
+          enum: [serviceTaskFailure, compensationFailure, timeout, poison, loopLimit, noPath]
         resolution:
           type: string
           nullable: true

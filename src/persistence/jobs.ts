@@ -140,6 +140,10 @@ export interface JobWithWorkspace {
   output_variables: string | null;
   error_code: string | null;
   is_compensation: number;
+  /** Loop-iteration discriminator (0004); 0 for every pre-loop row. */
+  occurrence: number;
+  /** Write-free fast-forward marker (0004): 1 once the engine applied the output. */
+  output_applied: number;
   /** Authoritative workspace via the JOIN to process_instances. */
   workspace_id: string;
   /** Owning instance status, for the terminal no-op-ack gate. */
@@ -160,6 +164,7 @@ export async function getJobInWorkspace(
     db,
     `SELECT j.job_id, j.instance_id, j.element_id, j.task_type, j.status, j.retry_limit,
             j.attempt_count, j.lock_token, j.output_variables, j.error_code, j.is_compensation,
+            j.occurrence, j.output_applied,
             pi.workspace_id AS workspace_id, pi.status AS instance_status
        FROM service_task_jobs j
        JOIN process_instances pi ON pi.instance_id = j.instance_id

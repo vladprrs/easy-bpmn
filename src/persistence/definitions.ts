@@ -139,8 +139,8 @@ export async function createVersion(
       stmt(
         db,
         `INSERT INTO bpmn_elements
-           (definition_version_id, element_id, type, name, task_type, message_name, retries, source_ref, target_ref, metadata)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+           (definition_version_id, element_id, type, name, task_type, message_name, retries, source_ref, target_ref, condition_expression, is_default, metadata)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
         [
           input.definitionVersionId,
           el.elementId,
@@ -151,6 +151,8 @@ export async function createVersion(
           el.retries ?? null,
           el.sourceRef ?? null,
           el.targetRef ?? null,
+          el.conditionExpression ?? null,
+          el.isDefault ? 1 : 0,
         ],
       ),
     );
@@ -190,9 +192,11 @@ export async function getVersionElements(
     message_name: string | null;
     source_ref: string | null;
     target_ref: string | null;
+    condition_expression: string | null;
+    is_default: number;
   }>(
     db,
-    `SELECT element_id, type, name, task_type, message_name, source_ref, target_ref
+    `SELECT element_id, type, name, task_type, message_name, source_ref, target_ref, condition_expression, is_default
        FROM bpmn_elements WHERE definition_version_id = ?`,
     [versionId],
   );
@@ -204,6 +208,8 @@ export async function getVersionElements(
     messageName: r.message_name,
     sourceRef: r.source_ref,
     targetRef: r.target_ref,
+    conditionExpression: r.condition_expression,
+    isDefault: r.is_default === 1,
   }));
 }
 

@@ -136,6 +136,9 @@ export interface BpmnElement {
   /** sequenceFlow / association only — persisted wiring endpoints (topology). */
   sourceRef?: string | null;
   targetRef?: string | null;
+  /** sequenceFlow only (M2) — FEEL condition on an XOR outgoing flow / `default` marker. */
+  conditionExpression?: string | null;
+  isDefault?: boolean;
 }
 
 export interface DefinitionVersion {
@@ -195,8 +198,8 @@ export interface Incident {
   status: "open";
   retryCount: number;
   payloadContext?: Record<string, unknown>;
-  /** SAGA (M1) — incident taxonomy + remediation linkage. */
-  kind?: "serviceTaskFailure" | "compensationFailure" | "timeout" | "poison";
+  /** SAGA (M1) incident taxonomy + remediation linkage; M2 adds loopLimit | noPath. */
+  kind?: "serviceTaskFailure" | "compensationFailure" | "timeout" | "poison" | "loopLimit" | "noPath";
   resolution?: "open" | "compensating" | "compensated" | "operatorResolved";
   createdAt: string;
 }

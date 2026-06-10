@@ -289,6 +289,11 @@ export interface JobRow {
   lock_expires_at: string | null;
   activation_expires_at: string | null;
   error_code: string | null;
+  // CONDITIONAL (0004) — loop-iteration discriminator + fast-forward marker.
+  /** Walk-local visit counter (design M2 §5). 0 for every pre-loop row/call site. */
+  occurrence: number;
+  /** 1 once the engine merged this job's output + advanced — rewalk skips it write-free. */
+  output_applied: number;
 }
 
 export async function getJobByElement(
@@ -313,6 +318,25 @@ export async function getForwardJobByElement(
     db,
     `SELECT * FROM service_task_jobs WHERE instance_id = ? AND element_id = ? AND is_compensation = 0`,
     [instanceId, elementId],
+  );
+}
+
+/**
+ * The FORWARD job for one specific iteration of an element (design M2 §5): the
+ * occurrence-aware lookup the loop-capable rewalk uses. No row → the iteration
+ * has not run; a row with un-applied output → the resume frontier.
+ */
+export async function getForwardJob(
+  db: D1Database,
+  instanceId: string,
+  elementId: string,
+  occurrence: number,
+): Promise<JobRow | null> {
+  return dbFirst<JobRow>(
+    db,
+    `SELECT * FROM service_task_jobs
+       WHERE instance_id = ? AND element_id = ? AND is_compensation = 0 AND occurrence = ?`,
+    [instanceId, elementId, occurrence],
   );
 }
 
@@ -345,14 +369,16 @@ export function createJobStmt(
     isCompensation?: boolean;
     compensatesElementId?: string | null;
     activationExpiresAt?: string | null;
+    // CONDITIONAL (0004) — optional; pre-loop callers default to occurrence 0.
+    occurrence?: number;
   },
 ): D1PreparedStatement {
   return stmt(
     db,
     `INSERT INTO service_task_jobs
        (job_id, instance_id, element_id, task_type, status, retry_limit, attempt_count, idempotency_key, input_variables, output_variables, created_at, updated_at, completed_at,
-        workspace_id, is_compensation, compensates_element_id, activation_expires_at)
-     VALUES (?, ?, ?, ?, 'created', ?, 0, ?, ?, NULL, ?, ?, NULL, ?, ?, ?, ?)`,
+        workspace_id, is_compensation, compensates_element_id, activation_expires_at, occurrence, output_applied)
+     VALUES (?, ?, ?, ?, 'created', ?, 0, ?, ?, NULL, ?, ?, NULL, ?, ?, ?, ?, ?, 0)`,
     [
       input.jobId,
       input.instanceId,
@@ -367,7 +393,26 @@ export function createJobStmt(
       input.isCompensation ? 1 : 0,
       input.compensatesElementId ?? null,
       input.activationExpiresAt ?? null,
+      input.occurrence ?? 0,
     ],
+  );
+}
+
+/**
+ * Mark a completed job's output as applied (design M2 §5): composed into the
+ * SAME dbBatch as the variable merge + transition, so the rewalk-from-start
+ * treats the step as write-free fast-forward and never re-merges an old
+ * iteration's output over newer variables.
+ */
+export function markJobOutputAppliedStmt(
+  db: D1Database,
+  jobId: string,
+  now: string,
+): D1PreparedStatement {
+  return stmt(
+    db,
+    `UPDATE service_task_jobs SET output_applied = 1, updated_at = ? WHERE job_id = ?`,
+    [now, jobId],
   );
 }
 
@@ -510,6 +555,8 @@ export interface SubscriptionRow {
   expires_at: string | null;
   consumed_at: string | null;
   external_message_id: string | null;
+  // CONDITIONAL (0004) — a Receive Task in a loop re-subscribes per visit.
+  occurrence: number;
 }
 
 export async function createSubscription(
@@ -527,14 +574,16 @@ export async function createSubscription(
     expiresAt: string;
     consumedAt?: string | null;
     externalMessageId?: string | null;
+    /** CONDITIONAL (0004) — keys the subscription to its loop iteration; defaults to 0. */
+    occurrence?: number;
     now: string;
   },
 ): Promise<void> {
   await dbRun(
     db,
     `INSERT INTO message_subscriptions
-       (subscription_id, workspace_id, instance_id, element_id, message_name, correlation_key, broker_key, workflow_event_type, status, created_at, expires_at, consumed_at, external_message_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (subscription_id, workspace_id, instance_id, element_id, message_name, correlation_key, broker_key, workflow_event_type, status, created_at, expires_at, consumed_at, external_message_id, occurrence)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       input.subscriptionId,
       input.workspaceId,
@@ -549,6 +598,7 @@ export async function createSubscription(
       input.expiresAt,
       input.consumedAt ?? null,
       input.externalMessageId ?? null,
+      input.occurrence ?? 0,
     ],
   );
 }
@@ -598,7 +648,14 @@ export async function markSubscriptionExpired(
 // Incidents
 // ---------------------------------------------------------------------------
 
-export type IncidentKind = "serviceTaskFailure" | "compensationFailure" | "timeout" | "poison";
+export type IncidentKind =
+  | "serviceTaskFailure"
+  | "compensationFailure"
+  | "timeout"
+  | "poison"
+  // CONDITIONAL (M2 §9) — loop-iteration cap exceeded | XOR with no true condition and no default.
+  | "loopLimit"
+  | "noPath";
 export type IncidentResolution = "open" | "compensating" | "compensated" | "operatorResolved";
 
 export function incidentStmt(

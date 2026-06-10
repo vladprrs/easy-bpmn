@@ -614,10 +614,10 @@ components:
             condition that selects the flow. Null on every other element.
         isDefault:
           type: boolean
-          nullable: true
           description: >
             True for the exclusiveGateway's `default` outgoing sequenceFlow (taken when no
-            condition matches; carries no conditionExpression).
+            condition matches; carries no conditionExpression). False on non-sequence-flow
+            elements.
     StartInstanceRequest:
       type: object
       required: [workspaceId, correlationKey, variables]

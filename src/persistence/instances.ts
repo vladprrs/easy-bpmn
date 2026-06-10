@@ -308,7 +308,14 @@ export async function getJobByElement(
   );
 }
 
-/** The FORWARD job for an element (is_compensation = 0). */
+/**
+ * The FORWARD job for an element (is_compensation = 0). Occurrence-unaware:
+ * once loops exist an element may have one row per iteration, so this orders
+ * by `occurrence DESC` to deterministically return the LATEST iteration
+ * instead of whichever row D1 happens to yield first.
+ *
+ * @deprecated prefer the occurrence-aware getForwardJob (TASK-32 migrates call sites)
+ */
 export async function getForwardJobByElement(
   db: D1Database,
   instanceId: string,
@@ -316,7 +323,9 @@ export async function getForwardJobByElement(
 ): Promise<JobRow | null> {
   return dbFirst<JobRow>(
     db,
-    `SELECT * FROM service_task_jobs WHERE instance_id = ? AND element_id = ? AND is_compensation = 0`,
+    `SELECT * FROM service_task_jobs
+       WHERE instance_id = ? AND element_id = ? AND is_compensation = 0
+       ORDER BY occurrence DESC`,
     [instanceId, elementId],
   );
 }
@@ -340,7 +349,13 @@ export async function getForwardJob(
   );
 }
 
-/** The COMPENSATION job for a forward element (is_compensation = 1). */
+/**
+ * The COMPENSATION job for a forward element (is_compensation = 1).
+ * Occurrence-unaware: orders by `occurrence DESC` so once loops exist it
+ * deterministically returns the latest iteration's compensation job.
+ *
+ * @deprecated prefer the occurrence-aware getForwardJob (TASK-32 migrates call sites)
+ */
 export async function getCompensationJobByElement(
   db: D1Database,
   instanceId: string,
@@ -348,7 +363,9 @@ export async function getCompensationJobByElement(
 ): Promise<JobRow | null> {
   return dbFirst<JobRow>(
     db,
-    `SELECT * FROM service_task_jobs WHERE instance_id = ? AND element_id = ? AND is_compensation = 1`,
+    `SELECT * FROM service_task_jobs
+       WHERE instance_id = ? AND element_id = ? AND is_compensation = 1
+       ORDER BY occurrence DESC`,
     [instanceId, elementId],
   );
 }
@@ -402,7 +419,9 @@ export function createJobStmt(
  * Mark a completed job's output as applied (design M2 §5): composed into the
  * SAME dbBatch as the variable merge + transition, so the rewalk-from-start
  * treats the step as write-free fast-forward and never re-merges an old
- * iteration's output over newer variables.
+ * iteration's output over newer variables. Guarded by `status = 'completed'` —
+ * output can only be "applied" for a completed job; flipping the marker on a
+ * created/running/failed job affects 0 rows.
  */
 export function markJobOutputAppliedStmt(
   db: D1Database,
@@ -411,7 +430,8 @@ export function markJobOutputAppliedStmt(
 ): D1PreparedStatement {
   return stmt(
     db,
-    `UPDATE service_task_jobs SET output_applied = 1, updated_at = ? WHERE job_id = ?`,
+    `UPDATE service_task_jobs SET output_applied = 1, updated_at = ?
+       WHERE job_id = ? AND status = 'completed'`,
     [now, jobId],
   );
 }

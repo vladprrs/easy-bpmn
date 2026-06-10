@@ -11,9 +11,12 @@ import { describe, expect, it } from "vitest";
 import {
   createJobStmt,
   createSubscription,
+  getCompensationJobByElement,
   getForwardJob,
+  getForwardJobByElement,
   getIncidentForInstance,
   incidentStmt,
+  jobCompleteStmt,
   markJobOutputAppliedStmt,
 } from "../../src/persistence/instances";
 import { insertSagaStepStmt } from "../../src/persistence/saga";
@@ -143,13 +146,30 @@ describe("occurrence-discriminated job rows (design §5)", () => {
     expect(o0?.output_applied).toBe(0);
     expect(o1?.job_id).toBe("job_o1");
     expect(o2).toBeNull();
+
+    // legacy occurrence-unaware lookups (deprecated) deterministically return
+    // the LATEST iteration, never an arbitrary row
+    const legacyFwd = await getForwardJobByElement(env.DB, inst, "reserveStock");
+    expect(legacyFwd?.job_id).toBe("job_o1");
+    const legacyComp = await getCompensationJobByElement(env.DB, inst, "reserveStock");
+    expect(legacyComp?.job_id).toBe("job_c1");
   });
 
-  it("markJobOutputAppliedStmt flips the write-free fast-forward marker", async () => {
+  it("markJobOutputAppliedStmt flips the marker for a COMPLETED job only", async () => {
     const inst = "pi_applied";
     await insertJob("job_app", inst, "reserveStock", 0);
-    await markJobOutputAppliedStmt(env.DB, "job_app", NOW).run();
-    const row = await getForwardJob(env.DB, inst, "reserveStock", 0);
+
+    // status 'created' → guarded UPDATE affects 0 rows, marker stays down
+    const miss = await markJobOutputAppliedStmt(env.DB, "job_app", NOW).run();
+    expect(miss.meta.changes).toBe(0);
+    let row = await getForwardJob(env.DB, inst, "reserveStock", 0);
+    expect(row?.output_applied).toBe(0);
+
+    // once completed, the flip applies
+    await jobCompleteStmt(env.DB, "job_app", { reserved: true }, NOW).run();
+    const hit = await markJobOutputAppliedStmt(env.DB, "job_app", NOW).run();
+    expect(hit.meta.changes).toBe(1);
+    row = await getForwardJob(env.DB, inst, "reserveStock", 0);
     expect(row?.output_applied).toBe(1);
   });
 });
@@ -183,7 +203,7 @@ describe("gateway_decisions builders (design §6)", () => {
     { flowId: "toLow", expression: "amount <= 100", result: true },
   ];
 
-  it("inserts and selects a decision; duplicate insert for the same occurrence is ignored", async () => {
+  it("inserts and selects a decision; a duplicate insert for the same occurrence REJECTS", async () => {
     const inst = "pi_gw";
     await insertGatewayDecisionStmt(env.DB, {
       decisionId: "gd_1",
@@ -197,19 +217,25 @@ describe("gateway_decisions builders (design §6)", () => {
       now: NOW,
     }).run();
 
-    // replay writes again → INSERT OR IGNORE keeps the recorded branch
-    await insertGatewayDecisionStmt(env.DB, {
-      decisionId: "gd_1_dup",
-      instanceId: inst,
-      elementId: "xorGw",
-      occurrence: 0,
-      chosenFlowId: "toHigh",
-      isDefault: false,
-      evaluations: [],
-      variablesSnapshot: null,
-      now: NOW,
-    }).run();
+    // a losing concurrent walk's plain INSERT hits the unique constraint and
+    // REJECTS — in the engine this aborts its whole batch (transition +
+    // history); the caller re-reads the decision and follows the recorded
+    // branch, never re-evaluates
+    await expect(
+      insertGatewayDecisionStmt(env.DB, {
+        decisionId: "gd_1_dup",
+        instanceId: inst,
+        elementId: "xorGw",
+        occurrence: 0,
+        chosenFlowId: "toHigh",
+        isDefault: false,
+        evaluations: [],
+        variablesSnapshot: null,
+        now: NOW,
+      }).run(),
+    ).rejects.toThrow(/UNIQUE/i);
 
+    // the original recorded branch is unchanged
     const d = await getGatewayDecision(env.DB, inst, "xorGw", 0);
     expect(d?.decisionId).toBe("gd_1");
     expect(d?.chosenFlowId).toBe("toLow");

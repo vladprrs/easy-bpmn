@@ -1,5 +1,5 @@
 // gateway_decisions — the persisted XOR branch record (M2 design §6). A row is
-// written INSERT OR IGNORE atomically with the transition out of the gateway
+// written with a plain INSERT atomically with the transition out of the gateway
 // (persist-before-advance), so crash/replay REUSES the recorded branch and never
 // re-evaluates conditions. Keyed per loop iteration by (instance_id, element_id,
 // occurrence). Statement builders only; branch selection lives in the engine.
@@ -55,10 +55,19 @@ export function mapGatewayDecision(row: GatewayDecisionRow): GatewayDecisionView
 }
 
 /**
- * INSERT OR IGNORE the branch decision — composed into the SAME dbBatch as the
- * transition to the chosen target (persist-before-advance). A duplicate
- * (instance_id, element_id, occurrence) is ignored: the first recorded decision
- * is authoritative and replay must take it, not re-evaluate.
+ * Plain INSERT (NOT `OR IGNORE`) of the branch decision — composed into the
+ * SAME dbBatch as the transition to the chosen target + its history event
+ * (persist-before-advance).
+ *
+ * Engine contract (check-first): the gateway step READS the decision row first;
+ * if one exists it follows the recorded branch with no writes. This INSERT only
+ * runs when no row was found. With a plain INSERT, a losing concurrent walk's
+ * unique-constraint violation on (instance_id, element_id, occurrence) aborts
+ * its ENTIRE batch atomically — transition and history included — and the
+ * caller must re-read the decision and follow the recorded branch; never
+ * re-evaluate. With `OR IGNORE`, the losing batch's transition would still
+ * commit while its decision row is discarded, permanently recording branch A
+ * while the instance advanced down branch B.
  */
 export function insertGatewayDecisionStmt(
   db: D1Database,
@@ -79,7 +88,7 @@ export function insertGatewayDecisionStmt(
 ): D1PreparedStatement {
   return stmt(
     db,
-    `INSERT OR IGNORE INTO gateway_decisions
+    `INSERT INTO gateway_decisions
        (decision_id, instance_id, element_id, occurrence, chosen_flow_id, is_default, evaluations, variables_snapshot, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [

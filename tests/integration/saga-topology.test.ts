@@ -1,6 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { createDraft, publishDraft, SAGA_BPMN, XOR_BPMN } from "../helpers";
+import { createDraft, publishDraft, SAGA_BPMN, XOR_BPMN, XOR_IN_TX_BPMN } from "../helpers";
 import {
   createVersion,
   getVersionElements,
@@ -173,5 +173,50 @@ describe("Conditional topology persistence (TASK-31)", () => {
     expect(stored!.nodes["GW_join"]!.outgoing).toEqual([
       { flowId: "f_end", targetId: "E", conditionExpression: null, isDefault: false },
     ]);
+  });
+
+  it("transaction-scoped XOR: getVersionGraph round-trips deep-equal + condition columns persist", async () => {
+    // Regression class: conditions dropped ONLY inside <transaction> scopes.
+    // The gateway-inside-transaction fixture must survive the same persistence
+    // round-trip as the flat XOR model above.
+    const r = await parseAndValidate(XOR_IN_TX_BPMN);
+    expect(r.ok).toBe(false); // gate stays shut until TASK-33
+    expect(r.graph).toBeDefined();
+    const versionId = `pdv_xortx_${crypto.randomUUID()}`;
+    await createVersion(env.DB, {
+      definitionVersionId: versionId,
+      draftId: `draft_xortx_${crypto.randomUUID()}`,
+      workspaceId: "default",
+      versionNumber: 1,
+      bpmnXml: XOR_IN_TX_BPMN,
+      bpmnXmlHash: "test-hash-xortx",
+      graph: r.graph!,
+      now: new Date().toISOString(),
+    });
+
+    // parsed_profile round-trip: tx-scoped conditional IR deep-equals a fresh parse
+    const stored = await getVersionGraph(env.DB, versionId);
+    const fresh = (await parseAndValidate(XOR_IN_TX_BPMN)).graph;
+    expect(stored).toEqual(fresh);
+    expect(stored!.nodes["GW"]!.scopeId).toBe("Tx");
+    expect(stored!.nodes["GW"]!.outgoing).toEqual([
+      { flowId: "t_a", targetId: "A", conditionExpression: "ok", isDefault: false },
+      { flowId: "t_b", targetId: "B", conditionExpression: null, isDefault: true },
+    ]);
+    expect(stored!.transactions!["Tx"]!.childIds).toContain("GW");
+
+    // ...and the bpmn_elements condition columns persist for tx-scoped flows
+    const rows = await env.DB.prepare(
+      `SELECT element_id, condition_expression, is_default FROM bpmn_elements
+         WHERE definition_version_id = ? AND type = 'sequenceFlow' ORDER BY element_id`,
+    )
+      .bind(versionId)
+      .all<{ element_id: string; condition_expression: string | null; is_default: number }>();
+    const byId = Object.fromEntries((rows.results ?? []).map((row) => [row.element_id, row]));
+    expect(byId["t_a"]).toMatchObject({ condition_expression: "ok", is_default: 0 });
+    expect(byId["t_b"]).toMatchObject({ condition_expression: null, is_default: 1 });
+    // process-level + remaining tx-internal flows stay unconditional
+    expect(byId["g1"]).toMatchObject({ condition_expression: null, is_default: 0 });
+    expect(byId["t2"]).toMatchObject({ condition_expression: null, is_default: 0 });
   });
 });

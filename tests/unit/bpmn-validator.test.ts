@@ -405,6 +405,54 @@ describe("Conditional graph IR: exclusiveGateway + live conditional edges (TASK-
     ]);
   });
 
+  it("probe: a gateway's default attr does NOT mark a same-id flow leaving a DIFFERENT node", async () => {
+    // GA declares default="fb1", but fb1's SOURCE is GB — default ownership is
+    // per gateway (Flow doc: "isDefault is true exactly for the flow referenced
+    // by its gateway's default attribute"), so fb1 must stay isDefault:false
+    // everywhere. The model is rejected by the publish gate, but the builder
+    // runs best-effort on invalid models, so the IR stays observable.
+    const CROSS_GATEWAY_DEFAULT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_xdef" targetNamespace="x">
+  <bpmn:process id="P_xdef" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="S" targetRef="GA" />
+    <bpmn:exclusiveGateway id="GA" default="fb1">
+      <bpmn:incoming>f0</bpmn:incoming>
+      <bpmn:outgoing>fa1</bpmn:outgoing>
+      <bpmn:outgoing>fa2</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="fa1" sourceRef="GA" targetRef="GB">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">x &gt; 1</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="fa2" sourceRef="GA" targetRef="GB" />
+    <bpmn:exclusiveGateway id="GB">
+      <bpmn:incoming>fa1</bpmn:incoming>
+      <bpmn:incoming>fa2</bpmn:incoming>
+      <bpmn:outgoing>fb1</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="fb1" sourceRef="GB" targetRef="E" />
+    <bpmn:endEvent id="E"><bpmn:incoming>fb1</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const r = await parseAndValidate(CROSS_GATEWAY_DEFAULT_BPMN);
+    expect(r.ok).toBe(false);
+    const g = r.graph!;
+    expect(g).toBeDefined();
+    // fb1 leaves GB, which declares NO default — GA's attr must not leak onto it
+    expect(g.nodes["GB"]!.outgoing).toEqual([
+      { flowId: "fb1", targetId: "E", conditionExpression: null, isDefault: false },
+    ]);
+    // GA's own outgoing is unaffected (its declared default is not among them)
+    expect(g.nodes["GA"]!.outgoing).toEqual([
+      { flowId: "fa1", targetId: "GB", conditionExpression: "x > 1", isDefault: false },
+      { flowId: "fa2", targetId: "GB", conditionExpression: null, isDefault: false },
+    ]);
+    // ...and the persisted-topology elements agree: NO flow is default here
+    for (const el of g.elements) {
+      if (el.type === "sequenceFlow") expect(el.isDefault).toBe(false);
+    }
+  });
+
   it("regression: linear MVP + M1 saga graphs keep conditionExpression null / isDefault false everywhere", async () => {
     for (const xml of [DEMO_BPMN, SAGA_BPMN]) {
       const r = await parseAndValidate(xml);

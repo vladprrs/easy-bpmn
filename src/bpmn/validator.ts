@@ -244,14 +244,22 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       const $type = el.$type;
 
       if ($type === SEQUENCE_FLOW_TYPE) {
-        // M2 graph IR: capture the raw FEEL condition body (tFormalExpression
-        // text) so the builder can emit live conditional edges. The publish
-        // gate below still REJECTS conditional flows until TASK-33 widens the
+        // M2 graph IR: capture the FEEL condition body (tFormalExpression
+        // text, TRIMMED — pretty-printed XML carries leading newlines/indent)
+        // so the builder can emit live conditional edges. The publish gate
+        // below still REJECTS conditional flows until TASK-33 widens the
         // accept matrix.
+        //
+        // NOTE (for TASK-33): an empty/whitespace-only <conditionExpression>
+        // is normalized to null here — downstream it is indistinguishable
+        // from "no condition at all". TASK-33's accept matrix rejects
+        // non-default condition-less gateway flows, so both shapes fall into
+        // the same (rejected) bucket; if that ever changes, the distinction
+        // must be re-captured at this site.
         const cond = el.conditionExpression as ModdleElement | undefined | null;
         const condBody =
           cond != null && typeof cond.body === "string" && cond.body.trim() !== ""
-            ? (cond.body as string)
+            ? cond.body.trim()
             : undefined;
         if (cond != null) {
           err(
@@ -712,14 +720,20 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
   const buildGraph = (processStart: NodeInfo): ExecutionGraph => {
     const processEnds = nodes.filter((n) => n.type === "endEvent" && n.scopeId === processId);
 
-    // Flows marked default by their gateway's `default` attribute (M2). A
+    // Flows marked default by their gateway's `default` attribute (M2).
+    // Ownership is PER GATEWAY: a flow is default only when its SOURCE is the
+    // gateway that declares it (Flow doc: "isDefault is true exactly for the
+    // flow referenced by its gateway's default attribute") — a gateway's
+    // `default` must never mark a same-id flow leaving a different node. A
     // `default` on a non-gateway activity does NOT mark its flow — conditions
     // and defaults live only on exclusiveGateway outgoing flows (design §2
     // decision 3); the activity case is rejected above.
-    const defaultFlowIds = new Set<string>();
+    const defaultFlowByGateway = new Map<string, string>();
     for (const n of nodes) {
-      if (n.type === "exclusiveGateway" && n.defaultFlowId) defaultFlowIds.add(n.defaultFlowId);
+      if (n.type === "exclusiveGateway" && n.defaultFlowId) defaultFlowByGateway.set(n.id, n.defaultFlowId);
     }
+    const isDefaultFlow = (f: FlowInfo): boolean =>
+      f.source != null && defaultFlowByGateway.get(f.source) === f.id;
 
     // Multi-edge IR (design §4.1): each node's full outgoing Flow[] in DOCUMENT
     // order — `flows` was collected by iterating `flowElements` in XML order,
@@ -735,7 +749,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         flowId: f.id,
         targetId: f.target,
         conditionExpression: f.conditionExpression ?? null,
-        isDefault: defaultFlowIds.has(f.id),
+        isDefault: isDefaultFlow(f),
       });
       outgoingFlows.set(f.source, arr);
     }
@@ -813,7 +827,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         sourceRef: f.source ?? null,
         targetRef: f.target ?? null,
         conditionExpression: f.conditionExpression ?? null,
-        isDefault: defaultFlowIds.has(f.id),
+        isDefault: isDefaultFlow(f),
       });
     }
     for (const m of messageElements) elements.push({ elementId: m.id, type: "message", name: m.name, messageName: m.name });

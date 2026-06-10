@@ -3,9 +3,11 @@ id: TASK-30
 title: >-
   FEEL condition engine: feelin-backed publish-time parse + strict-boolean
   runtime evaluation
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - Claude
 created_date: '2026-06-09 20:28'
+updated_date: '2026-06-10 17:13'
 labels:
   - saga
   - runtime
@@ -39,3 +41,28 @@ M2 resolves the saga-design §9 expression-language open question to FEEL via th
 - [ ] #5 Bundle check (R-M2-2): npx wrangler deploy --dry-run passes with feelin + luxon bundled; the resulting Worker bundle size is recorded in the task notes.
 - [ ] #6 Constitution gate: unit tests (plain vitest, no Workflow runtime needed); npm run test green.
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+Execution: subagent-driven (implementer + spec review + quality review) on branch m2-conditional-sagas.
+
+1. `npm install feelin` (pulls luxon transitively); pin v7.x.
+2. New src/runtime/expressions.ts wrapping feelin:
+   - parseCondition(expr): publish-time syntax-only check -> { ok: true } | { ok: false, reason } (reason string feeds the validator's element-id+reason ValidationIssue contract; no element id here — caller attaches).
+   - evaluateCondition(expr, variables): strict boolean-true contract — taken only on boolean true; numbers/strings/null/undefined are NOT taken. FEEL null-tolerance preserved (missing variable -> comparisons null -> not taken, NOT an error). Hard interpreter throw -> typed ExpressionEvaluationError (distinguishable so gateway dispatch can raise a deterministic incident).
+   - Context = instance variables JSON object (same shape service-task input uses).
+3. Unit tests (plain vitest, no Workflow runtime): boolean-true strictness; null-semantics matrix (missing var in comparison/equality/range/string ops -> not taken, no throw); parse rejects invalid FEEL with usable reason; hard-error path distinguishable.
+4. Bundle check R-M2-2: npx wrangler deploy --dry-run with feelin imported from a shipped module; record bundle size in task notes.
+5. npm run test green; typecheck green. Validator integration is TASK-33's job (this task only exposes the API).
+<!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Implemented src/runtime/expressions.ts wrapping feelin 7.0.1 (pinned ^7.0.1; pulls luxon + lezer-feel transitively). API: parseCondition(expression) -> { ok: true } | { ok: false, reason } — publish-time syntax-only check via parseExpression lezer tree scan for error nodes (node.type.isError), never executes; reason names the offending expression (truncated at 120 chars) + error position, ready for the validator's element-id+reason ValidationIssueData contract (TASK-33 attaches the id); empty/whitespace-only expressions rejected explicitly. evaluateCondition(expression, variables) -> { taken, value, warnings } — taken strictly value === true (no truthy coercion: 1/"x"/null/lists NOT taken); FEEL null-tolerance preserved (feelin v7 evaluate returns {value, warnings}; missing variable -> value null + NO_VARIABLE_FOUND warning, NOT a throw -> not taken); raw value + warning messages exposed for gatewayDecisionEvaluated diagnostics (design §6). Hard interpreter failure (e.g. feelin SyntaxError) -> dedicated ExpressionEvaluationError (carries .expression, preserves cause) so TASK-34 gateway dispatch raises a deterministic incident.
+
+Bundle check (R-M2-2, AC#5): feelin + all its deps declare sideEffects:false, so an unused import IS tree-shaken (verified: bare `import` and `void parseCondition` both left the bundle byte-identical at 401,770 B). Canary = real usage: GET / status body now includes `feel: parseCondition("true").ok` in src/index.ts (replaced by real validator/engine imports in TASK-33/34). With feelin+luxon bundled: npx wrangler deploy --dry-run passes; Total Upload 854.87 KiB / gzip 175.80 KiB (index.js 875,387 B raw) vs baseline 392.35 KiB / gzip 69.06 KiB (401,770 B) -> feelin+luxon cost ~462 KiB raw / ~107 KiB gzip; comfortably under the 1 MiB-gzip Worker limit.
+
+Tests: tests/unit/expressions.test.ts — 23 unit tests (plain vitest, no SELF.fetch/D1): parse accept/reject matrix incl. position-in-reason + empty + unknown-names-parse-ok; strict boolean-true matrix; comparison/equality/range/between/string-ops (starts with, contains, matches) + nested-context coverage; null-tolerance matrix (missing var in comparison/equality/range/string/compound/nested -> not taken, no throw, warnings surfaced); hard-error distinguishability (typed throw, expression+cause preserved, not-taken never throws). All FEEL semantics verified against feelin's actual behavior first (probed via node). Full suite 159/159 green (136 baseline + 23 new); typecheck green.
+<!-- SECTION:NOTES:END -->

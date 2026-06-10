@@ -3,11 +3,11 @@ id: TASK-29
 title: >-
   Conditional-saga persistence: D1 migration 0004 (occurrence discriminator,
   gateway_decisions, conditional topology columns) + contracts
-status: In Progress
+status: Done
 assignee:
   - Claude
 created_date: '2026-06-09 20:28'
-updated_date: '2026-06-10 16:42'
+updated_date: '2026-06-10 17:04'
 labels:
   - saga
   - persistence
@@ -72,4 +72,14 @@ Builders: src/persistence/gateway-decisions.ts (new — insertGatewayDecisionStm
 Contracts: api.ts Incident.kind + openapi.yaml incidents enum += loopLimit, noPath; openapi BpmnElement += conditionExpression/isDefault. Worker-facing /jobs/* schemas UNCHANGED — pinned by tests/contract/jobs-schema-pin.test.ts (exact shape-key sets + no occurrence leak + M1 payload round-trip).
 
 Tests: tests/integration/migration-0004-conditional.test.ts (12 tests: schema/index shapes via PRAGMA, per-occurrence job uniqueness + compensation-inherits-occurrence, saga_steps INSERT OR IGNORE dedup per occurrence with second-occurrence new row, gateway_decisions insert/select/dup-ignore, occurrence-keyed + legacy-default subscriptions, loopLimit/noPath incident round-trip) + 4 contract-pin tests. Full suite 136/136 green (120 baseline + 16 new); typecheck, check:docs, wrangler deploy --dry-run all pass. Engine/Workflow untouched (TASK-32/34 consume the builders). NOTE: one pre-existing timing flake observed once in saga-operator.test.ts (Hazard /cancel — instance still 'waiting' when polled); passed in isolation and on two full re-runs; unrelated to this change.
+
+Two-stage review done. Spec review: compliant. Quality review found 2 Important issues, fixed in 6afe09e: (1) gateway_decisions insert switched from INSERT OR IGNORE to plain INSERT — a losing concurrent walk's unique violation now aborts its whole dbBatch (decision+transition+history) atomically; engine contract documented in the builder: unique violation -> re-read and follow the recorded branch, never re-evaluate. (2) DEPLOY PRECONDITION: the new code writes the new columns by name on hot paths -> `npx wrangler d1 migrations apply easy_bpmn --remote` MUST run before the push that auto-deploys. Minor fixes: markJobOutputAppliedStmt guarded with status='completed'; legacy element lookups got ORDER BY occurrence DESC + @deprecated; openapi isDefault nullability fixed.
+
+Carried into TASK-32: widen job idempotencyKey to include occurrence (engine.ts:316 currently `${instanceId}:${elementId}`); migrate engine call sites off getForwardJobByElement; add occurrence-aware compensation job lookup (and fix the @deprecated pointer on getCompensationJobByElement which wrongly names getForwardJob).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Landed migrations/0004_conditional.sql (additive, verified safe on populated DB): occurrence + output_applied on service_task_jobs with unique index (instance_id, element_id, is_compensation, occurrence); occurrence on saga_steps (uq_saga_steps_forward -> instance/element/occurrence) and message_subscriptions; condition_expression/is_default on bpmn_elements; new gateway_decisions table per design §6 with plain-INSERT replay contract. New src/persistence/gateway-decisions.ts builders; occurrence-aware getForwardJob/createJobStmt/createSubscription (default 0, M1 call sites unchanged); markJobOutputAppliedStmt (status-guarded); IncidentKind += loopLimit|noPath (TS + openapi). Worker-facing /jobs/* schemas pinned by tests/contract/jobs-schema-pin.test.ts. Tests: 136/136 green (16 new across migration-0004-conditional.test.ts + jobs-schema-pin.test.ts); typecheck, check:docs, wrangler deploy --dry-run, d1 migrations apply --local all pass. Commits d826561 + 6afe09e. Risk: deploy ordering — apply 0004 remotely before pushing to the auto-deploying branch.
+<!-- SECTION:FINAL_SUMMARY:END -->

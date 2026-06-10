@@ -33,7 +33,11 @@ export type ParseConditionResult = { ok: true } | { ok: false; reason: string };
 export interface ConditionEvaluation {
   /** True only when the expression evaluated to boolean `true`. */
   taken: boolean;
-  /** The raw FEEL result (null when e.g. a referenced variable is missing). */
+  /**
+   * The raw FEEL result (null when e.g. a referenced variable is missing).
+   * May be a non-JSON-primitive FEEL object (Range/DateTime/function) —
+   * normalize before persisting (gateway_decisions.evaluations, diagnostics).
+   */
   value: unknown;
   /** Human-readable interpreter warnings; empty on a clean evaluation. */
   warnings: string[];

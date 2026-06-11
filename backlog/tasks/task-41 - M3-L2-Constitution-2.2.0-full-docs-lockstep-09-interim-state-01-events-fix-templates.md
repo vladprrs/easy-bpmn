@@ -7,7 +7,7 @@ status: Done
 assignee:
   - Claude
 created_date: '2026-06-11 17:18'
-updated_date: '2026-06-11 19:12'
+updated_date: '2026-06-11 19:21'
 labels:
   - saga
   - governance
@@ -24,8 +24,8 @@ modified_files:
   - .specify/templates/plan-template.md
   - .specify/templates/spec-template.md
   - CLAUDE.md
-  - docs/bpmn/09-easy-bpmn-profile.md
   - docs/bpmn/01-events.md
+  - docs/bpmn/09-easy-bpmn-profile.md
   - scripts/check-docs.mjs
   - specs/002-saga-orchestrator/m3-constitution-check.md
 priority: medium
@@ -67,4 +67,12 @@ Governance opener of M3 — docs/governance only, ZERO runtime change.
 UNTOUCHED (other tasks / later layers): src/bpmn/profile.ts DEFERRED_GATEWAY_REASONS, docs/bpmn/03-gateways.md EBG->M3 pointers, check:docs guard 5, all src/ runtime + validator (free error routing runtime is TASK-42).
 
 Gate: npm run check:docs green; npm run typecheck clean; npm run test 249/249 (unchanged).
+
+Done at commit 0d6584a (docs/governance only, zero runtime change, 249 tests unchanged). Constitution 2.1.0→2.2.0: new Sync Impact Report enumerating all 8 changed files + MINOR reasoning; Principle I gains the M3 accepted bullet (interrupting boundary timer on serviceTask/receiveTask never on transaction, timer/message intermediateCatchEvent, eventBasedGateway, free error routing; static ISO-8601 only); MVP-scope requalified (event-based dropped; timer-START/non-interrupting/timeCycle/signal/escalation/conditional/non-catch-message stay excluded); version footer 2.2.0. docs/bpmn/09 interim table (boundary timer→L3, intermediate catch+EBG→L4, free error routing→L2). 01-events scope rewritten + 2 stale-phrase guards (verified fire on old wording via normalizeWithLineMap). Templates + CLAUDE.md → v2.2.0. specs/002/m3-constitution-check.md records the Check vs 2.2.0 + closes the M2 procedural deviation. UNTOUCHED: profile.ts/DEFERRED_GATEWAY_REASONS, 03-gateways EBG→M3 pointer, check:docs guard 5, validator. Two-stage review: spec ✅ (thorough, also covered quality dims). FORWARD NOTE for TASK-44/46: the docs' interim reason 'M3 — not yet implemented' is a governance descriptor; the validator currently emits construct-specific deferral messages (boundary timer/intermediateCatch/EBG). As each layer opens its construct, reconcile or note — by end of L4 no M3 construct is rejected so the descriptor becomes moot.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+M3-L2 governance opener. Amended the constitution 2.1.0→2.2.0 (full procedure: Sync Impact Report enumerating all changed files, MINOR semver reasoning, Principle I accepted-set + MVP-scope requalification, version footer) to declare the full M3 construct set accepted — interrupting boundary timers on serviceTask/receiveTask, timer/message intermediate catch, eventBasedGateway, and free error-boundary routing (static ISO-8601 timers only) — while keeping timer START events, non-interrupting boundary timers, timeCycle, signal/escalation/conditional, and non-catch message events excluded. The validator still rejects each M3 construct until its runtime layer ships; this interim state is documented fully in docs/bpmn/09 (per-layer mapping: boundary timer L3, intermediate catch + EBG L4, free error routing L2) and in lockstep across CLAUDE.md, the two .specify templates, and a corrected docs/bpmn/01-events.md scope section (with two new check:docs stale-phrase guards). A recorded M3 Constitution Check (specs/002-saga-orchestrator/m3-constitution-check.md) checks the set against v2.2.0 and closes the M2 procedural deviation (M2 amended after opening constructs, recorded no check). Zero runtime change; profile.ts / 03-gateways EBG pointer / check:docs guard 5 / validator untouched (they flip at L4). 249/249 tests, typecheck, check:docs green. Spec review clean."
+<!-- SECTION:FINAL_SUMMARY:END -->

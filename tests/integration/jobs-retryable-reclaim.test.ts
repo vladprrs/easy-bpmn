@@ -161,6 +161,17 @@ describe("AC#3 — reclaim exhaustion: lease-expiry alone terminates via the exh
     expect(inst.body.incident.elementId).toBe("Task_check");
     expect((await jobRow(instanceId)).status).toBe("failed");
 
+    // Regression-lock the audit convention (TASK-40 review): the reclaim route now
+    // flows through the SAME deliverJobFailed tail as /jobs/fail exhaustion, and a
+    // lease-expiry exhaustion is a TECHNICAL-class failure whose budget is merely
+    // spent (no worker declared it non-retryable) → diagnostics.retryable === true.
+    // A FORWARD job → diagnostics.isCompensation === false. (AC#1 still locks the
+    // explicit `retryable:false` /jobs/fail route to retryable === false.)
+    const history = await get(`/instances/${instanceId}/history`);
+    const jf = history.body.events.find((e: any) => e.type === "jobFailed");
+    expect(jf.diagnostics.retryable).toBe(true);
+    expect(jf.diagnostics.isCompensation).toBe(false);
+
     // The exhaustion is terminal: no further lease is handed out.
     const reactivate = await authedPost("/jobs/activate", token, { taskType: "external-check", workerId: "w3" });
     expect(reactivate.body.jobs).toHaveLength(0);

@@ -721,6 +721,54 @@ async function leaseOnce(
 }
 
 /**
+ * Shared terminal-failure tail (TASK-40 review): every producer that settles a job
+ * to `failed` writes the SAME `jobFailed` audit row and delivers the SAME
+ * `{outcome:'failed'}` engine event, so the operator-visible history shape
+ * (`/instances/{id}/history`) and the wire shape stay identical across routes —
+ * worker `/jobs/fail` exhaustion + business error, the reclaim/lease-expiry route,
+ * and (M3-L3) timer-driven exhaustion. The engine refetches the job row and routes
+ * on its `error_code`, so the event's `retryable` is diagnostics-only; it is kept on
+ * the wire (and mirrored in the audit row) for observability. The audit `retryable`
+ * convention here is "the failure was of retryable (technical) class AND was not
+ * declared non-retryable": a naturally budget-exhausted technical failure is still
+ * `retryable: true`; only an explicit worker `retryable:false` or a business error
+ * (errorCode set) logs `false`.
+ */
+async function deliverJobFailed(
+  env: Env,
+  args: {
+    workspaceId: string;
+    instanceId: string;
+    elementId: string;
+    jobId: string;
+    errorCode: string | null;
+    retryable: boolean;
+    reason: string;
+    isCompensation: boolean;
+  },
+): Promise<void> {
+  await recordHistory(env.DB, {
+    workspaceId: args.workspaceId,
+    instanceId: args.instanceId,
+    elementId: args.elementId,
+    type: "jobFailed",
+    diagnostics: {
+      jobId: args.jobId,
+      errorCode: args.errorCode,
+      retryable: args.retryable,
+      reason: args.reason,
+      isCompensation: args.isCompensation,
+    },
+  });
+  await getExecutor(env).deliverJobResult({
+    workflowInstanceId: args.instanceId,
+    instanceId: args.instanceId,
+    elementId: args.elementId,
+    event: { outcome: "failed", jobId: args.jobId, retryable: args.retryable, errorCode: args.errorCode, reason: args.reason },
+  });
+}
+
+/**
  * Reclaim exhaustion (TASK-40): a lapsed in-flight lease whose retry budget is
  * spent terminates via the SAME exhaustion path as an explicit `/jobs/fail` with
  * the budget exhausted. The transition is guarded on the lapsed-lease predicate
@@ -742,19 +790,18 @@ async function exhaustExpiredLease(
 ): Promise<void> {
   const changed = await failExpiredLeaseConditional(env.DB, j.job_id, now);
   if (changed === 0) return; // a concurrent complete/re-lease won — do not deliver
-  const reason = "Reclaim retries exhausted (lease expiry).";
-  await recordHistory(env.DB, {
+  // A reclaim/lease-expiry exhaustion is a TECHNICAL-class failure whose budget is
+  // merely spent — no worker declared it non-retryable — so the audit convention
+  // logs it `retryable: true`, matching handleFailJob's naturally-exhausted case.
+  await deliverJobFailed(env, {
     workspaceId,
     instanceId: j.instance_id,
     elementId: j.element_id,
-    type: "jobFailed",
-    diagnostics: { jobId: j.job_id, errorCode: null, retryable: false, targetStatus: "failed", reason, isCompensation: j.is_compensation === 1 },
-  });
-  await getExecutor(env).deliverJobResult({
-    workflowInstanceId: j.instance_id,
-    instanceId: j.instance_id,
-    elementId: j.element_id,
-    event: { outcome: "failed", jobId: j.job_id, retryable: false, errorCode: null, reason },
+    jobId: j.job_id,
+    errorCode: null,
+    retryable: true,
+    reason: "Reclaim retries exhausted (lease expiry).",
+    isCompensation: j.is_compensation === 1,
   });
 }
 
@@ -863,23 +910,32 @@ async function handleFailJob(env: Env, jobId: string, request: Request): Promise
 
   const ack: JobCallbackAck = { jobId, outcome: "failed", disposition: "applied" };
   await putIdempotentResult(env.DB, "workerCallback", idemKey, ack, now);
-  await recordHistory(env.DB, {
-    workspaceId,
-    instanceId: job.instance_id,
-    elementId: job.element_id,
-    type: "jobFailed",
-    diagnostics: { jobId, errorCode: body.errorCode ?? null, retryable: !isBusiness && retryable, targetStatus, reason: body.reason, ...(parkUntil ? { backoffUntil: parkUntil } : {}) },
-  });
 
-  // Only deliver when the step has reached a terminal-for-the-step state the
-  // engine must act on. A technical retry stays parked (backoff) and is re-handed
-  // by the next activate once the delay elapses — no event is sent.
-  if (targetStatus === "failed") {
-    await getExecutor(env).deliverJobResult({
-      workflowInstanceId: job.instance_id,
+  if (willRetry) {
+    // Technical retry: the job stays parked behind backoff and is re-handed by the
+    // next activate once the delay elapses — NO event is sent. Audit the park (with
+    // the backoff window) rather than the shared terminal-failure tail.
+    await recordHistory(env.DB, {
+      workspaceId,
       instanceId: job.instance_id,
       elementId: job.element_id,
-      event: { outcome: "failed", jobId, retryable: !isBusiness && retryable, errorCode: body.errorCode ?? null, reason: body.reason },
+      type: "jobFailed",
+      diagnostics: { jobId, errorCode: body.errorCode ?? null, retryable: !isBusiness && retryable, targetStatus, reason: body.reason, ...(parkUntil ? { backoffUntil: parkUntil } : {}) },
+    });
+  } else {
+    // Terminal for the step — a business error (errorCode set) OR a technical
+    // exhaustion. Both flow through the shared tail: write the `jobFailed` audit
+    // row + deliver `{outcome:'failed'}` so the engine runs its exhaustion path
+    // (forward → serviceTaskFailure Hazard, compensation → compensationFailure).
+    await deliverJobFailed(env, {
+      workspaceId,
+      instanceId: job.instance_id,
+      elementId: job.element_id,
+      jobId,
+      errorCode: body.errorCode ?? null,
+      retryable: !isBusiness && retryable,
+      reason: body.reason,
+      isCompensation: job.is_compensation === 1,
     });
   }
   return json(ack, 200);

@@ -350,11 +350,30 @@ export async function getForwardJob(
 }
 
 /**
+ * The COMPENSATION job for one specific iteration of a forward element
+ * (design M2 §8): a compensation job inherits its forward step's occurrence,
+ * so the reverse pass keys its lookups by (element, occurrence).
+ */
+export async function getCompensationJob(
+  db: D1Database,
+  instanceId: string,
+  elementId: string,
+  occurrence: number,
+): Promise<JobRow | null> {
+  return dbFirst<JobRow>(
+    db,
+    `SELECT * FROM service_task_jobs
+       WHERE instance_id = ? AND element_id = ? AND is_compensation = 1 AND occurrence = ?`,
+    [instanceId, elementId, occurrence],
+  );
+}
+
+/**
  * The COMPENSATION job for a forward element (is_compensation = 1).
  * Occurrence-unaware: orders by `occurrence DESC` so once loops exist it
  * deterministically returns the latest iteration's compensation job.
  *
- * @deprecated prefer the occurrence-aware getForwardJob (TASK-32 migrates call sites)
+ * @deprecated prefer the occurrence-aware getCompensationJob (TASK-32 migrated the engine)
  */
 export async function getCompensationJobByElement(
   db: D1Database,
@@ -432,6 +451,28 @@ export function markJobOutputAppliedStmt(
     db,
     `UPDATE service_task_jobs SET output_applied = 1, updated_at = ?
        WHERE job_id = ? AND status = 'completed'`,
+    [now, jobId],
+  );
+}
+
+/**
+ * Mark a FAILED job's outcome as applied (TASK-32): the business-error branch
+ * (errorCode → boundary route) composes this into the SAME dbBatch as the
+ * `businessErrorCaught` history + the transition to the boundary target, so a
+ * rewalk fast-forwards the visit (re-deriving the deterministic boundary target
+ * from the graph + the persisted error_code) instead of re-routing — which
+ * would duplicate history and rewrite the cursor backwards. Guarded by
+ * `status = 'failed'` (the failure-routing twin of markJobOutputAppliedStmt).
+ */
+export function markFailedJobHandledStmt(
+  db: D1Database,
+  jobId: string,
+  now: string,
+): D1PreparedStatement {
+  return stmt(
+    db,
+    `UPDATE service_task_jobs SET output_applied = 1, updated_at = ?
+       WHERE job_id = ? AND status = 'failed'`,
     [now, jobId],
   );
 }
@@ -623,17 +664,26 @@ export async function createSubscription(
   );
 }
 
-export async function getActiveSubscription(
+/**
+ * The subscription row for one VISIT of a Receive Task (design M2 §5): the
+ * latest row at (instance, element, occurrence). The caller branches on its
+ * status — `consumed` means this iteration's message was already applied
+ * atomically with the transition (the write-free fast-forward predicate),
+ * `active` means this visit is the live wait frontier; anything else (or no
+ * row) means the visit still needs to register.
+ */
+export async function getSubscriptionForVisit(
   db: D1Database,
   instanceId: string,
   elementId: string,
+  occurrence: number,
 ): Promise<SubscriptionRow | null> {
   return dbFirst<SubscriptionRow>(
     db,
     `SELECT * FROM message_subscriptions
-       WHERE instance_id = ? AND element_id = ? AND status = 'active'
+       WHERE instance_id = ? AND element_id = ? AND occurrence = ?
        ORDER BY rowid DESC LIMIT 1`,
-    [instanceId, elementId],
+    [instanceId, elementId, occurrence],
   );
 }
 

@@ -659,7 +659,7 @@ async function leaseOnce(
     if (r.is_compensation === 1) {
       // A compensation job is seeded with the compensated forward step's captured
       // input + output from the ledger (design §4.4 / §4.3).
-      const step = await getSagaStep(env.DB, r.instance_id, r.compensates_element_id ?? r.element_id);
+      const step = await getSagaStep(env.DB, r.instance_id, r.compensates_element_id ?? r.element_id, r.occurrence);
       if (step) {
         job.originalInput = step.capturedInput;
         job.capturedOutput = step.capturedOutput;

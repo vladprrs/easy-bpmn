@@ -162,15 +162,22 @@ export async function getSagaStepsForInstance(
   return rows.map(mapSagaStep);
 }
 
+/**
+ * One iteration's ledger row (TASK-32): with loops each completed pass of an
+ * element is its own row, so lookups (e.g. seeding a compensation job's
+ * originalInput/capturedOutput at lease time) key by (element, occurrence) —
+ * the compensation job inherits its forward step's occurrence.
+ */
 export async function getSagaStep(
   db: D1Database,
   instanceId: string,
   elementId: string,
+  occurrence: number,
 ): Promise<SagaStepView | null> {
   const row = await dbFirst<SagaStepRow>(
     db,
-    `SELECT * FROM saga_steps WHERE instance_id = ? AND element_id = ?`,
-    [instanceId, elementId],
+    `SELECT * FROM saga_steps WHERE instance_id = ? AND element_id = ? AND occurrence = ?`,
+    [instanceId, elementId, occurrence],
   );
   return row ? mapSagaStep(row) : null;
 }

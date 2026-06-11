@@ -21,6 +21,8 @@ export interface LeasedJobRow {
   attempt_count: number;
   lock_token: string;
   input_variables: string;
+  /** Loop-iteration discriminator (0004): a compensation job inherits its forward step's occurrence. */
+  occurrence: number;
 }
 
 /**
@@ -61,7 +63,7 @@ export async function leaseJobs(
          ORDER BY j.created_at
          LIMIT ?)
         AND (status = 'created' OR (status = 'locked' AND lock_token IS NULL AND lock_expires_at < ?))
-      RETURNING job_id, instance_id, element_id, task_type, is_compensation, compensates_element_id, attempt_count, lock_token, input_variables`,
+      RETURNING job_id, instance_id, element_id, task_type, is_compensation, compensates_element_id, attempt_count, lock_token, input_variables, occurrence`,
     [
       input.workerId,
       input.lockToken,
@@ -315,6 +317,14 @@ export async function parkJobForBackoffConditional(
  * Operator-retry reset: a failed job at (instance, element, kind) becomes
  * leasable again with a fresh attempt budget + a re-snapshotted input (so an
  * operator's variable patch reaches the worker). Returns rows changed.
+ *
+ * Occurrence guard (TASK-32): with loops an element has one row PER iteration.
+ * The retry target is always the LIVE frontier — an un-applied failure
+ * (`failed` + output_applied=0) or an un-applicable poison completion
+ * (`completed` + output_applied=0, forward only). Rows whose outcome was
+ * already applied to the instance (output_applied=1) and already-compensated
+ * completed compensation rows are NEVER reset — resetting an old iteration
+ * would re-open it and break the rewalk's write-free fast-forward.
  */
 export async function resetJobForRetry(
   db: D1Database,
@@ -325,7 +335,8 @@ export async function resetJobForRetry(
     `UPDATE service_task_jobs
         SET status = 'created', attempt_count = 0, lock_token = NULL, lock_expires_at = NULL,
             worker_id = NULL, error_code = NULL, output_variables = NULL, input_variables = ?, completed_at = NULL, updated_at = ?
-      WHERE instance_id = ? AND element_id = ? AND is_compensation = ?`,
+      WHERE instance_id = ? AND element_id = ? AND is_compensation = ? AND output_applied = 0
+        AND (status = 'failed' OR (is_compensation = 0 AND status = 'completed'))`,
     [input.inputVariables, input.now, input.instanceId, input.elementId, input.isCompensation ? 1 : 0],
   ).run();
   return res.meta?.changes ?? 0;

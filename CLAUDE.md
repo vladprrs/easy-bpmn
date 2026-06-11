@@ -4,32 +4,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`easy-bpmn` is a **BPMN-lite Orchestrator MVP**: a single Cloudflare Workers (TypeScript) service that
-makes a tiny, *standard* subset of BPMN 2.0 executable without users running Camunda/Zeebe, a broker, or
-a workflow cluster. The supported happy path is exactly:
+`easy-bpmn` is a **BPMN-lite saga orchestrator**: a single Cloudflare Workers (TypeScript) service that
+makes a standard subset of BPMN 2.0 executable without Camunda/Zeebe. Implemented milestones:
 
-```
-Start Event → Service Task (remote worker) → Receive Task (await message) → End Event
-```
+- **M0** — governance, profile, linear happy path (Start → Service Task → Receive Task → End)
+- **M1** — canonical transaction-saga (pull/external-task workers, `bpmn:transaction` scope, compensation, error/cancel boundaries, operator cancel/retry)
+- **M2** — conditional sagas (`exclusiveGateway`, FEEL conditions via `feelin`, default flows, token-path cycles with per-occurrence ledger rows)
 
-**The MVP is implemented and deployed.** `src/`, `tests/`, `migrations/`, and `package.json` are on disk
-(the Spec Kit feature in `specs/001-bpmn-lite-orchestrator-mvp/`), the test suite is green, and the Worker
-is live at `https://bpmn.rntme.com` (Cloudflare Workers + D1 + Durable Object broker + Workflow), with
-GitHub Actions CI/CD at the repo root (`.github/workflows/`). The directory layout, commands, and
-dependencies described below are the **planned** target from `plan.md`/`quickstart.md`, not yet on disk.
+**M3 (timers + failure taxonomy) is the next milestone.** The Worker is live at `https://bpmn.rntme.com`
+(Cloudflare Workers + D1 + Durable Object broker + Workflow), with GitHub Actions CI/CD at the repo root.
 
 ## Source-of-truth hierarchy (read this before changing anything)
 
 Several overlapping document sets exist. When they conflict, this order wins:
 
 1. **`.specify/memory/constitution.md`** — governance. Five principles + MVP scope. Supersedes everything.
-2. **`specs/001-bpmn-lite-orchestrator-mvp/`** — the authoritative feature spec (Spec Kit). `spec.md`
-   (product behavior), `plan.md` (architecture/tech choices + the planned source layout),
-   `research.md` (resolved decisions), `data-model.md` (entities), `contracts/openapi.yaml` +
-   `contracts/runtime-contracts.md` (API + runtime contracts), `quickstart.md` (executable validation
-   scenarios). **This directory wins over the design doc and the `docs/bpmn/` reference.**
-3. **`docs/superpowers/specs/2026-06-07-bpmn-lite-orchestrator-mvp-design.md`** — implementation bridge
-   (module seams, decomposition, risk map). Distills #2; does not replace it.
+2. **`specs/002-saga-orchestrator/`** — the active implementation spec (M1–M5). `spec.md`, `plan.md`,
+   `data-model.md`, `contracts/openapi.yaml` + `contracts/runtime-contracts.md`, `quickstart.md`.
+   **This directory wins over the design docs and `docs/bpmn/`.** (`specs/001-bpmn-lite-orchestrator-mvp/`
+   covers the original linear MVP and is superseded for all saga work.)
+3. **`docs/superpowers/specs/`** — implementation bridge documents (module seams, M2 design, risk maps).
+   Distill the specs; do not replace them.
 4. **`docs/bpmn/`** — a general BPMN 2.0 reference + the `easy-bpmn` profile (`09-easy-bpmn-profile.md`,
    the **canonical transaction-saga + M2 conditional-saga** profile, in lockstep with constitution v2.1.0).
 
@@ -66,12 +61,31 @@ The three storage roles are distinct and must not be conflated:
 - **Cloudflare Workflow state** is *runtime execution state only*. It is **never** the inspection source
   of truth; inspection endpoints read D1. Every meaningful transition must also be written to D1 history.
 
-Planned module boundaries (keep responsibilities from leaking across seams):
+Module boundaries (keep responsibilities from leaking across seams):
 `src/index.ts` (routing) · `src/bpmn/*` (parse + profile validation, no runtime state) ·
 `src/contracts/*` (zod schemas — the validation boundary for untrusted input) · `src/persistence/*`
-(D1 statements) · `src/workflows/process-workflow.ts` (drives one instance) ·
-`src/durable-objects/correlation-broker.ts` (correlation only) · `src/runtime/*` (service-task adapter,
-receive-task helper, idempotency, errors) · `src/observability/*`.
+(D1 statements, including `saga.ts` for the saga ledger) · `src/workflows/process-workflow.ts` (drives one
+instance) · `src/durable-objects/correlation-broker.ts` (correlation only) ·
+`src/durable-objects/job-scheduler.ts` (per-job un-leasable DLQ timer — one DO per service_task_job) ·
+`src/runtime/engine.ts` (the rewalk/occurrence execution engine) ·
+`src/runtime/executor.ts` (WorkflowExecutor vs DirectExecutor seam) ·
+`src/runtime/*` (service-task, retry-policy, expressions, payload, errors) · `src/observability/*`.
+
+## Engine: rewalk/occurrence model (M2 — critical, non-obvious)
+
+Every engine drive **re-walks the graph from the start element**. A walk-local, in-memory visit counter
+assigns each visit of an element an **occurrence** (0-based). Occurrence is never derived from live D1 row
+counts — during a Workflow replay those reads see post-crash state and would desynchronize step names.
+
+- Every step name and persistence key carries the occurrence: `svc-create:el#2`, `wait-job:el#2`, `gw:el#1`.
+- Already-applied visits **fast-forward write-free** from D1: a completed job with `output_applied=1`, a
+  consumed subscription, or a bookkeeping node whose history event landed are pure cursor moves.
+- **Gateway decisions are persisted once and never re-evaluated**: an existing `gateway_decisions` row for
+  `(instance, gateway, occurrence)` is the rewalk fast-forward predicate; the recorded branch is reused
+  even if variables changed since.
+- `MAX_ELEMENT_OCCURRENCES = 1000` (in `src/runtime/engine.ts`) caps visits per element; exceeding it
+  triggers a `loopLimit` incident. `npm run check:docs` enforces that every copy of this constant in
+  `docs/bpmn/` and `specs/002-saga-orchestrator/` matches the engine source.
 
 ## Non-obvious invariants (enforce these in code and tests)
 
@@ -104,16 +118,26 @@ receive-task helper, idempotency, errors) · `src/observability/*`.
 - The correlation key is **supplied via the API** at instance start (MVP), not derived from a model-level
   subscription expression. The `<message>` element carries only its name.
 
-## Public API surface (from `contracts/openapi.yaml`)
+## Public API surface (from `specs/002-saga-orchestrator/contracts/openapi.yaml`)
 
-`POST /definitions/drafts` · `GET /definitions/drafts/{id}` · `POST /definitions/drafts/{id}/publish` ·
-`GET /definitions/versions/{id}` · `POST /definitions/versions/{id}/instances` ·
-`GET /instances/{id}` · `GET /instances/{id}/history` · `POST /messages` · `GET /messages/{id}`.
+**Definition lifecycle**: `POST /definitions/drafts` · `GET /definitions/drafts/{id}` ·
+`POST /definitions/drafts/{id}/publish` · `GET /definitions/versions/{id}` ·
+`POST /definitions/versions/{id}/instances`
 
-The API is the product contract — it must **not** expose Cloudflare Workflow internals (e.g.
-`workflowInstanceId` is never required from external message publishers).
+**Instance inspection + control**: `GET /instances/{id}` · `GET /instances/{id}/history` ·
+`POST /instances/{id}/cancel` · `POST /instances/{id}/retry`
 
-## Planned commands (from `quickstart.md` — valid once `src/` + `package.json` exist)
+**Message correlation**: `POST /messages` · `GET /messages/{id}`
+
+**Pull worker data plane**: `POST /jobs/activate` (long-poll lease) · `POST /jobs/{id}/complete` ·
+`POST /jobs/{id}/fail`
+
+**Worker credentials**: `POST /workers/credentials` · `DELETE /workers/credentials/{id}`
+
+The API must **not** expose Cloudflare Workflow internals (`workflowInstanceId` is never required from
+external callers). All saga/compensation inspection reads D1, never Workflow state.
+
+## Development commands
 
 ```bash
 npm install
@@ -121,15 +145,19 @@ npx wrangler d1 migrations apply easy_bpmn --local   # apply D1 schema locally
 npm run dev                                            # local Worker at http://localhost:8787
 npm run test                                           # full suite
 npm run test:unit                                      # bpmn validator, broker state, idempotency
-npm run test:contract                                  # endpoints vs contracts/openapi.yaml + runtime events
+npm run test:contract                                  # endpoints vs openapi.yaml + runtime contracts
 npm run test:integration                               # D1 + DO + Workflow + Worker (vitest-pool-workers)
+npx vitest run tests/integration/demo-flow.test.ts     # single test file
+npm run typecheck                                      # tsc --noEmit
+npm run check:docs                                     # docs consistency guard (CI enforced)
 npx wrangler deploy --dry-run                          # validate bindings/config
 ```
 
-Tests use **Vitest with `@cloudflare/vitest-pool-workers`** so D1, Durable Objects, Workflows, and the
-Worker run in the workerd runtime. Treat the six `quickstart.md` scenarios as executable validation
-targets, not just docs (demo flow, unsupported-BPMN rejection, duplicate publish, early-message buffering,
-retry→incident, immutable version binding).
+Tests use **Vitest with `@cloudflare/vitest-pool-workers`** — D1, Durable Objects, Workflows, and the
+Worker run in the workerd runtime (miniflare). The vitest config (`vitest.config.ts`) always overrides
+`EXECUTION_MODE=direct`, so **Workflow-mode-only paths** (step memoization across suspend/resume, operator
+resume after Workflow termination) are tested manually or via `wrangler dev`. See
+`tests/integration/demo-flow.test.ts` and the other quickstart scenarios as executable validation targets.
 
 ## Governance gate (Spec Kit constitution check)
 
@@ -146,8 +174,8 @@ aligned.
 This project is driven by two systems whose state lives in the repo:
 
 - **Spec Kit** (`.specify/`, plus `.agents/skills/speckit-*`): the spec→plan→tasks→implement workflow.
-  `AGENTS.md` points agents at the active `plan.md`. The next planned step (per the design doc) is
-  `writing-plans` / `/speckit-tasks` to turn the decomposition into concrete tasks + tests.
+  `AGENTS.md` points at `specs/001-bpmn-lite-orchestrator-mvp/plan.md` (original MVP); the active plan
+  for M1–M5 saga work is `specs/002-saga-orchestrator/plan.md`.
 - **Backlog.md MCP** (`backlog/`): all task and project management. Use it before creating tasks — the
   workflow is described below and is not summarized here.
 

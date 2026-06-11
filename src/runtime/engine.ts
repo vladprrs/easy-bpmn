@@ -132,7 +132,10 @@ const SVC_WAIT_TIMEOUT = "1 hour";
 /**
  * Loop-iteration cap (design M2 §5): a walk that would visit the same element
  * id more than this many times settles a terminal `loopLimit` incident instead
- * of spinning (and bounds the Workflow step budget).
+ * of spinning (and bounds the Workflow step budget — the cap-vs-platform-budget
+ * math lives next to the workflows config in wrangler.jsonc, R-M2-5). The cap
+ * counts walk-local VISITS per element, never lease attempts: technical
+ * retries of one iteration share one occurrence and do not consume it.
  */
 export const MAX_ELEMENT_OCCURRENCES = 1000;
 
@@ -240,6 +243,12 @@ async function loop(
     const occ = nextOccurrence(visits, cur);
     const tag = `${cur}#${occ}`;
 
+    // Loop guard (design M2 §5, TASK-35): only COMPLETED-VISIT re-entries
+    // reach this check — a technical retry of one iteration (re-lease, fail
+    // retryable) re-walks to the SAME frontier occurrence and never consumes
+    // the cap. Inside a transaction the trip is a HAZARD (saga §4.5): a
+    // terminal incident with NO auto-compensation; operator /cancel stays
+    // available to run the reverse pass over the completed iterations.
     if (occ >= MAX_ELEMENT_OCCURRENCES) {
       await runStep(`loop-limit:${tag}`, () =>
         createIncident(
@@ -248,7 +257,7 @@ async function loop(
           cur,
           0,
           `Element '${cur}' exceeded the loop-iteration cap (${MAX_ELEMENT_OCCURRENCES} visits).`,
-          { occurrence: occ },
+          { elementId: cur, occurrence: occ, cap: MAX_ELEMENT_OCCURRENCES },
           "loopLimit",
         ),
       );
@@ -571,6 +580,14 @@ async function applyForwardCompletion(
   // of un-applicable COMPLETIONS (counted from the serviceTaskOutputRejected
   // history), NOT the lease attempt_count — a technical retry must not consume the
   // poison budget. Poison NEVER compensates (only a business error → cancel does).
+  //
+  // DECISION (TASK-35, with loops legal): strikes are counted per
+  // (instance, element) ACROSS occurrences — every iteration of a loop shares
+  // ONE poison budget. Deliberate: an element whose completions keep breaching
+  // the merge limit is poisoning the instance regardless of which iteration
+  // produced the output, and should die fast rather than earn a fresh
+  // POISON_THRESHOLD per visit (×1000 under the loop cap). Per-occurrence
+  // budgets are TASK-36+ scope if a real model ever needs them.
   if (payloadByteSize(merged) > MAX_EVENT_PAYLOAD_BYTES) {
     const priorRejections = await countHistoryEventsOfType(env.DB, instanceId, elementId, "serviceTaskOutputRejected");
     const strike = priorRejections + 1;

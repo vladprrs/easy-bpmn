@@ -522,9 +522,9 @@ export const SAGA_XOR_NODEFAULT_BPMN = SAGA_XOR_BPMN.replace(' default="f_wire"'
  * FEEL-actionable variables. T_charge runs once, BEFORE the cycle; the
  * back-edge returns from T_switch to GW_retry (nothing "re-charges").
  * Legal from TASK-33 (cycles on the token path); reusable for TASK-32
- * (occurrence-counter rewalk) and TASK-35 (loop-guard shapes). A saga-loop
- * fixture — a compensatable step inside a <transaction> inside the cycle —
- * is still owed to TASK-35-AC#2/TASK-36.
+ * (occurrence-counter rewalk) and TASK-35 (loop-guard shapes). The saga-loop
+ * companion — a compensatable step inside a <transaction> inside the cycle —
+ * is SAGA_LOOP_BPMN below (TASK-35 AC2 / TASK-36).
  */
 export const LOOP_XOR_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
@@ -557,6 +557,80 @@ export const LOOP_XOR_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
     <bpmn:sequenceFlow id="f_back" sourceRef="T_switch" targetRef="GW_retry"/>
     <bpmn:sequenceFlow id="f_done" sourceRef="GW_retry" targetRef="E"/>
     <bpmn:endEvent id="E"><bpmn:incoming>f_done</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
+ * The owed saga-loop fixture (TASK-35 AC2; designed for TASK-36 reuse): a
+ * compensatable step INSIDE a transaction INSIDE a cycle.
+ *
+ *   Tx_loop: Tx_start → reserveItem (compensation boundary → releaseItem)
+ *            → GW_more ─ f_more (`more = true`) ──→ back to reserveItem
+ *                      ├ f_spin (`spin = true`) ──→ back to GW_more (self-loop)
+ *                      └ f_done (default) ────────→ finalize → Tx_ok
+ *   finalize carries an error boundary (FINALIZE_FAILED) → Tx_cancel; the
+ *   transaction carries a cancel boundary → Failed (SAGA_XOR_BPMN's wiring).
+ *
+ * Each `more = true` pass appends one occurrence-keyed ledger row for
+ * reserveItem (TASK-36: N iterations compensated in reverse after a business
+ * error on finalize). The `f_spin` SELF-LOOP is the loop-guard lever
+ * (TASK-35): a worker output arming `spin = true` makes GW_more revisit
+ * ITSELF — pure gateway visits, zero jobs — so an integration test trips the
+ * real MAX_ELEMENT_OCCURRENCES cap inside the transaction in seconds. It is
+ * inert (FEEL `spin = true` is false/null) unless a test sets `spin`.
+ */
+export const SAGA_LOOP_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+                  id="D_loopsaga" targetNamespace="http://easy-bpmn/example/loop-saga">
+  <bpmn:error id="Err_finalize" name="Finalize failed" errorCode="FINALIZE_FAILED"/>
+  <bpmn:process id="LoopSaga" isExecutable="true">
+    <bpmn:startEvent id="Start"/>
+    <bpmn:transaction id="Tx_loop" name="Reserve items">
+      <bpmn:startEvent id="Tx_start"/>
+      <bpmn:serviceTask id="reserveItem" name="Reserve item">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="reserve-item" retries="2"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="reserveItem_comp" attachedToRef="reserveItem">
+        <bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="releaseItem" name="Release item" isForCompensation="true">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="release-item" retries="5"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:association id="a1" associationDirection="One" sourceRef="reserveItem_comp" targetRef="releaseItem"/>
+      <bpmn:exclusiveGateway id="GW_more" name="More items?" default="f_done">
+        <bpmn:incoming>t2</bpmn:incoming>
+        <bpmn:incoming>f_spin</bpmn:incoming>
+        <bpmn:outgoing>f_more</bpmn:outgoing>
+        <bpmn:outgoing>f_spin</bpmn:outgoing>
+        <bpmn:outgoing>f_done</bpmn:outgoing>
+      </bpmn:exclusiveGateway>
+      <bpmn:sequenceFlow id="f_more" sourceRef="GW_more" targetRef="reserveItem">
+        <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">more = true</bpmn:conditionExpression>
+      </bpmn:sequenceFlow>
+      <bpmn:sequenceFlow id="f_spin" sourceRef="GW_more" targetRef="GW_more">
+        <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">spin = true</bpmn:conditionExpression>
+      </bpmn:sequenceFlow>
+      <bpmn:sequenceFlow id="f_done" sourceRef="GW_more" targetRef="finalize"/>
+      <bpmn:serviceTask id="finalize" name="Finalize order">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="finalize-order" retries="2"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="finalize_err" attachedToRef="finalize">
+        <bpmn:errorEventDefinition errorRef="Err_finalize"/></bpmn:boundaryEvent>
+      <bpmn:endEvent id="Tx_ok"/>
+      <bpmn:endEvent id="Tx_cancel"><bpmn:cancelEventDefinition/></bpmn:endEvent>
+      <bpmn:sequenceFlow id="t1" sourceRef="Tx_start"     targetRef="reserveItem"/>
+      <bpmn:sequenceFlow id="t2" sourceRef="reserveItem"  targetRef="GW_more"/>
+      <bpmn:sequenceFlow id="t3" sourceRef="finalize"     targetRef="Tx_ok"/>
+      <bpmn:sequenceFlow id="fe" sourceRef="finalize_err" targetRef="Tx_cancel"/>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="Tx_cancelled" attachedToRef="Tx_loop">
+      <bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:endEvent id="Done"/>
+    <bpmn:endEvent id="Failed"/>
+    <bpmn:sequenceFlow id="g1" sourceRef="Start"        targetRef="Tx_loop"/>
+    <bpmn:sequenceFlow id="g2" sourceRef="Tx_loop"      targetRef="Done"/>
+    <bpmn:sequenceFlow id="g3" sourceRef="Tx_cancelled" targetRef="Failed"/>
   </bpmn:process>
 </bpmn:definitions>`;
 

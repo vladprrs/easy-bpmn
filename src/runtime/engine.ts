@@ -340,9 +340,16 @@ function appliedForwardOutcome(
     const target = errorBoundaryTarget(graph, elementId, job.error_code);
     if (target) return { kind: "next", next: target };
   }
-  // Defensive: an applied marker on anything else cannot advance — the
-  // instance is already settled (incident/terminal) by the path that set it.
-  return { kind: "incident" };
+  // Defensive — unreachable by construction: output_applied=1 is only ever set
+  // on a completed apply or a business-routed failure (whose boundary target is
+  // re-derivable from the immutable graph). Returning a zero-write outcome here
+  // would zombify the instance silently; throw instead so workflow mode lands
+  // in the process-workflow catch-all (recordTerminalIncident) and direct mode
+  // surfaces the broken invariant to the caller.
+  throw new Error(
+    `Invariant violation: job ${job.job_id} (element ${elementId}, occurrence ${job.occurrence}) is marked ` +
+      `output_applied but is '${job.status}' with error_code ${job.error_code ? `'${job.error_code}' (no matching error boundary in the graph)` : "NULL"} — no successor can be derived.`,
+  );
 }
 
 async function driveForwardServiceTask(

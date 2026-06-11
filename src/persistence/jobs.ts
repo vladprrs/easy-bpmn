@@ -314,17 +314,27 @@ export async function parkJobForBackoffConditional(
 }
 
 /**
- * Operator-retry reset: a failed job at (instance, element, kind) becomes
- * leasable again with a fresh attempt budget + a re-snapshotted input (so an
- * operator's variable patch reaches the worker). Returns rows changed.
+ * Operator-retry reset: the incident element's job at (instance, element, kind)
+ * becomes leasable again with a fresh attempt budget + a re-snapshotted input
+ * (so an operator's variable patch reaches the worker). Returns rows changed.
  *
  * Occurrence guard (TASK-32): with loops an element has one row PER iteration.
- * The retry target is always the LIVE frontier — an un-applied failure
- * (`failed` + output_applied=0) or an un-applicable poison completion
- * (`completed` + output_applied=0, forward only). Rows whose outcome was
- * already applied to the instance (output_applied=1) and already-compensated
- * completed compensation rows are NEVER reset — resetting an old iteration
- * would re-open it and break the rewalk's write-free fast-forward.
+ * The retry target is always the LIVE frontier, i.e. output_applied = 0 plus:
+ *   * `failed` — technical exhaustion / uncaught business error / failed
+ *     compensation (a business-routed failure is marked applied atomically
+ *     with its boundary transition, so it never matches here);
+ *   * `completed` forward — an un-applicable poison completion;
+ *   * `created`/`locked` — the workflow-mode WAIT-TIMEOUT incidents
+ *     (svc-timeout / comp-timeout): nobody completed the job, so it is still
+ *     leasable/leased when the operator retries, and the input refresh must
+ *     reach it (M1 parity — M1's matcher had no status filter at all). Safe
+ *     under the rewalk: output_applied=1 is only ever set on a completed or
+ *     failed row, so a created/locked row is necessarily the unapplied
+ *     frontier, never an earlier applied iteration.
+ * Rows whose outcome was already applied to the instance (output_applied=1)
+ * and already-compensated completed compensation rows are NEVER reset —
+ * resetting an old iteration would re-open it and break the rewalk's
+ * write-free fast-forward.
  */
 export async function resetJobForRetry(
   db: D1Database,
@@ -336,7 +346,7 @@ export async function resetJobForRetry(
         SET status = 'created', attempt_count = 0, lock_token = NULL, lock_expires_at = NULL,
             worker_id = NULL, error_code = NULL, output_variables = NULL, input_variables = ?, completed_at = NULL, updated_at = ?
       WHERE instance_id = ? AND element_id = ? AND is_compensation = ? AND output_applied = 0
-        AND (status = 'failed' OR (is_compensation = 0 AND status = 'completed'))`,
+        AND (status IN ('created', 'locked', 'failed') OR (is_compensation = 0 AND status = 'completed'))`,
     [input.inputVariables, input.now, input.instanceId, input.elementId, input.isCompensation ? 1 : 0],
   ).run();
   return res.meta?.changes ?? 0;

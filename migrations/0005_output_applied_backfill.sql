@@ -9,21 +9,40 @@
 -- duplicating serviceTaskCompleted history / variable snapshots and re-merging
 -- old outputs over newer variables.
 --
--- M1's persist-before-advance contract means a completed forward job on a
--- non-incident instance has ALWAYS had its output applied (the apply and the
--- advance commit in one batch; the only completed-but-unapplied state is the
--- sub-second crash window between a worker callback and its drive). Instances
--- in `incident` are EXCLUDED: a poison incident (kind='poison') is exactly a
--- completed job whose output was NEVER applicable — marking it applied would
--- make an operator /retry fast-forward past the step instead of re-running it.
+-- Predicate: "this job's output was applied" — decided PER JOB via the
+-- variable_snapshots row that M1's applyForwardCompletion wrote in the SAME
+-- dbBatch as the variable merge + advance, with source='serviceTask' and
+-- source_id=<job_id>. That row exists if and only if the apply committed:
+--   * It was UNCONDITIONAL — written even when the worker output was empty
+--     (M1 parsed output_variables with a `{}` default and inserted the
+--     snapshot regardless), so empty-output applied jobs are still matched.
+--   * The M1 poison paths returned BEFORE the apply batch (below-threshold
+--     rejection re-opened the job; at-threshold went straight to a
+--     kind='poison' incident), so a poison-completed job has NO snapshot,
+--     stays output_applied=0, and an operator /retry re-runs the step
+--     instead of fast-forwarding past it.
+--   * The crash/lost-sendEvent window (worker /jobs/complete committed but
+--     the drive never applied — in workflow mode this state can persist up
+--     to the 1h waitForEvent timeout) also has NO snapshot, so the rewalk
+--     applies the output instead of silently dropping it forever.
+--   * Compensation completions never wrote variable snapshots (their
+--     "applied" state lives in saga_steps.compensation_status), and
+--     is_compensation = 0 excludes them anyway.
 --
--- Compensation jobs are untouched: their "applied" state lives in the saga
--- ledger (saga_steps.compensation_status), never in output_applied.
+-- Deliberately NOT keyed on process_instances.status: an instance can sit in
+-- 'incident' with EARLIER applied steps — those must be marked applied (or a
+-- post-/retry rewalk re-applies them), while the incident step's own
+-- unapplied completion (poison) must stay 0. Both fall out of the per-job
+-- snapshot check.
 UPDATE service_task_jobs
    SET output_applied = 1
  WHERE status = 'completed'
    AND is_compensation = 0
    AND output_applied = 0
-   AND instance_id IN (
-     SELECT instance_id FROM process_instances WHERE status != 'incident'
+   AND EXISTS (
+     SELECT 1
+       FROM variable_snapshots vs
+      WHERE vs.instance_id = service_task_jobs.instance_id
+        AND vs.source = 'serviceTask'
+        AND vs.source_id = service_task_jobs.job_id
    );

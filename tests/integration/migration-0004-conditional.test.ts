@@ -19,6 +19,7 @@ import {
   jobCompleteStmt,
   markJobOutputAppliedStmt,
 } from "../../src/persistence/instances";
+import { resetJobForRetry } from "../../src/persistence/jobs";
 import { insertSagaStepStmt } from "../../src/persistence/saga";
 import {
   getGatewayDecision,
@@ -171,6 +172,85 @@ describe("occurrence-discriminated job rows (design §5)", () => {
     expect(hit.meta.changes).toBe(1);
     row = await getForwardJob(env.DB, inst, "reserveStock", 0);
     expect(row?.output_applied).toBe(1);
+  });
+});
+
+describe("resetJobForRetry live-frontier matcher (TASK-32)", () => {
+  const PATCH = `{"patched":true}`;
+
+  async function jobState(jobId: string) {
+    return env.DB.prepare(
+      `SELECT status, output_applied, input_variables, attempt_count, lock_token FROM service_task_jobs WHERE job_id = ?`,
+    )
+      .bind(jobId)
+      .first<{ status: string; output_applied: number; input_variables: string; attempt_count: number; lock_token: string | null }>();
+  }
+
+  it("resets a LOCKED unapplied forward job (workflow svc-timeout incident) and refreshes its input", async () => {
+    const inst = "pi_retry_locked";
+    await insertJob("job_rt_locked", inst, "taskA", 0);
+    // workflow-mode svc-timeout leaves the job mid-lease: nobody completed it
+    await env.DB.prepare(
+      `UPDATE service_task_jobs SET status = 'locked', lock_token = 'tok', lock_expires_at = '2026-06-10T01:00:00Z', attempt_count = 2 WHERE job_id = 'job_rt_locked'`,
+    ).run();
+
+    const changes = await resetJobForRetry(env.DB, {
+      instanceId: inst,
+      elementId: "taskA",
+      isCompensation: false,
+      inputVariables: PATCH,
+      now: NOW,
+    });
+    expect(changes).toBe(1);
+    expect(await jobState("job_rt_locked")).toMatchObject({
+      status: "created",
+      attempt_count: 0,
+      lock_token: null,
+      input_variables: PATCH, // the operator's variable patch reaches the worker
+    });
+  });
+
+  it("resets a CREATED unapplied compensation job (workflow comp-timeout)", async () => {
+    const inst = "pi_retry_comp";
+    await insertJob("job_rt_comp", inst, "taskA", 0, true);
+
+    const changes = await resetJobForRetry(env.DB, {
+      instanceId: inst,
+      elementId: "taskA",
+      isCompensation: true,
+      inputVariables: PATCH,
+      now: NOW,
+    });
+    expect(changes).toBe(1);
+    expect((await jobState("job_rt_comp"))?.input_variables).toBe(PATCH);
+  });
+
+  it("resets the failed and poison-completed frontiers, NEVER an applied or compensated row", async () => {
+    const inst = "pi_retry_mixed";
+    // failed unapplied (technical exhaustion / uncaught business error)
+    await insertJob("job_rt_failed", inst, "taskFail", 0);
+    await env.DB.prepare(`UPDATE service_task_jobs SET status = 'failed' WHERE job_id = 'job_rt_failed'`).run();
+    // poison: completed forward, output never applicable
+    await insertJob("job_rt_poison", inst, "taskPoison", 0);
+    await jobCompleteStmt(env.DB, "job_rt_poison", { huge: "blob" }, NOW).run();
+    // APPLIED earlier iteration — must never re-open (breaks write-free rewalk)
+    await insertJob("job_rt_applied", inst, "taskDone", 0);
+    await jobCompleteStmt(env.DB, "job_rt_applied", { ok: true }, NOW).run();
+    await markJobOutputAppliedStmt(env.DB, "job_rt_applied", NOW).run();
+    // COMPLETED compensation — already compensated (ledger holds the state)
+    await insertJob("job_rt_comp_done", inst, "taskDone", 0, true);
+    await jobCompleteStmt(env.DB, "job_rt_comp_done", { released: true }, NOW).run();
+
+    const reset = (elementId: string, isCompensation: boolean) =>
+      resetJobForRetry(env.DB, { instanceId: inst, elementId, isCompensation, inputVariables: PATCH, now: NOW });
+
+    expect(await reset("taskFail", false)).toBe(1);
+    expect(await reset("taskPoison", false)).toBe(1);
+    expect(await reset("taskDone", false)).toBe(0);
+    expect(await reset("taskDone", true)).toBe(0);
+
+    expect(await jobState("job_rt_applied")).toMatchObject({ status: "completed", output_applied: 1 });
+    expect((await jobState("job_rt_comp_done"))?.status).toBe("completed");
   });
 });
 

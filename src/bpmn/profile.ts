@@ -12,11 +12,36 @@ export const SUPPORTED_NODE_TYPES: Record<string, NodeType> = {
   // SAGA (M0): the transaction scope and its boundary events.
   "bpmn:Transaction": "transaction",
   "bpmn:BoundaryEvent": "boundaryEvent",
+  // M2 conditional sagas (TASK-33): data-driven XOR branching. Split flows
+  // carry FEEL conditions + an optional gateway-owned default; the validator
+  // enforces the split/default/condition rules (validator.ts).
+  "bpmn:ExclusiveGateway": "exclusiveGateway",
 };
 
 export const SEQUENCE_FLOW_TYPE = "bpmn:SequenceFlow";
 export const ASSOCIATION_TYPE = "bpmn:Association";
 export const ERROR_TYPE = "bpmn:Error";
+
+/**
+ * Gateway types OUTSIDE the M2 profile, each with its roadmap pointer (saga
+ * design §8): parallel/inclusive need multiple concurrent tokens (M4
+ * concurrency), event-based routing needs timers/events (M3), complex is not
+ * on the roadmap. The validator rejects these with element id + this reason.
+ */
+export const DEFERRED_GATEWAY_REASONS: Record<string, string> = {
+  "bpmn:ParallelGateway":
+    "Parallel (AND) gateways need concurrent tokens, which are deferred to concurrency (M4). " +
+    "Only exclusiveGateway branching is supported.",
+  "bpmn:InclusiveGateway":
+    "Inclusive (OR) gateways activate multiple branches at once and are deferred to concurrency (M4). " +
+    "Only exclusiveGateway branching is supported.",
+  "bpmn:EventBasedGateway":
+    "Event-based gateways route on the first event to occur and are deferred to timers & events (M3). " +
+    "Only exclusiveGateway branching is supported.",
+  "bpmn:ComplexGateway":
+    "Complex gateways are not on the roadmap and are deferred to a later milestone. " +
+    "Only exclusiveGateway branching is supported.",
+};
 
 /** Event-definition $types we classify (start/end/boundary discriminators). */
 export const COMPENSATE_EVENT_DEFINITION = "bpmn:CompensateEventDefinition";

@@ -93,7 +93,12 @@ These are *referenced* by events/tasks but *declared* as top-level elements unde
 ## `easy-bpmn` scope
 
 **In scope:**
-- **Sequence Flow** (`sequenceFlow`) — plain, no conditions.
+- **Sequence Flow** (`sequenceFlow`) — plain by default; **since M2** a flow leaving an
+  `exclusiveGateway` may carry a FEEL `conditionExpression`, or be that gateway's `default` flow.
+  Conditions anywhere else are still rejected — see [`03-gateways.md`](./03-gateways.md).
+- **Association** (`association`) — **since M1**, exclusively as compensation wiring: from a
+  compensation boundary event to its `isForCompensation` handler. Free-floating associations to
+  artifacts remain ignorable annotation, not flow.
 - **Message** (`<message>`) — declares the message **name** a Receive Task waits for. The
   **correlation key** is supplied via the **API** at instance start in the MVP (constitution,
   Principle IV), *not* derived from a model-level subscription expression; model-level correlation is
@@ -101,10 +106,13 @@ These are *referenced* by events/tasks but *declared* as top-level elements unde
 - **Process variables** — initial variables at start; output variables persisted from service-task
   workers; payload applied on message correlation.
 
-**Out of scope (reject before publish):** conditional flow, default flow, **message flow** (no
-multi-pool collaboration in the MVP), associations, and **all** data shapes (`dataObject`,
-`dataStore`, `dataInput`/`dataOutput`, data associations). Signals, errors, and escalations are out of
-scope too.
+**Out of scope (reject before publish):** conditional or default flow **not leaving an
+`exclusiveGateway`** (including the "conditional sequence flow from a task" pattern and any implicit
+split), **message flow** (no multi-pool collaboration), and **all** data shapes (`dataObject`,
+`dataStore`, `dataInput`/`dataOutput`, data associations). Signals and escalations are out of scope
+too. (Errors are **in since M1** — `bpmn:error` + error boundary events drive the saga failure
+path; see [`01-events.md`](./01-events.md) and [`09`](./09-easy-bpmn-profile.md).)
 
-So the MVP's connector vocabulary is a single plain `sequenceFlow`, plus a `<message>` used purely for
-Receive Task correlation. See [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
+So the connector vocabulary is `sequenceFlow` (conditional/default only off an XOR gateway, since
+M2), the compensation `association` (since M1), and a `<message>` used purely for Receive Task
+correlation. See [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).

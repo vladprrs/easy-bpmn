@@ -1,43 +1,49 @@
-# Quickstart: SAGA Orchestrator (M1) Validation
+# Quickstart: SAGA Orchestrator Validation (M1 + M2)
 
-This guide describes the end-to-end validation scenarios for the M1 transaction-saga
-implementation plan. It is written as the target validation flow for the implementation generated
-from this feature. The seven scenarios are the named M1 constitution-critical test gates.
+This guide describes the end-to-end validation scenarios for the transaction-saga implementation:
+scenarios 1–9 are the named M1 constitution-critical gates; scenarios 10–14 are the M2
+conditional-saga gates (exclusiveGateway + FEEL + cycles), each mapping to a green integration
+test named next to it.
 
 ## Prerequisites
 
 - Node.js 22+ (Wrangler 4.x requires Node ≥22)
 - Wrangler installed through project dependencies
 - Cloudflare local development support for Workers, Workflows, Durable Objects, and D1
-- A Workers **Paid** plan target (Durable Objects force Paid; Workflow `limits.steps` headroom
-  ~25000)
+- A Workers **Paid** plan target (Durable Objects force Paid). Workflows step budget: **10,000
+  steps per instance by default**, raisable to **25,000** via `limits.steps` — see the verified
+  budget analysis in `wrangler.jsonc` (the M2 loop guard `MAX_ELEMENT_OCCURRENCES = 1000` trips
+  well inside the default for single-element loops).
 
 ## Setup
 
 ```bash
 npm install
-npx wrangler d1 migrations apply easy_bpmn --local   # applies 0001 + 0002_saga.sql
+npx wrangler d1 migrations apply easy_bpmn --local   # applies 0001 … 0005 (MVP, saga, topology, conditional, backfill)
 npm run test
 npm run dev
 ```
 
 Expected setup outcome:
 
-- Unit, contract, and integration tests pass (including the seven saga gates).
+- Unit, contract, and integration tests pass (including the M1 + M2 gates).
 - Local Worker API is available at `http://localhost:8787`.
 - Local D1 database has the MVP schema plus the saga ledger, jobs lease/DLQ columns, worker
-  credentials, incident `kind`/`resolution`, and the `(workspace_id, status)` list index.
+  credentials, incident `kind`/`resolution`, the `(workspace_id, status)` list index, the M2
+  `occurrence`/`output_applied` columns, conditional topology columns, and `gateway_decisions`.
 - Workflow and Durable Object bindings are available in local development.
 
 ## Scenario 1: Happy Saga Commits (gate: happy-saga-commit)
 
 1. Publish the §3 canonical order-saga (a `bpmn:transaction` with three forward Service Tasks each
-   routed by `easy-bpmn:taskDefinition type` to a distinct microservice).
+   routed by `easy-bpmn:taskDefinition type` to a distinct microservice; on disk as
+   `examples/order-saga.bpmn`).
 
 ```bash
 curl -sS http://localhost:8787/definitions/drafts \
   -H 'Content-Type: application/json' \
-  -d @examples/order-saga-draft.json
+  -d "$(jq -n --rawfile xml examples/order-saga.bpmn \
+        '{workspaceId: "default", name: "order saga", bpmnXml: $xml}')"
 curl -sS -X POST http://localhost:8787/definitions/drafts/{draftId}/publish
 ```
 
@@ -87,8 +93,12 @@ Complete `reserve-stock` and `charge-card`, then fail `confirm-shipping` with a 
 curl -sS http://localhost:8787/jobs/{confirmShippingJobId}/fail \
   -H 'Authorization: Bearer <workspace-default-worker-token>' \
   -H 'Content-Type: application/json' \
-  -d '{ "lockToken": "{lockToken}", "reason": "carrier rejected", "errorCode": "SHIPPING_REJECTED", "retryable": false }'
+  -d '{ "lockToken": "{lockToken}", "reason": "carrier rejected", "errorCode": "SHIPPING_REJECTED" }'
 ```
+
+> Note: the `errorCode` alone makes this a business failure. A `retryable` field is accepted but
+> **advisory/ignored server-side** — terminality is decided only by `errorCode` (business) or
+> retry-budget exhaustion (technical); see the runtime contracts.
 
 Expected outcome:
 
@@ -207,21 +217,112 @@ Expected outcome:
 - The instance does **NOT** enter `compensating` and **no** compensation jobs are created (poison is
   distinct from a business-error → cancel, the only compensating path).
 
+---
+
+The M2 scenarios below use the shipped sample model
+`examples/conditional-fulfillment-saga.bpmn` (XOR split/join + a loop + compensation wiring) or its
+test-fixture siblings (`tests/helpers.ts`: `SAGA_XOR_BPMN`, `SAGA_XOR_NODEFAULT_BPMN`,
+`SAGA_LOOP_BPMN`, `LOOP_XOR_BPMN`). The sample itself is publish-validated from disk by
+`tests/integration/sample-conditional-saga.test.ts`.
+
+## Scenario 10: Branch by Data (gate: branch-by-data — `tests/integration/xor-gateway.test.ts`)
+
+Publish the sample and start an instance; complete `reserve-item` with
+`{ "moreItems": false, "paymentMethod": "card" }`.
+
+```bash
+curl -sS http://localhost:8787/definitions/drafts \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -n --rawfile xml examples/conditional-fulfillment-saga.bpmn \
+        '{workspaceId: "default", name: "conditional saga", bpmnXml: $xml}')"
+```
+
+Expected outcome (tests: `"routes by data: evaluations recorded in document order…"`,
+`"takes the default flow when no condition is true…"`,
+`"multiple true conditions → the FIRST in document order wins…"`):
+
+- The token leaves `GW_method` on `Flow_pay_card` (FEEL `paymentMethod = "card"`); a `paymentMethod`
+  of anything else takes the gateway-owned `default` flow instead.
+- A `gateway_decisions` row records the chosen flow + per-flow evaluations in **document order**
+  (short-circuited at the first `true`); the `gatewayDecisionEvaluated` history event is the
+  operator surface.
+- The XOR join (`GW_paid`) is a pass-through decision; exactly one job exists, on the chosen branch.
+
+## Scenario 11: Loop N Iterations, Then Compensate Each (gate: loop-compensation — `tests/integration/loop-compensation.test.ts`)
+
+Complete `reserve-item` three times (worker output `moreItems: true` twice, then `false`), then fail
+the post-loop step with its model business error (e.g. `FINALIZE_FAILED` on `SAGA_LOOP_BPMN`).
+
+Expected outcome (test: `"3 iterations + business-failed finalize → 3 comp jobs in reverse seq
+order…"`):
+
+- Each iteration is its own occurrence-keyed job + `saga_steps` ledger row (occurrences 0..2).
+- The error boundary → cancel end cancels the transaction; the reverse pass creates **one
+  compensation job per iteration, highest occurrence first**, each seeded with **its own
+  iteration's** `originalInput` + `capturedOutput`.
+- `compensationStarted` AND `compensationCompleted` history events carry the iteration's
+  `occurrence`; the instance settles `compensated` via the cancel-boundary path.
+
+## Scenario 12: No Path → `noPath` Incident, Hazard `/cancel` (gate: nopath-hazard — `tests/integration/xor-gateway.test.ts`)
+
+Publish `SAGA_XOR_NODEFAULT_BPMN` (both gateway flows carry conditions, no default) and start an
+instance whose variables match **neither** condition.
+
+Expected outcome (tests: `"no condition true + no default → noPath incident…"`, `"operator /retry
+with a variable patch re-evaluates the failed visit FRESH…"`):
+
+- The gateway visit raises a **terminal incident `kind=noPath`** (the recorded evaluations in the
+  diagnostics); inside the transaction this is a **Hazard** — NO auto-compensation.
+- `POST /instances/{id}/cancel` then compensates the pending ledger (the operator remediation).
+- Alternatively `POST /instances/{id}/retry` re-evaluates the failed visit **fresh** (no decision
+  row was written for the failed visit), so a variable patch can route the saga forward.
+
+## Scenario 13: Loop Limit → `loopLimit` Incident (gate: loop-limit — `tests/integration/loop-limit.test.ts`)
+
+Drive a model into a hot cycle (the `f_spin` self-loop in `SAGA_LOOP_BPMN` / `LOOP_XOR_BPMN`'s
+gateway cycle) past `MAX_ELEMENT_OCCURRENCES = 1000`.
+
+Expected outcome (tests: `"loop guard — MAX_ELEMENT_OCCURRENCES trips a terminal loopLimit
+incident"`, `"loop guard inside a transaction — Hazard semantics"`, `"technical retries do not
+consume the cap"`):
+
+- The walk terminates with incident `kind=loopLimit` naming the tripping element; inside a
+  transaction this is Hazard semantics (no auto-compensation; operator `/cancel` available, and the
+  incident resolution advances `compensating → compensated` when the pass settles).
+- Technical retries of one iteration do **not** consume the visit cap (occurrence ≠ attempt).
+
+## Scenario 14: Decision-Replay Stability (gate: decision-replay — `tests/integration/xor-gateway.test.ts`, `tests/integration/xor-replay-workflow.test.ts`, `tests/integration/loop-replay-workflow.test.ts`, `tests/integration/loop-rewalk.test.ts`)
+
+Crash/resume an instance after a gateway decision committed, then mutate its variables and resume.
+
+Expected outcome (tests: `"mutating variables between resumes never re-routes a recorded decision"`
+(direct rewalk), `"crash after the decision committed (memo lost) + variables mutated → the replay
+keeps the recorded branch"` (Workflow memoization), `"rewalk fast-forward is write-free…"`):
+
+- A recorded `(instance, gateway, occurrence)` decision is **reused, never re-evaluated**, in BOTH
+  execution modes — the walk is the replay.
+- Rewalk fast-forward over applied steps is **write-free** (no duplicate jobs, history events, or
+  variable merges); resuming mid-loop lands on the exact frontier occurrence.
+
 ## Validation Commands
 
 ```bash
-npm run test:unit          # bpmn validator (saga accept/reject), graph scope, reverse-order ledger, retry backoff curve
-npm run test:contract      # /jobs/* + operator verbs + list + saga view vs contracts/openapi.yaml; job-result union (incl. timeout/poison kind); lease SQL
-npm run test:integration   # the nine saga gates above (D1 + DO + Workflow + pull workers)
+npm run test:unit          # bpmn validator (saga + conditional accept/reject, FEEL parse/null semantics), graph scope, reverse-order ledger, retry backoff curve
+npm run test:contract      # /jobs/* + operator verbs + list + saga view vs contracts/openapi.yaml; job-result union (incl. timeout/poison kind); lease SQL; the M2 /jobs/* schema pin (tests/contract/jobs-schema-pin.test.ts)
+npm run test:integration   # the nine M1 gates + the five M2 gates above (D1 + DO + Workflow + pull workers)
+npm run check:docs         # docs/bpmn/ consistency guard
 npx wrangler deploy --dry-run
 ```
 
 Expected validation outcome:
 
-- The §3 canonical order-saga publishes; each still-unsupported construct is rejected with element
-  id + reason; foreign-ns / DI / `documentation` are tolerated.
-- The nine integration gates pass: happy commit; business-error reverse compensation;
+- The §3 canonical order-saga AND the conditional sample publish; each still-unsupported construct
+  is rejected with element id + reason (deferred gateways with their milestone pointers);
+  foreign-ns / DI / `documentation` are tolerated.
+- The nine M1 integration gates pass: happy commit; business-error reverse compensation;
   compensator-fail remediation; duplicate complete/fail idempotency; terminal-instance no-op ack;
   cross-tenant activate reject; version binding through compensation; un-leasable-job DLQ timeout;
   poison-job termination.
+- The five M2 gates pass: branch-by-data; loop-N-iterations-then-compensate-each; noPath Hazard +
+  operator remediation; loopLimit guard; decision-replay stability.
 - No external workflow infrastructure (Camunda/Zeebe/broker/cluster) is deployed.

@@ -18,7 +18,9 @@ export type ElementType =
   | "transaction"
   | "boundaryEvent"
   | "association"
-  | "error";
+  | "error"
+  // M2 conditional sagas:
+  | "exclusiveGateway";
 
 /** A node in the executable graph (excludes sequence flows, messages, associations, errors). */
 export type NodeType =
@@ -28,7 +30,9 @@ export type NodeType =
   | "endEvent"
   // SAGA additions:
   | "transaction"
-  | "boundaryEvent";
+  | "boundaryEvent"
+  // M2 conditional sagas:
+  | "exclusiveGateway";
 
 /** Discriminator for end events: a plain (commit) end vs a transaction Cancel end. */
 export type EndKind = "none" | "cancel";
@@ -38,11 +42,20 @@ export type BoundaryKind = "error" | "cancel" | "compensate";
 
 /**
  * One outgoing sequence-flow edge of a node (design §4.1 multi-edge IR).
- * M1 is single-token, so a token-path node carries at most one Flow and the
- * derived `GraphNode.next` is `outgoing[0]?.targetId`. `conditionExpression` /
- * `isDefault` are the M2 branch-selection hook — always `null` / `false` in M1
- * (the validator still rejects conditional + default flows), present now so the
- * persisted shape is stable across the M1→M2 boundary.
+ *
+ * ORDER GUARANTEE (M2 design §2 decision 5): a node's `outgoing[]` preserves
+ * the DOCUMENT ORDER of its `<sequenceFlow>` elements — bpmn-moddle keeps a
+ * container's `flowElements` in XML order and the builder appends one Flow per
+ * sequence flow in that iteration order (never the `<bpmn:outgoing>` ref order
+ * inside the node). Document order IS the condition evaluation order: gateway
+ * branch selection evaluates non-default conditions first-true-wins in exactly
+ * this persisted order, so replay is deterministic.
+ *
+ * `conditionExpression` is the raw FEEL body of the flow's
+ * `<conditionExpression xsi:type="bpmn:tFormalExpression">` (live as of M2 for
+ * flows leaving an `exclusiveGateway`; `null` on unconditional flows).
+ * `isDefault` is `true` exactly for the flow referenced by its gateway's
+ * `default` attribute.
  */
 export interface Flow {
   flowId: string;
@@ -64,6 +77,14 @@ export interface GraphElement {
   /** sequenceFlow / association only — the wiring endpoints (persisted topology). */
   sourceRef?: string | null;
   targetRef?: string | null;
+  /**
+   * sequenceFlow only (M2 conditional topology) — the raw FEEL condition body
+   * on a flow leaving an exclusiveGateway, and the gateway's `default` marker
+   * (true exactly for the flow named by the gateway's `default` attribute).
+   * Persisted as bpmn_elements.condition_expression / is_default.
+   */
+  conditionExpression?: string | null;
+  isDefault?: boolean;
 }
 
 export interface GraphNode {
@@ -79,9 +100,12 @@ export interface GraphNode {
    */
   outgoing: Flow[];
   /**
-   * Derived convenience: the first outgoing edge's target (null at end / off
-   * path). The single-token engine reads `.next`; the M2 migration is to
-   * *select* among `outgoing[]` by condition.
+   * Derived convenience for NON-gateway nodes only: the first outgoing edge's
+   * target (`outgoing[0]?.targetId`, null at end / off path); the single-token
+   * engine reads it. The IR makes NO `.next` promise for `exclusiveGateway`
+   * nodes — it is always `null` there, because branch selection (evaluating
+   * `outgoing[]` conditions in document order, TASK-34) owns the successor
+   * choice and nothing may linearly advance through a gateway.
    */
   next: string | null;
   // --- SAGA M0 snapshot fields (optional; absent on linear MVP graphs) ---
@@ -162,5 +186,11 @@ export interface ValidationIssueData {
 export interface ValidationResult {
   ok: boolean;
   issues: ValidationIssueData[];
+  /**
+   * The execution-graph snapshot. On `ok: true` it is always present. On
+   * `ok: false` it is attached BEST-EFFORT (whenever a process-level start
+   * event anchors it) so the IR stays observable on rejected documents. `ok` —
+   * never `graph` presence — is the publish gate.
+   */
   graph?: ExecutionGraph;
 }

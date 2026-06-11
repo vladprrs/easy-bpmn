@@ -385,6 +385,10 @@ async function handleRetryInstance(env: Env, instanceId: string, request: Reques
     const incident = await getIncidentForInstance(env.DB, instanceId);
     const elementId = incident?.elementId;
     if (!elementId) throw new ConflictError(`Instance ${instanceId} has no incident element to retry.`);
+    // For a non-task incident element (e.g. an exclusiveGateway noPath) there is
+    // no job row, so this matches 0 rows BY DESIGN — the retry then just
+    // re-walks, and the failed visit (which recorded no decision row) is
+    // re-evaluated fresh against the patched variables.
     await resetJobForRetry(env.DB, { instanceId, elementId, isCompensation: false, inputVariables: variablesJson, now });
     await setIncidentResolution(env.DB, instanceId, "operatorResolved", now);
     const changed = await transitionStatusGuarded(env.DB, instanceId, ["incident"], "running", now);
@@ -659,7 +663,7 @@ async function leaseOnce(
     if (r.is_compensation === 1) {
       // A compensation job is seeded with the compensated forward step's captured
       // input + output from the ledger (design §4.4 / §4.3).
-      const step = await getSagaStep(env.DB, r.instance_id, r.compensates_element_id ?? r.element_id);
+      const step = await getSagaStep(env.DB, r.instance_id, r.compensates_element_id ?? r.element_id, r.occurrence);
       if (step) {
         job.originalInput = step.capturedInput;
         job.capturedOutput = step.capturedOutput;

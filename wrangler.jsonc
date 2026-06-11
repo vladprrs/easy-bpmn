@@ -44,6 +44,29 @@
   },
   "workflows": [
     {
+      // Step budget vs the engine loop guard (M2 design §5, risk R-M2-5).
+      //
+      // Platform budget: Cloudflare Workflows allows 10,000 steps per instance
+      // by default on Workers Paid, raisable here via "limits": { "steps": N }
+      // up to 25,000 (1,024 on Free; step.sleep doesn't count) — verified
+      // 2026-06-11, developers.cloudflare.com/workflows/reference/limits/.
+      // (The M2 design's 25,000 figure is that configurable MAX, not the
+      // default this deployment runs with.)
+      //
+      // Engine step cost: ~3-5 memoized steps per Service Task iteration
+      // (svc-create + wait-job + svc-apply, plus retry/timeout branches),
+      // ~1-2 per gateway visit (gw:, plus loop-limit on the tripping visit),
+      // ~1 per bookkeeping node (start/tx/commit/end).
+      //
+      // MAX_ELEMENT_OCCURRENCES = 1000 (src/runtime/engine.ts) caps visits PER
+      // ELEMENT: a typical loop (one task + one gateway per cycle) trips a
+      // loopLimit incident at roughly 4-7k steps — safely before the 10k
+      // platform budget. HONEST CAVEAT (TASK-34/35 analysis): a hot
+      // MULTI-element cycle in workflow mode multiplies — e.g. 3 tasks + a
+      // gateway per cycle ≈ 1000 × (3×4 + 1) ≈ 13k steps — and can exhaust the
+      // platform budget before any single element reaches its 1000-visit cap.
+      // If that shape becomes real, set "limits": { "steps": 25000 } here;
+      // the per-element cap itself is an engine constant, not config.
       "name": "easy-bpmn-process",
       "binding": "PROCESS_WORKFLOW",
       "class_name": "ProcessWorkflow"

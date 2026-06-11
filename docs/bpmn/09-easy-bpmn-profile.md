@@ -1,11 +1,14 @@
 # 09 — The `easy-bpmn` BPMN Profile
 
 This is the **contract** between the BPMN standard and what `easy-bpmn` actually executes. It is the
-operational reading of the [constitution](../../.specify/memory/constitution.md) (now **v2.0.0**, with
-the widened **Principle I — "Standard BPMN Profile Only"** and the new **Principle VI — "SAGA /
-Compensation Integrity"**). When in doubt, the constitution wins. The authoritative SAGA design is
-[`2026-06-08-saga-orchestrator-design.md`](../superpowers/specs/2026-06-08-saga-orchestrator-design.md);
-the Spec Kit feature is [`specs/002-saga-orchestrator`](../../specs/002-saga-orchestrator).
+operational reading of the [constitution](../../.specify/memory/constitution.md) (now **v2.1.0**, with
+the widened **Principle I — "Standard BPMN Profile Only"** covering the M2 conditional set and
+**Principle VI — "SAGA / Compensation Integrity"**). When in doubt, the constitution wins. The
+authoritative designs are
+[`2026-06-08-saga-orchestrator-design.md`](../superpowers/specs/2026-06-08-saga-orchestrator-design.md)
+(M1) and
+[`2026-06-09-m2-conditional-sagas-design.md`](../superpowers/specs/2026-06-09-m2-conditional-sagas-design.md)
+(M2); the Spec Kit feature is [`specs/002-saga-orchestrator`](../../specs/002-saga-orchestrator).
 
 > **Core principle (constitution I):** execute *only* standard BPMN 2.0 elements from this profile;
 > introduce **no** custom notation or platform-only semantics; and **reject unsupported standard-namespace
@@ -13,11 +16,13 @@ the Spec Kit feature is [`specs/002-saga-orchestrator`](../../specs/002-saga-orc
 
 The profile grows one milestone at a time, each guarded by a constitution amendment:
 
-- **M0/M1 (current): the canonical transaction-saga** — the linear core *plus* `bpmn:transaction`,
+- **M0/M1: the canonical transaction-saga** — the linear core *plus* `bpmn:transaction`,
   compensation/error/cancel boundary events, an `isForCompensation` handler, `bpmn:association`, a cancel
   end event, and root `bpmn:error`. Documented here.
-- **M2 → conditional sagas** (`exclusiveGateway` + conditional/default flows): target semantics in
-  [`03-gateways.md`](./03-gateways.md).
+- **M2 (current): conditional sagas** — `bpmn:exclusiveGateway` (XOR split + pass-through join), FEEL
+  `conditionExpression` (via `feelin`) on flows leaving an exclusiveGateway, the gateway-owned `default`
+  flow, and **cycles on the token path** (occurrence-discriminated iterations). Documented here;
+  execution semantics in [`03-gateways.md`](./03-gateways.md).
 - **M3 → time & failure taxonomy** (timers, per-step timeouts, error catalog):
   [`01-events.md`](./01-events.md). **One M1 exception:** a single **job-level activation TTL**
   (`service_task_jobs.activation_expires_at`, default 15 min) backs the un-leasable-job DLQ — a job
@@ -158,9 +163,35 @@ the transaction cancels; the engine compensates the completed steps in reverse �
 `releaseStock`; the cancel boundary then takes `SagaFailed`. (A real model adds an error boundary →
 cancel on *every* compensatable step whose later-failure should trigger rollback.)
 
-> **M1 stays single-token.** The forward path inside the transaction is linear. An interrupting error
-> boundary event *redirects* the single token to the cancel end event — it is **not** a parallel split —
-> so the engine is single-token in M1. Data-driven XOR is M2; true parallelism is M4.
+> **The engine stays single-token through M2.** An interrupting error boundary event *redirects* the
+> single token to the cancel end event — it is **not** a parallel split — and an XOR gateway routes
+> the single token down exactly one outgoing flow. True parallelism (multiple concurrent tokens) is M4.
+
+### Conditional saga (M2)
+
+The forward path may branch through an **`exclusiveGateway`** (XOR) and **loop back** through one:
+
+```text
+                          ┌─[ method = "card" ]──→ ⚙ payCard ──┐
+⚙ reserveFunds ──→ ( X )──┤                                    ├──→ ( X join ) ──→ ● Tx_ok
+                          └─[ default ]──────────→ ⚙ payWire ──┘
+```
+
+- A **split** evaluates its non-default outgoing FEEL conditions in **document order**; the first
+  boolean `true` wins; none true → the `default` flow; no default either → terminal incident
+  `kind=noPath` (a Hazard inside a transaction — no auto-compensation, operator `/cancel` available).
+- A **join** is a pass-through (no waiting — there is only one token).
+- **Cycles** are legal: each re-visit of an element is a distinct **occurrence** (its own job row,
+  ledger row, message subscription, and decision row). A walk-local visit counter exceeding
+  `MAX_ELEMENT_OCCURRENCES = 1000` → terminal incident `kind=loopLimit` (Hazard semantics inside a
+  transaction). Compensation in a loop compensates **every completed iteration**, in reverse
+  completion order (per-occurrence ledger rows; Principle VI is unchanged).
+- Every gateway visit persists a **`gateway_decisions`** row (chosen flow + per-flow evaluations)
+  atomically with the transition; crash/replay **reuses the recorded branch, never re-evaluates**.
+- The canonical executable example ships as
+  [`examples/conditional-fulfillment-saga.bpmn`](../../examples/conditional-fulfillment-saga.bpmn)
+  (XOR split/join + a loop + compensation wiring), publish-validated by
+  `tests/integration/sample-conditional-saga.test.ts`.
 
 ## Supported element set (the whitelist)
 
@@ -170,7 +201,8 @@ cancel on *every* compensatable step whose later-failure should trigger rollback
 | **Service Task** | `serviceTask` | A remote (pull) worker, bound by a stable **`taskType`** in `<extensionElements>` (`easy-bpmn` namespace) — **not** by id/name. Output variables persisted before advancing. |
 | **Receive Task** | `receiveTask` (with `messageRef`) | Durable wait state; resumed by a correlated external message. `instantiate="true"` is **rejected**. |
 | **None End Event** | `endEvent` (no child event definition) | Plain completion. A transaction's none end = **commit**. |
-| **Sequence Flow** | `sequenceFlow` | Plain only — **no** `conditionExpression`, no `default` (deferred to M2). Must connect nodes in the **same scope**. |
+| **Sequence Flow** | `sequenceFlow` | Plain everywhere **except** leaving an `exclusiveGateway` split: there every non-default flow carries a FEEL `conditionExpression`, and the gateway's `default` flow carries none. Must connect nodes in the **same scope**. Cycles on the token path are legal. |
+| **Exclusive Gateway** | `exclusiveGateway` | XOR **split** (1 in, N out): non-default outgoing flows carry FEEL conditions (`tFormalExpression`; parsed at publish via `feelin`), evaluated in document order, first `true` wins, else the `default` flow, else terminal `noPath`. XOR **join** (N in, 1 out): pass-through, no waiting. No boundary events may attach to a gateway. |
 | **Message** | `message` (root) | Declares the message **name** a Receive Task waits for. Correlation key is supplied via the **API** at start. |
 | **Transaction** | `transaction` | The **saga scope**: a none start event, supported children, a none end (commit), and optionally a cancel end. Compensation of its completed activities runs in reverse order on cancel. |
 | **Compensation Boundary Event** | `boundaryEvent` + `compensateEventDefinition` | A **compensation marker**: it is **neither interrupting nor non-interrupting** (the `cancelActivity` axis does not apply). MUST have **zero outgoing `sequenceFlow`** and **exactly one** outgoing `<association>` to an `isForCompensation` activity **in the same transaction scope**. |
@@ -215,10 +247,10 @@ Still deferred to later milestones; each requires its own constitution amendment
 |----------|-------------------|
 | Tasks | abstract `task`, `userTask`, `sendTask`, `manualTask`, `scriptTask`, `businessRuleTask` |
 | Events | timer / signal / escalation / conditional / message / link event definitions; **non-saga** boundary events (timer/signal/…); all `intermediateCatchEvent`/`intermediateThrowEvent`; terminate end; a non-cancel end-event definition |
-| Gateways | `exclusiveGateway`, `parallelGateway`, `inclusiveGateway`, `eventBasedGateway`, `complexGateway`, and any **implicit split (>1 outgoing sequence flow)** |
-| Flow | conditional sequence flow, default flow, `messageFlow`, a sequence flow crossing a transaction boundary |
+| Gateways | `parallelGateway` (M4 — concurrent tokens), `inclusiveGateway` (M4 — multi-branch activation), `eventBasedGateway` (M3 — timers & events), `complexGateway` (not on the roadmap), and any **implicit split (>1 outgoing sequence flow on a non-gateway node)** — pointers in lockstep with `DEFERRED_GATEWAY_REASONS` (`src/bpmn/profile.ts`) |
+| Flow | `conditionExpression` on any flow **not leaving an `exclusiveGateway`**, a `default` attribute on a non-gateway node, `messageFlow`, a sequence flow crossing a transaction boundary |
 | Structure | non-transaction `subProcess`, `adHocSubProcess`, `callActivity`, `collaboration`, `participant` (pools), `laneSet`/`lane`, `choreography` |
-| Loops/data | `multiInstanceLoopCharacteristics`, `standardLoopCharacteristics`, `dataObject`/`dataStore`/`dataInput`/`dataOutput` |
+| Loops/data | `multiInstanceLoopCharacteristics`, `standardLoopCharacteristics` (the activity **markers** — distinct from the accepted M2 cycles drawn as sequence flows through a gateway), `dataObject`/`dataStore`/`dataInput`/`dataOutput` |
 | Model instantiation | `receiveTask instantiate="true"` (or any non-none instantiation path) |
 | Platform | built-in tasklist, forms/assignment, process migration, full Zeebe/Camunda compatibility, visual modeler, advanced Operate-style UI |
 
@@ -240,12 +272,17 @@ A BPMN document is accepted for publish only if **all** hold:
    pools, lanes, or choreography.
 3. **Whitelist only (flow nodes), recursively.** Every flow node — at the process level **and inside each
    `transaction`** — is one of the supported nodes above. Any other standard-namespace flow node ⇒ reject
-   with the offending element id + reason. No implicit split (>1 outgoing sequence flow) on a token node.
+   with the offending element id + reason (deferred gateways carry their roadmap pointer). No implicit
+   split: >1 outgoing sequence flow is allowed **only on an `exclusiveGateway`**.
 4. **Event definitions.** Start events carry **no** event definition. End events are **none** (commit) or
    a **cancel** end **only inside a `transaction`**. Boundary events carry exactly one of
-   `compensate`/`error`/`cancel`.
-5. **Plain sequence flows, scoped.** No `conditionExpression`; no `default`; flows connect supported nodes
-   **in the same scope** (a flow may not cross a transaction boundary).
+   `compensate`/`error`/`cancel` and never attach to a gateway.
+5. **Conditions only on gateway splits, flows scoped.** A `conditionExpression` is allowed **only** on a
+   flow leaving a multi-out `exclusiveGateway`; there, every **non-default** outgoing flow MUST carry one
+   (FEEL; parse-checked at publish — a parse failure rejects with element id + reason), the `default`
+   flow MUST NOT, and the `default` attribute MUST reference one of the gateway's own outgoing flows.
+   All other flows are plain. Flows connect supported nodes **in the same scope** (a flow may not cross a
+   transaction boundary). Cycles on the token path are legal; reachability is BFS-based.
 6. **Structural sanity, per scope.** Each scope (the process and each transaction) has exactly one none
    start event, ≥1 none end event, every `*Ref` resolves, and every node is reachable (via sequence flow,
    boundary attachment, or compensation association).
@@ -273,7 +310,9 @@ do** (constitution V — operator clarity).
 | Start instance | Create instance bound to one version; seed variables; **audit**. |
 | **Service Task** | A durable **pull** job: persist the job (status `created`), wait on `bpmn_job_<jobId>`; a remote worker leases by `taskType`, runs, then `complete`/`fail`. On `complete`: persist output, then advance. Idempotent across retries/duplicate callbacks (lease + `lock_token`). |
 | **Receive Task** | Durable **wait state**; on an external message, correlate by `messageName` + `correlationKey` to exactly one instance; atomically apply payload + advance (constitution IV). |
-| **Transaction** | Enter a saga **scope**; record completed compensatable steps in the saga ledger (input + captured output), atomically with advance. |
+| **Transaction** | Enter a saga **scope**; record completed compensatable steps in the saga ledger (input + captured output), atomically with advance. In a loop, **each iteration is its own occurrence-keyed ledger row**, compensated separately. |
+| **Exclusive Gateway** | One persisted decision per visit (`gw:elementId#occurrence`): read variables from D1, evaluate non-default outgoing FEEL conditions in document order, first `true` wins, else `default`, else terminal incident `kind=noPath` (Hazard in a transaction). The `gateway_decisions` row + transition + `gatewayDecisionEvaluated` history event commit in **one batch** (persist-before-advance); replay reuses the recorded branch, never re-evaluates. |
+| **Cycles** | Re-visiting an element starts a new **occurrence** (fresh job row / ledger row / subscription; step names keyed `element#occurrence`). A visit counter exceeding `MAX_ELEMENT_OCCURRENCES = 1000` → terminal incident `kind=loopLimit` (no auto-compensation; operator `/cancel` available). |
 | **Reverse-order compensation** | On transaction cancel (error boundary → cancel end, or operator cancel), run each completed step's `isForCompensation` handler **in reverse completion order**, idempotently; on a compensator's retry-exhaustion → terminal `compensationFailed` + operator remediation (constitution VI). |
 | None end | Consume token; transaction commits / instance completes; **audit**. |
 | Any transition | Recorded in **audit history**; replay-safe & idempotent (constitution III & V). |
@@ -292,8 +331,17 @@ events + associations round-trips cleanly when `easy-bpmn` + DI are ignored).
 
 **ACCEPT** — the linear happy path: `startEvent(none) → serviceTask → receiveTask → endEvent(none)`.
 
-**REJECT** — an exclusive gateway:
-> `element 'Gateway_1' (exclusiveGateway) is not supported in this profile.`
+**ACCEPT** — a conditional saga: an XOR split whose non-default outgoing flows carry FEEL conditions
+(`method = "card"`), a `default` flow, an XOR join, and a loop back through the gateway — see
+[`examples/conditional-fulfillment-saga.bpmn`](../../examples/conditional-fulfillment-saga.bpmn).
+
+**REJECT** — a parallel gateway (deferred-gateway pointer):
+> `Parallel (AND) gateways need concurrent tokens, which are deferred to concurrency (M4). Only
+>  exclusiveGateway branching is supported.`
+
+**REJECT** — a condition on a flow not leaving an exclusiveGateway, an implicit split on a task, a
+non-default gateway flow with no condition, a `default` referencing a foreign flow, or an invalid FEEL
+expression — each with the offending element id.
 
 **REJECT** — a compensation boundary with an outgoing sequence flow:
 > `Compensation boundary event 'reserveStock_comp' must have zero outgoing sequence flows; it wires to a
@@ -317,9 +365,15 @@ events + associations round-trips cleanly when `easy-bpmn` + DI are ignored).
 - **Worker model.** Pull / external-task (`/jobs/activate`, `/complete`, `/fail`); the orchestrator never
   knows service addresses.
 - **Parser.** `bpmn-moddle` (namespace-aware).
+- **Expression language (M2).** **FEEL via `feelin`** — the BPMN/DMN-ecosystem language (Camunda 8
+  semantics), pure-JS interpreter (Workers-compatible, no `eval`), edited natively by Camunda Modeler →
+  true round-trip. JSONLogic / a custom JS subset were rejected as non-standard blobs inside
+  `conditionExpression` (they fail the canonicity test).
+- **Cycles (M2).** Occurrence-discriminated extension of the single-token engine; the tokens-first
+  alternative (pulling M4's `execution_tokens` forward) was rejected.
 
 **Roadmap (per-milestone target semantics):**
-- **M2 — conditional sagas:** `exclusiveGateway` + conditional/default flows. [`03-gateways.md`](./03-gateways.md).
+- **M2 — conditional sagas: SHIPPED** (constitution v2.1.0; this profile + [`03-gateways.md`](./03-gateways.md)).
 - **M3 — time & failure taxonomy:** timers, per-step timeouts, error catalog. [`01-events.md`](./01-events.md).
 - **M4 — concurrency:** `parallelGateway`, token set, AND-join, parallel-branch compensation.
   [`07-execution-semantics.md`](./07-execution-semantics.md).

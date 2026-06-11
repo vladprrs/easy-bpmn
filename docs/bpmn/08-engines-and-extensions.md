@@ -119,9 +119,12 @@ build:
 - **JUEL** (`${...}`) — Camunda 7 / Operaton.
 - **FEEL** (`=expr`) — Camunda 8 / Zeebe and DMN. "Friendly Enough Expression Language" — a small,
   side-effect-free expression language for conditions and data mapping.
-- **`easy-bpmn`**: the MVP has *no* conditional flows or gateways, so **no expression language is
-  required yet**. When branching is added, FEEL is the modern, standard choice (it's an OMG/DMN
-  standard), but that's a future decision.
+- **`easy-bpmn`**: **FEEL, since M2.** XOR branching ships with FEEL `conditionExpression`s on the
+  flows leaving an `exclusiveGateway`, evaluated via the **`feelin`** interpreter with
+  Camunda-compatible semantics (parse-checked at publish; evaluated at runtime in document order,
+  first `true` wins; a missing variable makes a comparison `null` → not taken, not an error). FEEL
+  was chosen because it is the modern, standard choice (an OMG/DMN standard). See the
+  "Conditional saga (M2)" section of [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
 
 ---
 

@@ -91,23 +91,30 @@ world*. `easy-bpmn` requires (constitution, Principle III):
 - **Persist-before-advance.** Worker output is persisted before the token moves on.
 
 Common implementation tools: a monotonic per-instance version/sequence, dedup keys on
-callbacks/messages, and atomic "apply payload + advance" writes. (On Cloudflare this maps naturally to a
-**Durable Object** per instance — single-threaded, transactional storage. See
+callbacks/messages, and atomic "apply payload + advance" writes. (On Cloudflare this maps to **one
+Cloudflare Workflow per process instance** for durable execution, plus a **single Durable Object
+correlation broker** — keyed by `workspaceId + messageName + correlationKey` — as the strongly
+consistent serialization point for message correlation; D1 stays the canonical store. See
 [`08-engines-and-extensions.md`](./08-engines-and-extensions.md).)
 
-## Error, escalation, compensation, transactions (advanced — out of MVP)
+## Error, escalation, compensation, transactions
 
-For completeness; none are in the MVP.
+`easy-bpmn` status: **error, compensation, and transaction are IN since M1** (the transaction-saga
+profile — see [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md)); **escalation remains out of
+scope** (rejected before publish).
 
 - **Error**: a thrown error searches *outward* for a matching error boundary event / error event
-  sub-process. Unhandled ⇒ the (sub)process fails. Errors are always interrupting.
+  sub-process. Unhandled ⇒ the (sub)process fails. Errors are always interrupting. (`easy-bpmn` M1:
+  error boundary events on saga steps route a business failure to the cancel end event.)
 - **Escalation**: like an error but may be **non-interrupting**; used for "notify, but keep going."
+  (`easy-bpmn`: out of scope.)
 - **Compensation**: after an activity has *successfully completed*, a compensation trigger runs its
   registered compensation handler to *undo* it (e.g. "refund the charge"). Handlers run in reverse
-  order of completion.
+  order of completion. (`easy-bpmn` M1: compensation boundary events + `isForCompensation` handlers
+  wired by `association`.)
 - **Transaction sub-process**: groups work with all-or-nothing semantics. A **cancel end** inside it
   triggers a **cancel boundary** event, which runs compensation for completed activities and rolls the
-  scope back.
+  scope back. (`easy-bpmn` M1: `bpmn:transaction` is the saga container.)
 
 ## Audit history
 
@@ -118,9 +125,9 @@ replay/debugging tractable.
 
 ---
 
-## `easy-bpmn` execution model (MVP)
+## `easy-bpmn` execution model
 
-A single token walks a straight line:
+The MVP happy path — a single token walks a straight line:
 
 ```text
 none start  → create token, persist instance (bound to definition version)
@@ -133,6 +140,11 @@ receiveTask → WAIT STATE: persist & park. External system POSTs message.
 none end    → consume token; no tokens left ⇒ instance completed
 ```
 
-No concurrency (no parallel tokens), no branching (no gateways), no timers, no boundary events. Every
-arrow is an audited, replay-safe, idempotent transition. That constrained model is precisely what makes
-the MVP *provably* durable. See [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
+The engine stays **single-token through M2**, but the line is no longer straight: **since M1** the
+token may pass through a `bpmn:transaction` whose steps carry **boundary events**
+(error/cancel/compensation — an interrupting boundary *redirects* the token, it never forks it), and
+**since M2** it may **branch and loop through an XOR `exclusiveGateway`** (FEEL conditions, default
+flow, occurrence-counted cycles — the token takes exactly one outgoing flow). Still out: parallel
+tokens (M4) and timers (M3). Every arrow is an audited, replay-safe, idempotent transition. That
+constrained model is precisely what makes the engine *provably* durable. See
+[`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).

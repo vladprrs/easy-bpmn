@@ -2,14 +2,16 @@ import { describe, expect, it } from "vitest";
 import {
   CALL_ACTIVITY_BPMN,
   createDraft,
+  deferredGatewayBpmn,
   drainSampleWorkers,
   get,
-  GATEWAY_BPMN,
   DEMO_BPMN,
   post,
   publishDraft,
   SAGA_BPMN,
+  SAGA_XOR_BPMN,
   startInstance,
+  XOR_BPMN,
 } from "../helpers";
 
 describe("Public API contract (openapi.yaml)", () => {
@@ -22,17 +24,55 @@ describe("Public API contract (openapi.yaml)", () => {
     expect(typeof r.body.createdAt).toBe("string");
   });
 
+  // TASK-33: exclusiveGateway models now publish, so the unsupported-draft 409
+  // case pins a STILL-rejected gateway type (parallelGateway, deferred to M4)
+  // instead of the old exclusiveGateway fixture.
   it("records validation issues for an unsupported draft and blocks publish with 409", async () => {
-    const draft = await createDraft(GATEWAY_BPMN, "bad");
+    const draft = await createDraft(deferredGatewayBpmn("parallelGateway"), "bad");
     expect(draft.status).toBe(201);
     expect(draft.body.status).toBe("invalid");
     expect(draft.body.validationIssues.length).toBeGreaterThan(0);
+    expect(draft.body.validationIssues.some((i: any) => i.elementId === "G" && /M4/.test(i.reason))).toBe(true);
 
     const pub = await publishDraft(draft.body.draftId);
     expect(pub.status).toBe(409);
     expect(pub.body.error).toBeTruthy();
     expect(Array.isArray(pub.body.validationIssues)).toBe(true);
     expect(pub.body.validationIssues.length).toBeGreaterThan(0);
+  });
+
+  // TASK-33 (M2): conditional models publish over the real HTTP path. This
+  // file covers the publish path only; instance-start + gateway-dispatch
+  // coverage lives in tests/integration/xor-gateway.test.ts (TASK-34).
+  it("publishes an XOR split/join model (FEEL conditions + default) into an immutable version (201)", async () => {
+    const draft = await createDraft(XOR_BPMN, "xor");
+    expect(draft.status).toBe(201);
+    expect(draft.body.status).toBe("valid");
+    expect(draft.body.validationIssues).toEqual([]);
+
+    const pub = await publishDraft(draft.body.draftId);
+    expect(pub.status).toBe(201);
+    expect(pub.body.status).toBe("published");
+    const gw = pub.body.elements.find((e: any) => e.elementId === "GW_split");
+    expect(gw.type).toBe("exclusiveGateway");
+    const flow = pub.body.elements.find((e: any) => e.elementId === "f_gold");
+    expect(flow).toMatchObject({ conditionExpression: "amount > 100", isDefault: false });
+    const def = pub.body.elements.find((e: any) => e.elementId === "f_def");
+    expect(def).toMatchObject({ conditionExpression: null, isDefault: true });
+  });
+
+  it("publishes a conditional saga (XOR inside a transaction) into an immutable version (201)", async () => {
+    const draft = await createDraft(SAGA_XOR_BPMN, "xor-saga");
+    expect(draft.status).toBe(201);
+    expect(draft.body.status).toBe("valid");
+
+    const pub = await publishDraft(draft.body.draftId);
+    expect(pub.status).toBe(201);
+    const types = pub.body.elements.map((e: any) => e.type);
+    expect(types).toContain("transaction");
+    expect(types).toContain("exclusiveGateway");
+    const card = pub.body.elements.find((e: any) => e.elementId === "f_card");
+    expect(card).toMatchObject({ conditionExpression: 'method = "card"', isDefault: false });
   });
 
   it("publishes the canonical transaction-saga (§3) into an immutable version (201)", async () => {

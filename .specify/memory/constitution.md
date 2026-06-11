@@ -1,37 +1,48 @@
 <!--
 Sync Impact Report
-Version change: 1.0.0 -> 2.0.0
-Rationale (MAJOR): expands product scope from the linear MVP profile to the
-canonical BPMN transaction-saga, in a way that invalidates the prior governance
-(the old MVP Scope list forbade compensation, transaction subprocess, and the
-saga boundary events). Per the versioning policy ("MAJOR = expand product scope
-in a way that invalidates existing governance"). Source: SAGA orchestrator design
-(docs/superpowers/specs/2026-06-08-saga-orchestrator-design.md §7, §2 decision #7).
+Version change: 2.0.0 -> 2.1.0
+Rationale (MINOR): materially expands Principle I's accepted construct set with
+the M2 conditional-saga constructs while preserving every existing principle
+(per the versioning policy: "MINOR = ... materially expand guidance while
+preserving existing principles"). The M2 set shipped behind this amendment:
+`bpmn:exclusiveGateway` (data-driven XOR split + pass-through join), FEEL
+`conditionExpression` (via `feelin`) on sequence flows leaving an
+exclusiveGateway, the gateway-owned `default` flow, and cycles (loops) on the
+token path. Source: M2 conditional-sagas design
+(docs/superpowers/specs/2026-06-09-m2-conditional-sagas-design.md §2, §3).
 Modified principles:
-- I. Standard BPMN-Lite Profile Only -> I. Standard BPMN Profile Only (widened to
-  the canonical-saga construct set; the no-custom-notation / XSD-valid /
-  round-trippable / reject-unsupported-flow-node-with-element-id-and-reason clause
-  is preserved verbatim in intent)
-Added principles:
-- VI. SAGA / Compensation Integrity
+- I. Standard BPMN Profile Only (accepted construct set widened with the M2
+  conditional set; the no-custom-notation / XSD-valid / round-trippable /
+  reject-unsupported-flow-node-with-element-id-and-reason clause is unchanged)
 Modified sections:
-- MVP Scope and Platform Constraints (exclusion list trimmed to remove only the
-  M1-shipped constructs: transaction subprocess, compensation, saga boundary
-  events; gateways/timers/non-transaction subprocess/multi-instance/user-task/
-  forms/migration/full-Camunda-Zeebe-compat/visual-modeler remain excluded)
+- MVP Scope and Platform Constraints (exclusion list trimmed by the M2
+  gateway/condition constructs: `exclusiveGateway`, FEEL conditionExpression on
+  flows leaving it, and default flows. Cycles on the token path are newly
+  accepted explicitly — previously implicitly excluded by the linear profile,
+  never a listed exclusion; the `multiInstanceLoopCharacteristics` /
+  `standardLoopCharacteristics` markers were the listed loop exclusions and
+  remain excluded. Parallel / inclusive /
+  event-based / complex gateways, conditional or default flows NOT leaving an
+  exclusiveGateway, timers, non-transaction subprocesses, multi-instance/loop
+  characteristics, user task/forms, migration, full Camunda/Zeebe compat, and
+  the visual modeler all remain excluded.)
+Unchanged principles:
+- II-V verbatim; VI (SAGA / Compensation Integrity) untouched — compensation
+  semantics are independent of how the token reached a step (M2 only adds
+  per-iteration ledger rows under the same reverse-order contract).
 Templates requiring updates:
-- updated: .specify/templates/plan-template.md (Constitution Check: widened BPMN
-  profile gate + new SAGA/Compensation-integrity gate)
-- updated: .specify/templates/spec-template.md (BPMN Profile Impact prompt covers
-  saga/compensation constructs)
-- updated: .specify/templates/tasks-template.md (constitution-critical test list
-  adds compensation ordering, saga state transitions, worker auth/workspace
-  isolation, operator remediation)
+- updated: .specify/templates/plan-template.md (Constitution Check BPMN-profile
+  gate names the M2 conditional set)
+- updated: .specify/templates/spec-template.md (BPMN Profile Impact prompt
+  covers the gateway/conditional constructs)
+- checked: .specify/templates/tasks-template.md (no construct list; generic
+  saga/compensation test guidance still accurate)
 - checked: AGENTS.md
-- checked: CLAUDE.md (Known doc drift note resolved separately)
+- updated: CLAUDE.md (profile-lockstep line -> v2.1.0; reject-list invariant
+  carves out the M2 set)
 Follow-up TODOs:
-- M2-M5 each still require their own amendment before adding gateways, timers,
-  parallelism, or composition.
+- M3 (timers/event taxonomy), M4 (parallelism), M5 (composition) each still
+  require their own amendment before widening the profile further.
 -->
 
 # easy-bpmn Constitution
@@ -44,11 +55,16 @@ The platform MUST execute only standard BPMN 2.0-compatible elements in this
 profile. The currently accepted construct set is:
 
 - the linear core — None Start Event, Service Task, Receive Task, None End Event,
-  Sequence Flow, and Message correlation; and
+  Sequence Flow, and Message correlation;
 - the canonical transaction-saga set — `bpmn:transaction` (the saga scope), the
   compensation / error / cancel `boundaryEvent`, an `isForCompensation` Service
   Task (compensation handler), `bpmn:association` (compensation wiring), a cancel
-  `endEvent` (only inside a transaction), and a root `bpmn:error`.
+  `endEvent` (only inside a transaction), and a root `bpmn:error`; and
+- the conditional set (M2) — `bpmn:exclusiveGateway` (data-driven XOR split and
+  pass-through join), FEEL `conditionExpression` (evaluated in document order)
+  on sequence flows leaving an exclusiveGateway, the gateway-owned `default`
+  flow, and cycles (loops) on the token path. Conditions appear ONLY on flows
+  leaving an exclusiveGateway; every other gateway type remains excluded.
 
 A saga is modeled in **canonical BPMN**: the only additive binding is
 `easy-bpmn:taskDefinition` carried inside the standard `<bpmn:extensionElements>`
@@ -63,8 +79,8 @@ reason; ignorable extension content (foreign-namespace `<extensionElements>`,
 Diagram Interchange, `documentation`, text annotations) MUST be tolerated and
 ignored, never rejected.
 
-Each later milestone (gateways/conditions, timers, parallelism, composition)
-widens this profile only by amending this constitution first.
+Each later milestone (timers, parallelism, composition) widens this profile
+only by amending this constitution first.
 
 Rationale: the product promise depends on making standard BPMN executable without
 inventing a notation or pretending to support the full BPMN ecosystem at once.
@@ -151,18 +167,24 @@ invocation, external event waiting, event correlation, and basic execution
 history.
 
 The platform MUST NOT include built-in tasklists, BPMN User Task, forms,
-assignment, gateways and conditional/default sequence flows, timer / signal /
-escalation / conditional / message events, non-transaction subprocesses,
-`callActivity`, ad-hoc subprocesses, multi-instance / loop characteristics,
-process migration, full Zeebe/Camunda compatibility, a visual BPMN modeler, or
-advanced Operate-style UI unless this constitution is amended first. (Each of
-these is added only by its own later milestone amendment — M2 gateways/conditions,
+assignment, parallel / inclusive / event-based / complex gateways, conditional
+or default sequence flows that do not leave an `exclusiveGateway`, timer /
+signal / escalation / conditional / message events, non-transaction
+subprocesses, `callActivity`, ad-hoc subprocesses, multi-instance / loop
+characteristics (`multiInstanceLoopCharacteristics` /
+`standardLoopCharacteristics` markers — distinct from the accepted cycles on
+the token path), process migration, full Zeebe/Camunda compatibility, a visual
+BPMN modeler, or advanced Operate-style UI unless this constitution is amended
+first. (Each of these is added only by its own later milestone amendment —
 M3 timers/event taxonomy, M4 parallelism, M5 composition.)
 
 The accepted saga set — the `bpmn:transaction` scope, compensation / error /
 cancel boundary events, the `isForCompensation` handler, `bpmn:association`, the
 cancel end event, and root `bpmn:error` — is in scope (Principle I); only those
-specific constructs were removed from this exclusion list.
+specific constructs were removed from this exclusion list. The accepted
+conditional set — `bpmn:exclusiveGateway`, FEEL `conditionExpression` on flows
+leaving it, the gateway-owned `default` flow, and cycles on the token path —
+is likewise in scope (Principle I, the M2 amendment); nothing else was removed.
 
 The first demo flow MUST run without requiring users to deploy their own workflow
 cluster, broker, BPMN engine, or dedicated operations stack.
@@ -207,4 +229,4 @@ Plans with unresolved constitution violations MUST NOT proceed to implementation
 until the violation is either removed or explicitly accepted through the
 Complexity Tracking section.
 
-**Version**: 2.0.0 | **Ratified**: 2026-06-07 | **Last Amended**: 2026-06-08
+**Version**: 2.1.0 | **Ratified**: 2026-06-07 | **Last Amended**: 2026-06-11

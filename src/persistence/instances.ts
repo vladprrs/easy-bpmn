@@ -289,6 +289,11 @@ export interface JobRow {
   lock_expires_at: string | null;
   activation_expires_at: string | null;
   error_code: string | null;
+  // CONDITIONAL (0004) — loop-iteration discriminator + fast-forward marker.
+  /** Walk-local visit counter (design M2 §5). 0 for every pre-loop row/call site. */
+  occurrence: number;
+  /** 1 once the engine merged this job's output + advanced — rewalk skips it write-free. */
+  output_applied: number;
 }
 
 export async function getJobByElement(
@@ -303,7 +308,14 @@ export async function getJobByElement(
   );
 }
 
-/** The FORWARD job for an element (is_compensation = 0). */
+/**
+ * The FORWARD job for an element (is_compensation = 0). Occurrence-unaware:
+ * once loops exist an element may have one row per iteration, so this orders
+ * by `occurrence DESC` to deterministically return the LATEST iteration
+ * instead of whichever row D1 happens to yield first.
+ *
+ * @deprecated prefer the occurrence-aware getForwardJob (TASK-32 migrates call sites)
+ */
 export async function getForwardJobByElement(
   db: D1Database,
   instanceId: string,
@@ -311,12 +323,58 @@ export async function getForwardJobByElement(
 ): Promise<JobRow | null> {
   return dbFirst<JobRow>(
     db,
-    `SELECT * FROM service_task_jobs WHERE instance_id = ? AND element_id = ? AND is_compensation = 0`,
+    `SELECT * FROM service_task_jobs
+       WHERE instance_id = ? AND element_id = ? AND is_compensation = 0
+       ORDER BY occurrence DESC`,
     [instanceId, elementId],
   );
 }
 
-/** The COMPENSATION job for a forward element (is_compensation = 1). */
+/**
+ * The FORWARD job for one specific iteration of an element (design M2 §5): the
+ * occurrence-aware lookup the loop-capable rewalk uses. No row → the iteration
+ * has not run; a row with un-applied output → the resume frontier.
+ */
+export async function getForwardJob(
+  db: D1Database,
+  instanceId: string,
+  elementId: string,
+  occurrence: number,
+): Promise<JobRow | null> {
+  return dbFirst<JobRow>(
+    db,
+    `SELECT * FROM service_task_jobs
+       WHERE instance_id = ? AND element_id = ? AND is_compensation = 0 AND occurrence = ?`,
+    [instanceId, elementId, occurrence],
+  );
+}
+
+/**
+ * The COMPENSATION job for one specific iteration of a forward element
+ * (design M2 §8): a compensation job inherits its forward step's occurrence,
+ * so the reverse pass keys its lookups by (element, occurrence).
+ */
+export async function getCompensationJob(
+  db: D1Database,
+  instanceId: string,
+  elementId: string,
+  occurrence: number,
+): Promise<JobRow | null> {
+  return dbFirst<JobRow>(
+    db,
+    `SELECT * FROM service_task_jobs
+       WHERE instance_id = ? AND element_id = ? AND is_compensation = 1 AND occurrence = ?`,
+    [instanceId, elementId, occurrence],
+  );
+}
+
+/**
+ * The COMPENSATION job for a forward element (is_compensation = 1).
+ * Occurrence-unaware: orders by `occurrence DESC` so once loops exist it
+ * deterministically returns the latest iteration's compensation job.
+ *
+ * @deprecated prefer the occurrence-aware getCompensationJob (TASK-32 migrated the engine)
+ */
 export async function getCompensationJobByElement(
   db: D1Database,
   instanceId: string,
@@ -324,7 +382,9 @@ export async function getCompensationJobByElement(
 ): Promise<JobRow | null> {
   return dbFirst<JobRow>(
     db,
-    `SELECT * FROM service_task_jobs WHERE instance_id = ? AND element_id = ? AND is_compensation = 1`,
+    `SELECT * FROM service_task_jobs
+       WHERE instance_id = ? AND element_id = ? AND is_compensation = 1
+       ORDER BY occurrence DESC`,
     [instanceId, elementId],
   );
 }
@@ -345,14 +405,16 @@ export function createJobStmt(
     isCompensation?: boolean;
     compensatesElementId?: string | null;
     activationExpiresAt?: string | null;
+    // CONDITIONAL (0004) — optional; pre-loop callers default to occurrence 0.
+    occurrence?: number;
   },
 ): D1PreparedStatement {
   return stmt(
     db,
     `INSERT INTO service_task_jobs
        (job_id, instance_id, element_id, task_type, status, retry_limit, attempt_count, idempotency_key, input_variables, output_variables, created_at, updated_at, completed_at,
-        workspace_id, is_compensation, compensates_element_id, activation_expires_at)
-     VALUES (?, ?, ?, ?, 'created', ?, 0, ?, ?, NULL, ?, ?, NULL, ?, ?, ?, ?)`,
+        workspace_id, is_compensation, compensates_element_id, activation_expires_at, occurrence, output_applied)
+     VALUES (?, ?, ?, ?, 'created', ?, 0, ?, ?, NULL, ?, ?, NULL, ?, ?, ?, ?, ?, 0)`,
     [
       input.jobId,
       input.instanceId,
@@ -367,7 +429,51 @@ export function createJobStmt(
       input.isCompensation ? 1 : 0,
       input.compensatesElementId ?? null,
       input.activationExpiresAt ?? null,
+      input.occurrence ?? 0,
     ],
+  );
+}
+
+/**
+ * Mark a completed job's output as applied (design M2 §5): composed into the
+ * SAME dbBatch as the variable merge + transition, so the rewalk-from-start
+ * treats the step as write-free fast-forward and never re-merges an old
+ * iteration's output over newer variables. Guarded by `status = 'completed'` —
+ * output can only be "applied" for a completed job; flipping the marker on a
+ * created/running/failed job affects 0 rows.
+ */
+export function markJobOutputAppliedStmt(
+  db: D1Database,
+  jobId: string,
+  now: string,
+): D1PreparedStatement {
+  return stmt(
+    db,
+    `UPDATE service_task_jobs SET output_applied = 1, updated_at = ?
+       WHERE job_id = ? AND status = 'completed'`,
+    [now, jobId],
+  );
+}
+
+/**
+ * Mark a FAILED job's outcome as applied (TASK-32): the business-error branch
+ * (errorCode → boundary route) composes this into the SAME dbBatch as the
+ * `businessErrorCaught` history + the transition to the boundary target, so a
+ * rewalk fast-forwards the visit (re-deriving the deterministic boundary target
+ * from the graph + the persisted error_code) instead of re-routing — which
+ * would duplicate history and rewrite the cursor backwards. Guarded by
+ * `status = 'failed'` (the failure-routing twin of markJobOutputAppliedStmt).
+ */
+export function markFailedJobHandledStmt(
+  db: D1Database,
+  jobId: string,
+  now: string,
+): D1PreparedStatement {
+  return stmt(
+    db,
+    `UPDATE service_task_jobs SET output_applied = 1, updated_at = ?
+       WHERE job_id = ? AND status = 'failed'`,
+    [now, jobId],
   );
 }
 
@@ -510,6 +616,8 @@ export interface SubscriptionRow {
   expires_at: string | null;
   consumed_at: string | null;
   external_message_id: string | null;
+  // CONDITIONAL (0004) — a Receive Task in a loop re-subscribes per visit.
+  occurrence: number;
 }
 
 export async function createSubscription(
@@ -527,14 +635,16 @@ export async function createSubscription(
     expiresAt: string;
     consumedAt?: string | null;
     externalMessageId?: string | null;
+    /** CONDITIONAL (0004) — keys the subscription to its loop iteration; defaults to 0. */
+    occurrence?: number;
     now: string;
   },
 ): Promise<void> {
   await dbRun(
     db,
     `INSERT INTO message_subscriptions
-       (subscription_id, workspace_id, instance_id, element_id, message_name, correlation_key, broker_key, workflow_event_type, status, created_at, expires_at, consumed_at, external_message_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (subscription_id, workspace_id, instance_id, element_id, message_name, correlation_key, broker_key, workflow_event_type, status, created_at, expires_at, consumed_at, external_message_id, occurrence)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       input.subscriptionId,
       input.workspaceId,
@@ -549,21 +659,31 @@ export async function createSubscription(
       input.expiresAt,
       input.consumedAt ?? null,
       input.externalMessageId ?? null,
+      input.occurrence ?? 0,
     ],
   );
 }
 
-export async function getActiveSubscription(
+/**
+ * The subscription row for one VISIT of a Receive Task (design M2 §5): the
+ * latest row at (instance, element, occurrence). The caller branches on its
+ * status — `consumed` means this iteration's message was already applied
+ * atomically with the transition (the write-free fast-forward predicate),
+ * `active` means this visit is the live wait frontier; anything else (or no
+ * row) means the visit still needs to register.
+ */
+export async function getSubscriptionForVisit(
   db: D1Database,
   instanceId: string,
   elementId: string,
+  occurrence: number,
 ): Promise<SubscriptionRow | null> {
   return dbFirst<SubscriptionRow>(
     db,
     `SELECT * FROM message_subscriptions
-       WHERE instance_id = ? AND element_id = ? AND status = 'active'
+       WHERE instance_id = ? AND element_id = ? AND occurrence = ?
        ORDER BY rowid DESC LIMIT 1`,
-    [instanceId, elementId],
+    [instanceId, elementId, occurrence],
   );
 }
 
@@ -598,7 +718,40 @@ export async function markSubscriptionExpired(
 // Incidents
 // ---------------------------------------------------------------------------
 
-export type IncidentKind = "serviceTaskFailure" | "compensationFailure" | "timeout" | "poison";
+export type IncidentKind =
+  | "serviceTaskFailure"
+  | "compensationFailure"
+  | "timeout"
+  | "poison"
+  // CONDITIONAL (M2 §9) — loop-iteration cap exceeded | XOR with no true condition and no default.
+  | "loopLimit"
+  | "noPath";
+/**
+ * Incident remediation lifecycle (one-way):
+ *
+ *   open → compensating       operator /cancel of a Hazard initiates the reverse pass
+ *   compensating → compensated  the reverse pass settles (engine settle batch, TASK-36)
+ *   open|compensating → operatorResolved  operator /retry — STICKY, never overwritten
+ *                                          (setIncidentResolution guards on it; the settle
+ *                                          advance is keyed on 'compensating' only)
+ *
+ * The AUTO-compensation path (business error → cancel end) raises no incident,
+ * so 'compensating'/'compensated' resolutions only ever appear on operator-
+ * cancelled Hazards.
+ *
+ * Known terminal-'open' state: /cancel of an incident instance with an EMPTY
+ * ledger (nothing compensatable, e.g. a noPath or gateway-only loopLimit
+ * Hazard) settles the instance 'cancelled' without touching the incident —
+ * the incident stays 'open' forever on a terminal instance. Candidate fix
+ * (M3): advance to 'operatorResolved' in the pending===0 cancel branch.
+ *
+ * Caveat: setIncidentResolution below updates ALL non-operatorResolved
+ * incidents of the instance (no incident_id filter) — with multiple incidents
+ * (Hazard 'compensating' + a later compensationFailure 'open'), an operator
+ * /retry flips BOTH to 'operatorResolved', so the Hazard never reaches its
+ * natural 'compensated'. Audit-attribution wart only; incident_id filter is
+ * an M3 candidate (callers hold the id).
+ */
 export type IncidentResolution = "open" | "compensating" | "compensated" | "operatorResolved";
 
 export function incidentStmt(
@@ -630,6 +783,24 @@ export function incidentStmt(
       input.resolution ?? "open",
       input.now,
     ],
+  );
+}
+
+/**
+ * Advance an incident's resolution as a BATCHABLE statement, guarded on the
+ * exact prior value — the compensation settle path uses it to complete the
+ * cancel-path lifecycle ('compensating' → 'compensated') atomically with the
+ * terminal transition, without ever touching 'open' or the sticky
+ * 'operatorResolved'. A 0-row match (no cancel-path incident) is a no-op.
+ */
+export function advanceIncidentResolutionStmt(
+  db: D1Database,
+  input: { instanceId: string; from: IncidentResolution; to: IncidentResolution },
+): D1PreparedStatement {
+  return stmt(
+    db,
+    `UPDATE incidents SET resolution = ? WHERE instance_id = ? AND resolution = ?`,
+    [input.to, input.instanceId, input.from],
   );
 }
 

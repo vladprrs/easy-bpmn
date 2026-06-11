@@ -21,6 +21,8 @@ export interface LeasedJobRow {
   attempt_count: number;
   lock_token: string;
   input_variables: string;
+  /** Loop-iteration discriminator (0004): a compensation job inherits its forward step's occurrence. */
+  occurrence: number;
 }
 
 /**
@@ -61,7 +63,7 @@ export async function leaseJobs(
          ORDER BY j.created_at
          LIMIT ?)
         AND (status = 'created' OR (status = 'locked' AND lock_token IS NULL AND lock_expires_at < ?))
-      RETURNING job_id, instance_id, element_id, task_type, is_compensation, compensates_element_id, attempt_count, lock_token, input_variables`,
+      RETURNING job_id, instance_id, element_id, task_type, is_compensation, compensates_element_id, attempt_count, lock_token, input_variables, occurrence`,
     [
       input.workerId,
       input.lockToken,
@@ -140,6 +142,10 @@ export interface JobWithWorkspace {
   output_variables: string | null;
   error_code: string | null;
   is_compensation: number;
+  /** Loop-iteration discriminator (0004); 0 for every pre-loop row. */
+  occurrence: number;
+  /** Write-free fast-forward marker (0004): 1 once the engine applied the output. */
+  output_applied: number;
   /** Authoritative workspace via the JOIN to process_instances. */
   workspace_id: string;
   /** Owning instance status, for the terminal no-op-ack gate. */
@@ -160,6 +166,7 @@ export async function getJobInWorkspace(
     db,
     `SELECT j.job_id, j.instance_id, j.element_id, j.task_type, j.status, j.retry_limit,
             j.attempt_count, j.lock_token, j.output_variables, j.error_code, j.is_compensation,
+            j.occurrence, j.output_applied,
             pi.workspace_id AS workspace_id, pi.status AS instance_status
        FROM service_task_jobs j
        JOIN process_instances pi ON pi.instance_id = j.instance_id
@@ -307,9 +314,37 @@ export async function parkJobForBackoffConditional(
 }
 
 /**
- * Operator-retry reset: a failed job at (instance, element, kind) becomes
- * leasable again with a fresh attempt budget + a re-snapshotted input (so an
- * operator's variable patch reaches the worker). Returns rows changed.
+ * Operator-retry reset: the incident element's job at (instance, element, kind)
+ * becomes leasable again with a fresh attempt budget + a re-snapshotted input
+ * (so an operator's variable patch reaches the worker). Returns rows changed.
+ *
+ * Occurrence guard (TASK-32): with loops an element has one row PER iteration.
+ * The retry target is always the LIVE frontier, i.e. output_applied = 0 plus:
+ *   * `failed` — technical exhaustion / uncaught business error / failed
+ *     compensation (a business-routed failure is marked applied atomically
+ *     with its boundary transition, so it never matches here);
+ *   * `completed` forward — an un-applicable poison completion;
+ *   * `created`/`locked` — the workflow-mode WAIT-TIMEOUT incidents
+ *     (svc-timeout / comp-timeout): nobody completed the job, so it is still
+ *     leasable/leased when the operator retries, and the input refresh must
+ *     reach it (M1 parity — M1's matcher had no status filter at all). Safe
+ *     under the rewalk: output_applied=1 is only ever set on a completed or
+ *     failed row, so a created/locked row is necessarily the unapplied
+ *     frontier, never an earlier applied iteration.
+ * Rows whose outcome was already applied to the instance (output_applied=1)
+ * and already-compensated completed compensation rows are NEVER reset —
+ * resetting an old iteration would re-open it and break the rewalk's
+ * write-free fast-forward.
+ *
+ * Also clears activation_expires_at: a reset job would otherwise keep its
+ * stale-past creation TTL while looking exactly like a fresh job
+ * (status='created', attempt_count=0), so a late/duplicate JobScheduler alarm
+ * would pass terminateUnleasableJob's guards and insta-fail the freshly
+ * retried job. NULL (rather than re-arming a future TTL) is safe by
+ * construction: terminateUnleasableJob no-ops on a NULL activation_expires_at
+ * (its "not yet expired" guard), and failUnleasableJobConditional is only
+ * reached past that guard — the operator's explicit retry IS the activation,
+ * so no DLQ TTL applies anymore.
  */
 export async function resetJobForRetry(
   db: D1Database,
@@ -319,8 +354,10 @@ export async function resetJobForRetry(
     db,
     `UPDATE service_task_jobs
         SET status = 'created', attempt_count = 0, lock_token = NULL, lock_expires_at = NULL,
+            activation_expires_at = NULL,
             worker_id = NULL, error_code = NULL, output_variables = NULL, input_variables = ?, completed_at = NULL, updated_at = ?
-      WHERE instance_id = ? AND element_id = ? AND is_compensation = ?`,
+      WHERE instance_id = ? AND element_id = ? AND is_compensation = ? AND output_applied = 0
+        AND (status IN ('created', 'locked', 'failed') OR (is_compensation = 0 AND status = 'completed'))`,
     [input.inputVariables, input.now, input.instanceId, input.elementId, input.isCompensation ? 1 : 0],
   ).run();
   return res.meta?.changes ?? 0;

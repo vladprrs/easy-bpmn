@@ -1,9 +1,10 @@
-# Runtime Contracts: SAGA Orchestrator (M1 — Canonical transaction-saga)
+# Runtime Contracts: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas)
 
 These contracts extend `specs/001-bpmn-lite-orchestrator-mvp/contracts/runtime-contracts.md`. The
 Process Workflow, Receive Task, Correlation Broker, and D1 Persistence contracts from the MVP carry
 forward unchanged; this document specifies the new pull-worker, compensation, idempotency, and
-saga-settlement contracts.
+saga-settlement contracts, plus the M2 conditional-dispatch contract (gateways + occurrence-keyed
+loops) at the end.
 
 ## Process Workflow Contract (delta)
 
@@ -107,8 +108,14 @@ A per-`taskType` Durable Object is **not** required for M1.
 ```
 ```json
 // POST /jobs/{jobId}/fail
-{ "lockToken": "lt_abc", "reason": "shipping carrier rejected", "errorCode": "SHIPPING_REJECTED", "retryable": false }
+{ "lockToken": "lt_abc", "reason": "shipping carrier rejected", "errorCode": "SHIPPING_REJECTED" }
 ```
+
+> **`retryable` is advisory and IGNORED server-side.** The schema accepts it (compatibility), but
+> the server derives the outcome exclusively from `errorCode` (present → business failure, never
+> retried) or the retry budget (`attempt_count < retries` → technical re-lease; exhausted →
+> terminal). A worker cannot force or suppress a retry via `retryable`. (M3 candidate: honor or
+> drop the field.)
 
 `complete`/`fail` are `lock_token`-conditional updates (`… WHERE job_id=? AND lock_token=?`) that
 rotate/clear the token:
@@ -132,7 +139,8 @@ rotate/clear the token:
 
 ## Failure Taxonomy
 
-- **Technical failure** — `fail retryable=true` / no `errorCode`, or a lease-expiry reclaim: the job
+- **Technical failure** — a `fail` with **no `errorCode`** (the body's `retryable` field is
+  advisory/ignored — see above), or a lease-expiry reclaim: the job
   is **parked behind an exponential-with-full-jitter backoff** (`status='locked'`, `lock_token=NULL`,
   `lock_expires_at = now + computeBackoffMs(attempt)`), so the activate gate re-leases it only after
   the delay — reusing the lease gate without a new column, and **distinct from the lease duration**
@@ -238,6 +246,48 @@ On transaction cancellation the runtime runs the reverse pass:
 - Large worker outputs ride an **R2 reference** (deliver only the reference in the event); keep
   `step.do` results small scalars to respect the ≤1 GB cumulative persisted-state-per-instance
   limit.
+
+## Conditional Dispatch Contract (M2 — exclusiveGateway + FEEL + occurrence-keyed loops)
+
+Design: `docs/superpowers/specs/2026-06-09-m2-conditional-sagas-design.md`. Constitution v2.1.0.
+
+**The `/jobs/*` worker surface is UNCHANGED.** Forward and compensation workers see exactly the M1
+request/response shapes; `occurrence` / `output_applied` never leak into the leased-job payload.
+Pinned by `tests/contract/jobs-schema-pin.test.ts` — widening the surface later must amend that pin
+deliberately.
+
+**Rules**:
+
+- **The walk is the replay.** The engine re-walks the graph from the start element on every
+  resume (both execution modes), counting visits per element id in memory (**occurrence**), and
+  fast-forwards through already-applied steps using canonical D1 state. Every Workflow step name
+  and persistence key carries the occurrence (`svc-create:el#2`, `wait-job:el#2`, `msg:el#1`,
+  `gw:el#0`); applied steps (`output_applied=1`) are **write-free** fast-forward.
+- **Gateway dispatch** (one persisted step per visit): an existing `gateway_decisions` row for
+  `(instance, gateway, occurrence)` is taken as-is (never re-evaluated). Otherwise: read variables
+  from D1 → evaluate non-default outgoing FEEL conditions in **document order** (`feelin`; a
+  missing variable makes a comparison `null` → not taken, no error) → first boolean `true` wins →
+  else the `default` flow → else terminal incident **`kind=noPath`**. The decision row + transition
+  + `gatewayDecisionEvaluated` history event commit in **one `dbBatch`** (persist-before-advance).
+- **`gatewayDecisionEvaluated` diagnostics**: `{ chosenFlowId, occurrence, isDefault, evaluations
+  [{flowId, expression, result, value, warnings?}], passThrough?, variablesSnapshotOmitted?,
+  variablesByteSize? }`. The decision row's `variables_snapshot` is capped by the event-payload
+  limit — an oversized context is omitted (`NULL` + the `variablesSnapshotOmitted: true` flag),
+  never an error.
+- **Failed visits write no decision row** (`noPath`, hard FEEL evaluation error): operator `/retry`
+  re-evaluates that visit **fresh**, so a variable patch can re-route it. A recorded (successful)
+  decision is permanent for its occurrence.
+- **Hazard semantics in a transaction**: `noPath` and `loopLimit` terminate WITHOUT
+  auto-compensation; operator `/cancel` compensates the pending ledger (incident resolution
+  `open → compensating → compensated`).
+- **Loop guard**: a walk-local visit counter exceeding `MAX_ELEMENT_OCCURRENCES = 1000` → terminal
+  incident **`kind=loopLimit`** naming the tripping element. Occurrence ≠ attempt: technical
+  retries of one iteration never consume the visit cap.
+- **Compensation across iterations**: each completed compensatable pass is its own occurrence-keyed
+  ledger row; the reverse pass compensates every iteration separately (highest `seq` first), each
+  compensation job inheriting its forward occurrence and seeded with **its own** iteration's
+  `originalInput` + `capturedOutput`. `compensationStarted`/`compensationCompleted` carry the
+  `occurrence` in diagnostics.
 
 ## Observability Contract
 

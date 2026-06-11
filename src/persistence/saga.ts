@@ -33,6 +33,8 @@ export interface SagaStepRow {
   trace_id: string | null;
   created_at: string;
   updated_at: string;
+  // CONDITIONAL (0004) — each completed pass of a looped step is its own row.
+  occurrence: number;
 }
 
 export interface SagaStepView {
@@ -40,6 +42,8 @@ export interface SagaStepView {
   scopeId: string;
   seq: number;
   elementId: string;
+  /** Loop-iteration discriminator (design M2 §8); 0 for non-looped steps. */
+  occurrence: number;
   forwardJobId: string;
   capturedInput: JsonObject;
   capturedOutput: JsonObject | null;
@@ -56,6 +60,7 @@ export function mapSagaStep(row: SagaStepRow): SagaStepView {
     scopeId: row.scope_id,
     seq: row.seq,
     elementId: row.element_id,
+    occurrence: row.occurrence,
     forwardJobId: row.forward_job_id,
     capturedInput: parseJson<JsonObject>(row.captured_input, {}),
     capturedOutput: row.captured_output ? parseJson<JsonObject>(row.captured_output, {}) : null,
@@ -71,7 +76,9 @@ export function mapSagaStep(row: SagaStepRow): SagaStepView {
  * INSERT OR IGNORE a completed forward step into the ledger. `seq` is computed
  * atomically as the next monotonic value within (instance_id, scope_id), so the
  * reverse pass walks steps in true completion order. A duplicate (instance_id,
- * element_id) is ignored — the replay/double-complete no-op.
+ * element_id, occurrence) is ignored — the replay/double-complete no-op, held
+ * PER loop iteration (design M2 §8): each completed pass of a looped step is
+ * its own ledger row and is compensated separately by the unchanged reverse pass.
  */
 export function insertSagaStepStmt(
   db: D1Database,
@@ -88,6 +95,8 @@ export function insertSagaStepStmt(
     /** 'pending' when a compensator exists, else 'notRequired'. */
     compensationStatus: CompensationStatus;
     traceId?: string | null;
+    /** CONDITIONAL (0004) — loop-iteration discriminator; defaults to 0. */
+    occurrence?: number;
     now: string;
   },
 ): D1PreparedStatement {
@@ -95,10 +104,10 @@ export function insertSagaStepStmt(
     db,
     `INSERT OR IGNORE INTO saga_steps
        (step_id, instance_id, scope_id, seq, element_id, forward_job_id, captured_input, captured_output,
-        compensation_element_id, compensation_task_type, compensation_job_id, compensation_status, trace_id, created_at, updated_at)
+        compensation_element_id, compensation_task_type, compensation_job_id, compensation_status, trace_id, created_at, updated_at, occurrence)
      SELECT ?, ?, ?,
             COALESCE((SELECT MAX(seq) FROM saga_steps WHERE instance_id = ? AND scope_id = ?), 0) + 1,
-            ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?`,
+            ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?`,
     [
       input.stepId,
       input.instanceId,
@@ -115,6 +124,7 @@ export function insertSagaStepStmt(
       input.traceId ?? null,
       input.now,
       input.now,
+      input.occurrence ?? 0,
     ],
   );
 }
@@ -152,15 +162,22 @@ export async function getSagaStepsForInstance(
   return rows.map(mapSagaStep);
 }
 
+/**
+ * One iteration's ledger row (TASK-32): with loops each completed pass of an
+ * element is its own row, so lookups (e.g. seeding a compensation job's
+ * originalInput/capturedOutput at lease time) key by (element, occurrence) —
+ * the compensation job inherits its forward step's occurrence.
+ */
 export async function getSagaStep(
   db: D1Database,
   instanceId: string,
   elementId: string,
+  occurrence: number,
 ): Promise<SagaStepView | null> {
   const row = await dbFirst<SagaStepRow>(
     db,
-    `SELECT * FROM saga_steps WHERE instance_id = ? AND element_id = ?`,
-    [instanceId, elementId],
+    `SELECT * FROM saga_steps WHERE instance_id = ? AND element_id = ? AND occurrence = ?`,
+    [instanceId, elementId, occurrence],
   );
   return row ? mapSagaStep(row) : null;
 }

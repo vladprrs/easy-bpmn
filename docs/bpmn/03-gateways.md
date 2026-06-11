@@ -77,11 +77,42 @@ is true — preventing "stuck token / no path" errors.
 
 ## `easy-bpmn` scope
 
-**Gateways are entirely out of scope for the MVP.** `exclusiveGateway`, `parallelGateway`,
-`inclusiveGateway`, `eventBasedGateway`, and `complexGateway` MUST all be rejected before publish with a
-user-visible reason (constitution, MVP scope section).
+**The exclusive (XOR) gateway is IN scope since M2** (constitution v2.1.0, conditional sagas). What
+M2 executes, anywhere a token node can appear (process level and inside a `transaction`):
 
-The MVP's only control flow is a straight line of sequence flows:
-`Start → Service Task → Receive Task → End`. No branching, no merging. Branching is the most likely
-*first* extension after the MVP, so this file documents the full picture for when that day comes — see
-[`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
+- **`exclusiveGateway`** — data-driven **split** (1 in, N out) and **pass-through join** (N in, 1 out;
+  no waiting). A 1-out gateway is a pass-through/merge and needs no conditions.
+- **FEEL conditions** — every **non-default** outgoing flow of a split MUST carry a
+  `conditionExpression` (`tFormalExpression`, FEEL, evaluated via `feelin` with Camunda-compatible
+  semantics). Conditions are FEEL-parsed at publish; evaluated at runtime in **document order**, first
+  `true` wins. FEEL null-tolerance is standard semantics: a missing variable makes a comparison
+  `null` → not `true` → flow not taken (not an error).
+- **`default` flow** — the gateway-owned no-match fallback (`default="flowId"`); MUST reference one of
+  the gateway's own outgoing flows and MUST NOT carry a condition. No `true` condition + no default →
+  terminal incident `kind=noPath` (a **Hazard** inside a transaction: no auto-compensation; operator
+  `/cancel` is available).
+- **Cycles on the token path** — loops back through an XOR gateway are legal; each iteration is
+  discriminated by an **occurrence** counter (jobs, ledger rows, subscriptions, branch decisions).
+  A walk-local counter exceeding `MAX_ELEMENT_OCCURRENCES = 1000` → terminal incident
+  `kind=loopLimit`.
+- **Audit/replay** — every gateway visit persists a `gateway_decisions` row atomically with the
+  transition; crash/replay reuses the recorded branch, never re-evaluates.
+
+Conditions live **only** on flows leaving an `exclusiveGateway`: a `conditionExpression` on any other
+flow (the "conditional sequence flow from a task" pattern above) and any implicit split (>1 outgoing
+flow on a non-gateway node) are still **rejected** before publish with element id + reason.
+
+The other four gateway types remain out of scope, each rejected before publish with a user-visible
+reason and its roadmap pointer (kept in lockstep with `DEFERRED_GATEWAY_REASONS` in
+`src/bpmn/profile.ts`):
+
+| Gateway | Status |
+|---------|--------|
+| `parallelGateway` | Deferred to **M4** (concurrency) — AND-splits need multiple concurrent tokens. |
+| `inclusiveGateway` | Deferred to **M4** (concurrency) — OR-splits activate multiple branches at once. |
+| `eventBasedGateway` | Deferred to **M3** (timers & events) — routes on the first event to occur. |
+| `complexGateway` | Not on the roadmap; deferred to a later milestone. |
+
+See [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md) for the full profile (validation rules,
+runtime mapping) and `docs/superpowers/specs/2026-06-09-m2-conditional-sagas-design.md` for the M2
+design.

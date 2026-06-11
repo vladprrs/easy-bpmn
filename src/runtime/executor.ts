@@ -3,7 +3,7 @@
 
 import type { Env } from "../env";
 import type { JobResultEvent, MessageEventPayload, ProcessWorkflowParams } from "../contracts/workflow-events";
-import { runInstance } from "./engine";
+import { recordTerminalIncident, runInstance } from "./engine";
 import { workflowEventTypeFor, workflowJobEventTypeFor } from "../bpmn/profile";
 
 export interface DeliverArgs {
@@ -66,7 +66,18 @@ class WorkflowExecutor implements Executor {
       try {
         await runInstance(this.env, args.instanceId, { runStep: inlineStep, waitFor: null, startAt: args.elementId });
       } catch (err) {
-        console.error(JSON.stringify({ level: "error", message: "deliverJobResult inline drive failed", instanceId: args.instanceId, error: err instanceof Error ? err.message : String(err) }));
+        const reason = err instanceof Error ? err.message : String(err);
+        console.error(JSON.stringify({ level: "error", message: "deliverJobResult inline drive failed", instanceId: args.instanceId, error: reason }));
+        // Mode parity with the process-workflow catch-all: an engine invariant
+        // violation must surface as an operator-visible incident, not just a
+        // log. recordTerminalIncident is status-guarded (never regresses a
+        // terminal instance); its own failure must not escape this catch either
+        // (the at-least-once worker callback would retry forever on a 500).
+        try {
+          await recordTerminalIncident(this.env, args.instanceId, `Engine drive failed: ${reason}`);
+        } catch (incErr) {
+          console.error(JSON.stringify({ level: "error", message: "recordTerminalIncident failed", instanceId: args.instanceId, error: incErr instanceof Error ? incErr.message : String(incErr) }));
+        }
       }
     }
   }
@@ -113,7 +124,18 @@ class DirectExecutor implements Executor {
         startAt: args.elementId,
       });
     } catch (err) {
-      console.error(JSON.stringify({ level: "error", message: "deliverJobResult resume failed", instanceId: args.instanceId, error: err instanceof Error ? err.message : String(err) }));
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(JSON.stringify({ level: "error", message: "deliverJobResult resume failed", instanceId: args.instanceId, error: reason }));
+      // Mode parity with the process-workflow catch-all: a direct-mode engine
+      // invariant violation must surface as an operator-visible incident, not
+      // just a log. recordTerminalIncident is status-guarded (never regresses
+      // a terminal instance); its own failure must not escape this catch
+      // either (the at-least-once worker would retry forever on a 500).
+      try {
+        await recordTerminalIncident(this.env, args.instanceId, `Engine drive failed: ${reason}`);
+      } catch (incErr) {
+        console.error(JSON.stringify({ level: "error", message: "recordTerminalIncident failed", instanceId: args.instanceId, error: incErr instanceof Error ? incErr.message : String(incErr) }));
+      }
     }
   }
 

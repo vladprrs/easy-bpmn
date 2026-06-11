@@ -18,9 +18,10 @@
 
 **BPMN Profile Impact**: [Supported BPMN elements touched — including any saga
 constructs (`bpmn:transaction`, compensation/error/cancel boundary events,
-`isForCompensation` handler, `bpmn:association`, cancel end event, `bpmn:error`) —
-unsupported elements that must be rejected before publish with element id + reason,
-or N/A with rationale]
+`isForCompensation` handler, `bpmn:association`, cancel end event, `bpmn:error`)
+or conditional constructs (`exclusiveGateway`, FEEL `conditionExpression` on its
+outgoing flows, `default` flow, token-path cycles) — unsupported elements that
+must be rejected before publish with element id + reason, or N/A with rationale]
 
 **SAGA / Compensation Impact**: [If sagas/compensation are touched: reverse-order
 compensation, transaction scoping, idempotent + at-least-once compensators,

@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-06-08 08:18'
+updated_date: '2026-06-09 20:31'
 labels:
   - epic
   - saga
@@ -18,9 +19,11 @@ references:
   - §9
   - §5 gateway_decisions stub)
   - docs/bpmn/03-gateways.md
+  - docs/superpowers/specs/2026-06-09-m2-conditional-sagas-design.md
 documentation:
   - docs/superpowers/specs/2026-06-08-saga-orchestrator-design.md
   - docs/bpmn/03-gateways.md
+  - docs/superpowers/specs/2026-06-09-m2-conditional-sagas-design.md
 priority: medium
 ordinal: 19000
 ---
@@ -33,13 +36,22 @@ Epic placeholder for milestone M2 (design §8). Add data-driven branching to the
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A follow-up brainstorming/spec pass slices M2 into concrete tasks before implementation starts.
-- [ ] #2 The FEEL-vs-restricted-evaluator decision (design §9) is resolved and recorded before M2 implementation.
+- [x] #1 A follow-up brainstorming/spec pass slices M2 into concrete tasks before implementation starts.
+- [x] #2 The FEEL-vs-restricted-evaluator decision (design §9) is resolved and recorded before M2 implementation.
 - [ ] #3 Branch decisions are persisted in gateway_decisions and replay-deterministic (acceptance defined per concrete task).
 <!-- AC:END -->
 
 ## Implementation Plan
 
 <!-- SECTION:PLAN:BEGIN -->
-Deferred epic. When M1 is complete: (1) resolve the expression-language open question (§9); (2) run a focused spec/plan for the multi-edge IR + exclusiveGateway + gateway_decisions; (3) slice into concrete tasks. This stub tracks the milestone, not a single PR.
+Sliced 2026-06-09 via the brainstorming/spec pass (docs/superpowers/specs/2026-06-09-m2-conditional-sagas-design.md, commit 233af4f). Decisions locked: FEEL via feelin (resolves design §9); cycles INCLUDED in M2 via an occurrence discriminator + rewalk-from-start resume ("the walk is the replay"); conditions only on exclusiveGateway outgoing flows; no-match → noPath Hazard. Concrete tasks (execute in dependency order): TASK-29 (migration 0004 + contracts) and TASK-30 (FEEL module) → TASK-31 (graph IR conditional edges) → TASK-33 (validator accept-and-validate) and TASK-32 (engine occurrence/rewalk — the critical path) → TASK-34 (gateway dispatch + gateway_decisions), TASK-35 (loop guard), TASK-36 (loop compensation) → TASK-37 (governance lockstep + quickstart). This epic tracks the milestone; AC #3 is delivered by TASK-34.
 <!-- SECTION:PLAN:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+created: 2026-06-09 20:31
+---
+M2 sliced into TASK-29..TASK-37 (2026-06-09). Expression language resolved: FEEL via feelin. Scope expansion vs the original §8 row: cycles are in (user decision), which adds the occurrence discriminator + rewalk-resume work (TASK-32) and lifts M2 from L toward XL.
+---
+<!-- COMMENTS:END -->

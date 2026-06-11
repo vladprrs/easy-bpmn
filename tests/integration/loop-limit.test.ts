@@ -45,12 +45,12 @@ async function leaseAndComplete(token: string, taskType: string, output: Record<
 }
 
 /** A retryable technical fail parks the job behind backoff; rewind the park so the next activate re-leases it. */
-async function rewindBackoff(taskType: string): Promise<void> {
+async function rewindBackoff(instanceId: string, taskType: string): Promise<void> {
   await env.DB.prepare(
     `UPDATE service_task_jobs SET lock_expires_at = '2000-01-01T00:00:00Z'
-       WHERE status = 'locked' AND lock_token IS NULL AND task_type = ?`,
+       WHERE status = 'locked' AND lock_token IS NULL AND instance_id = ? AND task_type = ?`,
   )
-    .bind(taskType)
+    .bind(instanceId, taskType)
     .run();
 }
 
@@ -236,12 +236,14 @@ describe("loop guard inside a transaction — Hazard semantics (AC2, SAGA_LOOP_B
         "compensated",
         "compensated",
       ]);
-      // The Hazard incident was settled by the operator cancel.
+      // Resolution is set to "compensating" at cancel-initiation (src/index.ts) and the
+      // compensation settle path never advances it to "compensated" — that enum member
+      // is currently never written (recorded as a TASK-36/37 carry).
       const incident = await env.DB.prepare(`SELECT kind, resolution FROM incidents WHERE instance_id = ?`)
         .bind(id)
         .first<{ kind: string; resolution: string }>();
       expect(incident?.kind).toBe("loopLimit");
-      expect(incident?.resolution).not.toBe("open");
+      expect(incident?.resolution).toBe("compensating");
     },
   );
 });
@@ -272,7 +274,7 @@ describe("technical retries do not consume the cap (AC3, LOOP_XOR_BPMN)", () => 
       retryable: true,
     });
     expect(failed.status).toBe(200);
-    await rewindBackoff("switch-payment-method");
+    await rewindBackoff(id, "switch-payment-method");
     const attempt2 = await leaseOne(token, "switch-payment-method");
     expect(attempt2.jobId).toBe(attempt1.jobId); // the SAME iteration, re-leased
     expect(attempt2.attempt).toBe(2);

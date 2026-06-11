@@ -120,16 +120,23 @@ export async function drainSampleWorkers(opts: {
     // A retryable fail now PARKS the job behind an exponential backoff (TASK-23
     // §4.1: status='locked', lock_token=NULL, future lock_expires_at) instead of
     // re-leasing instantly. This driver is the test stand-in for elapsed
-    // wall-clock, so fast-forward any backoff-parked job of the polled task types
-    // and keep draining (the design's "advance time" wrinkle).
+    // wall-clock, so fast-forward EVERY backoff-parked job of the polled task
+    // types and keep draining (the design's "advance time" wrinkle).
+    // Deliberately NO `lock_expires_at > now` filter: a job whose jitter expiry
+    // falls between the activate read above and this UPDATE would be invisible
+    // to BOTH (too far in the future to lease, already in the past to rewind),
+    // making the drain exit early — the saga-operator flake. `status='locked'
+    // AND lock_token IS NULL` is exactly the backoff-parked shape and never
+    // matches a live lease; rewinding an already-lapsed park is harmless (it
+    // just forces one more drain round).
     if (!didWork) {
       const ph = opts.taskTypes.map(() => "?").join(", ");
       const res = await env.DB.prepare(
         `UPDATE service_task_jobs SET lock_expires_at = '2000-01-01T00:00:00Z'
-           WHERE status = 'locked' AND lock_token IS NULL AND lock_expires_at > ?
+           WHERE status = 'locked' AND lock_token IS NULL
              AND task_type IN (${ph})`,
       )
-        .bind(new Date().toISOString(), ...opts.taskTypes)
+        .bind(...opts.taskTypes)
         .run();
       if ((res.meta?.changes ?? 0) > 0) didWork = true; // re-drain the freed jobs
     }

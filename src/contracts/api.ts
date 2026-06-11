@@ -2,6 +2,11 @@
 // types. zod is the validation boundary for untrusted input.
 
 import { z } from "zod";
+// Single source of the incident-kind taxonomy (M3-L1, TASK-39). Type-only, so it
+// erases at compile time — no runtime cycle despite instances.ts importing Incident
+// from here. The check:docs guard keeps IncidentKind ↔ the openapi enum in sync;
+// linking the interface here puts the API surface under that same single source.
+import type { IncidentKind } from "../persistence/instances";
 
 export const createDraftRequestSchema = z.object({
   workspaceId: z.string().min(1),
@@ -206,16 +211,7 @@ export interface Incident {
    * (service/receive wait caps) | conditionFailure (hard FEEL error). `timeout`
    * is LEGACY — retained for compatibility, never written by current code.
    */
-  kind?:
-    | "serviceTaskFailure"
-    | "compensationFailure"
-    | "timeout"
-    | "poison"
-    | "loopLimit"
-    | "noPath"
-    | "jobActivationTimeout"
-    | "waitTimeout"
-    | "conditionFailure";
+  kind?: IncidentKind;
   resolution?: "open" | "compensating" | "compensated" | "operatorResolved";
   createdAt: string;
 }

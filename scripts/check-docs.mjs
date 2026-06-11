@@ -193,7 +193,15 @@ if (!unionMatch) {
 } else if (!kindEnumMatch) {
   failures.push(`openapi.yaml no longer has the Incident.kind enum (containing serviceTaskFailure) — update this check.`);
 } else {
-  const unionKinds = new Set([...unionMatch[1].matchAll(/"(\w+)"/g)].map((m) => m[1]));
+  // Only union-member lines count — strip `//` comments first so a future
+  // `// see "foo"` inside the union can't be misread as an incident kind.
+  const unionKinds = new Set(
+    unionMatch[1]
+      .split("\n")
+      .map((line) => line.replace(/\/\/.*$/, "").match(/^\s*\|?\s*"(\w+)"/))
+      .filter((m) => m)
+      .map((m) => m[1]),
+  );
   const enumKinds = new Set(kindEnumMatch[1].split(",").map((s) => s.trim()).filter(Boolean));
   for (const k of unionKinds) {
     if (!enumKinds.has(k)) failures.push(`openapi.yaml Incident.kind enum is missing IncidentKind member "${k}".`);

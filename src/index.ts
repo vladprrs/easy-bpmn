@@ -73,7 +73,8 @@ import {
   getOpenIncidentsForInstance,
   listInstances,
   mergeInstanceVariables,
-  setIncidentResolution,
+  resolveAllOpenIncidents,
+  resolveIncident,
   transitionStatusGuarded,
 } from "./persistence/instances";
 import { getExternalMessage, insertExternalMessage } from "./persistence/messages";
@@ -353,7 +354,7 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
       // M3-L1 (TASK-39): a terminal empty-ledger cancel closes ALL open incidents
       // (here "all" is correct) so none is left dangling 'open' on a terminal
       // instance — the previously-known terminal-'open' wart.
-      await setIncidentResolution(env.DB, instanceId, "operatorResolved", now);
+      await resolveAllOpenIncidents(env.DB, instanceId, "operatorResolved", now);
       await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, type: "instanceCancelled", diagnostics: { by: "operator", emptyLedger: true } });
     }
     return json(await getInstance(env.DB, instanceId), 200);
@@ -364,9 +365,13 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
   if (changed > 0) {
     if (inst.status === "incident") {
       // Target ONLY the current Hazard incident (M3-L1, TASK-39) so a sibling
-      // incident is never collaterally moved into the compensation lifecycle.
+      // incident is never collaterally moved into the compensation lifecycle. An
+      // 'incident' status implies a Hazard row exists; if it is somehow absent we
+      // skip rather than silently flip ALL incidents.
       const hazard = await getIncidentForInstance(env.DB, instanceId);
-      await setIncidentResolution(env.DB, instanceId, "compensating", now, hazard?.incidentId);
+      if (hazard?.incidentId) {
+        await resolveIncident(env.DB, instanceId, hazard.incidentId, "compensating", now);
+      }
     }
     await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, type: "transactionCancelled", diagnostics: { by: "operator", fromHazard: inst.status === "incident" } });
     await resumeInline(env, instanceId);
@@ -390,8 +395,11 @@ async function handleRetryInstance(env: Env, instanceId: string, request: Reques
     await resetJobForRetry(env.DB, { instanceId, elementId: failed.elementId, isCompensation: true, inputVariables: variablesJson, now });
     await updateCompensationStatusStmt(env.DB, { stepId: failed.stepId, status: "pending", now }).run();
     // Resolve ONLY this compensationFailure incident (M3-L1, TASK-39) so a sibling
-    // Hazard 'compensating' is not collaterally flipped to operatorResolved.
-    await setIncidentResolution(env.DB, instanceId, "operatorResolved", now, incident?.incidentId);
+    // Hazard 'compensating' is not collaterally flipped to operatorResolved. If no
+    // incident row is present we skip rather than fall through to flipping ALL.
+    if (incident?.incidentId) {
+      await resolveIncident(env.DB, instanceId, incident.incidentId, "operatorResolved", now);
+    }
     const changed = await transitionStatusGuarded(env.DB, instanceId, ["compensationFailed"], "compensating", now);
     if (changed === 0) throw new ConflictError(`Instance ${instanceId} is no longer retryable.`);
     await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, elementId: failed.elementId, type: "operatorRetry", diagnostics: { target: "compensation" } });
@@ -408,8 +416,12 @@ async function handleRetryInstance(env: Env, instanceId: string, request: Reques
     // re-walks, and the failed visit (which recorded no decision row) is
     // re-evaluated fresh against the patched variables.
     await resetJobForRetry(env.DB, { instanceId, elementId, isCompensation: false, inputVariables: variablesJson, now });
-    // Resolve ONLY the targeted incident (M3-L1, TASK-39).
-    await setIncidentResolution(env.DB, instanceId, "operatorResolved", now, incident?.incidentId);
+    // Resolve ONLY the targeted incident (M3-L1, TASK-39). The elementId guard
+    // above already proves an incident row is present; the explicit id guard keeps
+    // the absence path from ever falling through to flipping ALL.
+    if (incident?.incidentId) {
+      await resolveIncident(env.DB, instanceId, incident.incidentId, "operatorResolved", now);
+    }
     const changed = await transitionStatusGuarded(env.DB, instanceId, ["incident"], "running", now);
     if (changed === 0) throw new ConflictError(`Instance ${instanceId} is no longer retryable.`);
     await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, elementId, type: "operatorRetry", diagnostics: { target: "forward" } });

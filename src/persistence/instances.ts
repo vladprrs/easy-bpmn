@@ -746,8 +746,9 @@ export type IncidentKind =
  *   open → compensating       operator /cancel of a Hazard initiates the reverse pass
  *   compensating → compensated  the reverse pass settles (engine settle batch, TASK-36)
  *   open|compensating → operatorResolved  operator /retry — STICKY, never overwritten
- *                                          (setIncidentResolution guards on it; the settle
- *                                          advance is keyed on 'compensating' only)
+ *                                          (resolveIncident / resolveAllOpenIncidents
+ *                                          guard on it; the settle advance is keyed on
+ *                                          'compensating' only)
  *
  * The AUTO-compensation path (business error → cancel end) raises no incident,
  * so 'compensating'/'compensated' resolutions only ever appear on operator-
@@ -759,12 +760,14 @@ export type IncidentKind =
  * branch now closes ALL open incidents as 'operatorResolved' so none is left
  * dangling 'open' on a terminal instance.
  *
- * Targeted resolution (FIXED M3-L1, TASK-39): setIncidentResolution below takes
- * an optional incidentId — an operator /retry flips ONLY the targeted incident,
- * so with multiple incidents (a Hazard 'compensating' + a later
- * compensationFailure 'open') the Hazard still reaches its natural 'compensated'
- * instead of being collaterally flipped. The unfiltered form is reserved for the
- * empty-ledger cancel above, where closing every open incident IS correct.
+ * Targeted resolution (FIXED M3-L1, TASK-39): resolveIncident below takes a
+ * REQUIRED incidentId — an operator /retry flips ONLY the targeted incident, so
+ * with multiple incidents (a Hazard 'compensating' + a later compensationFailure
+ * 'open') the Hazard still reaches its natural 'compensated' instead of being
+ * collaterally flipped. The unfiltered form is the separate, explicit
+ * resolveAllOpenIncidents, reserved for the empty-ledger cancel above, where
+ * closing every open incident IS correct. (The two were split from a single
+ * optional-id function to remove the silent "missing id ⇒ flip ALL" footgun.)
  */
 export type IncidentResolution = "open" | "compensating" | "compensated" | "operatorResolved";
 
@@ -819,28 +822,39 @@ export function advanceIncidentResolutionStmt(
 }
 
 /**
- * Set an incident's remediation resolution (operator retry / compensation).
- *
- * With `incidentId` (M3-L1, TASK-39): flips ONLY that incident, so an operator
- * /retry never collaterally resolves a sibling Hazard. Without it: flips ALL
- * non-operatorResolved incidents of the instance — reserved for the empty-ledger
- * /cancel, where closing every open incident is the intended terminal cleanup.
+ * Resolve ONE incident's remediation lifecycle by REQUIRED id (M3-L1, TASK-39) —
+ * an operator /retry or a cancel-from-Hazard flips ONLY the targeted incident,
+ * so a sibling Hazard mid-compensation is never collaterally moved. Always
+ * filtered; never overwrites the sticky 'operatorResolved'. (Split from the old
+ * optional-id setIncidentResolution so a missing id can no longer silently fall
+ * through to flipping ALL incidents — see resolveAllOpenIncidents for that.)
  */
-export async function setIncidentResolution(
+export async function resolveIncident(
+  db: D1Database,
+  instanceId: string,
+  incidentId: string,
+  resolution: IncidentResolution,
+  now: string,
+): Promise<void> {
+  await dbRun(
+    db,
+    `UPDATE incidents SET resolution = ? WHERE instance_id = ? AND incident_id = ? AND resolution != 'operatorResolved'`,
+    [resolution, instanceId, incidentId],
+  );
+}
+
+/**
+ * Resolve EVERY not-yet-resolved incident of an instance (M3-L1, TASK-39) — the
+ * explicit "all" form, reserved for the empty-ledger /cancel terminal cleanup
+ * where closing every open incident IS correct (none should be left dangling
+ * 'open' on a terminal instance). Never overwrites the sticky 'operatorResolved'.
+ */
+export async function resolveAllOpenIncidents(
   db: D1Database,
   instanceId: string,
   resolution: IncidentResolution,
   now: string,
-  incidentId?: string,
 ): Promise<void> {
-  if (incidentId) {
-    await dbRun(
-      db,
-      `UPDATE incidents SET resolution = ? WHERE instance_id = ? AND incident_id = ? AND resolution != 'operatorResolved'`,
-      [resolution, instanceId, incidentId],
-    );
-    return;
-  }
   await dbRun(
     db,
     `UPDATE incidents SET resolution = ? WHERE instance_id = ? AND resolution != 'operatorResolved'`,
@@ -852,18 +866,7 @@ export async function getIncidentForInstance(
   db: D1Database,
   instanceId: string,
 ): Promise<Incident | null> {
-  const row = await dbFirst<{
-    incident_id: string;
-    instance_id: string;
-    element_id: string;
-    reason: string;
-    status: string;
-    retry_count: number;
-    payload_context: string | null;
-    kind: string | null;
-    resolution: string | null;
-    created_at: string;
-  }>(
+  const row = await dbFirst<IncidentRow>(
     db,
     `SELECT * FROM incidents WHERE instance_id = ? ORDER BY rowid DESC LIMIT 1`,
     [instanceId],

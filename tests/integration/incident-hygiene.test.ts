@@ -4,12 +4,14 @@ import { DEMO_BPMN, drainSampleWorkers, get, post, publishAndStart } from "../he
 import {
   getOpenIncidentsForInstance,
   incidentStmt,
-  setIncidentResolution,
+  resolveIncident,
+  type IncidentKind,
+  type IncidentResolution,
 } from "../../src/persistence/instances";
 
 // M3-L1 (TASK-39) incident hygiene:
-//   1. setIncidentResolution gains an incident_id filter (today flips ALL
-//      non-operatorResolved rows).
+//   1. resolveIncident takes a REQUIRED incident id (only that incident flips);
+//      the unfiltered "all" form is the separate resolveAllOpenIncidents.
 //   2. inspection exposes the LIST of open incidents (today only the latest).
 //   3. operator /cancel with an empty ledger closes ALL open incidents.
 
@@ -20,7 +22,7 @@ async function newInstance(correlationKey: string): Promise<string> {
 
 async function insertIncident(
   instanceId: string,
-  opts: { incidentId: string; kind: string; resolution: string; elementId?: string },
+  opts: { incidentId: string; kind: IncidentKind; resolution: IncidentResolution; elementId?: string },
 ): Promise<void> {
   await incidentStmt(env.DB, {
     incidentId: opts.incidentId,
@@ -28,8 +30,8 @@ async function insertIncident(
     elementId: opts.elementId ?? "Task_check",
     reason: `${opts.kind} incident`,
     retryCount: 0,
-    kind: opts.kind as any,
-    resolution: opts.resolution as any,
+    kind: opts.kind,
+    resolution: opts.resolution,
     now: new Date().toISOString(),
   }).run();
 }
@@ -38,14 +40,14 @@ const resolutionOf = (incidentId: string) =>
   env.DB.prepare(`SELECT resolution FROM incidents WHERE incident_id = ?`).bind(incidentId).first<{ resolution: string }>();
 
 describe("incident hygiene (M3-L1, TASK-39)", () => {
-  it("setIncidentResolution with an incident_id filter flips ONLY the targeted incident", async () => {
+  it("resolveIncident with a required incident id flips ONLY the targeted incident", async () => {
     const id = await newInstance(`hyg-target-${crypto.randomUUID()}`);
     // A Hazard mid-compensation ('compensating') + a later compensationFailure ('open').
     await insertIncident(id, { incidentId: "inc_hazard", kind: "noPath", resolution: "compensating" });
     await insertIncident(id, { incidentId: "inc_later", kind: "compensationFailure", resolution: "open" });
 
     // Resolve ONLY the later one.
-    await setIncidentResolution(env.DB, id, "operatorResolved", new Date().toISOString(), "inc_later");
+    await resolveIncident(env.DB, id, "inc_later", "operatorResolved", new Date().toISOString());
 
     expect((await resolutionOf("inc_later"))!.resolution).toBe("operatorResolved");
     // The Hazard must NOT be flipped — it can still reach its natural 'compensated'.
@@ -63,7 +65,7 @@ describe("incident hygiene (M3-L1, TASK-39)", () => {
     expect(open.map((i) => i.incidentId)).toEqual(["inc_b", "inc_a"]); // newest-first, only the unresolved two
 
     // Resolving one drops it from the list.
-    await setIncidentResolution(env.DB, id, "operatorResolved", new Date().toISOString(), "inc_b");
+    await resolveIncident(env.DB, id, "inc_b", "operatorResolved", new Date().toISOString());
     expect((await getOpenIncidentsForInstance(env.DB, id)).map((i) => i.incidentId)).toEqual(["inc_a"]);
   });
 

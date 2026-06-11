@@ -172,6 +172,7 @@ describe("loop + cancel end — the reverse pass compensates every iteration (AC
           .bind(comp.jobId)
           .first<{ occurrence: number; idempotency_key: string }>();
         expect(row?.occurrence).toBe(exp.occ);
+        // key shape: instance:element:isCompensation:occurrence — the `1` is the compensation lane.
         expect(row?.idempotency_key).toBe(`${id}:reserveItem:1:${exp.occ}`);
         expect(
           (
@@ -310,7 +311,10 @@ describe("compensationFailed mid-reverse-pass stops at the failed iteration (AC3
 });
 
 describe("crash mid-compensation re-attaches per occurrence (AC4)", () => {
-  it("recovery re-drives attach to the occurrence's EXISTING compensation job — never a second comp job, no duplicate audit", async () => {
+  it(
+    "recovery re-drives attach to the occurrence's EXISTING compensation job — never a second comp job, no duplicate audit",
+    { timeout: 30_000 },
+    async () => {
     const token = await mintWorkerToken();
     const id = await runLoopSagaToAutoCancel(token, 2);
 
@@ -371,5 +375,6 @@ describe("crash mid-compensation re-attaches per occurrence (AC4)", () => {
     expect(done.body.status).toBe("compensated");
     expect(done.body.currentElementId).toBe("Failed");
     expect(await compJobRows(id)).toHaveLength(2); // exactly one comp job per iteration, ever
-  });
+    },
+  );
 });

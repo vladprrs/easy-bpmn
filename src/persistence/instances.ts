@@ -738,6 +738,19 @@ export type IncidentKind =
  * The AUTO-compensation path (business error → cancel end) raises no incident,
  * so 'compensating'/'compensated' resolutions only ever appear on operator-
  * cancelled Hazards.
+ *
+ * Known terminal-'open' state: /cancel of an incident instance with an EMPTY
+ * ledger (nothing compensatable, e.g. a noPath or gateway-only loopLimit
+ * Hazard) settles the instance 'cancelled' without touching the incident —
+ * the incident stays 'open' forever on a terminal instance. Candidate fix
+ * (M3): advance to 'operatorResolved' in the pending===0 cancel branch.
+ *
+ * Caveat: setIncidentResolution below updates ALL non-operatorResolved
+ * incidents of the instance (no incident_id filter) — with multiple incidents
+ * (Hazard 'compensating' + a later compensationFailure 'open'), an operator
+ * /retry flips BOTH to 'operatorResolved', so the Hazard never reaches its
+ * natural 'compensated'. Audit-attribution wart only; incident_id filter is
+ * an M3 candidate (callers hold the id).
  */
 export type IncidentResolution = "open" | "compensating" | "compensated" | "operatorResolved";
 

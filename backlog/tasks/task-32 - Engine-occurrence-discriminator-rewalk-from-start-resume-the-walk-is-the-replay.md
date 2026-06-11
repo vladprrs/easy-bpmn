@@ -3,9 +3,11 @@ id: TASK-32
 title: >-
   Engine: occurrence discriminator + rewalk-from-start resume ("the walk is the
   replay")
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - Claude
 created_date: '2026-06-09 20:29'
+updated_date: '2026-06-10 23:31'
 labels:
   - saga
   - engine
@@ -43,3 +45,16 @@ The load-bearing M2 change (design 2026-06-09 §5; risk R-M2-1). Cycles break tw
 - [ ] #5 Receive task inside a loop: the second iteration re-subscribes (occurrence-keyed) and correlates independently; duplicate complete/fail within one iteration advances at most once per occurrence (design §10.8).
 - [ ] #6 Constitution gate: the existing test suite stays green; any test edited because resume semantics changed is individually justified in the task notes; npm run test green.
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+Execution: subagent-driven (implementer + spec review + quality review) on branch m2-conditional-sagas. The heart of M2 (design §5, risk R-M2-1): occurrence = walk-local visit counter; engine always re-walks from the start element fast-forwarding WRITE-FREE through applied steps using canonical D1 state; direct mode switches from resume-at-current_element_id to the same rewalk.
+
+1. Engine: walk-local occurrence counters (in-memory Map elementId→count during the walk; NEVER derived from D1 row counts); every step name + persistence key gains #occ (svc-create:el#2, wait-job:el#2, msg:el#1, recv:el#k, tx:el#k, gw-guard stays per TASK-33 until TASK-34).
+2. Job lookup -> getForwardJob(instanceId, elementId, occurrence): no row -> create (new iteration); row with un-applied output -> apply (resume frontier); output_applied=1 -> write-free fast-forward (cursor move only). output_applied set in the SAME dbBatch as the advance. Widen idempotencyKey to include is_compensation+occurrence (carried from TASK-29 review). Migrate engine call sites off deprecated getForwardJobByElement; add occurrence-aware compensation job lookup + fix the @deprecated pointer on getCompensationJobByElement.
+3. Receive: subscriptions occurrence-keyed (TASK-29 column); broker key unchanged; sequential re-subscription per iteration.
+4. Fast-forward predicates per node kind derived from canonical D1 state (jobs: output_applied; receive: subscription consumed/correlated + transition applied; start/tx/end: position-relative — no writes, no duplicate history when pre-frontier). Hardest design point — implementer designs predicates from actual engine code.
+5. Tests (loop WITHOUT gateway dependency — TASK-34 not landed): cyclic graph injected via createVersion direct insert (bypasses publish gate's end-reachability), cycle Start→TaskA→Recv→TaskA so each iteration PARKS at the receive task giving the test full iteration control; N messages -> N+1 job rows occ 0..N, unique step names/event types, N+1 subscriptions. Replay determinism BOTH modes: direct = re-enter runInstance via deliverJobResult/deliverMessage mid-loop; workflow = memoizing runStep harness driving runInstance with simulated crash/replay (real CF Workflow runtime not testable under vitest EXECUTION_MODE=direct — harness simulates step memoization semantics). Duplicate complete/fail within an iteration advances at most once per occurrence. M1 suite stays green; any edited test individually justified.
+runStep/waitFor port signatures unchanged; process-workflow.ts NOT edited.
+<!-- SECTION:PLAN:END -->

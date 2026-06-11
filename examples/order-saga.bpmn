@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  order-saga — the §3 canonical M1 transaction-saga example.
+
+  A bpmn:transaction with three forward Service Tasks, each routed by
+  easy-bpmn:taskDefinition type to a distinct microservice:
+
+    * reserveStock (reserve-stock)  — compensated by releaseStock (release-stock)
+    * chargeCard   (charge-card)    — compensated by refundCard  (refund-card)
+    * confirmShipping (confirm-shipping) — its SHIPPING_REJECTED business error
+      is caught by an error boundary and routed to the cancel end event, which
+      cancels the transaction -> reverse-order compensation (refundCard, then
+      releaseStock) -> the transaction's cancel boundary takes the SagaFailed path.
+
+  Canonical copies kept in lockstep: docs/bpmn/09-easy-bpmn-profile.md §3 (the
+  embedded XML guarded by `npm run check:docs`) and tests/helpers.ts SAGA_BPMN
+  (the validator's accept + semantic round-trip fixture). This on-disk copy
+  exists for specs/002-saga-orchestrator/quickstart.md Scenarios 1-2.
+
+  Like conditional-fulfillment-saga.bpmn, this is the executable/reference form:
+  no Diagram Interchange (bpmndi) section, so opening it in a visual modeler
+  requires auto-layout or re-drawing; the semantic round-trip (parse -> re-export)
+  is what the constitution requires.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+                  id="Definitions_order_saga" targetNamespace="http://easy-bpmn/example/order-saga">
+  <bpmn:error id="Err_shipping" name="Shipping rejected" errorCode="SHIPPING_REJECTED"/>
+  <bpmn:process id="OrderSaga" isExecutable="true">
+    <bpmn:startEvent id="Start"/>
+    <bpmn:transaction id="Tx_order" name="Place order">
+      <bpmn:startEvent id="Tx_start"/>
+      <bpmn:serviceTask id="reserveStock" name="Reserve stock">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="reserve-stock" retries="3"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="reserveStock_comp" attachedToRef="reserveStock">
+        <bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="releaseStock" name="Release stock" isForCompensation="true">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="release-stock" retries="5"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:association id="a1" associationDirection="One" sourceRef="reserveStock_comp" targetRef="releaseStock"/>
+      <bpmn:serviceTask id="chargeCard" name="Charge card">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="charge-card" retries="2"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="chargeCard_comp" attachedToRef="chargeCard">
+        <bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="refundCard" name="Refund card" isForCompensation="true">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="refund-card" retries="5"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:association id="a2" associationDirection="One" sourceRef="chargeCard_comp" targetRef="refundCard"/>
+      <bpmn:serviceTask id="confirmShipping" name="Confirm shipping">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="confirm-shipping" retries="2"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="shipping_err" attachedToRef="confirmShipping">
+        <bpmn:errorEventDefinition errorRef="Err_shipping"/></bpmn:boundaryEvent>
+      <bpmn:endEvent id="Tx_ok"/>
+      <bpmn:endEvent id="Tx_cancel"><bpmn:cancelEventDefinition/></bpmn:endEvent>
+      <bpmn:sequenceFlow id="f1" sourceRef="Tx_start"        targetRef="reserveStock"/>
+      <bpmn:sequenceFlow id="f2" sourceRef="reserveStock"    targetRef="chargeCard"/>
+      <bpmn:sequenceFlow id="f3" sourceRef="chargeCard"      targetRef="confirmShipping"/>
+      <bpmn:sequenceFlow id="f4" sourceRef="confirmShipping" targetRef="Tx_ok"/>
+      <bpmn:sequenceFlow id="f5" sourceRef="shipping_err"    targetRef="Tx_cancel"/>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="Tx_cancelled" attachedToRef="Tx_order">
+      <bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:endEvent id="SagaFailed"/>
+    <bpmn:endEvent id="SagaDone"/>
+    <bpmn:sequenceFlow id="g1" sourceRef="Start"        targetRef="Tx_order"/>
+    <bpmn:sequenceFlow id="g2" sourceRef="Tx_order"     targetRef="SagaDone"/>
+    <bpmn:sequenceFlow id="g3" sourceRef="Tx_cancelled" targetRef="SagaFailed"/>
+  </bpmn:process>
+</bpmn:definitions>

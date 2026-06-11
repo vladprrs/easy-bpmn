@@ -15,9 +15,13 @@ Modified principles:
   conditional set; the no-custom-notation / XSD-valid / round-trippable /
   reject-unsupported-flow-node-with-element-id-and-reason clause is unchanged)
 Modified sections:
-- MVP Scope and Platform Constraints (exclusion list trimmed by exactly the
-  M2-shipped constructs: `exclusiveGateway`, FEEL conditionExpression on flows
-  leaving it, default flows, cycles on the token path. Parallel / inclusive /
+- MVP Scope and Platform Constraints (exclusion list trimmed by the M2
+  gateway/condition constructs: `exclusiveGateway`, FEEL conditionExpression on
+  flows leaving it, and default flows. Cycles on the token path are newly
+  accepted explicitly — previously implicitly excluded by the linear profile,
+  never a listed exclusion; the `multiInstanceLoopCharacteristics` /
+  `standardLoopCharacteristics` markers were the listed loop exclusions and
+  remain excluded. Parallel / inclusive /
   event-based / complex gateways, conditional or default flows NOT leaving an
   exclusiveGateway, timers, non-transaction subprocesses, multi-instance/loop
   characteristics, user task/forms, migration, full Camunda/Zeebe compat, and

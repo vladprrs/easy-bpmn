@@ -302,7 +302,9 @@ Deterministic replay of branch choices: one row per gateway **visit**, written a
 transition (persist-before-advance). An existing row for `(instance, gateway, occurrence)` is
 **reused, never re-evaluated** — crash/replay takes the recorded branch in both execution modes.
 No row is written for a **failed** visit (`noPath` / evaluation error), so an operator `/retry`
-re-evaluates that visit fresh.
+re-evaluates that visit fresh. `evaluations` is the **evaluation trace**, not the flow list:
+selection short-circuits at the first `true` condition, so only actually-evaluated flows appear —
+flows after the winner and the never-evaluated `default` are absent by design.
 
 ```sql
 CREATE TABLE gateway_decisions (
@@ -312,7 +314,7 @@ CREATE TABLE gateway_decisions (
   occurrence         INTEGER NOT NULL,
   chosen_flow_id     TEXT NOT NULL,
   is_default         INTEGER NOT NULL DEFAULT 0,
-  evaluations        TEXT NOT NULL,     -- JSON [{flowId, expression, result, value, warnings?}] in document order
+  evaluations        TEXT NOT NULL,     -- JSON [{flowId, expression, result, value?, warnings?}] in document order
   variables_snapshot TEXT,              -- evaluation context; NULL for pass-through joins / oversized contexts
   created_at         TEXT NOT NULL
 );

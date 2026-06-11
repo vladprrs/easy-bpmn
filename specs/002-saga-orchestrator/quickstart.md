@@ -36,12 +36,14 @@ Expected setup outcome:
 ## Scenario 1: Happy Saga Commits (gate: happy-saga-commit)
 
 1. Publish the §3 canonical order-saga (a `bpmn:transaction` with three forward Service Tasks each
-   routed by `easy-bpmn:taskDefinition type` to a distinct microservice).
+   routed by `easy-bpmn:taskDefinition type` to a distinct microservice; on disk as
+   `examples/order-saga.bpmn`).
 
 ```bash
 curl -sS http://localhost:8787/definitions/drafts \
   -H 'Content-Type: application/json' \
-  -d @examples/order-saga-draft.json
+  -d "$(jq -n --rawfile xml examples/order-saga.bpmn \
+        '{workspaceId: "default", name: "order saga", bpmnXml: $xml}')"
 curl -sS -X POST http://localhost:8787/definitions/drafts/{draftId}/publish
 ```
 

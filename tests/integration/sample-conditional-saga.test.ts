@@ -11,7 +11,7 @@ import { createDraft, get, leaseAndComplete, mintWorkerToken, publishDraft, star
 // Loading: a Vite `?raw` import — vitest-pool-workers runs the Vite transform
 // pipeline in Node before injecting test modules into workerd, so the on-disk
 // XML arrives as a plain string (workerd itself has no filesystem). Module
-// typing lives in tests/env.d.ts.
+// typing lives in tests/raw-imports.d.ts.
 
 describe("examples/conditional-fulfillment-saga.bpmn — the shipped sample is live-valid", () => {
   it("publishes against the live validator and executes its loop + branch happy path", async () => {

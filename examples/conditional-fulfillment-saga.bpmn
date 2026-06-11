@@ -24,8 +24,15 @@
 
   Everything here is standard BPMN 2.0. The ONLY additive binding is
   easy-bpmn:taskDefinition (worker routing `type` + `retries`) inside the
-  standard extensionElements escape hatch; the file round-trips through any
-  standard modeler that ignores the easy-bpmn namespace.
+  standard extensionElements escape hatch; the file SEMANTICALLY round-trips
+  (parse -> re-export) through any standard tool that ignores the easy-bpmn
+  namespace — that semantic round-trip is what the constitution requires and
+  what the test below pins.
+
+  NOTE: this file carries no Diagram Interchange (bpmndi) section — it is the
+  executable/reference form. Opening it in a visual modeler (bpmn-js / Camunda
+  Modeler) requires auto-layout or re-drawing; see simple-approval.bpmn for a
+  with-DI example.
 
   Publish-validated by tests/integration/sample-conditional-saga.test.ts.
 -->

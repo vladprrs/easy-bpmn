@@ -69,6 +69,36 @@ export async function recordHistory(db: D1Database, input: HistoryInput): Promis
   await historyStmt(db, input).run();
 }
 
+/**
+ * Existence check for a visit MARKER event at a specific occurrence (TASK-32
+ * bookkeeping fast-forward). Existence-of-THIS-occurrence, deliberately NOT a
+ * count: duplicate concurrent walks could double-write a marker, and a
+ * count-based predicate (`count > occ`) would then falsely fast-forward a
+ * later visit — existence-per-occurrence makes duplicates harmless audit noise.
+ * MIGRATION COMPAT: pre-rewalk (M1) marker events carry NO `occurrence` field
+ * in diagnostics — they are always visit 0, so the missing path folds to 0 via
+ * COALESCE (json_extract returns NULL for a missing key; `diagnostics` itself
+ * is NOT NULL by schema (0001) and always at least '{}', and json_extract(NULL)
+ * would fold to 0 through the same COALESCE anyway).
+ */
+export async function hasHistoryMarkerForOccurrence(
+  db: D1Database,
+  instanceId: string,
+  elementId: string,
+  type: string,
+  occurrence: number,
+): Promise<boolean> {
+  const row = await stmt(
+    db,
+    `SELECT 1 AS hit FROM history_events
+      WHERE instance_id = ? AND element_id = ? AND type = ?
+        AND COALESCE(json_extract(diagnostics, '$.occurrence'), 0) = ?
+      LIMIT 1`,
+    [instanceId, elementId, type, occurrence],
+  ).first<{ hit: number }>();
+  return row !== null;
+}
+
 /** Count history events of a given type for an instance element (e.g. poison strikes). */
 export async function countHistoryEventsOfType(
   db: D1Database,

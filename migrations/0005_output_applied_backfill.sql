@@ -1,5 +1,10 @@
 -- TASK-32 live-migration backfill — one-time data fix over 0004_conditional.sql.
 --
+-- OPERATIONAL ORDERING: apply this migration to the remote DB (together with
+-- 0004) BEFORE deploying the rewalk engine — the rewalk reads output_applied on
+-- its first resume of any in-flight M1 instance. Safe to re-run (idempotent:
+-- the WHERE clause matches only rows still needing the fix).
+--
 -- 0004 added `output_applied` with DEFAULT 0, so every job COMPLETED AND
 -- APPLIED under the pre-rewalk (M1) engine still carries output_applied = 0.
 -- The TASK-32 engine re-walks from the start element and uses output_applied

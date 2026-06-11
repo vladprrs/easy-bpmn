@@ -19,6 +19,8 @@ import type { ExecutionGraph } from "../../src/bpmn/graph";
 //      effects landed) — implemented as run-the-body-then-throw-without-memoizing.
 // waitFor is scripted per step name; an unscripted wait throws (= crash while
 // suspended). Same engine-harness-only cyclic fixture as loop-rewalk.test.ts.
+// NOT simulated: step.do retry-with-backoff on throwing step bodies, and real
+// event-type matching/buffering for waitForEvent (waits resolve by step name only).
 
 const MSG = "LoopMsg";
 

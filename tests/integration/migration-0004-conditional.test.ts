@@ -180,18 +180,20 @@ describe("resetJobForRetry live-frontier matcher (TASK-32)", () => {
 
   async function jobState(jobId: string) {
     return env.DB.prepare(
-      `SELECT status, output_applied, input_variables, attempt_count, lock_token FROM service_task_jobs WHERE job_id = ?`,
+      `SELECT status, output_applied, input_variables, attempt_count, lock_token, activation_expires_at FROM service_task_jobs WHERE job_id = ?`,
     )
       .bind(jobId)
-      .first<{ status: string; output_applied: number; input_variables: string; attempt_count: number; lock_token: string | null }>();
+      .first<{ status: string; output_applied: number; input_variables: string; attempt_count: number; lock_token: string | null; activation_expires_at: string | null }>();
   }
 
   it("resets a LOCKED unapplied forward job (workflow svc-timeout incident) and refreshes its input", async () => {
     const inst = "pi_retry_locked";
     await insertJob("job_rt_locked", inst, "taskA", 0);
-    // workflow-mode svc-timeout leaves the job mid-lease: nobody completed it
+    // workflow-mode svc-timeout leaves the job mid-lease: nobody completed it.
+    // The stale-PAST activation_expires_at simulates the creation-time DLQ TTL
+    // long lapsed by the time the operator retries.
     await env.DB.prepare(
-      `UPDATE service_task_jobs SET status = 'locked', lock_token = 'tok', lock_expires_at = '2026-06-10T01:00:00Z', attempt_count = 2 WHERE job_id = 'job_rt_locked'`,
+      `UPDATE service_task_jobs SET status = 'locked', lock_token = 'tok', lock_expires_at = '2026-06-10T01:00:00Z', attempt_count = 2, activation_expires_at = '2000-01-01T00:00:00Z' WHERE job_id = 'job_rt_locked'`,
     ).run();
 
     const changes = await resetJobForRetry(env.DB, {
@@ -207,6 +209,10 @@ describe("resetJobForRetry live-frontier matcher (TASK-32)", () => {
       attempt_count: 0,
       lock_token: null,
       input_variables: PATCH, // the operator's variable patch reaches the worker
+      // The stale DLQ TTL is cleared — otherwise a late/duplicate JobScheduler
+      // alarm would see a fresh-looking (created, attempt_count=0) job with a
+      // long-past activation_expires_at and insta-fail the retry.
+      activation_expires_at: null,
     });
   });
 
@@ -227,9 +233,10 @@ describe("resetJobForRetry live-frontier matcher (TASK-32)", () => {
 
   it("resets the failed and poison-completed frontiers, NEVER an applied or compensated row", async () => {
     const inst = "pi_retry_mixed";
-    // failed unapplied (technical exhaustion / uncaught business error)
+    // failed unapplied (technical exhaustion / uncaught business error),
+    // carrying a stale-past DLQ TTL from creation
     await insertJob("job_rt_failed", inst, "taskFail", 0);
-    await env.DB.prepare(`UPDATE service_task_jobs SET status = 'failed' WHERE job_id = 'job_rt_failed'`).run();
+    await env.DB.prepare(`UPDATE service_task_jobs SET status = 'failed', activation_expires_at = '2000-01-01T00:00:00Z' WHERE job_id = 'job_rt_failed'`).run();
     // poison: completed forward, output never applicable
     await insertJob("job_rt_poison", inst, "taskPoison", 0);
     await jobCompleteStmt(env.DB, "job_rt_poison", { huge: "blob" }, NOW).run();
@@ -248,6 +255,9 @@ describe("resetJobForRetry live-frontier matcher (TASK-32)", () => {
     expect(await reset("taskPoison", false)).toBe(1);
     expect(await reset("taskDone", false)).toBe(0);
     expect(await reset("taskDone", true)).toBe(0);
+
+    // The reset frontier sheds its stale DLQ TTL (late-alarm immunity).
+    expect((await jobState("job_rt_failed"))?.activation_expires_at).toBeNull();
 
     expect(await jobState("job_rt_applied")).toMatchObject({ status: "completed", output_applied: 1 });
     expect((await jobState("job_rt_comp_done"))?.status).toBe("completed");

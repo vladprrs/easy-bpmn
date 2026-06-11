@@ -335,6 +335,16 @@ export async function parkJobForBackoffConditional(
  * and already-compensated completed compensation rows are NEVER reset —
  * resetting an old iteration would re-open it and break the rewalk's
  * write-free fast-forward.
+ *
+ * Also clears activation_expires_at: a reset job would otherwise keep its
+ * stale-past creation TTL while looking exactly like a fresh job
+ * (status='created', attempt_count=0), so a late/duplicate JobScheduler alarm
+ * would pass terminateUnleasableJob's guards and insta-fail the freshly
+ * retried job. NULL (rather than re-arming a future TTL) is safe by
+ * construction: terminateUnleasableJob no-ops on a NULL activation_expires_at
+ * (its "not yet expired" guard), and failUnleasableJobConditional is only
+ * reached past that guard — the operator's explicit retry IS the activation,
+ * so no DLQ TTL applies anymore.
  */
 export async function resetJobForRetry(
   db: D1Database,
@@ -344,6 +354,7 @@ export async function resetJobForRetry(
     db,
     `UPDATE service_task_jobs
         SET status = 'created', attempt_count = 0, lock_token = NULL, lock_expires_at = NULL,
+            activation_expires_at = NULL,
             worker_id = NULL, error_code = NULL, output_variables = NULL, input_variables = ?, completed_at = NULL, updated_at = ?
       WHERE instance_id = ? AND element_id = ? AND is_compensation = ? AND output_applied = 0
         AND (status IN ('created', 'locked', 'failed') OR (is_compensation = 0 AND status = 'completed'))`,

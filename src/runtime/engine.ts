@@ -58,7 +58,7 @@ import { ACTIVATION_TTL_MS, POISON_THRESHOLD } from "./retry-policy";
 import { failUnleasableJobConditional, getJobRowById, reopenJobKeepAttemptStmt } from "../persistence/jobs";
 import { getVersionGraph } from "../persistence/definitions";
 import { dbBatch } from "../persistence/db";
-import { countHistoryEventsOfType, historyStmt } from "../persistence/history";
+import { countHistoryEventsOfType, hasHistoryMarkerForOccurrence, historyStmt } from "../persistence/history";
 import {
   applyTransitionStmt,
   createJobStmt,
@@ -693,12 +693,20 @@ async function handleForwardFailure(
 /**
  * Fast-forward predicate for BOOKKEEPING nodes (start / tx enter / commit end):
  * these nodes have no per-visit job or subscription row, but each visit writes
- * exactly ONE history event of `markerType` for `elementId` atomically with its
- * transition. History is append-only, so `count > occ` ⇔ visit `occ` already
- * applied. This is a live D1 read used only as an APPLIED predicate inside an
- * idempotent step body — never to derive the occurrence itself (in Workflow
- * mode normal replays don't even evaluate it: step.do memoization short-circuits
- * the body; only direct-mode rewalks and the crash-after-commit window do).
+ * exactly ONE history event of `markerType` for `elementId`, stamped with its
+ * occurrence, atomically with its transition. Applied ⇔ a marker for THIS
+ * occurrence exists. Deliberately existence-based, NOT `count > occ`: duplicate
+ * concurrent walks could double-write a marker, and a count-based predicate
+ * would then falsely fast-forward a later visit k+1 (for commitTransaction also
+ * falsely skipping markScopeStepsCommittedStmt, so a later cancel could
+ * re-compensate already-committed steps); existence-per-occurrence makes a
+ * duplicate marker harmless audit noise. M1 markers (pre-occurrence) carry no
+ * `occurrence` field and are always visit 0 — the predicate folds them to 0
+ * (see hasHistoryMarkerForOccurrence). This is a live D1 read used only as an
+ * APPLIED predicate inside an idempotent step body — never to derive the
+ * occurrence itself (in Workflow mode normal replays don't even evaluate it:
+ * step.do memoization short-circuits the body; only direct-mode rewalks and
+ * the crash-after-commit window do).
  */
 async function visitApplied(
   env: Env,
@@ -707,7 +715,7 @@ async function visitApplied(
   occ: number,
   markerType: string,
 ): Promise<boolean> {
-  return (await countHistoryEventsOfType(env.DB, instanceId, elementId, markerType)) > occ;
+  return hasHistoryMarkerForOccurrence(env.DB, instanceId, elementId, markerType, occ);
 }
 
 async function enterStart(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, node: GraphNode): Promise<string> {
@@ -718,14 +726,16 @@ async function enterStart(env: Env, instanceId: string, graph: ExecutionGraph, e
   if (isTransactionScope(graph, node.scopeId)) {
     // Inner transaction start — just advance (the transaction node already audited entry).
     await dbBatch(env.DB, [
-      historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "elementEntered", diagnostics: { elementType: "startEvent", scope: node.scopeId } }),
+      // MARKER: counted by visitApplied(...) — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
+      historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "elementEntered", diagnostics: { elementType: "startEvent", scope: node.scopeId, occurrence: occ } }),
       applyTransitionStmt(env.DB, { instanceId, currentElementId: next, status: "running", now }),
     ]);
     return next;
   }
   await dbBatch(env.DB, [
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "instanceStarted", diagnostics: { definitionVersionId: inst.definition_version_id, correlationKey: inst.correlation_key, traceId: traceIdFor(instanceId) } }),
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "elementEntered", diagnostics: { elementType: "startEvent" } }),
+    // MARKER: counted by visitApplied(...) — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "elementEntered", diagnostics: { elementType: "startEvent", occurrence: occ } }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: next, status: "running", now }),
   ]);
   return next;
@@ -735,7 +745,8 @@ async function enterTransaction(env: Env, instanceId: string, txId: string, occ:
   if (await visitApplied(env, instanceId, txId, occ, "transactionEntered")) return innerStart; // write-free rewalk
   const inst = await loadInst(env, instanceId);
   await dbBatch(env.DB, [
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionEntered", diagnostics: { transaction: txId, traceId: traceIdFor(instanceId) } }),
+    // MARKER: counted by visitApplied(...) — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionEntered", diagnostics: { transaction: txId, traceId: traceIdFor(instanceId), occurrence: occ } }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: innerStart, status: "running", now: nowIso() }),
   ]);
   return innerStart;
@@ -750,7 +761,8 @@ async function commitTransaction(env: Env, instanceId: string, graph: ExecutionG
   await dbBatch(env.DB, [
     // Terminalize this scope's ledger so a later cancel can't re-compensate it.
     markScopeStepsCommittedStmt(env.DB, { instanceId, scopeId: txId, now }),
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: endElementId, type: "elementEntered", diagnostics: { elementType: "endEvent", endKind: "none", scope: txId } }),
+    // MARKER: counted by visitApplied(...) — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: endElementId, type: "elementEntered", diagnostics: { elementType: "endEvent", endKind: "none", scope: txId, occurrence: occ } }),
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionCommitted", diagnostics: { transaction: txId } }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: outer ?? endElementId, status: "running", now }),
   ]);

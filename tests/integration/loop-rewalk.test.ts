@@ -234,6 +234,32 @@ describe("loop rewalk — occurrence-discriminated execution (direct mode)", () 
     expect(after.history["messageCorrelated"]).toBe(2);
   });
 
+  it("legacy M1 markers (no occurrence field in diagnostics) still fast-forward as occurrence 0", async () => {
+    const taskType = `loop-task-${crypto.randomUUID()}`;
+    const versionId = await injectLoopVersion(taskType);
+    const ck = `loop-legacy-${crypto.randomUUID()}`;
+    const started = await startInstance(versionId, { correlationKey: ck, variables: { seed: 1 } });
+    const id = started.body.instanceId as string;
+    expect(started.body.status).toBe("waiting"); // parked at TaskA occurrence 0
+
+    // Simulate a pre-deploy (M1) instance: marker events were written WITHOUT
+    // an occurrence field in diagnostics — the predicate must fold them to 0.
+    await env.DB.prepare(
+      `UPDATE history_events SET diagnostics = json_remove(diagnostics, '$.occurrence') WHERE instance_id = ?`,
+    )
+      .bind(id)
+      .run();
+
+    // Resuming rewalks through the start marker: pure write-free fast-forward —
+    // no duplicate instanceStarted/elementEntered, no state change.
+    const before = await snapshot(id);
+    expect(before.history["instanceStarted"]).toBe(1);
+    expect(before.history["elementEntered"]).toBe(2); // Start marker + TaskA entry
+    await resumeInline(env, id);
+    await resumeInline(env, id);
+    expect(await snapshot(id)).toEqual(before);
+  });
+
   it("apply-once across the crash window: a completed-but-unapplied job resumes exactly once (output_applied atomic with the advance)", async () => {
     const taskType = `loop-task-${crypto.randomUUID()}`;
     const versionId = await injectLoopVersion(taskType);

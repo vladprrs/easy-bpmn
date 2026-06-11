@@ -502,6 +502,22 @@ export const SAGA_XOR_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 </bpmn:definitions>`;
 
 /**
+ * SAGA_XOR_BPMN minus the gateway's `default` attribute: BOTH outgoing flows
+ * of GW_method carry conditions, so a payment method matching neither is the
+ * canonical no-match Hazard fixture (terminal incident kind=noPath inside the
+ * transaction; design §2 decision 5, §10.2). Derived from SAGA_XOR_BPMN by
+ * string surgery so the two stay structurally in lockstep — tests must assert
+ * it still PUBLISHES (a stale replace would silently fall back to the
+ * default-carrying original).
+ */
+export const SAGA_XOR_NODEFAULT_BPMN = SAGA_XOR_BPMN.replace(' default="f_wire"', "").replace(
+  '<bpmn:sequenceFlow id="f_wire" sourceRef="GW_method" targetRef="payWire"/>',
+  `<bpmn:sequenceFlow id="f_wire" sourceRef="GW_method" targetRef="payWire">
+        <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">method = "wire"</bpmn:conditionExpression>
+      </bpmn:sequenceFlow>`,
+);
+
+/**
  * A cyclic token path through a mixed (2-in/2-out) XOR gateway with
  * FEEL-actionable variables. T_charge runs once, BEFORE the cycle; the
  * back-edge returns from T_switch to GW_retry (nothing "re-charges").

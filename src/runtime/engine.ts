@@ -29,6 +29,14 @@
 //     once (re-applying would re-merge an old iteration's output over newer
 //     variables, rewrite the cursor backwards, and duplicate history).
 //
+// M2 (TASK-34) adds exclusiveGateway dispatch: one persisted step per visit
+// (`gw:el#occ`) evaluates non-default outgoing FEEL conditions in DOCUMENT
+// ORDER (first true wins → else default → else terminal noPath incident) and
+// commits the gateway_decisions row + transition + history event in ONE
+// dbBatch. An existing decision row for (instance, gateway, occurrence) is the
+// rewalk/replay fast-forward predicate — the recorded branch is reused, never
+// re-evaluated, even if variables changed since.
+//
 // Both drivers share this code: the Workflow suspends/resumes in place across
 // `waitFor` (step.do memoization fast-forwards replays by step NAME); the
 // deterministic DirectExecutor parks (waitFor=null) and resumes by re-running
@@ -38,8 +46,9 @@
 
 import type { Env } from "../env";
 import type { MessageEventPayload } from "../contracts/workflow-events";
-import type { ExecutionGraph, GraphNode } from "../bpmn/graph";
+import type { ExecutionGraph, Flow, GraphNode } from "../bpmn/graph";
 import { workflowEventTypeFor, workflowJobEventTypeFor } from "../bpmn/profile";
+import { ExpressionEvaluationError, evaluateCondition } from "./expressions";
 import { brokerKeyOf, type RegisterSubscriptionResult } from "./broker-types";
 import { MAX_EVENT_PAYLOAD_BYTES, payloadByteSize } from "./payload";
 import {
@@ -86,6 +95,11 @@ import {
   type SagaStepView,
 } from "../persistence/saga";
 import { messageCorrelatedStmt } from "../persistence/messages";
+import {
+  getGatewayDecision,
+  insertGatewayDecisionStmt,
+  type GatewayFlowEvaluation,
+} from "../persistence/gateway-decisions";
 
 export type RunStep = <T>(name: string, fn: () => Promise<T>) => Promise<T>;
 export type WaitOutcome = { kind: "event"; payload: unknown } | { kind: "timeout" };
@@ -275,23 +289,16 @@ async function loop(
     }
 
     if (node.type === "exclusiveGateway") {
-      // TASK-34 replaces this guard with real XOR branch dispatch. Until then
-      // a token reaching a published gateway (TASK-33 opened the publish gate)
-      // must NOT fall through and zombify in 'running' with no D1 write —
-      // settle the M1 terminal-incident path (incident row + incidentCreated
-      // history + status transition in one batch) so the operator sees it.
-      await runStep(`gw-guard:${tag}`, () =>
-        createIncident(
-          env,
-          instanceId,
-          cur,
-          0,
-          "exclusiveGateway dispatch is not yet supported by the engine (lands in TASK-34).",
-          {},
-          "serviceTaskFailure",
-        ),
-      );
-      return { status: "incident" };
+      // Branch selection OWNS the successor: the engine NEVER reads `.next` on
+      // a gateway (it is null by IR contract) — the chosen flow's targetId
+      // drives the cursor. One persisted step per visit; the recorded
+      // gateway_decisions row is the applied/fast-forward predicate (checked
+      // inside the idempotent body; Workflow replays additionally
+      // short-circuit on the memoized step name).
+      const r = await runStep(`gw:${tag}`, () => decideGateway(env, instanceId, cur, occ, node));
+      if (r.kind === "incident") return { status: "incident" };
+      cur = r.next;
+      continue;
     }
 
     if (node.type === "endEvent") {
@@ -726,7 +733,7 @@ async function enterStart(env: Env, instanceId: string, graph: ExecutionGraph, e
   if (isTransactionScope(graph, node.scopeId)) {
     // Inner transaction start — just advance (the transaction node already audited entry).
     await dbBatch(env.DB, [
-      // MARKER: counted by visitApplied(...) — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
+      // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
       historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "elementEntered", diagnostics: { elementType: "startEvent", scope: node.scopeId, occurrence: occ } }),
       applyTransitionStmt(env.DB, { instanceId, currentElementId: next, status: "running", now }),
     ]);
@@ -734,7 +741,7 @@ async function enterStart(env: Env, instanceId: string, graph: ExecutionGraph, e
   }
   await dbBatch(env.DB, [
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "instanceStarted", diagnostics: { definitionVersionId: inst.definition_version_id, correlationKey: inst.correlation_key, traceId: traceIdFor(instanceId) } }),
-    // MARKER: counted by visitApplied(...) — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
+    // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "elementEntered", diagnostics: { elementType: "startEvent", occurrence: occ } }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: next, status: "running", now }),
   ]);
@@ -745,7 +752,7 @@ async function enterTransaction(env: Env, instanceId: string, txId: string, occ:
   if (await visitApplied(env, instanceId, txId, occ, "transactionEntered")) return innerStart; // write-free rewalk
   const inst = await loadInst(env, instanceId);
   await dbBatch(env.DB, [
-    // MARKER: counted by visitApplied(...) — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
+    // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionEntered", diagnostics: { transaction: txId, traceId: traceIdFor(instanceId), occurrence: occ } }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: innerStart, status: "running", now: nowIso() }),
   ]);
@@ -761,12 +768,224 @@ async function commitTransaction(env: Env, instanceId: string, graph: ExecutionG
   await dbBatch(env.DB, [
     // Terminalize this scope's ledger so a later cancel can't re-compensate it.
     markScopeStepsCommittedStmt(env.DB, { instanceId, scopeId: txId, now }),
-    // MARKER: counted by visitApplied(...) — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
+    // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: endElementId, type: "elementEntered", diagnostics: { elementType: "endEvent", endKind: "none", scope: txId, occurrence: occ } }),
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionCommitted", diagnostics: { transaction: txId } }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: outer ?? endElementId, status: "running", now }),
   ]);
   return outer ?? endElementId;
+}
+
+// ---------------------------------------------------------------------------
+// Exclusive gateway — persisted XOR branch decision (design M2 §6, TASK-34)
+// ---------------------------------------------------------------------------
+
+type GatewayOutcome = { kind: "next"; next: string } | { kind: "incident" };
+
+/**
+ * JSON-safe normalization of a raw FEEL result before persisting it into
+ * gateway_decisions.evaluations / history diagnostics: feelin can return
+ * non-JSON values (Range, luxon DateTime, functions). Booleans, strings, and
+ * finite numbers pass through; FEEL null stays null; everything else becomes
+ * a deterministic `[feel:<Type>]` tag (the boolean `result` flag — not this
+ * raw value — is the branch-selection contract).
+ */
+function normalizeFeelValue(value: unknown): string | number | boolean | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "boolean" || typeof value === "string") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : String(value);
+  if (typeof value === "function") return "[feel:function]";
+  const name = (value as object).constructor?.name ?? typeof value;
+  return `[feel:${name}]`;
+}
+
+/** Resolve a recorded chosen_flow_id back to its target on the immutable graph. */
+function chosenFlowTarget(node: GraphNode, elementId: string, chosenFlowId: string): string {
+  const flow = node.outgoing.find((f) => f.flowId === chosenFlowId);
+  if (!flow) {
+    // Unreachable by construction: definition versions are immutable and the
+    // decision row was written from this same graph's outgoing[].
+    throw new Error(
+      `Invariant violation: gateway '${elementId}' recorded decision flow '${chosenFlowId}' is not among its outgoing flows.`,
+    );
+  }
+  return flow.targetId;
+}
+
+function isUniqueConstraintViolation(err: unknown): boolean {
+  return err instanceof Error && /UNIQUE/i.test(err.message);
+}
+
+/**
+ * One exclusiveGateway visit (idempotent step body, `gw:el#occ`):
+ *
+ * 1. A gateway_decisions row for (instance, gateway, occurrence) is the
+ *    rewalk/replay fast-forward predicate — take its chosen_flow_id with ZERO
+ *    writes and NEVER re-evaluate (crash/resume keeps the recorded branch even
+ *    if variables changed since). Row EXISTENCE, never history-marker counts.
+ * 2. Else evaluate the NON-default outgoing conditions in DOCUMENT ORDER
+ *    (= persisted outgoing[] order): first boolean `true` wins (selection
+ *    short-circuits — later flows are not evaluated and not recorded); none
+ *    true → the `default` flow (never evaluated); no default → terminal
+ *    incident kind=noPath. Inside a transaction noPath is a HAZARD (saga
+ *    design §4.5): no auto-compensation; the instance parks in 'incident'
+ *    where operator POST /instances/{id}/cancel stays available and
+ *    compensates the pending ledger. The FIRST hard interpreter failure
+ *    (ExpressionEvaluationError) aborts the whole evaluation → deterministic
+ *    operator-visible incident naming the flow (a later flow must never be
+ *    taken after an earlier hard error).
+ * 3. Persist decision row + transition to the chosen target +
+ *    `gatewayDecisionEvaluated` history event in ONE dbBatch
+ *    (persist-before-advance).
+ *
+ * PASS-THROUGH (1-out gateway: XOR join/merge, N-in/1-out — no waiting): take
+ * the single flow WITHOUT evaluating any condition it may carry (the validator
+ * tolerates one; the design pins pass-through semantics, §3). It still writes
+ * a normal decision row (single flow chosen, evaluations [], no snapshot)
+ * rather than a cheaper marker: the row at (instance, element, occurrence) is
+ * EXACTLY the per-visit fast-forward predicate a cyclic walk needs (visit k
+ * fast-forwards only on its own occurrence-k row), it keeps split and join on
+ * one code path and one race contract (plain INSERT + unique index), and it
+ * preserves the audit invariant "every gateway visit has a decision row". A
+ * history-marker variant would still cost one row per visit while adding a
+ * second predicate mechanism.
+ *
+ * Exported for the duplicate-walk race test; production entry is loop().
+ */
+export async function decideGateway(
+  env: Env,
+  instanceId: string,
+  elementId: string,
+  occ: number,
+  node: GraphNode,
+): Promise<GatewayOutcome> {
+  const recorded = await getGatewayDecision(env.DB, instanceId, elementId, occ);
+  if (recorded) {
+    return { kind: "next", next: chosenFlowTarget(node, elementId, recorded.chosenFlowId) };
+  }
+
+  const inst = await loadInst(env, instanceId);
+  const variables = parseJson<JsonObject>(inst.variables, {});
+
+  let chosen: Flow | null = null;
+  let isDefault = false;
+  const evaluations: GatewayFlowEvaluation[] = [];
+  const passThrough = node.outgoing.length === 1;
+
+  if (passThrough) {
+    chosen = node.outgoing[0]!;
+  } else {
+    for (const flow of node.outgoing) {
+      if (flow.isDefault) continue; // the default is the no-match fallback, never evaluated
+      const expression = flow.conditionExpression ?? "";
+      let evaluation;
+      try {
+        evaluation = evaluateCondition(expression, variables);
+      } catch (err) {
+        if (err instanceof ExpressionEvaluationError) {
+          return createIncident(
+            env,
+            instanceId,
+            elementId,
+            0,
+            `exclusiveGateway '${elementId}' condition on flow '${flow.flowId}' failed to evaluate: ${err.message}`,
+            { flowId: flow.flowId, expression, occurrence: occ },
+            "serviceTaskFailure",
+          );
+        }
+        throw err;
+      }
+      evaluations.push({
+        flowId: flow.flowId,
+        expression,
+        result: evaluation.taken,
+        value: normalizeFeelValue(evaluation.value),
+        ...(evaluation.warnings.length > 0 ? { warnings: evaluation.warnings } : {}),
+      });
+      if (evaluation.taken) {
+        chosen = flow; // first true wins (document order); stop evaluating
+        break;
+      }
+    }
+    if (!chosen) {
+      const fallback = node.outgoing.find((f) => f.isDefault === true);
+      if (fallback) {
+        chosen = fallback;
+        isDefault = true;
+      }
+    }
+  }
+
+  if (!chosen) {
+    // noPath — terminal incident (Hazard inside a transaction: no
+    // auto-compensation; operator /cancel compensates the pending ledger).
+    return createIncident(
+      env,
+      instanceId,
+      elementId,
+      0,
+      `exclusiveGateway '${elementId}' selected no path: no condition evaluated to true and the gateway has no default flow.`,
+      { occurrence: occ, evaluations: evaluations as unknown as JsonObject[] },
+      "noPath",
+    );
+  }
+
+  const next = chosen.targetId;
+  const now = nowIso();
+  // variables_snapshot is the evaluation context, capped by the existing
+  // payload limit: an oversized context is OMITTED (null + a diagnostics
+  // flag), never an error — the decision itself is unaffected.
+  const snapshotFits = payloadByteSize(variables) <= MAX_EVENT_PAYLOAD_BYTES;
+  const variablesSnapshot = passThrough || !snapshotFits ? null : variables;
+  const diagnostics: JsonObject = {
+    chosenFlowId: chosen.flowId,
+    occurrence: occ,
+    isDefault,
+    evaluations: evaluations as unknown as JsonObject[],
+    ...(passThrough ? { passThrough: true } : {}),
+    ...(!passThrough && !snapshotFits
+      ? { variablesSnapshotOmitted: true, variablesByteSize: payloadByteSize(variables) }
+      : {}),
+  };
+
+  try {
+    await dbBatch(env.DB, [
+      insertGatewayDecisionStmt(env.DB, {
+        decisionId: newId("gwd"),
+        instanceId,
+        elementId,
+        occurrence: occ,
+        chosenFlowId: chosen.flowId,
+        isDefault,
+        evaluations,
+        variablesSnapshot,
+        now,
+      }),
+      historyStmt(env.DB, {
+        workspaceId: inst.workspace_id,
+        instanceId,
+        elementId,
+        type: "gatewayDecisionEvaluated",
+        diagnostics,
+      }),
+      applyTransitionStmt(env.DB, { instanceId, currentElementId: next, status: "running", now }),
+    ]);
+  } catch (err) {
+    // Plain-INSERT race contract (gateway-decisions.ts): a losing concurrent
+    // walk's unique violation on (instance, element, occurrence) aborts its
+    // ENTIRE batch — transition and history included — so the loser re-reads
+    // the decision and follows the RECORDED branch; never re-evaluates. Only
+    // the unique violation with a confirmed winner row is handled; any other
+    // batch failure propagates untouched.
+    if (isUniqueConstraintViolation(err)) {
+      const winner = await getGatewayDecision(env.DB, instanceId, elementId, occ);
+      if (winner) {
+        return { kind: "next", next: chosenFlowTarget(node, elementId, winner.chosenFlowId) };
+      }
+    }
+    throw err;
+  }
+  return { kind: "next", next };
 }
 
 // ---------------------------------------------------------------------------

@@ -7,11 +7,26 @@
 import { dbFirst, stmt } from "./db";
 import { parseJson, toJson, type JsonObject } from "../util";
 
-/** One condition evaluation, recorded in document order (= evaluation order). */
+/**
+ * One condition evaluation, recorded in document order (= evaluation order).
+ * Only flows ACTUALLY evaluated appear: selection short-circuits at the first
+ * `true`, so flows after the winner (and the never-evaluated default) are
+ * absent by design — the record is the evaluation trace, not the flow list.
+ */
 export interface GatewayFlowEvaluation {
   flowId: string;
   expression: string;
+  /** True only when the expression evaluated to boolean `true` (strict contract). */
   result: boolean;
+  /**
+   * The raw FEEL result, normalized to JSON-safe before persisting:
+   * booleans / strings / finite numbers pass through; FEEL null (e.g. missing
+   * variable) stays null; everything else (Range / DateTime / function / list /
+   * context) becomes a deterministic `[feel:<Type>]` string tag.
+   */
+  value?: string | number | boolean | null;
+  /** Interpreter warnings (e.g. "Variable 'amount' not found"); omitted when clean. */
+  warnings?: string[];
 }
 
 export interface GatewayDecisionRow {

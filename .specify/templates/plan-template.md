@@ -44,12 +44,15 @@ For each gate, mark PASS, FAIL, or N/A with rationale. Any FAIL requires an
 entry in Complexity Tracking before implementation planning may continue.
 
 - **BPMN profile**: Feature uses only standard BPMN 2.0-compatible elements within
-  the supported profile (the linear core plus the canonical transaction-saga set:
+  the supported profile (the linear core, the canonical transaction-saga set —
   `bpmn:transaction`, compensation/error/cancel boundary events, `isForCompensation`
-  handler, `bpmn:association`, cancel end event, root `bpmn:error`), introduces no
-  custom notation, stays XSD-valid and modeler-round-trippable when easy-bpmn
-  extensions + DI are ignored, and rejects unsupported standard-namespace flow
-  nodes before publish with the element id + a user-visible reason.
+  handler, `bpmn:association`, cancel end event, root `bpmn:error` — plus the M2
+  conditional set: `bpmn:exclusiveGateway`, FEEL `conditionExpression` on flows
+  leaving an exclusiveGateway, the gateway-owned `default` flow, cycles on the
+  token path), introduces no custom notation, stays XSD-valid and
+  modeler-round-trippable when easy-bpmn extensions + DI are ignored, and rejects
+  unsupported standard-namespace flow nodes before publish with the element id +
+  a user-visible reason.
 - **SAGA / Compensation integrity**: If the feature touches sagas, compensation
   runs in reverse completion order, scoped to its transaction, idempotent +
   at-least-once; compensation is triggered only by transaction Cancel (never by an

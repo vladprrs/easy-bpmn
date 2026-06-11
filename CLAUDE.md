@@ -31,7 +31,7 @@ Several overlapping document sets exist. When they conflict, this order wins:
 3. **`docs/superpowers/specs/2026-06-07-bpmn-lite-orchestrator-mvp-design.md`** — implementation bridge
    (module seams, decomposition, risk map). Distills #2; does not replace it.
 4. **`docs/bpmn/`** — a general BPMN 2.0 reference + the `easy-bpmn` profile (`09-easy-bpmn-profile.md`,
-   now the **canonical transaction-saga** profile, in lockstep with constitution v2.0.0).
+   the **canonical transaction-saga + M2 conditional-saga** profile, in lockstep with constitution v2.1.0).
 
 ### Architecture is Workflow-per-instance + DO-broker (not DO-per-instance)
 
@@ -83,8 +83,10 @@ receive-task helper, idempotency, errors) · `src/observability/*`.
   element's runtime meaning, no non-standard attribute *required to parse*. Every accepted file must stay
   XSD-valid and round-trip through a standard modeler (bpmn-js / Camunda Modeler) when `easy-bpmn`
   extensions and Diagram Interchange are ignored.
-- **Reject unsupported *flow nodes* before publish, with element id + reason** (gateways, timers, user
-  tasks, subprocesses, conditional/default flows, `instantiate="true"`, etc.). But **tolerate and ignore**
+- **Reject unsupported *flow nodes* before publish, with element id + reason** (non-XOR gateways, timers,
+  user tasks, subprocesses, conditional/default flows not leaving an `exclusiveGateway`,
+  `instantiate="true"`, etc. — `exclusiveGateway` + FEEL conditions + default flows + token-path cycles
+  are IN since M2 / constitution v2.1.0). But **tolerate and ignore**
   *ignorable extension content* — foreign-namespace `<extensionElements>` (`camunda:`/`zeebe:`/…), Diagram
   Interchange, and `documentation`. Rejecting a file merely for carrying those is itself non-canonical.
   Both sides need test coverage.

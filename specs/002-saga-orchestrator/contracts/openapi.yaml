@@ -314,9 +314,11 @@ paths:
         - workerCredential: []
       description: >
         lock_token-conditional and idempotent via the workerCallback record (a duplicate fail
-        returns the prior outcome and does not re-count an attempt). retryable=true / no
-        errorCode is a technical failure (re-lease); an errorCode matching a model
-        bpmn:error/@errorCode raises that BPMN error -> error boundary -> cancel.
+        returns the prior outcome and does not re-count an attempt). No errorCode = a technical
+        failure (re-lease until the retry budget is exhausted); an errorCode matching a model
+        bpmn:error/@errorCode raises that BPMN error -> error boundary -> cancel. The `retryable`
+        field is accepted but advisory/IGNORED server-side - terminality is decided only by
+        errorCode (business) or retry-budget exhaustion (technical).
       parameters:
         - $ref: "#/components/parameters/JobId"
       requestBody:
@@ -855,7 +857,11 @@ components:
         retryable:
           type: boolean
           nullable: true
-          description: true / unset with no errorCode = technical failure (re-lease).
+          description: >
+            Advisory and IGNORED server-side: the outcome is derived exclusively from errorCode
+            (present = business failure, never retried) or the retry budget (no errorCode =
+            technical failure, re-leased until attempts exhaust). Kept in the schema for worker
+            compatibility; M3 will either honor or drop it.
       additionalProperties: false
     JobCallbackResponse:
       type: object

@@ -1,11 +1,13 @@
-# Data Model: SAGA Orchestrator (M1 — Canonical transaction-saga)
+# Data Model: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas)
 
 All M1 changes are **additive migrations** (`migrations/0002_saga.sql`); published definition
 versions are never mutated. The MVP entities (Workspace, Process Definition Draft, Validation
 Issue, Process Definition Version, BPMN Element, Worker Attempt, Message Subscription, External
 Message, Variable Snapshot, History Event, Idempotency Record) carry forward from
 `specs/001-bpmn-lite-orchestrator-mvp/data-model.md`; only the deltas and new entities are
-described here.
+described here. The **M2 deltas** (occurrence discriminator, conditional topology,
+`gateway_decisions` — migrations `0004_conditional.sql` + `0005_output_applied_backfill.sql`) are
+described in their own section at the end.
 
 ## Entity: Transaction Scope (graph IR)
 
@@ -146,8 +148,9 @@ CREATE INDEX idx_jobs_leasable ON service_task_jobs (task_type, status, lock_exp
   duplicate worker matches 0 rows.
 - **Operator retry RESETS the existing job row** (`status → created`, new `lock_token`, attempt
   accounting) rather than inserting — mirroring the MVP forward-reuse behavior.
-- The index shape is **not stable past M1**: gateways/loops/multiInstance (M2/M4/M5) re-break it
-  (same element runs N times) and will need a token/iteration discriminator.
+- The index shape was **not stable past M1**: loops re-run the same element N times. **Resolved in
+  M2** — the `occurrence` discriminator (see "M2 Deltas" below) widens the unique index to
+  `(instance_id, element_id, is_compensation, occurrence)`.
 
 ## Entity: Worker Credential
 
@@ -262,12 +265,100 @@ existing `diagnostics` JSON column.
   status='compensating' WHERE status IN ('running','waiting')`) so only the first call initiates one
   reverse pass; `/retry` is a conditional reset keyed on the current incident/failed status.
 
+## M2 Deltas (Conditional Sagas — `0004_conditional.sql` + `0005_output_applied_backfill.sql`)
+
+All additive. Design: `docs/superpowers/specs/2026-06-09-m2-conditional-sagas-design.md` §4–§9.
+
+> **The `/jobs/*` worker API surface is UNCHANGED by M2.** `occurrence` and `output_applied` are
+> persistence-internal; a deployed M1 pull worker keeps working against an M2 orchestrator with
+> zero changes. This compatibility contract is **pinned by
+> `tests/contract/jobs-schema-pin.test.ts`** (exact request/response key sets; the leased-job shape
+> never surfaces `occurrence`/`outputApplied`) — widening it later must amend that pin deliberately.
+
+### Occurrence discriminator (loops: the same element runs N times)
+
+- `service_task_jobs` + `occurrence INTEGER NOT NULL DEFAULT 0` and
+  `output_applied INTEGER NOT NULL DEFAULT 0`; unique index recreated as
+  `uq_jobs_instance_element_kind (instance_id, element_id, is_compensation, occurrence)` — one
+  forward + one compensation job **per iteration**. A compensation job inherits its forward step's
+  occurrence.
+- `saga_steps` + `occurrence INTEGER NOT NULL DEFAULT 0`; `uq_saga_steps_forward` recreated as
+  `(instance_id, element_id, occurrence)` — each completed pass of a compensatable step is its own
+  ledger row (the `INSERT OR IGNORE` dedup contract preserved per iteration), so the reverse pass
+  compensates every iteration separately with zero algorithm change.
+- `message_subscriptions` + `occurrence INTEGER NOT NULL DEFAULT 0` — a Receive Task in a loop
+  re-subscribes per visit; the broker key (`workspaceId + messageName + correlationKey`) is
+  unchanged.
+- `output_applied` marks a completed job whose output the engine already merged + advanced past,
+  set **in the same `dbBatch` as the advance**, so the rewalk-from-start treats applied steps as
+  write-free fast-forward. Migration `0005` backfills it for jobs applied under the M1 engine
+  (predicate: the job's `variable_snapshots` row with `source='serviceTask'`), and MUST be applied
+  before deploying the rewalk engine.
+- Every `DEFAULT 0` keeps each existing M1 row and call site at its exact prior semantics.
+
+### Entity: Gateway Decision (new table `gateway_decisions`)
+
+Deterministic replay of branch choices: one row per gateway **visit**, written atomically with the
+transition (persist-before-advance). An existing row for `(instance, gateway, occurrence)` is
+**reused, never re-evaluated** — crash/replay takes the recorded branch in both execution modes.
+No row is written for a **failed** visit (`noPath` / evaluation error), so an operator `/retry`
+re-evaluates that visit fresh.
+
+```sql
+CREATE TABLE gateway_decisions (
+  decision_id        TEXT PRIMARY KEY,
+  instance_id        TEXT NOT NULL,
+  element_id         TEXT NOT NULL,     -- the exclusiveGateway
+  occurrence         INTEGER NOT NULL,
+  chosen_flow_id     TEXT NOT NULL,
+  is_default         INTEGER NOT NULL DEFAULT 0,
+  evaluations        TEXT NOT NULL,     -- JSON [{flowId, expression, result, value, warnings?}] in document order
+  variables_snapshot TEXT,              -- evaluation context; NULL for pass-through joins / oversized contexts
+  created_at         TEXT NOT NULL
+);
+CREATE UNIQUE INDEX uq_gateway_decisions ON gateway_decisions (instance_id, element_id, occurrence);
+```
+
+**Validation Rules**:
+- `variables_snapshot` is size-capped by the existing event-payload limit: an oversized context is
+  **omitted** (`NULL` + a `variablesSnapshotOmitted: true` flag with `variablesByteSize` in the
+  history diagnostics), never an error — the decision itself is unaffected.
+- A losing concurrent walk's unique violation aborts its whole batch; the loser re-reads and
+  follows the **recorded** branch.
+
+### Conditional topology (`bpmn_elements`)
+
+`+ condition_expression TEXT`, `+ is_default INTEGER NOT NULL DEFAULT 0` — a `sequenceFlow` leaving
+an `exclusiveGateway` persists its FEEL condition (document order = evaluation order) or the
+gateway's `default` marker; `NULL`/`0` on all other rows. `getVersionGraph` replay stays
+deep-equal with a fresh parse, conditions included.
+
+### Incident (kind values widened)
+
+`incidents.kind` (unconstrained TEXT — contracts-level change only) gains:
+
+- `loopLimit` — a walk-local visit counter exceeded `MAX_ELEMENT_OCCURRENCES = 1000`; Hazard
+  semantics inside a transaction (no auto-compensation; operator `/cancel` available, resolution
+  advancing `compensating → compensated` when the pass settles).
+- `noPath` — an exclusiveGateway found no `true` condition and has no default; Hazard semantics
+  inside a transaction; operator `/retry` re-evaluates the visit fresh (no decision row exists for
+  the failed visit).
+
+Full enum (zod + openapi): `serviceTaskFailure | compensationFailure | timeout | poison |
+loopLimit | noPath`.
+
+### History Event (free-text type absorbs the M2 event)
+
+- `gatewayDecisionEvaluated` — per gateway visit, carrying `{ chosenFlowId, occurrence, isDefault,
+  evaluations, passThrough?, variablesSnapshotOmitted?, variablesByteSize? }` in `diagnostics`; the
+  operator surface for branch decisions (no new public endpoint in M2).
+- `compensationStarted` **and** `compensationCompleted` diagnostics carry the iteration's
+  `occurrence` so each loop iteration's rollback is auditable.
+
 ## Roadmap stub tables (named here; created in later milestones)
 
-Named now for the roadmap; **not** created in `0002_saga.sql`:
+Named now for the roadmap; **not** created yet:
 
-- `gateway_decisions` (M2) — deterministic replay of branch choices (persist the *evaluated*
-  decision regardless of expression language).
 - `timers` (M3) — boundary timers, per-step timeouts, event deadlines (via `step.sleep` / DO
   alarms).
 - `execution_tokens` (M4) — the single `current_element_id` becomes one token among many; the

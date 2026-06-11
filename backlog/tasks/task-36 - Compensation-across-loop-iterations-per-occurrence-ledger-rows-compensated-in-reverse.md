@@ -3,11 +3,11 @@ id: TASK-36
 title: >-
   Compensation across loop iterations: per-occurrence ledger rows compensated in
   reverse
-status: In Progress
+status: Done
 assignee:
   - Claude
 created_date: '2026-06-09 20:30'
-updated_date: '2026-06-11 07:41'
+updated_date: '2026-06-11 11:58'
 labels:
   - saga
   - engine
@@ -37,11 +37,11 @@ M2 design 2026-06-09 §8. Each completed pass of a compensatable step becomes it
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Loop+cancel integration test: N≥2 completed iterations of a compensatable step followed by a business error → cancel end → the reverse pass creates N compensation jobs in reverse seq order, each seeded with its own iteration's captured input/output.
-- [ ] #2 Per-occurrence dedup: a duplicate forward completion of one occurrence stays a ledger no-op; a new occurrence inserts a new ledger row.
-- [ ] #3 compensationFailed mid-reverse-pass stops at the failed iteration (already-compensated suffix stays compensated); operator /retry resumes from exactly that iteration — extends the M1 scenario across occurrences.
-- [ ] #4 Crash during compensation of iteration k re-attaches to that occurrence's existing compensation job on recovery (no second comp job).
-- [ ] #5 Constitution gate: integration tests above (vitest-pool-workers); npm run test green.
+- [x] #1 Loop+cancel integration test: N≥2 completed iterations of a compensatable step followed by a business error → cancel end → the reverse pass creates N compensation jobs in reverse seq order, each seeded with its own iteration's captured input/output.
+- [x] #2 Per-occurrence dedup: a duplicate forward completion of one occurrence stays a ledger no-op; a new occurrence inserts a new ledger row.
+- [x] #3 compensationFailed mid-reverse-pass stops at the failed iteration (already-compensated suffix stays compensated); operator /retry resumes from exactly that iteration — extends the M1 scenario across occurrences.
+- [x] #4 Crash during compensation of iteration k re-attaches to that occurrence's existing compensation job on recovery (no second comp job).
+- [x] #5 Constitution gate: integration tests above (vitest-pool-workers); npm run test green.
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -56,3 +56,19 @@ Execution: subagent-driven (implementer + spec review + quality review) on branc
 5. Carried: resolve the never-written incident resolution 'compensated' (advance it at compensation settle OR drop the enum member; update the loop-limit pin in lockstep, justified). Hoist a parameterized leaseOne/leaseAndComplete into tests/helpers.ts (3+ per-file copies exist).
 Constitution gate: integration tests (vitest-pool-workers); npm run test green.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+HEADLINE: the design §8 claim PROVEN — the existing reverse pass (ORDER BY seq DESC) compensated every iteration separately with ZERO engine algorithm change; all 4 ACs were green against the existing engine on first run. Only engine change: the carried resolution-lifecycle fix — advanceIncidentResolutionStmt (guarded UPDATE WHERE resolution='compensating') in the settleSagaCompensated dbBatch advances compensating->compensated atomically with the terminal transition; operatorResolved is sticky (asserted); loop-limit pin updated in lockstep.
+
+Two-stage review done. Spec review: compliant (per-job seeding traced through the real /jobs/activate path — getSagaStep by element+occurrence; retry budget real — retryLimit from the handler's retries=5, 5 lease+fail rounds exhaust it exactly; both crash windows faithful; resolution advance covers the ONLY status='compensated' write site; nuance noted: the duplicate /jobs/complete short-circuits at the idempotency layer before the ledger INSERT OR IGNORE — layered dedup, contract satisfied). Quality review: Yes + polish in 58c1344 (lifecycle doc caveats: terminal-'open' incidents on cancelled-empty-ledger instances + setIncidentResolution instance-wide breadth; AC4 timeout; idempotency-key lane comment).
+
+PRE-EXISTING FINDINGS surfaced (carries): (a) /jobs/fail `retryable` field is accepted by the schema but IGNORED server-side — terminality is errorCode or budget exhaustion only; runtime-contracts.md + quickstart.md showcase retryable:false as if it mattered -> TASK-37 must document it as advisory/ignored; M3 decision: honor or drop. (b) setIncidentResolution updates ALL non-operatorResolved incidents (no incident_id filter) — M3: add the filter. (c) compensationStarted diagnostics carry occurrence, compensationCompleted doesn't — TASK-37 candidate. (d) cancelled-empty-ledger incidents stay 'open' forever — M3: advance to operatorResolved in the pending===0 cancel branch. (e) test-helper name collision: saga-pull-jobs/saga-backoff local leaseOne variants — rename to seedAndLease on next touch.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Loop compensation proven and hardened on the auto path: 3 completed reserveItem iterations + business-failed finalize -> Tx_cancel -> auto reverse pass creates one comp job per occurrence in reverse seq order (one in flight at a time), each seeded via the real /jobs/activate path with ITS OWN iteration's originalInput + capturedOutput (chained-input shape asserted); compensationStarted occurrences [2,1,0]; zero incidents on the auto path. Hostile duplicate /jobs/complete = stable prior ack + ledger deep-equal unchanged. compensationFailed mid-reverse stops at the failed iteration (suffix stays compensated); /retry resets the SAME comp job row and resumes from exactly that occurrence -> compensated; operatorResolved sticky. Crash during compensation re-attaches per occurrence in both unleased and leased windows (one comp job per iteration, ever). Incident resolution lifecycle completed: compensating->compensated advanced atomically in the settle batch (the never-written enum member now written); lifecycle + caveats documented at IncidentResolution. leaseOne/leaseAndComplete/rewindBackoff hoisted into tests/helpers.ts (2 files converted; meaningfully-different local variants left, justified). Tests 232/232 ×2. Commits bda2a17 + 58c1344. Engine algorithm changes: zero (design §8 claim held).
+<!-- SECTION:FINAL_SUMMARY:END -->

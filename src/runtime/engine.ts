@@ -1115,7 +1115,9 @@ async function markStepCompensated(env: Env, instanceId: string, step: SagaStepV
   const inst = await loadInst(env, instanceId);
   await dbBatch(env.DB, [
     updateCompensationStatusStmt(env.DB, { stepId: step.stepId, status: "compensated", now: nowIso() }),
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: step.elementId, type: "compensationCompleted", diagnostics: { handler: step.compensationElementId } }),
+    // `occurrence` mirrors compensationStarted (TASK-37 carry): without it an
+    // operator could not tell WHICH loop iteration finished compensating.
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: step.elementId, type: "compensationCompleted", diagnostics: { handler: step.compensationElementId, occurrence: step.occurrence } }),
   ]);
 }
 

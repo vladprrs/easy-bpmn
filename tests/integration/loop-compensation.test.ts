@@ -63,12 +63,15 @@ async function compJobRows(instanceId: string) {
   return res.results ?? [];
 }
 
-async function compensationStartedOccurrences(instanceId: string): Promise<number[]> {
+async function compensationOccurrences(instanceId: string, type: string): Promise<number[]> {
   const history = await get(`/instances/${instanceId}/history`);
   return history.body.events
-    .filter((e: any) => e.type === "compensationStarted")
+    .filter((e: any) => e.type === type && e.diagnostics?.occurrence !== undefined)
     .map((e: any) => e.diagnostics.occurrence as number);
 }
+
+const compensationStartedOccurrences = (instanceId: string) =>
+  compensationOccurrences(instanceId, "compensationStarted");
 
 /**
  * Drive N completed reserveItem iterations (occurrence k completes with
@@ -184,8 +187,12 @@ describe("loop + cancel end — the reverse pass compensates every iteration (AC
         ).toBe(200);
       }
 
-      // Reverse seq order on the audit surface too.
+      // Reverse seq order on the audit surface too — and per-step
+      // compensationCompleted carries the SAME occurrence (TASK-37 carry: an
+      // operator can match each completion to its loop iteration). The
+      // occurrence-less filter excludes the transaction-level settle event.
       expect(await compensationStartedOccurrences(id)).toEqual([2, 1, 0]);
+      expect(await compensationOccurrences(id, "compensationCompleted")).toEqual([2, 1, 0]);
 
       // Settled: saga-failed terminal via the cancel boundary; every iteration
       // compensated; N comp jobs total (one per iteration, none doubled).

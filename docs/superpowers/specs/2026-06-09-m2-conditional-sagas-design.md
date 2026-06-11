@@ -231,3 +231,30 @@ Integration unless noted:
 
 **Next step after backlog:** `writing-plans` for the M2 task set (per-task implementation plans),
 then implement in task order 1→9 (5 and 6 are the critical path; 1–4 unblock them).
+
+---
+
+## 13. Implementation deltas (post-implementation amendments, TASK-37)
+
+Corrections and clarifications recorded after the M2 implementation landed (TASK-29..36); the
+sections above are left as written for history.
+
+- **Step budget (§5, §11 R-M2-5): the running budget is 10,000, not 25,000.** Cloudflare Workflows
+  allows **10,000 steps per instance by default on Workers Paid**; 25,000 is the configurable
+  **maximum** via `"limits": { "steps": N }` (1,024 on Free; `step.sleep` doesn't count) — verified
+  2026-06-11 against developers.cloudflare.com/workflows/reference/limits/. This deployment runs
+  the 10k default; the per-shape arithmetic (a single-element loop trips `loopLimit` at ~4-7k
+  steps, safely inside 10k; a hot multi-element cycle can exhaust the platform budget first) and
+  the escalation knob live in the **`wrangler.jsonc` workflows block comment**, which is the
+  authoritative budget note.
+- **`variablesSnapshotOmitted` flag shape (§6).** `gateway_decisions.variables_snapshot` is capped
+  by the existing event-payload limit as designed (R-M2-4); the implemented shape: an oversized
+  evaluation context stores `variables_snapshot = NULL` and the `gatewayDecisionEvaluated` history
+  diagnostics carry `variablesSnapshotOmitted: true` + `variablesByteSize` — an omission marker,
+  never an error (the decision itself is unaffected). Pass-through (1-out) gateway visits also
+  store `NULL` (no conditions were evaluated), without the flag.
+- **Retry-after-noPath semantics (§6).** A **failed** gateway visit (`noPath`, or a hard FEEL
+  evaluation error) writes **no** `gateway_decisions` row — the row is written only atomically with
+  a successful transition. Consequently an operator `POST /instances/{id}/retry` **re-evaluates the
+  failed visit fresh** (typically after a variable patch), which is the intended remediation;
+  "reused, never re-evaluated" applies only to recorded (successful) decisions.

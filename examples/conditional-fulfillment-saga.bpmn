@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  conditional-fulfillment-saga — the canonical M2 conditional-saga example.
+
+  An order-fulfillment transaction saga that exercises every M2 construct
+  (constitution v2.1.0; docs/bpmn/09-easy-bpmn-profile.md "Conditional saga"):
+
+    * a LOOP:  reserveItem runs once per order line, cycling back through the
+      XOR gateway GW_more while the worker reports `moreItems = true`. Each
+      iteration is its own occurrence (job row + saga-ledger row), so a later
+      cancellation compensates EVERY reservation, in reverse completion order.
+    * an XOR SPLIT: GW_method routes by data — FEEL `paymentMethod = "card"`
+      takes the card branch; anything else falls through the gateway-owned
+      `default` flow to the wire-transfer branch.
+    * an XOR JOIN:  GW_paid merges the two payment branches (pass-through).
+    * COMPENSATION WIRING: reserveItem and chargeCard each carry a compensation
+      boundary event associated to an isForCompensation handler (releaseItem /
+      refundCard). The wire branch deliberately has no compensator (a ledger
+      row settles `notRequired`).
+    * the SAGA FAILURE PATH: a CONFIRM_FAILED business error on confirmOrder is
+      caught by its error boundary and routed to the cancel end event, which
+      cancels the transaction -> reverse-order compensation -> the transaction's
+      cancel boundary takes the OrderFailed path.
+
+  Everything here is standard BPMN 2.0. The ONLY additive binding is
+  easy-bpmn:taskDefinition (worker routing `type` + `retries`) inside the
+  standard extensionElements escape hatch; the file round-trips through any
+  standard modeler that ignores the easy-bpmn namespace.
+
+  Publish-validated by tests/integration/sample-conditional-saga.test.ts.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+                  id="Definitions_conditional_fulfillment"
+                  targetNamespace="http://easy-bpmn/examples/conditional-fulfillment-saga">
+
+  <!-- The business error confirmOrder's worker may raise via /jobs/fail
+       { errorCode: "CONFIRM_FAILED" }; caught by errorRef on Boundary_confirm_error. -->
+  <bpmn:error id="Error_confirm" name="Order confirmation failed" errorCode="CONFIRM_FAILED"/>
+
+  <bpmn:process id="ConditionalFulfillment" name="Conditional order fulfillment" isExecutable="true">
+
+    <bpmn:startEvent id="OrderReceived" name="Order received">
+      <bpmn:outgoing>Flow_to_saga</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="Flow_to_saga" sourceRef="OrderReceived" targetRef="Tx_fulfillment"/>
+
+    <!-- ================= The saga scope ================= -->
+    <bpmn:transaction id="Tx_fulfillment" name="Fulfill order">
+      <bpmn:startEvent id="FulfillmentStarted" name="Fulfillment started">
+        <bpmn:outgoing>Flow_to_reserve</bpmn:outgoing>
+      </bpmn:startEvent>
+
+      <!-- Loop body: one reservation per order line. The worker's output sets
+           `moreItems` (true -> another pass) — each pass is a new occurrence. -->
+      <bpmn:serviceTask id="ReserveItem" name="Reserve item">
+        <bpmn:extensionElements>
+          <easy-bpmn:taskDefinition type="reserve-item" retries="3"/>
+        </bpmn:extensionElements>
+        <bpmn:incoming>Flow_to_reserve</bpmn:incoming>
+        <bpmn:incoming>Flow_more_items</bpmn:incoming>
+        <bpmn:outgoing>Flow_reserved</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <!-- Compensation marker: no outgoing sequence flow, one association to the handler. -->
+      <bpmn:boundaryEvent id="Boundary_reserve_comp" attachedToRef="ReserveItem">
+        <bpmn:compensateEventDefinition/>
+      </bpmn:boundaryEvent>
+      <bpmn:serviceTask id="ReleaseItem" name="Release item" isForCompensation="true">
+        <bpmn:extensionElements>
+          <easy-bpmn:taskDefinition type="release-item" retries="5"/>
+        </bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:association id="Assoc_release" associationDirection="One"
+                        sourceRef="Boundary_reserve_comp" targetRef="ReleaseItem"/>
+
+      <!-- LOOP gateway: condition first (document order = evaluation order),
+           the gateway-owned default is the no-match exit to checkout. -->
+      <bpmn:exclusiveGateway id="GW_more" name="More items?" default="Flow_checkout">
+        <bpmn:incoming>Flow_reserved</bpmn:incoming>
+        <bpmn:outgoing>Flow_more_items</bpmn:outgoing>
+        <bpmn:outgoing>Flow_checkout</bpmn:outgoing>
+      </bpmn:exclusiveGateway>
+      <bpmn:sequenceFlow id="Flow_more_items" name="yes" sourceRef="GW_more" targetRef="ReserveItem">
+        <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">moreItems = true</bpmn:conditionExpression>
+      </bpmn:sequenceFlow>
+      <bpmn:sequenceFlow id="Flow_checkout" name="no (default)" sourceRef="GW_more" targetRef="GW_method"/>
+
+      <!-- SPLIT gateway: branch by data. -->
+      <bpmn:exclusiveGateway id="GW_method" name="Payment method?" default="Flow_pay_wire">
+        <bpmn:incoming>Flow_checkout</bpmn:incoming>
+        <bpmn:outgoing>Flow_pay_card</bpmn:outgoing>
+        <bpmn:outgoing>Flow_pay_wire</bpmn:outgoing>
+      </bpmn:exclusiveGateway>
+      <bpmn:sequenceFlow id="Flow_pay_card" name="card" sourceRef="GW_method" targetRef="ChargeCard">
+        <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">paymentMethod = "card"</bpmn:conditionExpression>
+      </bpmn:sequenceFlow>
+      <bpmn:sequenceFlow id="Flow_pay_wire" name="wire (default)" sourceRef="GW_method" targetRef="ChargeWire"/>
+
+      <!-- Card branch: compensatable (refund on rollback). -->
+      <bpmn:serviceTask id="ChargeCard" name="Charge card">
+        <bpmn:extensionElements>
+          <easy-bpmn:taskDefinition type="charge-card" retries="2"/>
+        </bpmn:extensionElements>
+        <bpmn:incoming>Flow_pay_card</bpmn:incoming>
+        <bpmn:outgoing>Flow_card_paid</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="Boundary_charge_comp" attachedToRef="ChargeCard">
+        <bpmn:compensateEventDefinition/>
+      </bpmn:boundaryEvent>
+      <bpmn:serviceTask id="RefundCard" name="Refund card" isForCompensation="true">
+        <bpmn:extensionElements>
+          <easy-bpmn:taskDefinition type="refund-card" retries="5"/>
+        </bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:association id="Assoc_refund" associationDirection="One"
+                        sourceRef="Boundary_charge_comp" targetRef="RefundCard"/>
+
+      <!-- Wire branch: no compensator on purpose (its ledger row settles notRequired). -->
+      <bpmn:serviceTask id="ChargeWire" name="Charge by wire transfer">
+        <bpmn:extensionElements>
+          <easy-bpmn:taskDefinition type="charge-wire" retries="2"/>
+        </bpmn:extensionElements>
+        <bpmn:incoming>Flow_pay_wire</bpmn:incoming>
+        <bpmn:outgoing>Flow_wire_paid</bpmn:outgoing>
+      </bpmn:serviceTask>
+
+      <!-- JOIN gateway: pass-through merge of the alternative branches. -->
+      <bpmn:exclusiveGateway id="GW_paid" name="Paid">
+        <bpmn:incoming>Flow_card_paid</bpmn:incoming>
+        <bpmn:incoming>Flow_wire_paid</bpmn:incoming>
+        <bpmn:outgoing>Flow_to_confirm</bpmn:outgoing>
+      </bpmn:exclusiveGateway>
+      <bpmn:sequenceFlow id="Flow_card_paid" sourceRef="ChargeCard" targetRef="GW_paid"/>
+      <bpmn:sequenceFlow id="Flow_wire_paid" sourceRef="ChargeWire" targetRef="GW_paid"/>
+      <bpmn:sequenceFlow id="Flow_to_confirm" sourceRef="GW_paid" targetRef="ConfirmOrder"/>
+
+      <!-- The step whose business failure rolls the whole saga back:
+           error boundary -> cancel end -> reverse-order compensation. -->
+      <bpmn:serviceTask id="ConfirmOrder" name="Confirm order">
+        <bpmn:extensionElements>
+          <easy-bpmn:taskDefinition type="confirm-order" retries="2"/>
+        </bpmn:extensionElements>
+        <bpmn:incoming>Flow_to_confirm</bpmn:incoming>
+        <bpmn:outgoing>Flow_confirmed</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="Boundary_confirm_error" attachedToRef="ConfirmOrder">
+        <bpmn:errorEventDefinition errorRef="Error_confirm"/>
+      </bpmn:boundaryEvent>
+      <bpmn:sequenceFlow id="Flow_cancel" sourceRef="Boundary_confirm_error" targetRef="FulfillmentCancelled"/>
+
+      <bpmn:sequenceFlow id="Flow_to_reserve" sourceRef="FulfillmentStarted" targetRef="ReserveItem"/>
+      <bpmn:sequenceFlow id="Flow_reserved" sourceRef="ReserveItem" targetRef="GW_more"/>
+      <bpmn:sequenceFlow id="Flow_confirmed" sourceRef="ConfirmOrder" targetRef="FulfillmentDone"/>
+
+      <!-- None end = the transaction COMMITS; cancel end = compensate-and-fail. -->
+      <bpmn:endEvent id="FulfillmentDone" name="Fulfillment committed">
+        <bpmn:incoming>Flow_confirmed</bpmn:incoming>
+      </bpmn:endEvent>
+      <bpmn:endEvent id="FulfillmentCancelled" name="Cancel fulfillment">
+        <bpmn:incoming>Flow_cancel</bpmn:incoming>
+        <bpmn:cancelEventDefinition/>
+      </bpmn:endEvent>
+    </bpmn:transaction>
+
+    <!-- The saga-failed path: taken after the reverse compensation pass. -->
+    <bpmn:boundaryEvent id="Boundary_saga_cancelled" attachedToRef="Tx_fulfillment">
+      <bpmn:cancelEventDefinition/>
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="Flow_failed" sourceRef="Boundary_saga_cancelled" targetRef="OrderFailed"/>
+    <bpmn:sequenceFlow id="Flow_placed" sourceRef="Tx_fulfillment" targetRef="OrderPlaced"/>
+
+    <bpmn:endEvent id="OrderPlaced" name="Order placed">
+      <bpmn:incoming>Flow_placed</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="OrderFailed" name="Order failed (compensated)">
+      <bpmn:incoming>Flow_failed</bpmn:incoming>
+    </bpmn:endEvent>
+
+  </bpmn:process>
+</bpmn:definitions>

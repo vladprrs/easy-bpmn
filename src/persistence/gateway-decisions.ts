@@ -19,10 +19,8 @@ export interface GatewayFlowEvaluation {
   /** True only when the expression evaluated to boolean `true` (strict contract). */
   result: boolean;
   /**
-   * The raw FEEL result, normalized to JSON-safe before persisting:
-   * booleans / strings / finite numbers pass through; FEEL null (e.g. missing
-   * variable) stays null; everything else (Range / DateTime / function / list /
-   * context) becomes a deterministic `[feel:<Type>]` string tag.
+   * The raw FEEL result, made JSON-safe by `normalizeFeelValue`
+   * (runtime/expressions.ts — the canonical normalization contract).
    */
   value?: string | number | boolean | null;
   /** Interpreter warnings (e.g. "Variable 'amount' not found"); omitted when clean. */

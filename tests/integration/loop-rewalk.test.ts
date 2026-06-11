@@ -8,13 +8,14 @@ import type { ExecutionGraph } from "../../src/bpmn/graph";
 
 // TASK-32 — "the walk is the replay" (design M2 §5), DIRECT mode.
 //
-// ENGINE-HARNESS-ONLY fixture (not publishable): gateway dispatch has not
-// landed (TASK-34), so the cyclic graph is injected DIRECTLY via createVersion,
-// bypassing the publish gate (which would reject a model with no reachable end
-// event). Shape: Start → TaskA (serviceTask) → Recv (receiveTask) → back to
-// TaskA. Each iteration the instance PARKS at the Receive Task, so the test
-// drives the loop one message at a time. The instance never completes — these
-// tests pin the occurrence machinery, not process completion.
+// ENGINE-HARNESS-ONLY fixture (not publishable): the cyclic graph has no
+// reachable end event (the publish gate rejects that), and the per-iteration
+// PARKING these tests need comes from the receive-task cycle — so it is
+// injected DIRECTLY via createVersion, bypassing the publish gate. Shape:
+// Start → TaskA (serviceTask) → Recv (receiveTask) → back to TaskA. Each
+// iteration the instance PARKS at the Receive Task, so the test drives the
+// loop one message at a time. The instance never completes — these tests pin
+// the occurrence machinery, not process completion.
 //
 // NOTE: each test mints its OWN taskType. The loop instance is intentionally
 // left with a forever-leasable parked job, and D1 job state is visible across

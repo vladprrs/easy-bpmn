@@ -48,7 +48,7 @@ import type { Env } from "../env";
 import type { MessageEventPayload } from "../contracts/workflow-events";
 import type { ExecutionGraph, Flow, GraphNode } from "../bpmn/graph";
 import { workflowEventTypeFor, workflowJobEventTypeFor } from "../bpmn/profile";
-import { ExpressionEvaluationError, evaluateCondition } from "./expressions";
+import { ExpressionEvaluationError, evaluateCondition, normalizeFeelValue } from "./expressions";
 import { brokerKeyOf, type RegisterSubscriptionResult } from "./broker-types";
 import { MAX_EVENT_PAYLOAD_BYTES, payloadByteSize } from "./payload";
 import {
@@ -783,20 +783,13 @@ async function commitTransaction(env: Env, instanceId: string, graph: ExecutionG
 type GatewayOutcome = { kind: "next"; next: string } | { kind: "incident" };
 
 /**
- * JSON-safe normalization of a raw FEEL result before persisting it into
- * gateway_decisions.evaluations / history diagnostics: feelin can return
- * non-JSON values (Range, luxon DateTime, functions). Booleans, strings, and
- * finite numbers pass through; FEEL null stays null; everything else becomes
- * a deterministic `[feel:<Type>]` tag (the boolean `result` flag — not this
- * raw value — is the branch-selection contract).
+ * Re-type recorded evaluations for JSON diagnostics. GatewayFlowEvaluation is
+ * JSON-safe by construction (`value` is pre-normalized by normalizeFeelValue),
+ * but as an interface it lacks the index signature JsonObject wants — the
+ * fresh object literal supplies it without an unchecked cast.
  */
-function normalizeFeelValue(value: unknown): string | number | boolean | null {
-  if (value === null || value === undefined) return null;
-  if (typeof value === "boolean" || typeof value === "string") return value;
-  if (typeof value === "number") return Number.isFinite(value) ? value : String(value);
-  if (typeof value === "function") return "[feel:function]";
-  const name = (value as object).constructor?.name ?? typeof value;
-  return `[feel:${name}]`;
+function evaluationsAsJson(evaluations: GatewayFlowEvaluation[]): JsonObject[] {
+  return evaluations.map((e) => ({ ...e }));
 }
 
 /** Resolve a recorded chosen_flow_id back to its target on the immutable graph. */
@@ -877,7 +870,14 @@ export async function decideGateway(
   } else {
     for (const flow of node.outgoing) {
       if (flow.isDefault) continue; // the default is the no-match fallback, never evaluated
-      const expression = flow.conditionExpression ?? "";
+      const expression = flow.conditionExpression;
+      if (expression == null) {
+        // Unreachable by construction: the publish gate requires a condition on
+        // every non-default flow of a multi-out gateway, and versions are immutable.
+        throw new Error(
+          `Invariant violation: non-default flow '${flow.flowId}' of exclusiveGateway '${elementId}' carries no condition expression.`,
+        );
+      }
       let evaluation;
       try {
         evaluation = evaluateCondition(expression, variables);
@@ -925,7 +925,7 @@ export async function decideGateway(
       elementId,
       0,
       `exclusiveGateway '${elementId}' selected no path: no condition evaluated to true and the gateway has no default flow.`,
-      { occurrence: occ, evaluations: evaluations as unknown as JsonObject[] },
+      { occurrence: occ, evaluations: evaluationsAsJson(evaluations) },
       "noPath",
     );
   }
@@ -935,17 +935,16 @@ export async function decideGateway(
   // variables_snapshot is the evaluation context, capped by the existing
   // payload limit: an oversized context is OMITTED (null + a diagnostics
   // flag), never an error — the decision itself is unaffected.
-  const snapshotFits = payloadByteSize(variables) <= MAX_EVENT_PAYLOAD_BYTES;
+  const variablesByteSize = payloadByteSize(variables);
+  const snapshotFits = variablesByteSize <= MAX_EVENT_PAYLOAD_BYTES;
   const variablesSnapshot = passThrough || !snapshotFits ? null : variables;
   const diagnostics: JsonObject = {
     chosenFlowId: chosen.flowId,
     occurrence: occ,
     isDefault,
-    evaluations: evaluations as unknown as JsonObject[],
+    evaluations: evaluationsAsJson(evaluations),
     ...(passThrough ? { passThrough: true } : {}),
-    ...(!passThrough && !snapshotFits
-      ? { variablesSnapshotOmitted: true, variablesByteSize: payloadByteSize(variables) }
-      : {}),
+    ...(!passThrough && !snapshotFits ? { variablesSnapshotOmitted: true, variablesByteSize } : {}),
   };
 
   try {

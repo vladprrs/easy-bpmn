@@ -41,8 +41,9 @@ describe("Public API contract (openapi.yaml)", () => {
     expect(pub.body.validationIssues.length).toBeGreaterThan(0);
   });
 
-  // TASK-33 (M2): conditional models publish over the real HTTP path. Publish
-  // ONLY — gateway dispatch is TASK-34, so no instance is started here.
+  // TASK-33 (M2): conditional models publish over the real HTTP path. This
+  // file covers the publish path only; instance-start + gateway-dispatch
+  // coverage lives in tests/integration/xor-gateway.test.ts (TASK-34).
   it("publishes an XOR split/join model (FEEL conditions + default) into an immutable version (201)", async () => {
     const draft = await createDraft(XOR_BPMN, "xor");
     expect(draft.status).toBe(201);

@@ -201,6 +201,53 @@ describe("exclusiveGateway no-match — terminal noPath, Hazard inside a transac
     expect(done.body.status).toBe("compensated");
     expect(done.body.saga.steps.find((s: any) => s.elementId === "reserveFunds").compensationStatus).toBe("compensated");
   });
+
+  it("operator /retry with a variable patch re-evaluates the failed visit FRESH and the saga completes forward", async () => {
+    const { instance } = await publishAndStart(SAGA_XOR_NODEFAULT_BPMN, {
+      correlationKey: `xor-retry-${crypto.randomUUID()}`,
+      variables: { method: "bank" }, // matches neither "card" nor "wire"
+    });
+    expect(instance.status).toBe(201);
+    const id = instance.body.instanceId;
+
+    const token = await mintWorkerToken();
+    await leaseAndComplete(token, "reserve-funds", { reservationId: "rf-1" });
+    const hazard = await get(`/instances/${id}`);
+    expect(hazard.body.status).toBe("incident");
+    expect(hazard.body.incident.kind).toBe("noPath");
+
+    // Operator patches the routing variable and retries. The incident element
+    // is the GATEWAY — there is no job row for it, so resetJobForRetry matches
+    // 0 rows by design (see handleRetryInstance) and the retry must still
+    // succeed by simply re-walking.
+    const retry = await post(`/instances/${id}/retry`, { variables: { method: "card" } });
+    expect(retry.status).toBe(200);
+
+    // FRESH evaluation: the failed visit recorded NO decision row (the
+    // incident was the record), so the rewalk decides occurrence 0 anew
+    // against the patched variables and routes down f_card.
+    expect(retry.body.status).toBe("waiting");
+    expect(retry.body.currentElementId).toBe("payCard");
+    const decision = await getGatewayDecision(env.DB, id, "GW_method", 0);
+    expect(decision).toBeTruthy();
+    expect(decision!.chosenFlowId).toBe("f_card");
+    expect(decision!.isDefault).toBe(false);
+    expect(decision!.evaluations.map((e) => [e.flowId, e.result])).toEqual([["f_card", true]]);
+    expect(decision!.variablesSnapshot).toEqual({ method: "card", reservationId: "rf-1" });
+
+    // The original noPath incident was settled by the operator, not left open.
+    const incident = await env.DB.prepare(`SELECT kind, resolution FROM incidents WHERE instance_id = ?`)
+      .bind(id)
+      .first<{ kind: string; resolution: string }>();
+    expect(incident).toEqual({ kind: "noPath", resolution: "operatorResolved" });
+
+    // Drain the chosen branch: the transaction commits and the saga completes
+    // forward — the once-stranded compensatable step is terminalized.
+    await leaseAndComplete(token, "pay-card", { paid: true });
+    const done = await get(`/instances/${id}`);
+    expect(done.body.status).toBe("completed");
+    expect(done.body.saga.steps.find((s: any) => s.elementId === "reserveFunds").compensationStatus).toBe("committed");
+  });
 });
 
 describe("decision replay — direct-mode rewalk reuses the persisted decision", () => {

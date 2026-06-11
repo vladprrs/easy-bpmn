@@ -35,12 +35,34 @@ export interface ConditionEvaluation {
   taken: boolean;
   /**
    * The raw FEEL result (null when e.g. a referenced variable is missing).
-   * May be a non-JSON-primitive FEEL object (Range/DateTime/function) —
-   * normalize before persisting (gateway_decisions.evaluations, diagnostics).
+   * May be a non-JSON-primitive FEEL object — pass it through
+   * `normalizeFeelValue` before persisting.
    */
   value: unknown;
   /** Human-readable interpreter warnings; empty on a clean evaluation. */
   warnings: string[];
+}
+
+/**
+ * JSON-safe normalization of a raw FEEL result (`ConditionEvaluation.value`)
+ * before persisting it (gateway_decisions.evaluations, history diagnostics):
+ * feelin can return non-JSON values (Range, luxon DateTime, functions).
+ *
+ * THE canonical normalization contract — other docstrings point here:
+ * booleans, strings, and finite numbers pass through; FEEL null (e.g. a
+ * missing variable) stays null; non-finite numbers become their string form
+ * ("NaN"/"Infinity"/"-Infinity"); everything else (Range / DateTime /
+ * function / list / context) becomes a deterministic `[feel:<Type>]` string
+ * tag. The boolean `taken`/`result` flag — not this raw value — is the
+ * branch-selection contract.
+ */
+export function normalizeFeelValue(value: unknown): string | number | boolean | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "boolean" || typeof value === "string") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : String(value);
+  if (typeof value === "function") return "[feel:function]";
+  const name = (value as object).constructor?.name ?? typeof value;
+  return `[feel:${name}]`;
 }
 
 /**

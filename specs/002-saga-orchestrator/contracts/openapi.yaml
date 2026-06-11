@@ -755,6 +755,13 @@ components:
             incident:
               $ref: "#/components/schemas/Incident"
               nullable: true
+            openIncidents:
+              type: array
+              description: >
+                All not-yet-resolved incidents (resolution open|compensating),
+                newest-first (M3-L1). The `incident` field above is the latest one.
+              items:
+                $ref: "#/components/schemas/Incident"
     ActivateJobsRequest:
       type: object
       required: [taskType, workerId]
@@ -995,7 +1002,14 @@ components:
         kind:
           type: string
           nullable: true
-          enum: [serviceTaskFailure, compensationFailure, timeout, poison, loopLimit, noPath]
+          description: >
+            Incident taxonomy. `timeout` is LEGACY (M1) — retained for backward
+            compatibility but never written by current code: M3-L1 split it into
+            `jobActivationTimeout` (un-leasable-job DLQ) and `waitTimeout`
+            (un-guarded service-task / receive-task wait caps). `conditionFailure`
+            is a hard FEEL evaluation error on an exclusiveGateway flow. The
+            compensation-wait cap deliberately stays `compensationFailure`.
+          enum: [serviceTaskFailure, compensationFailure, timeout, poison, loopLimit, noPath, jobActivationTimeout, waitTimeout, conditionFailure]
         resolution:
           type: string
           nullable: true

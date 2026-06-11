@@ -23,6 +23,10 @@
 //      specs/002-saga-orchestrator/ matches the engine constant in
 //      src/runtime/engine.ts (the value is repeated in ~5 docs and would rot
 //      silently if M3 retunes it).
+//   5. The incident-kind taxonomy is single-sourced (M3-L1, TASK-39): the
+//      `IncidentKind` union in src/persistence/instances.ts and the
+//      `Incident.kind` enum in contracts/openapi.yaml are the SAME SET — a new
+//      kind can't be persisted without being documented, nor vice versa.
 //
 // Scope note: the negative-phrase checks target docs/bpmn/ ONLY. The design
 // artifacts under docs/superpowers/specs/ intentionally *quote* stale phrasing
@@ -176,6 +180,26 @@ if (!engineMatch) {
         }
       }
     });
+  }
+}
+
+// 7) Incident-kind taxonomy single-source: IncidentKind union == openapi enum set.
+const incidentSrc = readFileSync(join(repoRoot, "src", "persistence", "instances.ts"), "utf8");
+const openapiSrc = readFileSync(join(sagaSpecDir, "contracts", "openapi.yaml"), "utf8");
+const unionMatch = incidentSrc.match(/export type IncidentKind =([\s\S]*?);/);
+const kindEnumMatch = openapiSrc.match(/enum:\s*\[([^\]]*serviceTaskFailure[^\]]*)\]/);
+if (!unionMatch) {
+  failures.push(`src/persistence/instances.ts no longer defines "export type IncidentKind = …;" — update this check.`);
+} else if (!kindEnumMatch) {
+  failures.push(`openapi.yaml no longer has the Incident.kind enum (containing serviceTaskFailure) — update this check.`);
+} else {
+  const unionKinds = new Set([...unionMatch[1].matchAll(/"(\w+)"/g)].map((m) => m[1]));
+  const enumKinds = new Set(kindEnumMatch[1].split(",").map((s) => s.trim()).filter(Boolean));
+  for (const k of unionKinds) {
+    if (!enumKinds.has(k)) failures.push(`openapi.yaml Incident.kind enum is missing IncidentKind member "${k}".`);
+  }
+  for (const k of enumKinds) {
+    if (!unionKinds.has(k)) failures.push(`src/persistence/instances.ts IncidentKind union is missing openapi enum member "${k}".`);
   }
 }
 

@@ -325,7 +325,7 @@ compensate via v1's handlers and the history reference only v1.
   surviving completion's `capturedOutput` is the compensation basis (forward workers MUST
   be idempotent on `jobId`).
 - A job whose `taskType` nobody polls expires at its job-level activation TTL → terminal
-  incident (`kind=timeout`) + operator alert (the single job-level TTL that exists in M1
+  incident (`kind=jobActivationTimeout`) + operator alert (the single job-level TTL that exists in M1
   even though general timers are M3).
 - A `complete` output (or message/worker payload) exceeding the Cloudflare Workflows
   ~1 MiB event limit is rejected explicitly **before** event delivery, not failed inside
@@ -478,7 +478,7 @@ later-failure should trigger rollback.
   `jobId`; the runtime documents that lease expiry can run a step twice and that the
   surviving completion's captured output is authoritative.
 - **FR-014**: A job whose `taskType` is never polled MUST expire at a job-level activation
-  TTL → terminal incident (`kind=timeout`) + operator alert; a per-job `waitForEvent`
+  TTL → terminal incident (`kind=jobActivationTimeout`) + operator alert; a per-job `waitForEvent`
   timeout MUST be handled inside the engine (routed to the technical-failure branch), never
   reaching the Workflow catch-all that would turn a task-level timeout into a terminal
   incident bypassing compensation.

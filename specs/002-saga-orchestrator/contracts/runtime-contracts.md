@@ -160,7 +160,7 @@ rotate/clear the token:
   `JobScheduler` Durable Object alarm armed at job creation fires at expiry, re-reads D1, and if the
   job is still un-leased (`status='created' AND attempt_count=0`) routes a synthetic
   `{ outcome:'failed', retryable:false, kind:'timeout', reason:'un-leasable' }` → terminal incident
-  `kind=timeout` + a `jobActivationExpired` history event. A progressed/late/duplicate alarm is an
+  `kind=jobActivationTimeout` + a `jobActivationExpired` history event. A progressed/late/duplicate alarm is an
   idempotent no-op. **Never** compensates.
 - **Poison job** — a worker that **completes** with output that cannot be applied (the MERGE into
   instance variables would breach the ~1 MiB event-payload limit) is re-opened up to

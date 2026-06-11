@@ -22,8 +22,8 @@ export const RETRY_POLICY: RetryPolicy = {
 
 /**
  * Job-level activation TTL: a created job nobody leases within this window is
- * un-leasable → DLQ (terminal incident kind='timeout'). The lone M1 job-level
- * timer (general timers are M3).
+ * un-leasable → DLQ (terminal incident kind='jobActivationTimeout'). The lone M1
+ * job-level timer (general timers are M3).
  */
 export const ACTIVATION_TTL_MS = 15 * 60 * 1000;
 

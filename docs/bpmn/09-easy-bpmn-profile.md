@@ -26,7 +26,7 @@ The profile grows one milestone at a time, each guarded by a constitution amendm
 - **M3 → time & failure taxonomy** (timers, per-step timeouts, error catalog):
   [`01-events.md`](./01-events.md). **One M1 exception:** a single **job-level activation TTL**
   (`service_task_jobs.activation_expires_at`, default 15 min) backs the un-leasable-job DLQ — a job
-  nobody leases in time settles to a terminal incident `kind=timeout` via a per-job `JobScheduler`
+  nobody leases in time settles to a terminal incident `kind=jobActivationTimeout` via a per-job `JobScheduler`
   Durable Object alarm. It is *not* a model-level timer (no BPMN timer event); general timers remain
   M3. Retry backoff (exponential + jitter, base 1s / factor 2 / cap 30s) and poison-job termination
   (`kind=poison`, no compensation) ship in M1 too.

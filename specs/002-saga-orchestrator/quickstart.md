@@ -199,7 +199,7 @@ armed. At expiry the alarm re-reads D1 and, the job still un-leased, terminates 
 
 Expected outcome:
 
-- The instance settles to a **terminal incident** with `kind=timeout`; a `jobActivationExpired`
+- The instance settles to a **terminal incident** with `kind=jobActivationTimeout`; a `jobActivationExpired`
   history event is written and the reason is specific (`un-leasable`), **not** the
   `process-workflow` catch-all `Workflow terminated:`.
 - A job that was **leased before** `activation_expires_at` is **not** timed out (the alarm no-ops).

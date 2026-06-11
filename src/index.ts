@@ -70,6 +70,7 @@ import {
   getIncidentForInstance,
   getInstance,
   getInstanceRow,
+  getOpenIncidentsForInstance,
   listInstances,
   mergeInstanceVariables,
   setIncidentResolution,
@@ -261,6 +262,10 @@ async function handleGetInstance(env: Env, instanceId: string): Promise<Response
     instance.status === "incident" || instance.status === "compensationFailed"
       ? await getIncidentForInstance(env.DB, instanceId)
       : null;
+  // M3-L1 (TASK-39): expose ALL open incidents, not just the latest — an
+  // instance can carry several live incidents (e.g. a Hazard mid-compensation
+  // plus a later compensationFailure).
+  const openIncidents = await getOpenIncidentsForInstance(env.DB, instanceId);
 
   // Saga view — present once the instance has a transaction ledger.
   const steps = await getSagaStepsForInstance(env.DB, instanceId);
@@ -293,6 +298,7 @@ async function handleGetInstance(env: Env, instanceId: string): Promise<Response
       traceId: traceIdFor(instanceId),
     },
     incident,
+    openIncidents,
     saga,
   };
   return json(inspection, 200);
@@ -344,6 +350,10 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
   if (pending === 0) {
     const changed = await transitionStatusGuarded(env.DB, instanceId, [...CANCELLABLE_FROM], "cancelled", now);
     if (changed > 0) {
+      // M3-L1 (TASK-39): a terminal empty-ledger cancel closes ALL open incidents
+      // (here "all" is correct) so none is left dangling 'open' on a terminal
+      // instance — the previously-known terminal-'open' wart.
+      await setIncidentResolution(env.DB, instanceId, "operatorResolved", now);
       await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, type: "instanceCancelled", diagnostics: { by: "operator", emptyLedger: true } });
     }
     return json(await getInstance(env.DB, instanceId), 200);
@@ -352,7 +362,12 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
   // Status-conditional → only the first cancel initiates one reverse pass.
   const changed = await transitionStatusGuarded(env.DB, instanceId, [...CANCELLABLE_FROM], "compensating", now);
   if (changed > 0) {
-    if (inst.status === "incident") await setIncidentResolution(env.DB, instanceId, "compensating", now);
+    if (inst.status === "incident") {
+      // Target ONLY the current Hazard incident (M3-L1, TASK-39) so a sibling
+      // incident is never collaterally moved into the compensation lifecycle.
+      const hazard = await getIncidentForInstance(env.DB, instanceId);
+      await setIncidentResolution(env.DB, instanceId, "compensating", now, hazard?.incidentId);
+    }
     await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, type: "transactionCancelled", diagnostics: { by: "operator", fromHazard: inst.status === "incident" } });
     await resumeInline(env, instanceId);
   }
@@ -371,9 +386,12 @@ async function handleRetryInstance(env: Env, instanceId: string, request: Reques
   if (inst.status === "compensationFailed") {
     const failed = await getFailedStep(env.DB, instanceId);
     if (!failed) throw new ConflictError(`Instance ${instanceId} has no failed compensation step to retry.`);
+    const incident = await getIncidentForInstance(env.DB, instanceId);
     await resetJobForRetry(env.DB, { instanceId, elementId: failed.elementId, isCompensation: true, inputVariables: variablesJson, now });
     await updateCompensationStatusStmt(env.DB, { stepId: failed.stepId, status: "pending", now }).run();
-    await setIncidentResolution(env.DB, instanceId, "operatorResolved", now);
+    // Resolve ONLY this compensationFailure incident (M3-L1, TASK-39) so a sibling
+    // Hazard 'compensating' is not collaterally flipped to operatorResolved.
+    await setIncidentResolution(env.DB, instanceId, "operatorResolved", now, incident?.incidentId);
     const changed = await transitionStatusGuarded(env.DB, instanceId, ["compensationFailed"], "compensating", now);
     if (changed === 0) throw new ConflictError(`Instance ${instanceId} is no longer retryable.`);
     await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, elementId: failed.elementId, type: "operatorRetry", diagnostics: { target: "compensation" } });
@@ -390,7 +408,8 @@ async function handleRetryInstance(env: Env, instanceId: string, request: Reques
     // re-walks, and the failed visit (which recorded no decision row) is
     // re-evaluated fresh against the patched variables.
     await resetJobForRetry(env.DB, { instanceId, elementId, isCompensation: false, inputVariables: variablesJson, now });
-    await setIncidentResolution(env.DB, instanceId, "operatorResolved", now);
+    // Resolve ONLY the targeted incident (M3-L1, TASK-39).
+    await setIncidentResolution(env.DB, instanceId, "operatorResolved", now, incident?.incidentId);
     const changed = await transitionStatusGuarded(env.DB, instanceId, ["incident"], "running", now);
     if (changed === 0) throw new ConflictError(`Instance ${instanceId} is no longer retryable.`);
     await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, elementId, type: "operatorRetry", diagnostics: { target: "forward" } });

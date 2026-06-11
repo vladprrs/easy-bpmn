@@ -485,6 +485,8 @@ export async function decideGateway(
         evaluation = evaluateCondition(expression, variables);
       } catch (err) {
         if (err instanceof ExpressionEvaluationError) {
+          // M3-L1 (TASK-39): a hard FEEL error is its own taxonomy bucket
+          // ('conditionFailure'), no longer masked as a serviceTaskFailure.
           return createIncident(
             env,
             instanceId,
@@ -492,7 +494,7 @@ export async function decideGateway(
             0,
             `exclusiveGateway '${elementId}' condition on flow '${flow.flowId}' failed to evaluate: ${err.message}`,
             { flowId: flow.flowId, expression, occurrence: occ },
-            "serviceTaskFailure",
+            "conditionFailure",
           );
         }
         throw err;
@@ -645,7 +647,9 @@ async function driveReceiveTask(
     // have applied this visit's message while we waited — advance, don't fail.
     const fresh = await getSubscriptionForVisit(env.DB, instanceId, elementId, occ);
     if (fresh?.status === "consumed") return { kind: "next", next };
-    await runStep(`recv-timeout:${tag}`, () => createIncident(env, instanceId, elementId, 0, "Receive Task wait timed out.", { messageName }, "timeout"));
+    // M3-L1 (TASK-39): the un-guarded receive-task wait cap is 'waitTimeout'
+    // (shared with the service-task wait cap), split out of the legacy 'timeout'.
+    await runStep(`recv-timeout:${tag}`, () => createIncident(env, instanceId, elementId, 0, "Receive Task wait timed out.", { messageName }, "waitTimeout"));
     return { kind: "incident" };
   }
   const event = parseMessageEvent(outcome.payload);

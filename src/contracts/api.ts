@@ -200,8 +200,22 @@ export interface Incident {
   status: "open";
   retryCount: number;
   payloadContext?: Record<string, unknown>;
-  /** SAGA (M1) incident taxonomy + remediation linkage; M2 adds loopLimit | noPath. */
-  kind?: "serviceTaskFailure" | "compensationFailure" | "timeout" | "poison" | "loopLimit" | "noPath";
+  /**
+   * Incident taxonomy + remediation linkage. SAGA (M1) base + M2 (loopLimit |
+   * noPath) + M3-L1 (TASK-39) split: jobActivationTimeout (DLQ) | waitTimeout
+   * (service/receive wait caps) | conditionFailure (hard FEEL error). `timeout`
+   * is LEGACY — retained for compatibility, never written by current code.
+   */
+  kind?:
+    | "serviceTaskFailure"
+    | "compensationFailure"
+    | "timeout"
+    | "poison"
+    | "loopLimit"
+    | "noPath"
+    | "jobActivationTimeout"
+    | "waitTimeout"
+    | "conditionFailure";
   resolution?: "open" | "compensating" | "compensated" | "operatorResolved";
   createdAt: string;
 }
@@ -223,7 +237,13 @@ export interface SagaInspection {
 export interface ProcessInstanceInspection extends ProcessInstance {
   historySummary: HistoryEvent[];
   diagnostics: Record<string, unknown>;
+  /** The latest incident (LIMIT 1) — kept for backward compatibility. */
   incident?: Incident | null;
+  /**
+   * All not-yet-resolved incidents, newest-first (M3-L1, TASK-39). Lets an
+   * operator see every live incident, not just the latest one.
+   */
+  openIncidents?: Incident[];
   /** Saga view — present when the instance has a transaction ledger. */
   saga?: SagaInspection | null;
 }

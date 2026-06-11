@@ -147,9 +147,12 @@ export async function driveForwardServiceTask(
     return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, fresh));
   }
   if (outcome.kind === "timeout") {
-    // A genuine timeout: nobody completed the job (still created/locked).
+    // A genuine wait-cap: nobody completed the job (still created/locked). M3-L1
+    // (TASK-39): the un-guarded service-task wait cap is 'waitTimeout', split out
+    // of the legacy overloaded 'timeout'. NOTE: `outcome.kind === "timeout"` is the
+    // wait-OUTCOME discriminator (a different axis) — only the incident kind changes.
     return runStep(`svc-timeout:${tag}`, () =>
-      createIncident(env, instanceId, elementId, node.retries ?? 1, "Service Task timed out waiting for a worker.", { jobId: fresh.job_id }, "timeout"),
+      createIncident(env, instanceId, elementId, node.retries ?? 1, "Service Task timed out waiting for a worker.", { jobId: fresh.job_id }, "waitTimeout"),
     );
   }
   // Defensive: event arrived but job is not terminal — treat as a technical incident.
@@ -230,9 +233,9 @@ async function armJobScheduler(env: Env, jobId: string, activationExpiresAt: str
  * D1 is canonical — the DO holds no authoritative state — so this re-reads the job
  * and only acts if it is STILL an un-leased, expired forward job on a non-terminal
  * instance. Otherwise (progressed / already settled / late-or-duplicate alarm) it
- * is an idempotent no-op. The terminal incident kind='timeout' is written directly
- * (never falling through to the process-workflow.ts catch-all), so the DLQ outcome
- * is assertable in direct mode without a live Workflow.
+ * is an idempotent no-op. The terminal incident kind='jobActivationTimeout' is
+ * written directly (never falling through to the process-workflow.ts catch-all),
+ * so the DLQ outcome is assertable in direct mode without a live Workflow.
  */
 export async function terminateUnleasableJob(env: Env, jobId: string): Promise<void> {
   const job = await getJobRowById(env.DB, jobId);
@@ -264,12 +267,16 @@ export async function terminateUnleasableJob(env: Env, jobId: string): Promise<v
   // / incidentCreated HISTORY events remain visible. Accepted as minor audit noise
   // (no state/remediation impact) over the worse corrupt-terminal alternative.
   const incidentId = newId("inc");
+  // M3-L1 (TASK-39): the DLQ kind is its OWN taxonomy bucket, split out of the
+  // legacy overloaded 'timeout'. A single local const so the incident row and its
+  // history event can never drift apart.
+  const kind = "jobActivationTimeout" as const;
   const reason = "Service Task job expired before any worker leased it (un-leasable taskType).";
   const payloadContext: JsonObject = { reason, jobId, taskType: job.task_type, activationExpiresAt: job.activation_expires_at, dlq: "un-leasable" };
   await dbBatch(env.DB, [
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId: inst.instance_id, elementId: job.element_id, type: "jobActivationExpired", diagnostics: { jobId, taskType: job.task_type, activationExpiresAt: job.activation_expires_at } }),
-    incidentStmt(env.DB, { incidentId, instanceId: inst.instance_id, elementId: job.element_id, reason, retryCount: 0, kind: "timeout", resolution: "open", payloadContext, now }),
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId: inst.instance_id, elementId: job.element_id, type: "incidentCreated", diagnostics: { incidentId, reason, kind: "timeout", retryCount: 0 }, payloadSnapshot: payloadContext }),
+    incidentStmt(env.DB, { incidentId, instanceId: inst.instance_id, elementId: job.element_id, reason, retryCount: 0, kind, resolution: "open", payloadContext, now }),
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId: inst.instance_id, elementId: job.element_id, type: "incidentCreated", diagnostics: { incidentId, reason, kind, retryCount: 0 }, payloadSnapshot: payloadContext }),
     transitionStatusGuardedStmt(env.DB, inst.instance_id, ["running", "waiting"], "incident", now),
   ]);
 }

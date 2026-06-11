@@ -136,7 +136,7 @@ CREATE INDEX idx_jobs_leasable ON service_task_jobs (task_type, status, lock_exp
 - `worker_id` / `lock_token` / `lock_expires_at`: The pull lease (claimer, conditional-update token,
   lease deadline).
 - `activation_expires_at`: Job-level DLQ TTL — a job whose `taskType` nobody polls expires here →
-  terminal incident (`kind=timeout`).
+  terminal incident (`kind=jobActivationTimeout`).
 - `error_code`: The business error code from a `fail` (matched to `bpmn:error/@errorCode`).
 - `status`: `created | running | completed | failed`, plus the lease state `locked` (a `created`/
   re-leasable job is leased to `locked` with a `lock_token`).

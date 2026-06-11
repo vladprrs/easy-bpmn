@@ -762,3 +762,81 @@ describe("Exclusive-gateway reject matrix (TASK-33, M2 design §3)", () => {
     expect(r.issues.some((i) => i.elementId === "T" && /default/.test(i.reason) && /exclusiveGateway/.test(i.reason))).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// M2 final review: token-path flows into NON-TOKEN nodes. The linearity checks
+// skip boundary events and compensation handlers, so without explicit endpoint
+// rules these two probe models published OK and wedged the engine (the walk
+// fell through with no terminal write). Both fixtures are valid EXCEPT for the
+// offending flow(s) — the issue counts pin that the new rules are the only gate.
+// ---------------------------------------------------------------------------
+
+describe("Token-path flows into non-token nodes (M2 final review)", () => {
+  it("rejects sequence flows into and out of an isForCompensation handler (pre-M2 probe)", async () => {
+    // TxStart → A → H(isForCompensation) → TxEnd: a handler spliced into the
+    // token path. Published OK since M1; the engine then silently wedged on H.
+    const FLOW_THROUGH_HANDLER_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:sequenceFlow id="g1" sourceRef="S" targetRef="Tx"/>
+    <bpmn:transaction id="Tx">
+      <bpmn:startEvent id="TxS"/>
+      <bpmn:sequenceFlow id="t1" sourceRef="TxS" targetRef="A"/>
+      <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="step-a"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="t2" sourceRef="A" targetRef="H"/>
+      <bpmn:serviceTask id="H" isForCompensation="true"><bpmn:extensionElements><easy-bpmn:taskDefinition type="undo-a"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="t3" sourceRef="H" targetRef="TxE"/>
+      <bpmn:endEvent id="TxE"/>
+    </bpmn:transaction>
+    <bpmn:sequenceFlow id="g2" sourceRef="Tx" targetRef="E"/>
+    <bpmn:endEvent id="E"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const r = await parseAndValidate(FLOW_THROUGH_HANDLER_BPMN);
+    expect(r.ok).toBe(false);
+    // incoming flow: handlers are invoked via their <association>, never the token
+    expect(r.issues.some((i) => i.elementId === "t2" && /targets compensation handler 'H'/.test(i.reason))).toBe(true);
+    // outgoing flow: handlers have no outgoing sequence flows
+    expect(r.issues.some((i) => i.elementId === "t3" && /leaves compensation handler 'H'/.test(i.reason))).toBe(true);
+    // the model is otherwise valid — these two are the only gate failures
+    expect(r.issues).toHaveLength(2);
+  });
+
+  it("rejects a gateway flow targeting a boundary event (NEW-in-M2 probe)", async () => {
+    // M1's no-split rule made flow-into-boundary structurally impossible; an
+    // XOR default flow opened the route. The boundary's OWN outgoing flow (g3,
+    // the escalation path) stays legal — only the INCOMING flow rejects.
+    const GATEWAY_INTO_BOUNDARY_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:sequenceFlow id="f0" sourceRef="S" targetRef="GW"/>
+    <bpmn:exclusiveGateway id="GW" default="f_bad"/>
+    <bpmn:sequenceFlow id="f_go" sourceRef="GW" targetRef="Tx"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">ok = true</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_bad" sourceRef="GW" targetRef="Tx_cancelled"/>
+    <bpmn:transaction id="Tx">
+      <bpmn:startEvent id="TxS"/>
+      <bpmn:sequenceFlow id="t1" sourceRef="TxS" targetRef="A"/>
+      <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="step-a"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="t2" sourceRef="A" targetRef="TxE"/>
+      <bpmn:endEvent id="TxE"/>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="Tx_cancelled" attachedToRef="Tx"><bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="g2" sourceRef="Tx" targetRef="Done"/>
+    <bpmn:sequenceFlow id="g3" sourceRef="Tx_cancelled" targetRef="Failed"/>
+    <bpmn:endEvent id="Done"/>
+    <bpmn:endEvent id="Failed"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const r = await parseAndValidate(GATEWAY_INTO_BOUNDARY_BPMN);
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some(
+        (i) => i.elementId === "f_bad" && /targets boundary event 'Tx_cancelled'/.test(i.reason) && /activated by the runtime/.test(i.reason),
+      ),
+    ).toBe(true);
+    // the model is otherwise valid — the incoming flow is the only gate failure
+    expect(r.issues).toHaveLength(1);
+  });
+});

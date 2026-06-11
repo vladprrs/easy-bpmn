@@ -524,6 +524,12 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     else m.set(k, [v]);
   };
 
+  const isBoundary = (n: NodeInfo) => n.type === "boundaryEvent";
+  const isHandler = (n: NodeInfo) => n.type === "serviceTask" && n.isForCompensation === true;
+  // Token-path nodes participate in linearity/reachability; boundary events and
+  // compensation handlers are reached via attachment/association, not the token.
+  const isTokenNode = (n: NodeInfo) => !isBoundary(n) && !isHandler(n);
+
   for (const f of flows) {
     const src = f.source ? nodeById.get(f.source) : undefined;
     const tgt = f.target ? nodeById.get(f.target) : undefined;
@@ -555,15 +561,44 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       );
       continue;
     }
+    // Token-path endpoint rules (M2 final review): boundary events and
+    // compensation handlers are never sequence-flow TARGETS (and a handler is
+    // never a SOURCE) — the linearity checks below deliberately skip non-token
+    // nodes, so without these degree rules a model could route the token into
+    // a node the engine never dispatches, wedging the instance. The engine
+    // keeps a defensive incident for graphs that bypass this gate. A flow
+    // LEAVING a boundary event stays legal — error/cancel boundaries route
+    // their escalation path that way (degree-checked per kind below); the
+    // compensate boundary's zero-outgoing rule also lives below.
+    if (isBoundary(tgt)) {
+      err(
+        `Sequence flow '${f.id}' targets boundary event '${tgt.id}'. Boundary events attach to activities ` +
+          "and are activated by the runtime, never by an incoming sequence flow.",
+        f.id,
+        "sequenceFlow",
+      );
+    }
+    if (isHandler(tgt)) {
+      err(
+        `Sequence flow '${f.id}' targets compensation handler '${tgt.id}'. Compensation handlers (isForCompensation) ` +
+          "are invoked by the compensation mechanism via their <association>, never by sequence flow.",
+        f.id,
+        "sequenceFlow",
+      );
+    }
+    if (isHandler(src)) {
+      err(
+        `Sequence flow '${f.id}' leaves compensation handler '${src.id}'. Compensation handlers (isForCompensation) ` +
+          "must have no outgoing sequence flows; control returns to the compensation mechanism when the handler completes.",
+        f.id,
+        "sequenceFlow",
+      );
+    }
+    // Errors above still record adjacency so the per-kind boundary degree
+    // checks below see a coherent picture (reachability is gated on no errors).
     pushTo(outgoing, f.source!, f.target!);
     pushTo(incoming, f.target!, f.source!);
   }
-
-  const isBoundary = (n: NodeInfo) => n.type === "boundaryEvent";
-  const isHandler = (n: NodeInfo) => n.type === "serviceTask" && n.isForCompensation === true;
-  // Token-path nodes participate in linearity/reachability; boundary events and
-  // compensation handlers are reached via attachment/association, not the token.
-  const isTokenNode = (n: NodeInfo) => !isBoundary(n) && !isHandler(n);
 
   const scopeIds = Array.from(new Set(scopes.map((s) => s.id)));
   const scopeKindOf = new Map(scopes.map((s) => [s.id, s.kind]));

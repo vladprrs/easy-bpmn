@@ -325,8 +325,23 @@ async function loop(
       return { status: "completed" };
     }
 
-    // boundary events / compensation handlers are never on the token path.
-    return { status: "completed" };
+    // Boundary events / compensation handlers are never on the token path —
+    // the validator rejects sequence flows into them (M2 final review). A walk
+    // can only land here on an injected/legacy graph that bypassed the publish
+    // gate: fail LOUD with a deterministic incident instead of silently
+    // returning "completed" with no terminal write (a wedged instance).
+    await runStep(`non-token:${tag}`, () =>
+      createIncident(
+        env,
+        instanceId,
+        cur,
+        0,
+        `Element '${cur}' (${node.type}) is not a token-path node — the validator should have rejected this model.`,
+        { elementId: cur, nodeType: node.type },
+        "serviceTaskFailure",
+      ),
+    );
+    return { status: "incident" };
   }
 }
 

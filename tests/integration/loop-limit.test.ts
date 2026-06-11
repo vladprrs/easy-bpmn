@@ -1,6 +1,17 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { LOOP_XOR_BPMN, SAGA_LOOP_BPMN, authedPost, get, mintWorkerToken, post, publishAndStart } from "../helpers";
+import {
+  LOOP_XOR_BPMN,
+  SAGA_LOOP_BPMN,
+  authedPost,
+  get,
+  leaseAndComplete,
+  leaseOne,
+  mintWorkerToken,
+  post,
+  publishAndStart,
+  rewindBackoff,
+} from "../helpers";
 import { ensureWorkspace } from "../../src/persistence/db";
 import { createVersion } from "../../src/persistence/definitions";
 import { createInstance } from "../../src/persistence/instances";
@@ -25,34 +36,6 @@ import type { ExecutionGraph } from "../../src/bpmn/graph";
 // cycle burns the REAL MAX_ELEMENT_OCCURRENCES in seconds — one decision-row
 // dbBatch per visit. No test-only cap override exists; production and tests
 // share the one constant.
-
-/** Lease the single open job of `taskType` over the pull plane. */
-async function leaseOne(token: string, taskType: string) {
-  const r = await authedPost("/jobs/activate", token, { taskType, workerId: "loop-worker" });
-  expect(r.status).toBe(200);
-  expect(r.body.jobs).toHaveLength(1);
-  return r.body.jobs[0] as { jobId: string; lockToken: string; elementId: string; attempt: number };
-}
-
-async function leaseAndComplete(token: string, taskType: string, output: Record<string, unknown> = {}) {
-  const job = await leaseOne(token, taskType);
-  const done = await authedPost(`/jobs/${job.jobId}/complete`, token, {
-    lockToken: job.lockToken,
-    outputVariables: output,
-  });
-  expect(done.status).toBe(200);
-  return job;
-}
-
-/** A retryable technical fail parks the job behind backoff; rewind the park so the next activate re-leases it. */
-async function rewindBackoff(instanceId: string, taskType: string): Promise<void> {
-  await env.DB.prepare(
-    `UPDATE service_task_jobs SET lock_expires_at = '2000-01-01T00:00:00Z'
-       WHERE status = 'locked' AND lock_token IS NULL AND instance_id = ? AND task_type = ?`,
-  )
-    .bind(instanceId, taskType)
-    .run();
-}
 
 async function decisionCount(instanceId: string, elementId: string): Promise<number> {
   const row = await env.DB.prepare(
@@ -236,14 +219,15 @@ describe("loop guard inside a transaction — Hazard semantics (AC2, SAGA_LOOP_B
         "compensated",
         "compensated",
       ]);
-      // Resolution is set to "compensating" at cancel-initiation (src/index.ts) and the
-      // compensation settle path never advances it to "compensated" — that enum member
-      // is currently never written (recorded as a TASK-36/37 carry).
+      // Carry resolved in TASK-36: /cancel sets resolution='compensating', and the
+      // reverse-pass settle (engine settleSagaCompensated) advances it to
+      // 'compensated' in the same dbBatch as the terminal transition — the
+      // natural completion of the cancel-path incident lifecycle.
       const incident = await env.DB.prepare(`SELECT kind, resolution FROM incidents WHERE instance_id = ?`)
         .bind(id)
         .first<{ kind: string; resolution: string }>();
       expect(incident?.kind).toBe("loopLimit");
-      expect(incident?.resolution).toBe("compensating");
+      expect(incident?.resolution).toBe("compensated");
     },
   );
 });

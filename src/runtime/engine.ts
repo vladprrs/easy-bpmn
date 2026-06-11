@@ -69,6 +69,7 @@ import { getVersionGraph } from "../persistence/definitions";
 import { dbBatch } from "../persistence/db";
 import { countHistoryEventsOfType, hasHistoryMarkerForOccurrence, historyStmt } from "../persistence/history";
 import {
+  advanceIncidentResolutionStmt,
   applyTransitionStmt,
   createJobStmt,
   getCompensationJob,
@@ -1148,6 +1149,14 @@ async function settleSagaCompensated(env: Env, instanceId: string, scopeId: stri
   await dbBatch(env.DB, [
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: scopeId, type: "compensationCompleted", diagnostics: { transaction: scopeId, outcome: "compensated" } }),
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: finalEl, type: "sagaFailed", diagnostics: { settledVia: finalEl } }),
+    // Incident lifecycle (TASK-36 carry): an operator /cancel of a Hazard set
+    // the incident resolution to 'compensating'; the settle is its natural
+    // completion → advance to 'compensated' atomically with the terminal
+    // transition. Guarded on the exact prior value, so the /retry path's
+    // sticky 'operatorResolved' and an 'open' incident are never clobbered,
+    // and instances with no incident (auto cancel-end / operator cancel of a
+    // running saga) no-op.
+    advanceIncidentResolutionStmt(env.DB, { instanceId, from: "compensating", to: "compensated" }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: finalEl, status: "compensated", completedAt: now, now }),
   ]);
 }

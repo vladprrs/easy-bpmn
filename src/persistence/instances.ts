@@ -726,6 +726,19 @@ export type IncidentKind =
   // CONDITIONAL (M2 §9) — loop-iteration cap exceeded | XOR with no true condition and no default.
   | "loopLimit"
   | "noPath";
+/**
+ * Incident remediation lifecycle (one-way):
+ *
+ *   open → compensating       operator /cancel of a Hazard initiates the reverse pass
+ *   compensating → compensated  the reverse pass settles (engine settle batch, TASK-36)
+ *   open|compensating → operatorResolved  operator /retry — STICKY, never overwritten
+ *                                          (setIncidentResolution guards on it; the settle
+ *                                          advance is keyed on 'compensating' only)
+ *
+ * The AUTO-compensation path (business error → cancel end) raises no incident,
+ * so 'compensating'/'compensated' resolutions only ever appear on operator-
+ * cancelled Hazards.
+ */
 export type IncidentResolution = "open" | "compensating" | "compensated" | "operatorResolved";
 
 export function incidentStmt(
@@ -757,6 +770,24 @@ export function incidentStmt(
       input.resolution ?? "open",
       input.now,
     ],
+  );
+}
+
+/**
+ * Advance an incident's resolution as a BATCHABLE statement, guarded on the
+ * exact prior value — the compensation settle path uses it to complete the
+ * cancel-path lifecycle ('compensating' → 'compensated') atomically with the
+ * terminal transition, without ever touching 'open' or the sticky
+ * 'operatorResolved'. A 0-row match (no cancel-path incident) is a no-op.
+ */
+export function advanceIncidentResolutionStmt(
+  db: D1Database,
+  input: { instanceId: string; from: IncidentResolution; to: IncidentResolution },
+): D1PreparedStatement {
+  return stmt(
+    db,
+    `UPDATE incidents SET resolution = ? WHERE instance_id = ? AND resolution = ?`,
+    [input.to, input.instanceId, input.from],
   );
 }
 

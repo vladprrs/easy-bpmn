@@ -3,9 +3,11 @@ id: TASK-36
 title: >-
   Compensation across loop iterations: per-occurrence ledger rows compensated in
   reverse
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - Claude
 created_date: '2026-06-09 20:30'
+updated_date: '2026-06-11 07:41'
 labels:
   - saga
   - engine
@@ -41,3 +43,16 @@ M2 design 2026-06-09 §8. Each completed pass of a compensatable step becomes it
 - [ ] #4 Crash during compensation of iteration k re-attaches to that occurrence's existing compensation job on recovery (no second comp job).
 - [ ] #5 Constitution gate: integration tests above (vitest-pool-workers); npm run test green.
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+Execution: subagent-driven (implementer + spec review + quality review) on branch m2-conditional-sagas. Much of the plumbing pre-landed: saga_steps.occurrence + per-occurrence INSERT OR IGNORE (TASK-29), comp jobs inherit forward occurrence end-to-end incl. /jobs/activate seeding by (element, occurrence) (TASK-32), SAGA_LOOP_BPMN fixture + the operator-/cancel reverse pass over 2 occurrences already pinned (TASK-35). This task proves and hardens the remaining contract on the AUTO-compensation path and the failure/recovery matrix:
+
+1. AC1 loop+cancel-end: SAGA_LOOP_BPMN — drive f_more for N>=2 completed reserveItem iterations, then business-fail finalize (FINALIZE_FAILED error boundary -> Tx_cancel cancel end) -> AUTO reverse pass creates N comp jobs in reverse seq order, each seeded with ITS iteration's originalInput + capturedOutput (assert per-job seeding, not just count/order).
+2. AC2 per-occurrence dedup: duplicate forward completion of one occurrence = ledger no-op; new occurrence = new row (persistence-level test exists from TASK-29 — extend to the engine path if not covered: duplicate /jobs/complete within an iteration).
+3. AC3 compensationFailed mid-reverse stops at the failed iteration (already-compensated suffix stays compensated); operator /retry resumes from EXACTLY that iteration — extends the M1 scenario across occurrences.
+4. AC4 crash during compensation of iteration k re-attaches to that occurrence's existing compensation job (no second comp job) — the M1 'compensating ledger row re-attaches to compensation_job_id' rule per occurrence.
+5. Carried: resolve the never-written incident resolution 'compensated' (advance it at compensation settle OR drop the enum member; update the loop-limit pin in lockstep, justified). Hoist a parameterized leaseOne/leaseAndComplete into tests/helpers.ts (3+ per-file copies exist).
+Constitution gate: integration tests (vitest-pool-workers); npm run test green.
+<!-- SECTION:PLAN:END -->

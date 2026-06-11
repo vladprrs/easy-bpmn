@@ -7,7 +7,7 @@ status: Done
 assignee:
   - Claude
 created_date: '2026-06-09 20:30'
-updated_date: '2026-06-11 07:20'
+updated_date: '2026-06-11 07:40'
 labels:
   - saga
   - engine
@@ -69,6 +69,12 @@ AC4: wrangler.jsonc workflows block now documents the verified platform budget (
 Poison-strikes decision (carried from TASK-32): KEPT — serviceTaskOutputRejected strikes stay per (instance, element) ACROSS occurrences; a loop shares one poison budget (a poison-looping element should die fast, not earn POISON_THRESHOLD×1000 strikes). Documented at the strike-count site in applyForwardCompletion; per-occurrence budgets are TASK-36+ scope if ever needed.
 
 No test-only cap override added: the gateway-only-cycle economics made the real constant fast enough (preferred path).
+
+Two-stage review done. Spec review: compliant (fixture publishes through the real validator incl. the GW_more self-loop; Hazard asserts zero comp jobs BEFORE /cancel and reverse occurrence order after; AC3 pins exact job table + same-jobId re-lease; wrangler figures verified against live Cloudflare docs — 10,000 steps default on Workers Paid / 25,000 max via limits.steps / 1,024 Free; step.sleep excluded). Quality review: With fixes -> 6ac3763: loopLimit incident resolution assertion tightened from not-'open' to exactly 'compensating'; rewindBackoff scoped by instance_id.
+
+GAP RECORDED (carry to TASK-36/37): incident resolution 'compensated' is an enum member that is NEVER written — /cancel sets 'compensating' and the compensation settle path never advances it. TASK-36 (touches the settle path) should either advance resolution on settle or drop the dead member; the loop-limit test pins current behavior and must be updated in lockstep. Carry to TASK-37: design doc §5/§11 still reads as if 25k is the running step budget — correct to 10k default / 25k max (the wrangler.jsonc block is already right). Test-helper dedup: leaseAndComplete/leaseOne now have 3+ per-file copies — hoist a parameterized version into tests/helpers.ts on next touch (TASK-36).
+
+Poison decision documented at the strike site: serviceTaskOutputRejected strikes stay per (instance, element) ACROSS occurrences — a poison-looping element dies fast instead of earning POISON_THRESHOLD×1000.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

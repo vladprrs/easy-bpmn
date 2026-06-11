@@ -1,6 +1,7 @@
 // Shared test helpers: HTTP client over the Worker (SELF) + BPMN fixtures.
 
 import { SELF, env } from "cloudflare:test";
+import { expect } from "vitest";
 import { invokeSampleWorker } from "../src/runtime/service-task";
 
 const BASE = "https://easy-bpmn.test";
@@ -142,6 +143,61 @@ export async function drainSampleWorkers(opts: {
     }
   }
   return ran;
+}
+
+/** The job shape /jobs/activate hands a pull worker (the test-relevant fields). */
+export interface LeasedTestJob {
+  jobId: string;
+  instanceId: string;
+  elementId: string;
+  taskType: string;
+  isCompensation: boolean;
+  attempt: number;
+  lockToken: string;
+  variables: Record<string, unknown>;
+  /** Compensation-job seeding from the ledger (design §4.4): the forward step's captured input. */
+  originalInput?: Record<string, unknown>;
+  /** Compensation-job seeding from the ledger: the forward step's captured output. */
+  capturedOutput?: Record<string, unknown> | null;
+}
+
+/** Lease the single open job of `taskType` over the pull plane (asserts exactly one). */
+export async function leaseOne(token: string, taskType: string, workerId = "test-worker"): Promise<LeasedTestJob> {
+  const r = await authedPost("/jobs/activate", token, { taskType, workerId });
+  expect(r.status).toBe(200);
+  expect(r.body.jobs).toHaveLength(1);
+  return r.body.jobs[0] as LeasedTestJob;
+}
+
+/** leaseOne + complete with `output` (asserts the 200 ack); returns the leased job. */
+export async function leaseAndComplete(
+  token: string,
+  taskType: string,
+  output: Record<string, unknown> = {},
+  workerId = "test-worker",
+): Promise<LeasedTestJob> {
+  const job = await leaseOne(token, taskType, workerId);
+  const done = await authedPost(`/jobs/${job.jobId}/complete`, token, {
+    lockToken: job.lockToken,
+    outputVariables: output,
+  });
+  expect(done.status).toBe(200);
+  return job;
+}
+
+/**
+ * A retryable technical fail parks the job behind an exponential backoff
+ * (status='locked', lock_token NULL, future lock_expires_at — TASK-23 §4.1);
+ * rewind the park so the next /jobs/activate re-leases it (the test stand-in
+ * for elapsed wall-clock).
+ */
+export async function rewindBackoff(instanceId: string, taskType: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE service_task_jobs SET lock_expires_at = '2000-01-01T00:00:00Z'
+       WHERE status = 'locked' AND lock_token IS NULL AND instance_id = ? AND task_type = ?`,
+  )
+    .bind(instanceId, taskType)
+    .run();
 }
 
 export async function createDraft(bpmnXml: string, name = "demo", workspaceId = "default") {

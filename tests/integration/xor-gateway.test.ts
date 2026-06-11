@@ -4,8 +4,8 @@ import {
   LOOP_XOR_BPMN,
   SAGA_XOR_NODEFAULT_BPMN,
   XOR_BPMN,
-  authedPost,
   get,
+  leaseAndComplete,
   mintWorkerToken,
   post,
   publishAndStart,
@@ -27,20 +27,6 @@ import type { ExecutionGraph } from "../../src/bpmn/graph";
 // decision row + transition + gatewayDecisionEvaluated history event commit
 // in ONE dbBatch; an existing row for (instance, gateway, occurrence) is the
 // rewalk fast-forward predicate — reused, never re-evaluated.
-
-/** Lease the single open job of `taskType` over the pull plane and complete it. */
-async function leaseAndComplete(token: string, taskType: string, output: Record<string, unknown> = {}) {
-  const r = await authedPost("/jobs/activate", token, { taskType, workerId: "xor-worker" });
-  expect(r.status).toBe(200);
-  expect(r.body.jobs).toHaveLength(1);
-  const job = r.body.jobs[0] as { jobId: string; lockToken: string; elementId: string };
-  const done = await authedPost(`/jobs/${job.jobId}/complete`, token, {
-    lockToken: job.lockToken,
-    outputVariables: output,
-  });
-  expect(done.status).toBe(200);
-  return job;
-}
 
 async function gatewayHistoryEvents(instanceId: string) {
   const history = await get(`/instances/${instanceId}/history`);

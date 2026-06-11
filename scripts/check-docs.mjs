@@ -99,6 +99,11 @@ const stalePatterns = [
   [/plain, no conditions/i, "stale pre-M2 scope claim (FEEL conditions on XOR-gateway flows are IN since M2)"],
   [/no expression language is required yet/i, "stale pre-M2 scope claim (FEEL via feelin is IN since M2)"],
   [/none are in the MVP/i, "stale pre-M1 scope claim (error/compensation/transaction are IN since M1)"],
+  // 01-events.md scope section (fixed M3-L2, TASK-41): the pre-M1 events-scope
+  // claims were already false for the shipped saga set and now also for the
+  // M3-accepted set. Match the OLD sentences precisely so reintroducing them fails.
+  [/In scope: None Start Event and None End Event only/i, "stale pre-M1 events-scope claim in 01-events (compensation/error/cancel boundary events are IN since M1; M3 timer/message intermediate catch + boundary timers + eventBasedGateway are accepted in constitution v2.2.0, opened per validator layer)"],
+  [/all intermediate events, all boundary events, and terminate/i, "stale pre-M1 events-scope claim in 01-events (boundary events are IN since M1; M3 adds timer/message intermediate catch + boundary timers + eventBasedGateway, accepted in v2.2.0)"],
 ];
 for (const file of readdirSync(bpmnDir).filter((f) => f.endsWith(".md"))) {
   const text = readFileSync(join(bpmnDir, file), "utf8");

@@ -49,10 +49,16 @@ entry in Complexity Tracking before implementation planning may continue.
   handler, `bpmn:association`, cancel end event, root `bpmn:error` — plus the M2
   conditional set: `bpmn:exclusiveGateway`, FEEL `conditionExpression` on flows
   leaving an exclusiveGateway, the gateway-owned `default` flow, cycles on the
-  token path), introduces no custom notation, stays XSD-valid and
-  modeler-round-trippable when easy-bpmn extensions + DI are ignored, and rejects
-  unsupported standard-namespace flow nodes before publish with the element id +
-  a user-visible reason.
+  token path — plus the M3 time-&-failure-taxonomy set: an interrupting boundary
+  `timerEventDefinition` on a `serviceTask`/`receiveTask`, a timer/message
+  `intermediateCatchEvent`, the `bpmn:eventBasedGateway`, and free error-boundary
+  routing, static ISO-8601 `timeDate`/`timeDuration` triggers only — accepted in
+  constitution v2.2.0, the validator opening each construct as its runtime layer
+  ships and rejecting it with "M3 — not yet implemented" until then, per
+  `docs/bpmn/09-easy-bpmn-profile.md`), introduces no custom notation, stays
+  XSD-valid and modeler-round-trippable when easy-bpmn extensions + DI are
+  ignored, and rejects unsupported standard-namespace flow nodes before publish
+  with the element id + a user-visible reason.
 - **SAGA / Compensation integrity**: If the feature touches sagas, compensation
   runs in reverse completion order, scoped to its transaction, idempotent +
   at-least-once; compensation is triggered only by transaction Cancel (never by an

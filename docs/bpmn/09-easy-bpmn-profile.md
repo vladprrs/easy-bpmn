@@ -1,9 +1,14 @@
 # 09 — The `easy-bpmn` BPMN Profile
 
 This is the **contract** between the BPMN standard and what `easy-bpmn` actually executes. It is the
-operational reading of the [constitution](../../.specify/memory/constitution.md) (now **v2.1.0**, with
-the widened **Principle I — "Standard BPMN Profile Only"** covering the M2 conditional set and
-**Principle VI — "SAGA / Compensation Integrity"**). When in doubt, the constitution wins. The
+operational reading of the [constitution](../../.specify/memory/constitution.md) (now **v2.2.0**, with
+the widened **Principle I — "Standard BPMN Profile Only"** covering the M2 conditional set **and the M3
+time-&-failure-taxonomy set** — interrupting boundary timers, timer/message intermediate catch events,
+the `eventBasedGateway`, and free error-boundary routing — and **Principle VI — "SAGA / Compensation
+Integrity"**). The M3 set is **accepted in v2.2.0 but opened per validator layer**: each construct stays
+rejected with the reason `M3 — not yet implemented` until its runtime ships (the interim state defined in
+[Explicitly out of scope](#explicitly-out-of-scope-must-be-rejected-before-publish) below). When in doubt,
+the constitution wins. The
 authoritative designs are
 [`2026-06-08-saga-orchestrator-design.md`](../superpowers/specs/2026-06-08-saga-orchestrator-design.md)
 (M1) and
@@ -19,17 +24,21 @@ The profile grows one milestone at a time, each guarded by a constitution amendm
 - **M0/M1: the canonical transaction-saga** — the linear core *plus* `bpmn:transaction`,
   compensation/error/cancel boundary events, an `isForCompensation` handler, `bpmn:association`, a cancel
   end event, and root `bpmn:error`. Documented here.
-- **M2 (current): conditional sagas** — `bpmn:exclusiveGateway` (XOR split + pass-through join), FEEL
+- **M2: conditional sagas** — `bpmn:exclusiveGateway` (XOR split + pass-through join), FEEL
   `conditionExpression` (via `feelin`) on flows leaving an exclusiveGateway, the gateway-owned `default`
   flow, and **cycles on the token path** (occurrence-discriminated iterations). Documented here;
   execution semantics in [`03-gateways.md`](./03-gateways.md).
-- **M3 → time & failure taxonomy** (timers, per-step timeouts, error catalog):
-  [`01-events.md`](./01-events.md). **One M1 exception:** a single **job-level activation TTL**
+- **M3 (current) → time & failure taxonomy** (timers, per-step timeouts, error catalog):
+  [`01-events.md`](./01-events.md). The M3 construct set — interrupting boundary `timerEventDefinition` on
+  a `serviceTask`/`receiveTask`, timer/message `intermediateCatchEvent`, the `bpmn:eventBasedGateway`, and
+  free error-boundary routing — is **accepted in constitution v2.2.0** but **opened per validator layer**:
+  see the interim marking under [Explicitly out of scope](#explicitly-out-of-scope-must-be-rejected-before-publish).
+  **One M1 exception (already shipped):** a single **job-level activation TTL**
   (`service_task_jobs.activation_expires_at`, default 15 min) backs the un-leasable-job DLQ — a job
   nobody leases in time settles to a terminal incident `kind=jobActivationTimeout` via a per-job `JobScheduler`
-  Durable Object alarm. It is *not* a model-level timer (no BPMN timer event); general timers remain
-  M3. Retry backoff (exponential + jitter, base 1s / factor 2 / cap 30s) and poison-job termination
-  (`kind=poison`, no compensation) ship in M1 too.
+  Durable Object alarm. It is *not* a model-level timer (no BPMN timer event); general (model-level) timers
+  are the staged M3 set above. Retry backoff (exponential + jitter, base 1s / factor 2 / cap 30s) and
+  poison-job termination (`kind=poison`, no compensation) ship in M1 too.
 - **M4 → concurrency** (`parallelGateway`, token set, AND-join):
   [`07-execution-semantics.md`](./07-execution-semantics.md).
 - **M5 → composition** (`callActivity`, non-transaction `subProcess`, `multiInstance`,
@@ -241,13 +250,37 @@ with `xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"` on `<definitions>`. Notes:
 
 ## Explicitly out of scope (must be rejected before publish)
 
-Still deferred to later milestones; each requires its own constitution amendment first:
+### Accepted in v2.2.0, opened per validator layer (the M3 interim state)
+
+The M3 time-&-failure-taxonomy set is **accepted by the constitution (Principle I, v2.2.0)**, but its
+runtime ships in layers. Each construct below is therefore **still rejected before publish**, with a
+user-visible reason, **until its layer ships** — accepted-in-governance, staged-in-runtime. The
+[M3 design](../superpowers/specs/2026-06-11-m3-time-failure-taxonomy-design.md) (§3, §8, §10) and the
+recorded [M3 Constitution Check](../../specs/002-saga-orchestrator/m3-constitution-check.md) are the
+source artifacts. This is the documented interim state, **not drift**: this file stays in lockstep with
+both the amendment *and* the validator, and the gap between them is named here.
+
+| Construct | Accepted | Validator layer | Interim rejection |
+|-----------|:--------:|:---------------:|-------------------|
+| Interrupting boundary `timerEventDefinition` on `serviceTask`/`receiveTask` (static ISO-8601 `timeDate`/`timeDuration`; never on a `transaction`) | v2.2.0 | **L3** | reason `M3 — not yet implemented` |
+| `intermediateCatchEvent` + `timerEventDefinition` (token-path delay) | v2.2.0 | **L4** | reason `M3 — not yet implemented` |
+| `intermediateCatchEvent` + `messageEventDefinition` (receive-task-shaped wait; required EBG branch target, also standalone) | v2.2.0 | **L4** | reason `M3 — not yet implemented` |
+| `eventBasedGateway` (deterministic race over timer/message catch branches) | v2.2.0 | **L4** | rejected today via `DEFERRED_GATEWAY_REASONS` ("…deferred to timers & events (M3)…", `src/bpmn/profile.ts`); that pointer and `check:docs` guard 5 flip to accept at L4 |
+| Free error-boundary routing (any number of distinct-`errorCode` interrupting boundaries + ≤1 catch-all, each targeting any token-path node in the same scope) | v2.2.0 | **L2** | the M1 "error boundary must target a cancel end event" restriction (the supported-set table and rule 11 below) is lifted in this profile and the validator when L2's error-routing slice ships |
+
+Once a construct's layer ships, its row moves into the supported element set above and the validator
+accepts-and-validates it. Until then, a constitution-allowed construct staying rejected with the reason
+above is **documented behavior**, not a profile bug.
+
+### Still deferred (need a future constitution amendment)
+
+These remain out of scope; each requires its own later-milestone amendment first (none is opened by v2.2.0):
 
 | Category | Rejected elements |
 |----------|-------------------|
 | Tasks | abstract `task`, `userTask`, `sendTask`, `manualTask`, `scriptTask`, `businessRuleTask` |
-| Events | timer / signal / escalation / conditional / message / link event definitions; **non-saga** boundary events (timer/signal/…); all `intermediateCatchEvent`/`intermediateThrowEvent`; terminate end; a non-cancel end-event definition |
-| Gateways | `parallelGateway` (M4 — concurrent tokens), `inclusiveGateway` (M4 — multi-branch activation), `eventBasedGateway` (M3 — timers & events), `complexGateway` (not on the roadmap), and any **implicit split (>1 outgoing sequence flow on a non-gateway node)** — pointers in lockstep with `DEFERRED_GATEWAY_REASONS` (`src/bpmn/profile.ts`) |
+| Events | timer **start** events, `signal` / `escalation` / `conditional` / `link` event definitions; **non-interrupting** boundary timers and `timeCycle` triggers (M4); `intermediateThrowEvent`; **non-catch** message events (message throw/end); terminate end; a non-cancel end-event definition. (The M3-accepted interrupting boundary timers and timer/message intermediate **catch** events are in the interim table above, not here.) |
+| Gateways | `parallelGateway` (M4 — concurrent tokens), `inclusiveGateway` (M4 — multi-branch activation), `complexGateway` (not on the roadmap), and any **implicit split (>1 outgoing sequence flow on a non-gateway node)** — pointers in lockstep with `DEFERRED_GATEWAY_REASONS` (`src/bpmn/profile.ts`). (`eventBasedGateway` is M3-accepted — see the interim table above.) |
 | Flow | `conditionExpression` on any flow **not leaving an `exclusiveGateway`**, a `default` attribute on a non-gateway node, `messageFlow`, a sequence flow crossing a transaction boundary |
 | Structure | non-transaction `subProcess`, `adHocSubProcess`, `callActivity`, `collaboration`, `participant` (pools), `laneSet`/`lane`, `choreography` |
 | Loops/data | `multiInstanceLoopCharacteristics`, `standardLoopCharacteristics` (the activity **markers** — distinct from the accepted M2 cycles drawn as sequence flows through a gateway), `dataObject`/`dataStore`/`dataInput`/`dataOutput` |
@@ -374,11 +407,18 @@ expression — each with the offending element id.
 
 **Roadmap (per-milestone target semantics):**
 - **M2 — conditional sagas: SHIPPED** (constitution v2.1.0; this profile + [`03-gateways.md`](./03-gateways.md)).
-- **M3 — time & failure taxonomy:** timers, per-step timeouts, error catalog. [`01-events.md`](./01-events.md).
+- **M3 — time & failure taxonomy: ACCEPTED (constitution v2.2.0), opening per validator layer** —
+  interrupting boundary timers, timer/message intermediate catch, `eventBasedGateway`, free error routing,
+  per-step timeouts, error catalog (interim markings above). [`01-events.md`](./01-events.md).
 - **M4 — concurrency:** `parallelGateway`, token set, AND-join, parallel-branch compensation.
   [`07-execution-semantics.md`](./07-execution-semantics.md).
 - **M5 — composition:** `callActivity`, non-transaction `subProcess`, `multiInstance`, `signal`/`escalation`.
   [`02-activities.md`](./02-activities.md).
 
 > Any expansion of this profile requires amending the constitution first (Governance & scope). This file
-> is updated in lockstep with that amendment and with the `src/bpmn/validator.ts` accept/reject behavior.
+> is updated in lockstep with that amendment **and** with the `src/bpmn/validator.ts` accept/reject
+> behavior. When the two legitimately disagree — a construct **accepted** by a constitution amendment whose
+> validator runtime ships in a later layer (the M3 interim state) — that gap is **named explicitly** in the
+> [Accepted in v2.2.0, opened per validator layer](#explicitly-out-of-scope-must-be-rejected-before-publish)
+> table, so a constitution-allowed construct rejected with `M3 — not yet implemented` until its layer ships
+> is documented behavior, not drift.

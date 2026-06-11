@@ -26,7 +26,10 @@ Several overlapping document sets exist. When they conflict, this order wins:
 3. **`docs/superpowers/specs/`** — implementation bridge documents (module seams, M2 design, risk maps).
    Distill the specs; do not replace them.
 4. **`docs/bpmn/`** — a general BPMN 2.0 reference + the `easy-bpmn` profile (`09-easy-bpmn-profile.md`,
-   the **canonical transaction-saga + M2 conditional-saga** profile, in lockstep with constitution v2.1.0).
+   the **canonical transaction-saga + M2 conditional-saga** profile, with the **M3 time-&-failure-taxonomy
+   set** (boundary/intermediate timers, message intermediate catch, `eventBasedGateway`, free error
+   routing) **accepted in constitution v2.2.0 but opened per validator layer** — see the interim markings
+   in `09`; in lockstep with constitution v2.2.0).
 
 ### Architecture is Workflow-per-instance + DO-broker (not DO-per-instance)
 
@@ -97,10 +100,14 @@ counts — during a Workflow replay those reads see post-crash state and would d
   element's runtime meaning, no non-standard attribute *required to parse*. Every accepted file must stay
   XSD-valid and round-trip through a standard modeler (bpmn-js / Camunda Modeler) when `easy-bpmn`
   extensions and Diagram Interchange are ignored.
-- **Reject unsupported *flow nodes* before publish, with element id + reason** (non-XOR gateways, timers,
-  user tasks, subprocesses, conditional/default flows not leaving an `exclusiveGateway`,
-  `instantiate="true"`, etc. — `exclusiveGateway` + FEEL conditions + default flows + token-path cycles
-  are IN since M2 / constitution v2.1.0). But **tolerate and ignore**
+- **Reject unsupported *flow nodes* before publish, with element id + reason** (parallel/inclusive/complex
+  gateways, user tasks, non-transaction subprocesses, conditional/default flows not leaving an
+  `exclusiveGateway`, `instantiate="true"`, etc. — `exclusiveGateway` + FEEL conditions + default flows +
+  token-path cycles are IN since M2 / constitution v2.1.0; the **M3 set** — interrupting boundary/
+  intermediate timers, message intermediate catch, `eventBasedGateway`, free error routing — is **accepted
+  in constitution v2.2.0 but still rejected per-layer** with reason `M3 — not yet implemented` until its
+  runtime layer ships, the documented interim state in `docs/bpmn/09-easy-bpmn-profile.md`). But
+  **tolerate and ignore**
   *ignorable extension content* — foreign-namespace `<extensionElements>` (`camunda:`/`zeebe:`/…), Diagram
   Interchange, and `documentation`. Rejecting a file merely for carrying those is itself non-canonical.
   Both sides need test coverage.

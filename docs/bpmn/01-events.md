@@ -122,13 +122,36 @@ Consume the token. When the last token is consumed, the instance ends.
 
 ## `easy-bpmn` scope
 
-**In scope:** **None Start Event** and **None End Event** only.
+The profile grows one milestone at a time, each gated by a constitution amendment; the
+[`easy-bpmn` profile](./09-easy-bpmn-profile.md) is the operative contract (and the constitution wins).
+Measured against the events in this file:
 
-Everything else in this file — message/timer/signal/error/escalation/conditional start & end events,
-**all** intermediate events, **all** boundary events, and terminate — is **out of scope** for the MVP
-and MUST be rejected before publish with a user-visible reason (constitution, Principles I & the MVP
-scope section). The MVP starts instances via API (a none start) and ends them via a none end.
+**Start / end events.** The **None Start Event** (instances start via the API) and the **None End Event**
+(ordinary completion / transaction commit) are the only start and terminal events. Inside a
+`transaction`, a **Cancel End Event** is also accepted — reaching it triggers reverse-order compensation
+(M1). Every other start/end trigger — message/timer/signal/conditional **start** events, and
+error/escalation/signal/message/compensation/**terminate** **end** events — is **out of scope** and
+rejected before publish with a user-visible reason.
 
-The one message-shaped behavior we *do* support is the **Receive Task** wait + message correlation —
-but that is modeled as a *task*, not an intermediate message catch event. See
-[`02-activities.md`](./02-activities.md) and [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
+**Boundary events.** The **compensation**, **error**, and **cancel** boundary events are in scope since
+**M1** as the canonical transaction-saga shape (a compensation marker wired to an `isForCompensation`
+handler, an error boundary, and a cancel boundary on the `transaction`). The blanket "boundary events are
+out of scope" claim held only for the original linear MVP.
+
+**M3 — time & failure taxonomy (accepted in constitution v2.2.0, opened per validator layer).** The M3
+amendment adds, as drawn standard BPMN: an **interrupting boundary `timerEventDefinition`** on a
+`serviceTask`/`receiveTask`, a **timer or message `intermediateCatchEvent`** on the token path, the
+**`eventBasedGateway`** (a deterministic race over its catch-event branches), and **free error-boundary
+routing**. Timer triggers are static ISO-8601 `timeDate`/`timeDuration` literals only. These are
+**accepted**, but each stays rejected with the reason `M3 — not yet implemented` until its validator layer
+ships — the interim state documented in [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
+
+**Still out of scope** (each needs a future amendment): timer **start** events (instances start via API);
+**non-interrupting** boundary timers and `timeCycle` (M4); `signal`/`escalation`/`conditional` events and
+boundary timers on a `transaction` (M5); `intermediateThrowEvent`; **link** events; **non-catch** message
+events; and the **terminate** end event.
+
+The original message-shaped behavior remains the **Receive Task** wait + message correlation — modeled as
+a *task*. M3 adds the equivalent **message `intermediateCatchEvent`** (the same wait/correlation/resume
+machinery, modeled as an *event*). See [`02-activities.md`](./02-activities.md) and
+[`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).

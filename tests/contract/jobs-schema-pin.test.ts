@@ -80,6 +80,11 @@ describe("worker-facing /jobs/* schemas are pinned to the M1 shape", () => {
       }).success,
     ).toBe(true);
     expect(completeJobRequestSchema.safeParse({ lockToken: "lt_1", outputVariables: { ok: true } }).success).toBe(true);
+    // The fail-request SHAPE is unchanged by M3-L1; only the SEMANTICS of `retryable`
+    // changed (TASK-40: now HONORED server-side — false ⇒ immediate exhaustion,
+    // omitted/true ⇒ backoff retry). Both values, and omission, remain valid requests.
     expect(failJobRequestSchema.safeParse({ lockToken: "lt_1", reason: "boom", retryable: true }).success).toBe(true);
+    expect(failJobRequestSchema.safeParse({ lockToken: "lt_1", reason: "boom", retryable: false }).success).toBe(true);
+    expect(failJobRequestSchema.safeParse({ lockToken: "lt_1", reason: "boom" }).success).toBe(true);
   });
 });

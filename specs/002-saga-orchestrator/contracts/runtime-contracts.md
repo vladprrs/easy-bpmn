@@ -111,11 +111,13 @@ A per-`taskType` Durable Object is **not** required for M1.
 { "lockToken": "lt_abc", "reason": "shipping carrier rejected", "errorCode": "SHIPPING_REJECTED" }
 ```
 
-> **`retryable` is advisory and IGNORED server-side.** The schema accepts it (compatibility), but
-> the server derives the outcome exclusively from `errorCode` (present → business failure, never
-> retried) or the retry budget (`attempt_count < retries` → technical re-lease; exhausted →
-> terminal). A worker cannot force or suppress a retry via `retryable`. (M3 candidate: honor or
-> drop the field.)
+> **`retryable` is HONORED server-side (M3, TASK-40).** For a technical failure (no `errorCode`):
+> omitted/`true` → normal backoff retry until the budget (`attempt_count < retries`) exhausts;
+> `false` → **immediate exhaustion** — the worker declares the failure permanent, so remaining
+> technical retries are skipped and the job goes straight to the terminal exhaustion path. It is
+> ignored when `errorCode` is present (a business failure is never retried). **Behavior change:** a
+> worker already sending `retryable=false` (legal and ignored before M3) now short-circuits its
+> remaining retries instead of being re-leased — called out in the openapi delta / release note.
 
 `complete`/`fail` are `lock_token`-conditional updates (`… WHERE job_id=? AND lock_token=?`) that
 rotate/clear the token:
@@ -139,17 +141,20 @@ rotate/clear the token:
 
 ## Failure Taxonomy
 
-- **Technical failure** — a `fail` with **no `errorCode`** (the body's `retryable` field is
-  advisory/ignored — see above), or a lease-expiry reclaim: the job
+- **Technical failure** — a `fail` with **no `errorCode`** and `retryable` omitted/`true` (see
+  above), or a lease-expiry reclaim with retries remaining: the job
   is **parked behind an exponential-with-full-jitter backoff** (`status='locked'`, `lock_token=NULL`,
   `lock_expires_at = now + computeBackoffMs(attempt)`), so the activate gate re-leases it only after
   the delay — reusing the lease gate without a new column, and **distinct from the lease duration**
   (`leaseMs` bounds one in-flight attempt; backoff spaces attempts apart). A **lease-expiry reclaim**
   (a held lock that lapsed, i.e. a crashed/slow worker) is parked the same way by the activate
-  reclaim pre-pass before it can be re-handed (so reclaims are spaced, not instant). Counts against
-  `retries` via the explicit `/jobs/fail` path. (Terminating a job that exhausts its budget purely
-  through repeated lease-expiry — never an explicit `/jobs/fail` — is a per-step timeout, deferred to
-  **M3**; M1 only spaces such reclaims.)
+  reclaim pre-pass before it can be re-handed (so reclaims are spaced, not instant), each re-lease
+  counting against `retries`. **Exhaustion routes to the terminal exhaustion path regardless of how
+  the budget was spent** (M3, TASK-40): an explicit `/jobs/fail` (or one with `retryable=false`,
+  which exhausts immediately) AND a pure lease-expiry reclaim that reaches `attempt_count >= retries`
+  both terminate via the same path — the reclaim pre-pass flips the lapsed lease to `failed` (guarded
+  on the lapsed-lease predicate, no worker token) and delivers `{outcome:'failed', errorCode:null}`,
+  so a job exhausted purely through lease expiry no longer retries forever.
   Defaults (`src/runtime/retry-policy.ts`): **`baseMs=1000`, `factor=2`, `maxBackoffMs=30_000`**;
   `computeBackoffMs(n) = round(rand() · min(maxBackoffMs, baseMs·factor^(n-1)))`. Exhaustion
   **inside** a transaction is a **Hazard** → terminal incident (`kind=serviceTaskFailure`); an

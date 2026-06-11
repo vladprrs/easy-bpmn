@@ -45,12 +45,14 @@ import {
 } from "./persistence/worker-credentials";
 import {
   completeJobConditional,
+  failExpiredLeaseConditional,
   failJobConditional,
   getJobInWorkspace,
   leaseJobs,
   parkExpiredLease,
   parkJobForBackoffConditional,
   selectExpiredInFlightLeases,
+  type ExpiredLeaseRow,
 } from "./persistence/jobs";
 import { computeBackoffMs } from "./runtime/retry-policy";
 import { getSagaStep } from "./persistence/saga";
@@ -660,10 +662,16 @@ async function leaseOnce(
   // Reclaim pre-pass (design §4.1 reclaim leg): an EXPIRED in-flight lease (a
   // crashed/slow worker's lapsed lock) is parked behind backoff before it can be
   // re-leased, so a reclaim is spaced like a retryable fail rather than re-handed
-  // instantly. (Terminating a reclaim once retries are exhausted is a per-step
-  // timeout — deferred to M3; backoff just spaces the attempts here.)
+  // instantly. Reclaim re-leases bump attempt_count, so once the retry budget is
+  // exhausted (TASK-40) the lapsed lease is routed to the SAME exhaustion path as
+  // an explicit /jobs/fail — otherwise a job exhausted purely through lease expiry
+  // would retry forever.
   for (const j of await selectExpiredInFlightLeases(env.DB, workspaceId, taskType, now)) {
-    await parkExpiredLease(env.DB, j.job_id, isoPlusMs(now, computeBackoffMs(j.attempt_count)), now);
+    if (j.attempt_count >= j.retry_limit) {
+      await exhaustExpiredLease(env, workspaceId, j, now);
+    } else {
+      await parkExpiredLease(env.DB, j.job_id, isoPlusMs(now, computeBackoffMs(j.attempt_count)), now);
+    }
   }
 
   const leaseUntil = isoPlusMs(now, leaseMs);
@@ -710,6 +718,44 @@ async function leaseOnce(
     });
   }
   return jobs;
+}
+
+/**
+ * Reclaim exhaustion (TASK-40): a lapsed in-flight lease whose retry budget is
+ * spent terminates via the SAME exhaustion path as an explicit `/jobs/fail` with
+ * the budget exhausted. The transition is guarded on the lapsed-lease predicate
+ * (no worker token exists — the lease lapsed), so a concurrent complete/re-lease
+ * wins the 0-row race and we DELIVER NOTHING in that case. On a 1-row win we write
+ * the audit `jobFailed` row and deliver `{outcome:'failed', errorCode:null}` so the
+ * engine runs its exhaustion path: a FORWARD job → serviceTaskFailure Hazard
+ * (`handleForwardFailure` re-reads the row and routes on error_code=null); a
+ * COMPENSATION job → compensationFailure (the engine resumes the reverse pass and
+ * reads the now-`failed` comp job), exactly as a worker `fail` of either would.
+ * The event's `retryable`/`errorCode` are informational — the engine refetches the
+ * job row and never branches on them for correctness.
+ */
+async function exhaustExpiredLease(
+  env: Env,
+  workspaceId: string,
+  j: ExpiredLeaseRow,
+  now: string,
+): Promise<void> {
+  const changed = await failExpiredLeaseConditional(env.DB, j.job_id, now);
+  if (changed === 0) return; // a concurrent complete/re-lease won — do not deliver
+  const reason = "Reclaim retries exhausted (lease expiry).";
+  await recordHistory(env.DB, {
+    workspaceId,
+    instanceId: j.instance_id,
+    elementId: j.element_id,
+    type: "jobFailed",
+    diagnostics: { jobId: j.job_id, errorCode: null, retryable: false, targetStatus: "failed", reason, isCompensation: j.is_compensation === 1 },
+  });
+  await getExecutor(env).deliverJobResult({
+    workflowInstanceId: j.instance_id,
+    instanceId: j.instance_id,
+    elementId: j.element_id,
+    event: { outcome: "failed", jobId: j.job_id, retryable: false, errorCode: null, reason },
+  });
 }
 
 async function handleCompleteJob(env: Env, jobId: string, request: Request): Promise<Response> {
@@ -787,8 +833,12 @@ async function handleFailJob(env: Env, jobId: string, request: Request): Promise
   // and then only AFTER an exponential backoff park (design §4.1): the job stays
   // 'locked' with no lock_token and lock_expires_at = now + backoff, so the
   // activate gate re-leases it only once the delay has elapsed.
+  // `retryable` is HONORED (TASK-40): omitted/true ⇒ retryable (default); false ⇒
+  // the worker declares the technical failure permanent, so remaining retries are
+  // skipped and the job is exhausted immediately (the standard exhaustion path).
   const isBusiness = !!body.errorCode;
-  const willRetry = !isBusiness && job.attempt_count < job.retry_limit;
+  const retryable = body.retryable !== false;
+  const willRetry = !isBusiness && retryable && job.attempt_count < job.retry_limit;
   const targetStatus: "created" | "failed" = isBusiness ? "failed" : willRetry ? "created" : "failed";
 
   let parkUntil: string | null = null;
@@ -818,7 +868,7 @@ async function handleFailJob(env: Env, jobId: string, request: Request): Promise
     instanceId: job.instance_id,
     elementId: job.element_id,
     type: "jobFailed",
-    diagnostics: { jobId, errorCode: body.errorCode ?? null, retryable: !isBusiness, targetStatus, reason: body.reason, ...(parkUntil ? { backoffUntil: parkUntil } : {}) },
+    diagnostics: { jobId, errorCode: body.errorCode ?? null, retryable: !isBusiness && retryable, targetStatus, reason: body.reason, ...(parkUntil ? { backoffUntil: parkUntil } : {}) },
   });
 
   // Only deliver when the step has reached a terminal-for-the-step state the
@@ -829,7 +879,7 @@ async function handleFailJob(env: Env, jobId: string, request: Request): Promise
       workflowInstanceId: job.instance_id,
       instanceId: job.instance_id,
       elementId: job.element_id,
-      event: { outcome: "failed", jobId, retryable: !isBusiness, errorCode: body.errorCode ?? null, reason: body.reason },
+      event: { outcome: "failed", jobId, retryable: !isBusiness && retryable, errorCode: body.errorCode ?? null, reason: body.reason },
     });
   }
   return json(ack, 200);

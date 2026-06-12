@@ -89,9 +89,12 @@ rows (migration `0003_topology.sql`). Topology is therefore queryable and replay
 
 A saga is a `<bpmn:transaction>`. Each forward step is a `serviceTask` with an `easy-bpmn:taskDefinition`
 `type`. Each compensatable step carries a **compensation boundary event** wired (via `<bpmn:association>`)
-to an `isForCompensation` handler. A business failure is caught by an **error boundary event** routing to
-a **cancel end event**; cancelling the transaction triggers **reverse-order compensation** of the
-completed steps; a **cancel boundary event** on the transaction takes the "saga failed" path.
+to an `isForCompensation` handler. A business failure is caught by an **error boundary event**; in the
+canonical rollback pattern it routes to a **cancel end event**, and cancelling the transaction triggers
+**reverse-order compensation** of the completed steps. (Since **M3-L2** an error boundary may instead route
+to **any token-path node in the same scope** — e.g. an alternate forward path — leaving the saga ledger
+intact; the completed steps stay compensatable if the saga cancels later. See the supported set + rule 11.)
+A **cancel boundary event** on the transaction takes the "saga failed" path.
 
 > **BPMN crux (spec §10.5.5 "Transaction"):** when a transaction is **cancelled**, the engine
 > **automatically** compensates the transaction's successfully-completed activities **in reverse
@@ -173,8 +176,9 @@ the transaction cancels; the engine compensates the completed steps in reverse �
 cancel on *every* compensatable step whose later-failure should trigger rollback.)
 
 > **The engine stays single-token through M2.** An interrupting error boundary event *redirects* the
-> single token to the cancel end event — it is **not** a parallel split — and an XOR gateway routes
-> the single token down exactly one outgoing flow. True parallelism (multiple concurrent tokens) is M4.
+> single token to its outgoing target — a cancel end event, or (since **M3-L2**) any other token-path
+> node — it is **not** a parallel split, and an XOR gateway routes the single token down exactly one
+> outgoing flow. True parallelism (multiple concurrent tokens) is M4.
 
 ### Conditional saga (M2)
 
@@ -215,7 +219,7 @@ The forward path may branch through an **`exclusiveGateway`** (XOR) and **loop b
 | **Message** | `message` (root) | Declares the message **name** a Receive Task waits for. Correlation key is supplied via the **API** at start. |
 | **Transaction** | `transaction` | The **saga scope**: a none start event, supported children, a none end (commit), and optionally a cancel end. Compensation of its completed activities runs in reverse order on cancel. |
 | **Compensation Boundary Event** | `boundaryEvent` + `compensateEventDefinition` | A **compensation marker**: it is **neither interrupting nor non-interrupting** (the `cancelActivity` axis does not apply). MUST have **zero outgoing `sequenceFlow`** and **exactly one** outgoing `<association>` to an `isForCompensation` activity **in the same transaction scope**. |
-| **Error Boundary Event** | `boundaryEvent` + `errorEventDefinition` | **Interrupting**; attached to a `serviceTask`; routes to a **cancel end event**. Its `errorRef` MUST resolve to a declared root `<bpmn:error>`. Catching is by the Error's `@id`; the worker's `fail.errorCode` matches the Error's `@errorCode`. |
+| **Error Boundary Event** | `boundaryEvent` + `errorEventDefinition` | **Interrupting**; attached to a `serviceTask` (never a compensation handler). Routes its single outgoing flow to **any token-path node in the same scope** (M3-L2) — no longer cancel-end-only. An activity may carry **any number of boundaries with distinct, non-empty `@errorCode`s** plus **at most one catch-all** (`errorEventDefinition` with **no** `errorRef`). A coded boundary's `errorRef` MUST resolve to a declared root `<bpmn:error>` with a non-empty `@errorCode`. Matching on a worker `fail.errorCode`: **exact `@errorCode` → catch-all → uncaught Hazard** (the catch-all catches any business code, even undeclared ones). |
 | **Cancel Boundary Event** | `boundaryEvent` + `cancelEventDefinition` | **Interrupting**; attached **only to the `transaction`**; its single outgoing flow is the "saga failed" path. |
 | **Compensation Handler** | `serviceTask isForCompensation="true"` | A handler off the token path, reached **only** via compensation (the association from a compensation boundary). Bound by its own `easy-bpmn:taskDefinition type`. Must live inside a transaction. |
 | **Cancel End Event** | `endEvent` + `cancelEventDefinition` | Allowed **only inside a `transaction`**. Reaching it cancels the transaction → reverse-order compensation. |
@@ -266,7 +270,11 @@ both the amendment *and* the validator, and the gap between them is named here.
 | `intermediateCatchEvent` + `timerEventDefinition` (token-path delay) | v2.2.0 | **L4** | reason `M3 — not yet implemented` |
 | `intermediateCatchEvent` + `messageEventDefinition` (receive-task-shaped wait; required EBG branch target, also standalone) | v2.2.0 | **L4** | reason `M3 — not yet implemented` |
 | `eventBasedGateway` (deterministic race over timer/message catch branches) | v2.2.0 | **L4** | rejected today via `DEFERRED_GATEWAY_REASONS` ("…deferred to timers & events (M3)…", `src/bpmn/profile.ts`); that pointer and `check:docs` guard 5 flip to accept at L4 |
-| Free error-boundary routing (any number of distinct-`errorCode` interrupting boundaries + ≤1 catch-all, each targeting any token-path node in the same scope) | v2.2.0 | **L2** | the M1 "error boundary must target a cancel end event" restriction (the supported-set table and rule 11 below) is lifted in this profile and the validator when L2's error-routing slice ships |
+
+**Shipped:** Free error-boundary routing (any number of distinct-`@errorCode` interrupting boundaries + ≤1
+catch-all, each targeting any token-path node in the same scope) shipped in **M3-L2 (TASK-42)** — the M1
+"error boundary must target a cancel end event" restriction is lifted; see the supported element set above
+and **rule 11**.
 
 Once a construct's layer ships, its row moves into the supported element set above and the validator
 accepts-and-validates it. Until then, a constitution-allowed construct staying rejected with the reason
@@ -325,8 +333,12 @@ A BPMN document is accepted for publish only if **all** hold:
 9. **Receive task is well-formed.** Has a `messageRef` resolving to a named `<message>`.
 10. **Compensation wiring.** A compensation boundary event has **zero outgoing sequence flow** and
     **exactly one** `<association>` to an `isForCompensation` service task **in the same transaction**.
-11. **Error boundary → cancel.** An error boundary event is attached to a `serviceTask`, has exactly one
-    outgoing flow to a **cancel end event**, and its `errorRef` resolves to a declared `<bpmn:error>`.
+11. **Error boundary routing (M3-L2).** An error boundary event is attached to a `serviceTask` (never an
+    `isForCompensation` handler) and has exactly one outgoing flow to **any token-path node in the same
+    scope** (not a start event, a boundary event, or a handler). Per activity: **distinct, non-empty
+    `@errorCode`s** on the coded boundaries (each `errorRef` resolving to a declared `<bpmn:error>`) plus
+    **at most one catch-all** (no `errorRef`). A worker `fail.errorCode` matches **exact `@errorCode` →
+    catch-all → uncaught Hazard**.
 12. **Cancel placement.** A cancel **end event** appears only inside a `transaction`; a cancel **boundary
     event** is attached only to the `transaction`.
 13. **Extensions tolerated, not required.** Foreign-namespace `<extensionElements>`, DI, `documentation`,

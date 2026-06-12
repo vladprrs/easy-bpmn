@@ -840,3 +840,176 @@ describe("Token-path flows into non-token nodes (M2 final review)", () => {
     expect(r.issues).toHaveLength(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Free error-boundary routing (M3-L2, TASK-42, design §3 + §7 gates 7-8).
+//
+// Lifts the M1 "an error boundary's single outgoing flow must target a cancel
+// end event" restriction. An activity may now carry any number of interrupting
+// error boundaries with DISTINCT, NON-EMPTY @errorCode values, plus at most one
+// catch-all (errorEventDefinition with no errorRef), each routing to any
+// token-path node in the same scope. These are process-level models (no
+// transaction) precisely to prove free routing no longer requires a cancel end.
+// ---------------------------------------------------------------------------
+describe("Free error-boundary routing (M3-L2, TASK-42)", () => {
+  const svc = (id: string, type: string) =>
+    `<bpmn:serviceTask id="${id}"><bpmn:extensionElements><easy-bpmn:taskDefinition type="${type}"/></bpmn:extensionElements></bpmn:serviceTask>`;
+
+  /** Process-level error-routing model: S → router → E, plus injectable error
+   *  boundaries on `router`, their alternate-path targets, and the wiring flows.
+   *  Valid (accept) by default: two distinct-code boundaries + one catch-all. */
+  function errRouteBpmn(o: { errors?: string; boundaries?: string; targets?: string; flows?: string } = {}): string {
+    const errors = o.errors ??
+      `<bpmn:error id="Err_A" name="A failed" errorCode="CODE_A"/><bpmn:error id="Err_B" name="B failed" errorCode="CODE_B"/>`;
+    const boundaries = o.boundaries ??
+      `<bpmn:boundaryEvent id="b_a" attachedToRef="router"><bpmn:errorEventDefinition errorRef="Err_A"/></bpmn:boundaryEvent>
+       <bpmn:boundaryEvent id="b_b" attachedToRef="router"><bpmn:errorEventDefinition errorRef="Err_B"/></bpmn:boundaryEvent>
+       <bpmn:boundaryEvent id="b_c" attachedToRef="router"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>`;
+    const targets = o.targets ?? `${svc("svcA", "svc-a")}${svc("svcB", "svc-b")}${svc("svcC", "svc-c")}`;
+    const flows = o.flows ??
+      `<bpmn:sequenceFlow id="fa" sourceRef="b_a" targetRef="svcA"/>
+       <bpmn:sequenceFlow id="fb" sourceRef="b_b" targetRef="svcB"/>
+       <bpmn:sequenceFlow id="fc" sourceRef="b_c" targetRef="svcC"/>
+       <bpmn:sequenceFlow id="fa2" sourceRef="svcA" targetRef="E"/>
+       <bpmn:sequenceFlow id="fb2" sourceRef="svcB" targetRef="E"/>
+       <bpmn:sequenceFlow id="fc2" sourceRef="svcC" targetRef="E"/>`;
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_er" targetNamespace="x">
+  ${errors}
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    ${svc("router", "router")}
+    ${targets}
+    ${boundaries}
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="router"/>
+    <bpmn:sequenceFlow id="s1" sourceRef="router" targetRef="E"/>
+    ${flows}
+  </bpmn:process>
+</bpmn:definitions>`;
+  }
+
+  it("accepts multi-boundary + catch-all routing to alternate token-path nodes", async () => {
+    const r = await parseAndValidate(errRouteBpmn());
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    const n = r.graph!.nodes;
+    // coded boundaries carry their resolved @errorCode and route to their alt path
+    expect(n["b_a"]?.boundaryKind).toBe("error");
+    expect(n["b_a"]?.errorCode).toBe("CODE_A");
+    expect(n["b_a"]?.next).toBe("svcA");
+    expect(n["b_b"]?.errorCode).toBe("CODE_B");
+    expect(n["b_b"]?.next).toBe("svcB");
+    // the catch-all (no errorRef) builds with errorCode === null and a next —
+    // null unambiguously means catch-all (empty-coded boundaries are rejected)
+    expect(n["b_c"]?.boundaryKind).toBe("error");
+    expect(n["b_c"]?.errorRef ?? null).toBeNull();
+    expect(n["b_c"]?.errorCode ?? null).toBeNull();
+    expect(n["b_c"]?.next).toBe("svcC");
+  });
+
+  it("rejects two error boundaries on one activity sharing an @errorCode", async () => {
+    const r = await parseAndValidate(
+      errRouteBpmn({
+        errors: `<bpmn:error id="Err_A" errorCode="CODE_A"/><bpmn:error id="Err_A2" errorCode="CODE_A"/>`,
+        boundaries: `<bpmn:boundaryEvent id="b_a" attachedToRef="router"><bpmn:errorEventDefinition errorRef="Err_A"/></bpmn:boundaryEvent>
+          <bpmn:boundaryEvent id="b_a2" attachedToRef="router"><bpmn:errorEventDefinition errorRef="Err_A2"/></bpmn:boundaryEvent>`,
+        targets: `${svc("svcA", "svc-a")}${svc("svcA2", "svc-a2")}`,
+        flows: `<bpmn:sequenceFlow id="fa" sourceRef="b_a" targetRef="svcA"/>
+          <bpmn:sequenceFlow id="fa2" sourceRef="b_a2" targetRef="svcA2"/>
+          <bpmn:sequenceFlow id="ea" sourceRef="svcA" targetRef="E"/>
+          <bpmn:sequenceFlow id="ea2" sourceRef="svcA2" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "b_a2" && /CODE_A/.test(i.reason) && /distinct/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects an errorRef to an Error with an empty/missing @errorCode (hidden catch-all)", async () => {
+    const r = await parseAndValidate(
+      errRouteBpmn({
+        errors: `<bpmn:error id="Err_empty" name="No code"/>`,
+        boundaries: `<bpmn:boundaryEvent id="b_e" attachedToRef="router"><bpmn:errorEventDefinition errorRef="Err_empty"/></bpmn:boundaryEvent>`,
+        targets: svc("svcA", "svc-a"),
+        flows: `<bpmn:sequenceFlow id="fe" sourceRef="b_e" targetRef="svcA"/>
+          <bpmn:sequenceFlow id="ea" sourceRef="svcA" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "b_e" && /@errorCode/.test(i.reason) && /catch-all/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a second catch-all error boundary on one activity", async () => {
+    const r = await parseAndValidate(
+      errRouteBpmn({
+        errors: ``,
+        boundaries: `<bpmn:boundaryEvent id="b_c1" attachedToRef="router"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>
+          <bpmn:boundaryEvent id="b_c2" attachedToRef="router"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>`,
+        targets: `${svc("svcA", "svc-a")}${svc("svcB", "svc-b")}`,
+        flows: `<bpmn:sequenceFlow id="fc1" sourceRef="b_c1" targetRef="svcA"/>
+          <bpmn:sequenceFlow id="fc2" sourceRef="b_c2" targetRef="svcB"/>
+          <bpmn:sequenceFlow id="ea" sourceRef="svcA" targetRef="E"/>
+          <bpmn:sequenceFlow id="eb" sourceRef="svcB" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "b_c2" && /catch-all/.test(i.reason) && /more than one/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects an error-boundary flow targeting a start event", async () => {
+    const r = await parseAndValidate(
+      errRouteBpmn({
+        errors: `<bpmn:error id="Err_A" errorCode="CODE_A"/>`,
+        boundaries: `<bpmn:boundaryEvent id="b_a" attachedToRef="router"><bpmn:errorEventDefinition errorRef="Err_A"/></bpmn:boundaryEvent>`,
+        targets: ``,
+        flows: `<bpmn:sequenceFlow id="fa" sourceRef="b_a" targetRef="S"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "fa" && /start event 'S'/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects an error-boundary flow targeting another boundary event", async () => {
+    const r = await parseAndValidate(
+      errRouteBpmn({
+        errors: `<bpmn:error id="Err_A" errorCode="CODE_A"/><bpmn:error id="Err_B" errorCode="CODE_B"/>`,
+        boundaries: `<bpmn:boundaryEvent id="b_a" attachedToRef="router"><bpmn:errorEventDefinition errorRef="Err_A"/></bpmn:boundaryEvent>
+          <bpmn:boundaryEvent id="b_b" attachedToRef="router"><bpmn:errorEventDefinition errorRef="Err_B"/></bpmn:boundaryEvent>`,
+        targets: svc("svcB", "svc-b"),
+        flows: `<bpmn:sequenceFlow id="fa" sourceRef="b_a" targetRef="b_b"/>
+          <bpmn:sequenceFlow id="fb" sourceRef="b_b" targetRef="svcB"/>
+          <bpmn:sequenceFlow id="eb" sourceRef="svcB" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "fa" && /targets boundary event 'b_b'/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a boundary event attached to an isForCompensation handler", async () => {
+    const r = await parseAndValidate(
+      sagaBpmn({ innerExtra: `<bpmn:boundaryEvent id="bad_on_handler" attachedToRef="undoA"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>` }),
+    );
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some((i) => i.elementId === "bad_on_handler" && /attached to compensation handler 'undoA'/.test(i.reason)),
+    ).toBe(true);
+    // The `continue` after the handler-attachment rejection must suppress the
+    // misleading per-kind reasons (a handler IS a serviceTask, and this boundary
+    // has no outgoing flow) — exactly ONE reason fires.
+    expect(r.issues).toHaveLength(1);
+  });
+
+  it("rejects an error-boundary flow targeting a compensation handler", async () => {
+    const r = await parseAndValidate(
+      sagaBpmn({ errBoundaryFlow: `<bpmn:sequenceFlow id="fe" sourceRef="stepB_err" targetRef="undoA"/>` }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "fe" && /targets compensation handler 'undoA'/.test(i.reason))).toBe(true);
+  });
+
+  it("still tolerates ignorable content on a saga carrying an error boundary (regression)", async () => {
+    const r = await parseAndValidate(SAGA_TOLERANT_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+  });
+});

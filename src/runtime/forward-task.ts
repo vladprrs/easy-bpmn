@@ -41,19 +41,30 @@ import { insertSagaStepStmt } from "../persistence/saga";
 import { loadInst, isTransactionScope, SVC_WAIT_TIMEOUT, type RunStep, type WaitForEvent } from "./engine-shared";
 import { createIncident, parkWaiting } from "./incidents";
 
-/** The cancel end target an error boundary on `elementId` routes to, matching errorCode. */
+/**
+ * The token-path node an error boundary on `elementId` routes the failed token
+ * to, by `errorCode`. Free error-boundary routing (M3-L2, TASK-42): an activity
+ * may carry many DISTINCT-`@errorCode` interrupting boundaries plus at most one
+ * catch-all (validator-enforced), each targeting ANY token-path node — no longer
+ * cancel-end-only. The matching precedence is:
+ *   exact `@errorCode` → catch-all (`errorCode == null`) → null (→ caller Hazard).
+ * After validation a null `errorCode` UNAMBIGUOUSLY means catch-all (a coded
+ * boundary with an empty/missing `@errorCode` is rejected at publish), so the
+ * catch-all matches ANY business code including ones not declared as a
+ * `<bpmn:error>`. Deterministic regardless of node-iteration order: an exact
+ * match returns immediately; otherwise the (single) catch-all is the fallback.
+ */
 function errorBoundaryTarget(graph: ExecutionGraph, elementId: string, errorCode: string | null): string | null {
+  // The catch-all's target (its `next`, or null if it routes nowhere) doubles as
+  // the "no catch-all found" sentinel: both yield null, which the caller treats
+  // as an uncaught business error (→ Hazard). No separate presence flag needed.
+  let catchAll: string | null = null;
   for (const [, node] of Object.entries(graph.nodes)) {
-    if (
-      node.type === "boundaryEvent" &&
-      node.boundaryKind === "error" &&
-      node.attachedToRef === elementId &&
-      (errorCode == null || node.errorCode === errorCode)
-    ) {
-      return node.next ?? null;
-    }
+    if (node.type !== "boundaryEvent" || node.boundaryKind !== "error" || node.attachedToRef !== elementId) continue;
+    if (node.errorCode != null && node.errorCode === errorCode) return node.next ?? null; // exact wins
+    if (node.errorCode == null) catchAll = node.next ?? null;
   }
-  return null;
+  return catchAll;
 }
 
 export type ForwardOutcome = { kind: "next"; next: string } | { kind: "waiting" } | { kind: "incident" };
@@ -414,7 +425,10 @@ async function handleForwardFailure(
 
   const inst = await loadInst(env, instanceId);
   if (job.error_code) {
-    // Business error → route to the matching error boundary's cancel end.
+    // Business error → route to the matching error boundary's target (any
+    // token-path node; exact @errorCode → catch-all). The token then walks
+    // forward like any other: it triggers compensation only if it REACHES a
+    // cancel end, otherwise the saga continues with the ledger intact.
     const target = errorBoundaryTarget(graph, elementId, job.error_code);
     if (target) {
       const now = nowIso();

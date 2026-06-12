@@ -192,6 +192,34 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     }
   }
 
+  // An `errorRef` on an <errorEventDefinition> that names a non-existent <error>
+  // is DROPPED by bpmn-moddle (exactly like an unresolved `default`), leaving the
+  // parsed boundary indistinguishable from a genuine catch-all (no errorRef).
+  // Recover those dangling refs from the parser warnings — keyed by the OWNING
+  // boundary event id (the warning's element is the errorEventDefinition; its
+  // $parent is the boundary) — so the error-boundary rules can reject them with
+  // an element id instead of silently accepting a hidden catch-all (M3-L2).
+  //
+  // CAUTION: like the `bpmn:default` block above, the warning shape
+  // (`property: "bpmn:errorRef"`, the `$parent` boundary id) is moddle-INTERNAL
+  // and version-coupled, not a public contract — it is pinned by the "rejects an
+  // error boundary whose errorRef does not resolve" unit test, which must break
+  // loudly on a bpmn-moddle upgrade that reshapes it.
+  const danglingErrorRef = new Map<string, string>();
+  for (const w of parsed.warnings as Array<{
+    message?: string;
+    property?: string;
+    value?: unknown;
+    element?: { $parent?: { id?: string; $type?: string } };
+  }>) {
+    if (w?.property === "bpmn:errorRef" && typeof w.message === "string" && /unresolved reference/i.test(w.message)) {
+      const owner = w.element?.$parent;
+      if (owner?.$type === "bpmn:BoundaryEvent" && typeof owner.id === "string") {
+        danglingErrorRef.set(owner.id, String(w.value));
+      }
+    }
+  }
+
   const definitions = parsed.definitions;
   const rootElements = asArray<ModdleElement>(definitions.rootElements);
 
@@ -570,6 +598,16 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     // LEAVING a boundary event stays legal — error/cancel boundaries route
     // their escalation path that way (degree-checked per kind below); the
     // compensate boundary's zero-outgoing rule also lives below.
+    if (tgt.type === "startEvent") {
+      // A start event begins a scope; routing a token INTO it (e.g. an error
+      // boundary's free-routing target — M3-L2) is rejected generally so timer
+      // boundary targets (L3) inherit the same constraint.
+      err(
+        `Sequence flow '${f.id}' targets start event '${tgt.id}'. A start event begins a scope and takes no incoming sequence flow.`,
+        f.id,
+        "sequenceFlow",
+      );
+    }
     if (isBoundary(tgt)) {
       err(
         `Sequence flow '${f.id}' targets boundary event '${tgt.id}'. Boundary events attach to activities ` +
@@ -765,6 +803,22 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       );
       continue;
     }
+    // A boundary event on a compensation handler (isForCompensation) would leak a
+    // token out of the compensation lane: the handler is off the token path,
+    // reached only via its <association>, so its boundary's outgoing flow has no
+    // valid token semantics. Reject generally (M3-L2, TASK-42) so L3 timer
+    // boundaries inherit it. NOTE: a handler IS a serviceTask, so the per-kind
+    // "must be attached to a service task" checks would PASS it — this rule is
+    // what catches it. `continue` so only this reason fires for the attachment.
+    if (isHandler(attached)) {
+      err(
+        `Boundary event '${n.id}' is attached to compensation handler '${attached.id}' (isForCompensation). ` +
+          "Boundary events cannot attach to a compensation handler — it is off the token path, reached only via its compensation <association>.",
+        n.id,
+        "boundaryEvent",
+      );
+      continue;
+    }
     if (attached.scopeId !== n.scopeId) {
       err(`Boundary event '${n.id}' is attached to an element in a different scope.`, n.id, "boundaryEvent");
     }
@@ -814,30 +868,56 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       if (attached.type !== "serviceTask") {
         err(`Error boundary event '${n.id}' must be attached to a service task.`, n.id, "boundaryEvent");
       }
-      if (!n.errorRef || !errorsById.has(n.errorRef)) {
+      // errorRef handling (M3-L2, TASK-42):
+      //  - PRESENT-but-unresolved (moddle dropped it; recovered via the dangling
+      //    map) → reject. It is NOT a catch-all — a typo must not silently widen
+      //    to "match any code".
+      //  - PRESENT-and-resolved → its <bpmn:error> @errorCode must be NON-EMPTY.
+      //    An empty/absent code would silently act as a catch-all (the engine
+      //    matches errorCode==null to any code), so it is rejected.
+      //  - ABSENT → this IS the catch-all: leave n.errorCode undefined so the
+      //    graph carries errorCode:null, the unambiguous "match any code" marker.
+      const danglingRef = danglingErrorRef.get(n.id);
+      if (danglingRef !== undefined) {
         err(
-          `Error boundary event '${n.id}' has an errorRef that does not resolve to a declared <bpmn:error>.`,
+          `Error boundary event '${n.id}' has an errorRef '${danglingRef}' that does not resolve to a declared <bpmn:error>.`,
           n.id,
           "boundaryEvent",
         );
-      } else {
-        n.errorCode = errorsById.get(n.errorRef)!.errorCode ?? undefined;
-      }
-      if (outs.length !== 1) {
-        err(
-          `Error boundary event '${n.id}' must have exactly one outgoing sequence flow (routing to a cancel end event); found ${outs.length}.`,
-          n.id,
-          "boundaryEvent",
-        );
-      } else {
-        const tgt = nodeById.get(outs[0]!);
-        if (!tgt || tgt.type !== "endEvent" || tgt.endKind !== "cancel") {
+      } else if (n.errorRef != null) {
+        if (!errorsById.has(n.errorRef)) {
           err(
-            `Error boundary event '${n.id}' must route to a cancel end event (so the transaction cancels and compensates).`,
+            `Error boundary event '${n.id}' has an errorRef that does not resolve to a declared <bpmn:error>.`,
             n.id,
             "boundaryEvent",
           );
+        } else {
+          const code = errorsById.get(n.errorRef)!.errorCode;
+          if (code == null || code.trim() === "") {
+            err(
+              `Error boundary event '${n.id}' references error '${n.errorRef}', which has no (or an empty) @errorCode. ` +
+                "A coded error boundary needs a non-empty @errorCode; omit the errorRef to make this a catch-all boundary.",
+              n.id,
+              "boundaryEvent",
+            );
+          } else {
+            n.errorCode = code;
+          }
         }
+      }
+      // Lifted target rule (M3-L2): exactly ONE outgoing flow, to any token-path
+      // node in the SAME scope (no longer "a cancel end event"). The forbidden
+      // targets are already rejected by the per-flow endpoint rules above — a
+      // flow into a boundaryEvent, a compensation handler, a startEvent, or
+      // across a transaction boundary — so only the single-outgoing degree is
+      // checked here. The recorded branch then walks forward like any token: it
+      // triggers compensation only if it reaches a cancel end, else it continues.
+      if (outs.length !== 1) {
+        err(
+          `Error boundary event '${n.id}' must have exactly one outgoing sequence flow (routing to a token-path node in the same scope); found ${outs.length}.`,
+          n.id,
+          "boundaryEvent",
+        );
       }
     } else if (n.boundaryKind === "cancel") {
       if (attached.type !== "transaction") {
@@ -853,6 +933,54 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
           n.id,
           "boundaryEvent",
         );
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Per-activity error-boundary aggregation (M3-L2, TASK-42): on one activity
+  // the coded boundaries must carry DISTINCT @errorCodes and there may be at
+  // most ONE catch-all (errorEventDefinition with no errorRef). Grouped by
+  // attachedToRef so the reject names the offending (second) boundary by id.
+  // -------------------------------------------------------------------------
+  const errBoundariesByActivity = new Map<string, NodeInfo[]>();
+  for (const n of nodes) {
+    if (n.type === "boundaryEvent" && n.boundaryKind === "error" && n.attachedToRef) {
+      const arr = errBoundariesByActivity.get(n.attachedToRef);
+      if (arr) arr.push(n);
+      else errBoundariesByActivity.set(n.attachedToRef, [n]);
+    }
+  }
+  for (const [activityId, boundaries] of errBoundariesByActivity) {
+    const seenCodes = new Set<string>();
+    let catchAllCount = 0;
+    for (const b of boundaries) {
+      // A dangling errorRef already errored above and is neither a catch-all nor
+      // a coded boundary — exclude it so it neither counts as a second catch-all
+      // nor masks a real one.
+      if (danglingErrorRef.has(b.id)) continue;
+      if (b.errorRef == null) {
+        // Catch-all (no errorRef): at most one per activity.
+        if (++catchAllCount > 1) {
+          err(
+            `Activity '${activityId}' has more than one catch-all error boundary (an errorEventDefinition with no errorRef). ` +
+              "At most one catch-all error boundary is allowed per activity.",
+            b.id,
+            "boundaryEvent",
+          );
+        }
+      } else if (b.errorCode != null) {
+        // A coded boundary that resolved to a non-empty @errorCode (unresolved /
+        // empty-code boundaries already errored above and carry no errorCode).
+        if (seenCodes.has(b.errorCode)) {
+          err(
+            `Activity '${activityId}' has more than one error boundary catching @errorCode '${b.errorCode}'. ` +
+              "An activity's coded error boundaries must have distinct @errorCode values.",
+            b.id,
+            "boundaryEvent",
+          );
+        }
+        seenCodes.add(b.errorCode);
       }
     }
   }

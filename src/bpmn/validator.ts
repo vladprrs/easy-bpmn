@@ -80,10 +80,12 @@ function readTaskDefinition(
 }
 
 /**
- * Validate a boundary timer's `<timerEventDefinition>` (M3-L3 design §3): it MUST
- * carry exactly ONE of `timeDate`|`timeDuration`, each a STATIC ISO-8601 literal
- * that parses. Zero/two time children, a `timeCycle`, a FEEL expression, or a
- * non-parsing literal are each rejected with a reason (the caller adds element id).
+ * Validate a model timer's `<timerEventDefinition>` (boundary or intermediate
+ * catch — M3-L3/L4 design §3/§4.4): it MUST carry exactly ONE of
+ * `timeDate`|`timeDuration`, each a STATIC ISO-8601 literal that parses. Zero/two
+ * time children, a `timeCycle`, a FEEL expression, or a non-parsing literal are
+ * each rejected with a reason (the caller adds element id + construct name, so the
+ * reason text stays construct-neutral).
  */
 function readTimerTrigger(
   def: ModdleElement,
@@ -99,7 +101,7 @@ function readTimerTrigger(
   const duration = bodyOf(def.timeDuration);
   const present = (date !== undefined ? 1 : 0) + (duration !== undefined ? 1 : 0);
   if (present === 0) {
-    return { ok: false, reason: "has no timeDate or timeDuration; a boundary timer needs exactly one static ISO-8601 timeDate or timeDuration." };
+    return { ok: false, reason: "has no timeDate or timeDuration; a timer needs exactly one static ISO-8601 timeDate or timeDuration." };
   }
   if (present === 2) {
     return { ok: false, reason: "declares both a timeDate and a timeDuration; exactly one is required." };

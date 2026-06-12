@@ -1335,6 +1335,16 @@ describe("Timer intermediate catch (M3-L4, TASK-45)", () => {
     expect(r.issues.some((i) => i.elementId === "catch" && /timeCycle/.test(i.reason))).toBe(true);
   });
 
+  it("rejects an empty timerEventDefinition with a construct-neutral reason (no 'boundary' leak)", async () => {
+    const r = await parseAndValidate(catchBpmn({ def: `<bpmn:timerEventDefinition/>` }));
+    expect(r.ok).toBe(false);
+    const issue = r.issues.find((i) => i.elementId === "catch" && /no timeDate or timeDuration/.test(i.reason));
+    expect(issue).toBeDefined();
+    // The shared readTimerTrigger reason must NOT call a catch a "boundary timer".
+    expect(issue!.reason).toMatch(/Intermediate catch event 'catch'/);
+    expect(issue!.reason).not.toMatch(/boundary/);
+  });
+
   it("rejects BOTH timeDate and timeDuration", async () => {
     const r = await parseAndValidate(
       catchBpmn({ def: `<bpmn:timerEventDefinition><bpmn:timeDate>2026-01-01T00:00:00Z</bpmn:timeDate><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition>` }),

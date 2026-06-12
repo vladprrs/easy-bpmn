@@ -244,6 +244,13 @@ export async function settleBoundaryTimerCancel(
  * the instance 'cancelled', each in its own batch, so a stray alarm afterwards is a
  * decided no-op — no mid-compensation firing (gate 10). Best-effort: a timer that
  * fired in the cancel window loses the decider INSERT and is left as-is.
+ *
+ * An `eventGateway` timer decides on `gateway_decisions`, NOT `timer_outcomes`
+ * (design §4.5), so the sweep settles it with the bookkeeping flip + history ONLY —
+ * writing a `timer_outcomes` row would falsify the "EBG timer has no decider row"
+ * invariant. A stray post-cancel alarm still no-ops: fireTimer guards on
+ * status!='armed' (this flip) and the terminal instance, and planEventGatewayTimerFire
+ * guards on the cursor having moved off the gateway.
  */
 export async function cancelArmedTimersForInstance(env: Env, instanceId: string): Promise<void> {
   const inst = await getInstanceRow(env.DB, instanceId);
@@ -251,8 +258,21 @@ export async function cancelArmedTimersForInstance(env: Env, instanceId: string)
   const timers = await listTimersForInstance(env.DB, instanceId);
   for (const t of timers) {
     if (t.status !== "armed") continue;
-    if (await getTimerOutcome(env.DB, t.timerId)) continue;
     const now = nowIso();
+    if (t.kind === "eventGateway") {
+      await dbBatch(env.DB, [
+        flipTimerCancelledStmt(env.DB, { timerId: t.timerId, now }),
+        historyStmt(env.DB, {
+          workspaceId: inst.workspace_id,
+          instanceId,
+          elementId: t.elementId,
+          type: "timerCancelled",
+          diagnostics: { kind: "eventGateway", gateway: t.gatewayId, occurrence: t.occurrence, reason: "operator cancel" },
+        }),
+      ]);
+      continue;
+    }
+    if (await getTimerOutcome(env.DB, t.timerId)) continue;
     try {
       await dbBatch(env.DB, [
         insertTimerOutcomeStmt(env.DB, { timerId: t.timerId, outcome: "cancelled", now }),

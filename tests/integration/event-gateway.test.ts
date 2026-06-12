@@ -240,10 +240,14 @@ describe("eventBasedGateway — operator /cancel during the race", () => {
     const t = await ebgTimer(id);
     expect(t.status).toBe("armed");
 
-    // Empty ledger → terminal cancel; the shared sweep settles the armed EBG timer.
+    // Empty ledger → terminal cancel; the shared sweep settles the armed EBG timer
+    // with the bookkeeping flip ONLY — an eventGateway timer decides on
+    // gateway_decisions, so it must NOT get a timer_outcomes row (design §4.5).
     const cancel = await post(`/instances/${id}/cancel`, {});
     expect(cancel.body.status).toBe("cancelled");
     expect((await ebgTimer(id)).status).toBe("cancelled");
+    const outcomeRows = await env.DB.prepare(`SELECT COUNT(*) AS n FROM timer_outcomes WHERE timer_id = ?`).bind(t.timer_id).first<{ n: number }>();
+    expect(outcomeRows?.n).toBe(0);
 
     // A stray alarm now finds a decided/terminal instance → no-op (never advances,
     // never records an EBG decision).

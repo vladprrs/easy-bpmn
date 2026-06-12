@@ -168,7 +168,15 @@ export async function driveEventBasedGateway(
 
   // (1) Decision fast-forward — write-free cursor move.
   const decided = await getGatewayDecision(env.DB, instanceId, elementId, occ);
-  if (decided) return { kind: "next", next: winnerNextOf(graph, node, decided.chosenFlowId) };
+  if (decided) {
+    // A pending message addressed to ANY branch of this (now decided) gateway is
+    // consumed HERE so it never leaks to a downstream node sharing its name — the
+    // winning message was already applied; a losing-branch message (e.g. one that
+    // correlated in the gap before the timer-win supersede) is dropped (mirrors
+    // driveReceiveTask's consumed fast-forward).
+    const consumedPending = !!pending && branches.message.some((b) => b.messageName === pending.messageName);
+    return { kind: "next", next: winnerNextOf(graph, node, decided.chosenFlowId), consumedPending };
+  }
 
   // (2) Direct-mode pending message: apply the matching branch (message wins).
   if (pending) {
@@ -182,9 +190,18 @@ export async function driveEventBasedGateway(
   }
 
   // (3) Park (first visit) or self-heal re-register (rewalk past an armed park).
-  const r = await runStep(`ebg:${tag}`, () => parkEventBasedGateway(env, instanceId, graph, elementId, node, occ, branches));
+  const r = await runStep(`ebg:${tag}`, () => parkEventBasedGateway(env, instanceId, elementId, occ, branches));
   if (r.kind === "incident") return { kind: "incident" };
-  if (r.kind === "correlated") return { kind: "next", next: r.next }; // early-buffered claimed at registration
+  if (r.kind === "correlated") {
+    // Early-buffered message claimed at registration → apply in its OWN memoized
+    // step (B1): the park step captured the event, so a Workflow-mode crash between
+    // the broker consume (committed in `ebg:`) and the decision commit re-applies the
+    // CAPTURED event on retry instead of re-hitting the now-empty broker — mirroring
+    // driveReceiveTask's recv→msg split. applyEbgMessage is idempotent on re-run.
+    const applied = await runStep(`ebg-msg:${tag}`, () => applyEbgMessage(env, instanceId, graph, elementId, node, occ, r.branch, branches, r.event));
+    if (applied.kind === "incident") return { kind: "incident" };
+    return { kind: "next", next: applied.next };
+  }
 
   // (4) Direct mode: park; the broker delivery / timer alarm resumes inline.
   if (!waitFor) return { kind: "waiting" };
@@ -240,7 +257,12 @@ function isTimerFiredWake(payload: unknown): boolean {
 // Park — register every message branch + arm the timer, then park
 // ---------------------------------------------------------------------------
 
-type ParkOutcome = { kind: "waiting" } | { kind: "correlated"; next: string } | { kind: "incident" };
+type ParkOutcome =
+  | { kind: "waiting" }
+  // An early-buffered message was claimed at registration — the CAPTURED event is
+  // returned (NOT applied here) so the dispatch applies it in its own memoized step.
+  | { kind: "correlated"; branch: EbgMessageBranch; event: MessageEventPayload }
+  | { kind: "incident" };
 
 /**
  * Park the EBG visit (design §4.5.1). First visit: ONE D1 batch = a subscription
@@ -256,9 +278,7 @@ type ParkOutcome = { kind: "waiting" } | { kind: "correlated"; next: string } | 
 async function parkEventBasedGateway(
   env: Env,
   instanceId: string,
-  graph: ExecutionGraph,
   gwId: string,
-  node: GraphNode,
   occ: number,
   branches: EbgBranches,
 ): Promise<ParkOutcome> {
@@ -343,7 +363,15 @@ async function parkEventBasedGateway(
       }),
       applyTransitionStmt(env.DB, { instanceId, currentElementId: gwId, status: "waiting", now }),
     );
-    await dbBatch(env.DB, stmts);
+    try {
+      await dbBatch(env.DB, stmts);
+    } catch (err) {
+      // The branch subscriptions use a DETERMINISTIC id (replay-stable), so a
+      // concurrent duplicate park collides on the subscription PK. Treat the
+      // conflict as "another drive parked this visit" and fall through to the
+      // (idempotent) broker loop + DO arm — never a terminal incident (S1).
+      if (!isUniqueConstraintViolation(err)) throw err;
+    }
     // Arm the timer DO after commit (best-effort, non-fatal — the rewalk re-arms).
     if (timerId && fireAt) await armTimerDO(env, timerId, fireAt);
   } else if (branches.timer) {
@@ -354,6 +382,13 @@ async function parkEventBasedGateway(
 
   // Broker registrations in document order; first early-buffered correlation wins.
   for (const m of subMeta) {
+    if (alreadyParked) {
+      // A rewalk must not re-open a branch whose subscription already resolved
+      // (consumed/superseded) — re-registering would clear the broker's consumed
+      // marker and leak a zombie active subscription holding the key (S2).
+      const cur = await getSubscriptionForVisit(env.DB, instanceId, m.branch.catchId, occ);
+      if (cur && cur.status !== "active") continue;
+    }
     const broker = env.CORRELATION_BROKER.get(env.CORRELATION_BROKER.idFromName(m.brokerKey));
     const result = (await broker.registerSubscription({
       workspaceId: inst.workspace_id,
@@ -388,9 +423,10 @@ async function parkEventBasedGateway(
     }
     if (result.status === "correlated") {
       // Early-buffered message → this branch wins at registration (document order).
-      const applied = await applyEbgMessage(env, instanceId, graph, gwId, node, occ, m.branch, branches, result.event);
-      if (applied.kind === "incident") return { kind: "incident" };
-      return { kind: "correlated", next: applied.next };
+      // Return the CAPTURED event; the dispatch applies it in its own memoized step
+      // (B1) so the apply survives a crash between this broker consume and the
+      // decision commit.
+      return { kind: "correlated", branch: m.branch, event: result.event };
     }
   }
   return { kind: "waiting" };

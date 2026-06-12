@@ -49,6 +49,18 @@ describe("CorrelationBroker", () => {
     expect(pub.event.payload).toEqual({ approved: true });
   });
 
+  it("returns the subscription's STORED workflow_event_type on correlation (M3-L4 §4.5 delivery contract)", async () => {
+    // For an eventBasedGateway branch the stored wake type is the per-visit GATEWAY
+    // type (not the per-message type), so a single waitForEvent is woken by any
+    // branch. The delivery path honors THIS value rather than re-deriving from the
+    // message name — the broker must surface it on the correlated result.
+    const b = broker("k-ebg-type");
+    await b.registerSubscription(regReq({ workflowEventType: "bpmn_ebg_EBG_0" }));
+    const pub = await b.publishMessage(pubReq());
+    expect(pub.outcome).toBe("correlated");
+    expect(pub.workflowEventType).toBe("bpmn_ebg_EBG_0");
+  });
+
   it("buffers an early message and correlates it on registration", async () => {
     const b = broker("k-buffer");
     const pub = await b.publishMessage(pubReq());

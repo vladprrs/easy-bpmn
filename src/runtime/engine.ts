@@ -110,6 +110,7 @@ import {
 } from "./boundary-timer";
 import { getTimer, timerIdFor } from "../persistence/timers";
 import { driveIntermediateCatch } from "./intermediate-timer";
+import { driveEventBasedGateway } from "./event-gateway";
 
 // Public surface (M3-L0): the node-kind blocks moved to sibling modules, but the
 // engine.ts import path stays the stable façade for every dependent — re-export
@@ -297,6 +298,21 @@ async function loop(
       // short-circuit on the memoized step name).
       const r = await runStep(`gw:${tag}`, () => decideGateway(env, instanceId, cur, occ, node));
       if (r.kind === "incident") return { status: "incident" };
+      cur = r.next;
+      continue;
+    }
+
+    if (node.type === "eventBasedGateway") {
+      // M3-L4 (TASK-46): the timer/message race. Like the XOR gateway, branch
+      // selection owns the successor and the recorded gateway_decisions row is the
+      // fast-forward predicate — but the decision is claimed by a CONCURRENT writer
+      // (broker message apply vs fireTimer), not check-first. The winning branch's
+      // catch is never re-dispatched: the EBG advances straight to the catch's
+      // single outgoing flow. Reuses the SAME `pending` consume rule as receiveTask.
+      const r = await driveEventBasedGateway(env, instanceId, graph, cur, occ, node, runStep, waitFor, pending);
+      if (r.kind === "waiting") return { status: "waiting" };
+      if (r.kind === "incident") return { status: "incident" };
+      if (r.consumedPending) pending = undefined;
       cur = r.next;
       continue;
     }

@@ -19,10 +19,11 @@ import { isTerminalInstanceStatus, isoIsBefore, nowIso } from "../util";
 import { dbBatch } from "../persistence/db";
 import { getVersionGraph } from "../persistence/definitions";
 import { getInstanceRow, type InstanceRow } from "../persistence/instances";
-import { getTimer, getTimerOutcome, type TimerView } from "../persistence/timers";
+import { flipTimerCancelledStmt, getTimer, getTimerOutcome, type TimerView } from "../persistence/timers";
 import { getExecutor } from "./executor";
 import { isUniqueConstraintViolation, planBoundaryTimerFire, supersedeBrokerSubscription } from "./boundary-timer";
 import { planIntermediateCatchFire } from "./intermediate-timer";
+import { planEventGatewayTimerFire } from "./event-gateway";
 
 /**
  * Settle a fired model timer (design §4.3). Re-reads D1 and NO-OPS unless every
@@ -51,11 +52,47 @@ export async function fireTimer(env: Env, timerId: string): Promise<void> {
   const inst = await getInstanceRow(env.DB, timer.instanceId);
   if (!inst || isTerminalInstanceStatus(inst.status)) return;
 
-  // Dispatch by construct (design §4.3/§4.4). Boundary + intermediateCatch decide
-  // on `timer_outcomes`; the eventGateway timer (TASK-46) decides on
-  // gateway_decisions and is not armed in this layer.
+  // Dispatch by construct (design §4.3/§4.4/§4.5). Boundary + intermediateCatch
+  // decide on `timer_outcomes`; the eventGateway timer decides on
+  // `gateway_decisions` (TASK-46) — its generic guard above (status armed, no
+  // decider) holds too: an EBG timer has no `timer_outcomes` row, so
+  // getTimerOutcome is always null and the decision check lives in its plan builder.
   if (timer.kind === "boundary") return fireBoundaryTimer(env, timer, inst);
   if (timer.kind === "intermediateCatch") return fireIntermediateCatchTimer(env, timer, inst);
+  if (timer.kind === "eventGateway") return fireEventGatewayTimer(env, timer, inst);
+}
+
+/**
+ * The DO-alarm fire path for an EBG timer branch (design §4.5.3). Composes the
+ * winning batch via the SHARED builder `planEventGatewayTimerFire` (event-gateway.ts)
+ * — the PLAIN `gateway_decisions` INSERT (the claim) + the bookkeeping flip + the
+ * supersede of ALL message-branch subscriptions + `timerFired`/`ebgDecision` + the
+ * transition to the timer catch's flow — commits it, supersedes the losing message
+ * brokers, and wakes the instance. On the decider conflict (a message branch won
+ * the race) the batch aborts WHOLESALE → flip this timer's bookkeeping `cancelled`
+ * and no-op (the losing-fireTimer path, design §4.5.3).
+ */
+async function fireEventGatewayTimer(env: Env, timer: TimerView, inst: InstanceRow): Promise<void> {
+  const graph: ExecutionGraph | null = await getVersionGraph(env.DB, inst.definition_version_id);
+  if (!graph) return;
+  const plan = await planEventGatewayTimerFire(env, graph, timer, inst);
+  if (plan.kind !== "fire") {
+    // Message won / instance progressed → flip the bookkeeping `cancelled` so the
+    // row does not linger `armed` (status-guarded; the decision is the truth).
+    await flipTimerCancelledStmt(env.DB, { timerId: timer.timerId, now: nowIso() }).run();
+    return;
+  }
+  try {
+    await dbBatch(env.DB, plan.stmts);
+  } catch (err) {
+    if (isUniqueConstraintViolation(err)) {
+      await flipTimerCancelledStmt(env.DB, { timerId: timer.timerId, now: nowIso() }).run();
+      return; // a message claimed the decider first → no-op
+    }
+    throw err;
+  }
+  for (const sub of plan.brokerSubs) await supersedeBrokerSubscription(env, sub);
+  await getExecutor(env).wakeTimer(plan.wake);
 }
 
 /**

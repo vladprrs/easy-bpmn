@@ -589,6 +589,7 @@ async function handlePublishMessage(env: Env, request: Request): Promise<Respons
     workflowInstanceId: result.workflowInstanceId,
     instanceId: result.instanceId,
     elementId: result.elementId,
+    workflowEventType: result.workflowEventType,
     event: result.event,
   });
 

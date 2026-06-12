@@ -4,12 +4,20 @@
 import type { Env } from "../env";
 import type { JobResultEvent, MessageEventPayload, ProcessWorkflowParams } from "../contracts/workflow-events";
 import { recordTerminalIncident, runInstance } from "./engine";
-import { workflowEventTypeFor, workflowJobEventTypeFor } from "../bpmn/profile";
+import { workflowJobEventTypeFor } from "../bpmn/profile";
 
 export interface DeliverArgs {
   workflowInstanceId: string;
   instanceId: string;
   elementId: string;
+  /**
+   * The matched subscription's STORED Workflow wake type (M3-L4, TASK-46, §4.5):
+   * `sendEvent` fires on THIS type rather than re-deriving it from the message
+   * name. For a receiveTask / standalone message catch it equals
+   * workflowEventTypeFor(messageName); for an eventBasedGateway branch it is the
+   * per-visit gateway type, so a single waitForEvent is woken by any branch.
+   */
+  workflowEventType: string;
   event: MessageEventPayload;
 }
 
@@ -53,8 +61,11 @@ class WorkflowExecutor implements Executor {
 
   async deliver(args: DeliverArgs): Promise<void> {
     const instance = await this.env.PROCESS_WORKFLOW.get(args.workflowInstanceId);
+    // Honor the subscription's STORED wake type (M3-L4, §4.5) — for an EBG branch
+    // it is the per-visit gateway type; for a receiveTask / standalone catch it is
+    // byte-identical to workflowEventTypeFor(messageName).
     await instance.sendEvent({
-      type: workflowEventTypeFor(args.event.messageName),
+      type: args.workflowEventType,
       payload: args.event,
     });
   }

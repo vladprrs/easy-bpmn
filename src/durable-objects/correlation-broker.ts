@@ -176,6 +176,8 @@ export class CorrelationBroker extends DurableObject<Env> {
         workflowInstanceId: sub.workflowInstanceId,
         elementId: sub.elementId,
         subscriptionId: sub.subscriptionId,
+        // Honor the subscription's STORED wake type on delivery (M3-L4, §4.5).
+        workflowEventType: sub.workflowEventType,
         event: {
           externalMessageId: req.externalMessageId,
           messageName: req.messageName,

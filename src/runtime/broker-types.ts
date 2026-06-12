@@ -44,6 +44,13 @@ export type BrokerPublishResult =
       workflowInstanceId: string;
       elementId: string;
       subscriptionId: string;
+      // The STORED Workflow wake type of the matched subscription (M3-L4, TASK-46,
+      // design §4.5): the delivery path sends `sendEvent` on THIS type rather than
+      // re-deriving it from the message name. For a receiveTask / standalone catch
+      // it equals workflowEventTypeFor(messageName) (byte-identical, no change); for
+      // an eventBasedGateway branch it is the per-visit gateway type so ONE
+      // waitForEvent is woken by whichever branch resolves.
+      workflowEventType: string;
       event: MessageEventPayload;
     }
   | { outcome: "buffered"; externalMessageId: string; expiresAt: string }

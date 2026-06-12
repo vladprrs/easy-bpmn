@@ -620,27 +620,32 @@ export interface SubscriptionRow {
   occurrence: number;
 }
 
-export async function createSubscription(
-  db: D1Database,
-  input: {
-    subscriptionId: string;
-    workspaceId: string;
-    instanceId: string;
-    elementId: string;
-    messageName: string;
-    correlationKey: string;
-    brokerKey: string;
-    workflowEventType: string;
-    status: "active" | "consumed";
-    expiresAt: string;
-    consumedAt?: string | null;
-    externalMessageId?: string | null;
-    /** CONDITIONAL (0004) — keys the subscription to its loop iteration; defaults to 0. */
-    occurrence?: number;
-    now: string;
-  },
-): Promise<void> {
-  await dbRun(
+interface CreateSubscriptionInput {
+  subscriptionId: string;
+  workspaceId: string;
+  instanceId: string;
+  elementId: string;
+  messageName: string;
+  correlationKey: string;
+  brokerKey: string;
+  workflowEventType: string;
+  status: "active" | "consumed";
+  expiresAt: string;
+  consumedAt?: string | null;
+  externalMessageId?: string | null;
+  /** CONDITIONAL (0004) — keys the subscription to its loop iteration; defaults to 0. */
+  occurrence?: number;
+  now: string;
+}
+
+/**
+ * INSERT statement for one message subscription row. The statement form lets an
+ * eventBasedGateway compose ALL its branch subscriptions into the SAME park batch
+ * as the timer arm + transition (M3-L4, TASK-46, design §4.5.1 — persist-before-
+ * advance, atomic so a parked EBG always has its full subscription set).
+ */
+export function createSubscriptionStmt(db: D1Database, input: CreateSubscriptionInput): D1PreparedStatement {
+  return stmt(
     db,
     `INSERT INTO message_subscriptions
        (subscription_id, workspace_id, instance_id, element_id, message_name, correlation_key, broker_key, workflow_event_type, status, created_at, expires_at, consumed_at, external_message_id, occurrence)
@@ -662,6 +667,10 @@ export async function createSubscription(
       input.occurrence ?? 0,
     ],
   );
+}
+
+export async function createSubscription(db: D1Database, input: CreateSubscriptionInput): Promise<void> {
+  await createSubscriptionStmt(db, input).run();
 }
 
 /**

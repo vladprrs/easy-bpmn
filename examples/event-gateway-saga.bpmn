@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  event-gateway-saga — the M3 canonical eventBasedGateway "message-vs-timer race"
+  example (design 2026-06-11-m3-time-failure-taxonomy §4.5 / §7 gate 5).
+
+  An order needs an approval decision. After submitRequest the token parks on an
+  bpmn:eventBasedGateway that races two intermediate catch events:
+
+    * onApproval — a MESSAGE intermediate catch (message ApprovalGranted); the
+      same wait/correlation/resume machinery as a receiveTask (correlation key
+      supplied at instance start; the <message> carries only its name).
+    * onDeadline — a TIMER intermediate catch (PT24H).
+
+  Whichever occurs first wins, deterministically, in both orders. The race
+  decides on a single gateway_decisions row claimed by a plain INSERT in the
+  same D1 batch as the transition (design decision #5): if ApprovalGranted
+  correlates first the token advances down fulfilRequest -> Approved and the
+  armed timer is settled `cancelled` + the losing subscription superseded; if
+  the PT24H deadline elapses first the timer fires, the message subscription is
+  superseded, and the token advances down escalateRequest -> Escalated. A late
+  publish to a superseded subscription gets the stable buffered/no-match outcome
+  (the at-most-one-active-subscription invariant holds).
+
+  Profile notes (design §3): the EBG has >=2 outgoing flows; every target is an
+  intermediateCatchEvent whose ONLY incoming flow is from the gateway; at most
+  one timer branch; message branches reference distinct messages; no
+  instantiate="true"; no eventGatewayType="Parallel".
+
+  Executable/reference form (no Diagram Interchange); the semantic round-trip
+  and the live-validator publish are verified by
+  tests/integration/sample-m3-models.test.ts.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+                  id="Definitions_event_gateway_saga" targetNamespace="http://easy-bpmn/example/event-gateway-saga">
+  <bpmn:message id="Msg_approval" name="ApprovalGranted"/>
+  <bpmn:process id="ApprovalGateway" isExecutable="true">
+    <bpmn:startEvent id="Start"/>
+    <bpmn:serviceTask id="submitRequest" name="Submit request">
+      <bpmn:extensionElements><easy-bpmn:taskDefinition type="submit-request" retries="3"/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:eventBasedGateway id="AwaitDecision" name="Await decision"/>
+    <bpmn:intermediateCatchEvent id="onApproval">
+      <bpmn:messageEventDefinition messageRef="Msg_approval"/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="onDeadline">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT24H</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:serviceTask id="fulfilRequest" name="Fulfil request">
+      <bpmn:extensionElements><easy-bpmn:taskDefinition type="fulfil-request" retries="3"/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="escalateRequest" name="Escalate request">
+      <bpmn:extensionElements><easy-bpmn:taskDefinition type="escalate-request" retries="3"/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="Approved"/>
+    <bpmn:endEvent id="Escalated"/>
+    <bpmn:sequenceFlow id="s0" sourceRef="Start"           targetRef="submitRequest"/>
+    <bpmn:sequenceFlow id="s1" sourceRef="submitRequest"   targetRef="AwaitDecision"/>
+    <bpmn:sequenceFlow id="e1" sourceRef="AwaitDecision"   targetRef="onApproval"/>
+    <bpmn:sequenceFlow id="e2" sourceRef="AwaitDecision"   targetRef="onDeadline"/>
+    <bpmn:sequenceFlow id="m1" sourceRef="onApproval"      targetRef="fulfilRequest"/>
+    <bpmn:sequenceFlow id="m2" sourceRef="onDeadline"      targetRef="escalateRequest"/>
+    <bpmn:sequenceFlow id="z1" sourceRef="fulfilRequest"   targetRef="Approved"/>
+    <bpmn:sequenceFlow id="z2" sourceRef="escalateRequest" targetRef="Escalated"/>
+  </bpmn:process>
+</bpmn:definitions>

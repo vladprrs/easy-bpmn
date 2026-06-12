@@ -11,7 +11,9 @@ makes a standard subset of BPMN 2.0 executable without Camunda/Zeebe. Implemente
 - **M1** — canonical transaction-saga (pull/external-task workers, `bpmn:transaction` scope, compensation, error/cancel boundaries, operator cancel/retry)
 - **M2** — conditional sagas (`exclusiveGateway`, FEEL conditions via `feelin`, default flows, token-path cycles with per-occurrence ledger rows)
 
-**M3 (timers + failure taxonomy) is the next milestone.** The Worker is live at `https://bpmn.rntme.com`
+- **M3** — time & failure taxonomy (interrupting boundary/intermediate timers, message intermediate catch, `eventBasedGateway`, free error routing, the `timeout` incident-kind split + honored `retryable`) — **shipped** (constitution v2.2.0; the runtime opened per validator layer, now complete).
+
+**M4 (concurrency: parallel gateway, token set, AND-join) is the next milestone.** The Worker is live at `https://bpmn.rntme.com`
 (Cloudflare Workers + D1 + Durable Object broker + Workflow), with GitHub Actions CI/CD at the repo root.
 
 ## Source-of-truth hierarchy (read this before changing anything)
@@ -26,10 +28,10 @@ Several overlapping document sets exist. When they conflict, this order wins:
 3. **`docs/superpowers/specs/`** — implementation bridge documents (module seams, M2 design, risk maps).
    Distill the specs; do not replace them.
 4. **`docs/bpmn/`** — a general BPMN 2.0 reference + the `easy-bpmn` profile (`09-easy-bpmn-profile.md`,
-   the **canonical transaction-saga + M2 conditional-saga** profile, with the **M3 time-&-failure-taxonomy
-   set** (boundary/intermediate timers, message intermediate catch, `eventBasedGateway`, free error
-   routing) **accepted in constitution v2.2.0 but opened per validator layer** — see the interim markings
-   in `09`; in lockstep with constitution v2.2.0).
+   the **canonical transaction-saga + M2 conditional-saga + M3 time-&-failure-taxonomy** profile (the M3
+   set — boundary/intermediate timers, message intermediate catch, `eventBasedGateway`, free error
+   routing — was **accepted in constitution v2.2.0 and has now fully shipped**; no construct remains in
+   the interim per-layer state in `09`; in lockstep with constitution v2.2.0).
 
 ### Architecture is Workflow-per-instance + DO-broker (not DO-per-instance)
 
@@ -104,9 +106,9 @@ counts — during a Workflow replay those reads see post-crash state and would d
   gateways, user tasks, non-transaction subprocesses, conditional/default flows not leaving an
   `exclusiveGateway`, `instantiate="true"`, etc. — `exclusiveGateway` + FEEL conditions + default flows +
   token-path cycles are IN since M2 / constitution v2.1.0; the **M3 set** — interrupting boundary/
-  intermediate timers, message intermediate catch, `eventBasedGateway`, free error routing — is **accepted
-  in constitution v2.2.0 but still rejected per-layer** with reason `M3 — not yet implemented` until its
-  runtime layer ships, the documented interim state in `docs/bpmn/09-easy-bpmn-profile.md`). But
+  intermediate timers, message intermediate catch, `eventBasedGateway`, free error routing — is **IN since
+  M3 / constitution v2.2.0** (accepted-and-validated; the runtime opened per validator layer and is now
+  complete — see `docs/bpmn/09-easy-bpmn-profile.md`)). But
   **tolerate and ignore**
   *ignorable extension content* — foreign-namespace `<extensionElements>` (`camunda:`/`zeebe:`/…), Diagram
   Interchange, and `documentation`. Rejecting a file merely for carrying those is itself non-canonical.

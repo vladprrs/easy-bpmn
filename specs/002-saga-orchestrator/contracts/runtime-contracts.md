@@ -1,4 +1,4 @@
-# Runtime Contracts: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas)
+# Runtime Contracts: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas; M3 — Time & failure taxonomy)
 
 These contracts extend `specs/001-bpmn-lite-orchestrator-mvp/contracts/runtime-contracts.md`. The
 Process Workflow, Receive Task, Correlation Broker, and D1 Persistence contracts from the MVP carry
@@ -175,13 +175,20 @@ rotate/clear the token:
   does not consume the poison budget. (Those strike rows persist across an operator `/retry`, so a
   retry does not grant a fresh poison budget.) The instance does **NOT** enter `compensating` and
   **no** compensation jobs are created.
-- **Business error** — `fail` with an `errorCode` matching a model `bpmn:error/@errorCode`: not
-  retried; raises that BPMN error → caught by the matching error boundary (`errorRef →
-  bpmn:error/@id`) → routed to the cancel end event → transaction cancels → compensation.
+- **Business error** — `fail` with an `errorCode`: not retried; raises that BPMN error → matched
+  against the activity's interrupting error boundaries by **exact `@errorCode`** → else a catch-all
+  boundary → else **Hazard**. The matched boundary's outgoing flow routes the token to any token-path
+  node in the scope (M3 free routing; routing to a cancel end event triggers the transaction's
+  cancel → compensation, the canonical M1 shape). See the M3 Timer/Race-Decider/Failure-Taxonomy
+  contract below.
+- **Un-guarded wait cap / hard condition error** — an un-guarded service-task or receive-task wait
+  hitting the 1-hour safety-net cap raises **`kind=waitTimeout`** (the M3 split of the overloaded
+  `timeout`); a hard FEEL evaluation error raises **`kind=conditionFailure`**. A wait guarded by a
+  modeled timer never raises `waitTimeout`.
 
 `errorRef`/boundary catching is by the Error's **`@id`** (QName); the worker's `fail.errorCode`
-matches the Error's **`@errorCode`** (wire value). Richer error catalogs and per-error routing beyond
-cancel are M3.
+matches the Error's **`@errorCode`** (wire value). Multi-boundary + catch-all routing and richer
+incident kinds shipped in M3 (Constitution v2.2.0).
 
 ## Compensation Contract
 
@@ -293,6 +300,61 @@ deliberately.
   compensation job inheriting its forward occurrence and seeded with **its own** iteration's
   `originalInput` + `capturedOutput`. `compensationStarted`/`compensationCompleted` carry the
   `occurrence` in diagnostics.
+
+## Timer, Race-Decider & Failure-Taxonomy Contract (M3 — timers + eventBasedGateway + error routing)
+
+Design: `docs/superpowers/specs/2026-06-11-m3-time-failure-taxonomy-design.md`. Constitution v2.2.0.
+
+**The `/jobs/*` worker surface is UNCHANGED** (still pinned by `tests/contract/jobs-schema-pin.test.ts`);
+the only behavior change on the surface is that **`retryable` is now honored** (see Failure
+Taxonomy). Model timers, `eventBasedGateway`, intermediate catch events, and free error routing are
+all standard BPMN — no new extension binding.
+
+**Rules**:
+
+- **Arming (persist-before-advance).** A timer row is written `INSERT OR IGNORE` in the **same
+  `dbBatch`** as the wait it guards (the `svc-create` job batch, the subscription-registration
+  batch, or the catch/EBG park batch), paired with the `timerArmed` history row on first arm only;
+  `fire_at` is computed once in code (`timeDate` as-is; `now + timeDuration`) and snapshotted. A
+  rewalk revisiting an `armed` row is a write-free re-park that idempotently re-arms the DO alarm
+  (self-healing).
+- **One deciding row per race, plain-INSERT, in the transition batch.** Boundary / intermediate-catch
+  timers decide on a `timer_outcomes` row; `eventBasedGateway` timers decide on `gateway_decisions`
+  (no `timer_outcomes` row). The decider is a **plain `INSERT`** (never `INSERT OR IGNORE`) composed
+  into the same `dbBatch` as the loser-visible transition, so a losing contender's **whole batch
+  aborts** on the unique-constraint violation and converts to the recorded outcome. This is the
+  normative `src/persistence/gateway-decisions.ts` contract; it holds in **both** execution modes
+  (Workflow first-event-wins memoization is a second guard, not the primary one).
+- **Fire** (`alarm → fireTimer(timerId)`): re-read D1 → no-op unless the instance is non-terminal,
+  the row is `armed` with `fire_at <= now`, **and** the timer's visit is still the instance's current
+  wait. Then one batch = the decider claim (`fired`) + `status → fired` + abandon the in-flight job /
+  supersede the active subscription (status-conditional; a late worker `complete`/`fail` or publish
+  gets the stable superseded/buffered no-op) + `timerFired` history + the transition out of the wait.
+  A fired model timer is **never** an incident.
+- **Every abnormal exit settles the timer.** Normal completion, error-boundary route, retry
+  exhaustion, and operator `/cancel` each carry a plain `INSERT … 'cancelled'` decider + the
+  `armed → cancelled` flip, so a stray alarm afterwards no-ops (no mid-compensation firing). DO
+  disarm is best-effort.
+- **`eventBasedGateway` decides on `gateway_decisions`.** Token arrival registers occurrence-keyed
+  subscriptions for every message branch + a timer row for the timer branch (best-effort broker
+  registrations after the batch, re-registered idempotently on rewalk). Each EBG-branch subscription
+  stores the **gateway visit's** wake event type in the existing
+  `message_subscriptions.workflow_event_type` column — the delivery path **honors the stored value**
+  instead of re-deriving it from the message name (the symmetry contract is relaxed for EBG
+  subscriptions). Message wins / timer wins / early-buffered-message-at-registration / two buffered
+  branches (model-document-order first hit) are all replay-stable via the single decision row.
+- **Free error routing.** An activity may carry multiple interrupting error boundaries with
+  **distinct, non-empty `@errorCode`s** plus at most one catch-all (`errorEventDefinition` without
+  `errorRef`). Matching on a worker `fail` with `errorCode`: exact `@errorCode` → catch-all →
+  (no match) **Hazard** (Constitution VI untouched). The boundary's outgoing flow targets any
+  token-path node in the same scope (the M1 "must target a cancel end" rule is lifted). An error
+  handled by an alternate path inside a transaction leaves the saga ledger untouched — all completed
+  steps stay compensatable until the scope cancels or commits.
+- **Wait cap vs modeled timer.** A wait guarded by an armed modeled timer never raises `waitTimeout`;
+  in Workflow mode its `waitForEvent` timeout is sized to `fire_at` (a 7-day timer costs O(1) steps)
+  and doubles as the lost-alarm backstop — on any wake the engine settles overdue timers
+  (`fire_at <= now`) exactly as the alarm would. Un-guarded waits keep the fixed 1-hour cap →
+  `waitTimeout`.
 
 ## Observability Contract
 

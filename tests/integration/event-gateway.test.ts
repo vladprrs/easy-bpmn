@@ -1,6 +1,6 @@
 import { env, runDurableObjectAlarm } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { get, leaseAndComplete, mintWorkerToken, publishAndStart, publishMessage } from "../helpers";
+import { get, leaseAndComplete, mintWorkerToken, post, publishAndStart, publishMessage } from "../helpers";
 import { resumeInline } from "../../src/runtime/engine";
 
 // eventBasedGateway runtime end-to-end (M3-L4, TASK-46; design §4.5, §7 gate 5).
@@ -229,6 +229,31 @@ describe("eventBasedGateway — early-buffered + tie-break (M3-L4 §7 gate 5)", 
 
     await leaseAndComplete(token, "ebg-a", {});
     expect((await get(`/instances/${id}`)).body.status).toBe("completed");
+  });
+});
+
+describe("eventBasedGateway — operator /cancel during the race", () => {
+  it("operator /cancel settles the armed timer branch; a stray alarm afterwards is a no-op", async () => {
+    const { instance } = await publishAndStart(TIMER_MSG_EBG, { correlationKey: "ebg-cancel", variables: {} });
+    const id = instance.body.instanceId;
+    expect(instance.body.currentElementId).toBe("EBG");
+    const t = await ebgTimer(id);
+    expect(t.status).toBe("armed");
+
+    // Empty ledger → terminal cancel; the shared sweep settles the armed EBG timer.
+    const cancel = await post(`/instances/${id}/cancel`, {});
+    expect(cancel.body.status).toBe("cancelled");
+    expect((await ebgTimer(id)).status).toBe("cancelled");
+
+    // A stray alarm now finds a decided/terminal instance → no-op (never advances,
+    // never records an EBG decision).
+    await env.DB.prepare(`UPDATE timers SET fire_at = '2000-01-01T00:00:00Z' WHERE timer_id = ?`).bind(t.timer_id).run();
+    await runDurableObjectAlarm(timerStub(t.timer_id));
+    const stable = await get(`/instances/${id}`);
+    expect(stable.body.status).toBe("cancelled");
+    expect(stable.body.currentElementId).toBe("EBG");
+    expect(await gwDecision(id)).toBeNull();
+    expect(await historyTypes(id)).not.toContain("ebgDecision");
   });
 });
 

@@ -230,6 +230,29 @@ export interface SagaInspection {
   steps: SagaStepInspection[];
 }
 
+/**
+ * One model timer in the instance-inspection `timers` block (M3-L3 design §6) —
+ * read straight from D1 (the `timers` table), so Workflow internals stay hidden.
+ * The schema lands here now (TASK-43) as the contract/validation boundary; the
+ * inspection endpoint that POPULATES the block is TASK-44 (M3-L3 runtime).
+ */
+export const timerInspectionSchema = z.object({
+  timerId: z.string(),
+  elementId: z.string(),
+  occurrence: z.number().int(),
+  /** boundary | intermediateCatch | eventGateway — the arming construct. */
+  kind: z.enum(["boundary", "intermediateCatch", "eventGateway"]),
+  /** Bookkeeping/read-model status (the authoritative outcome is the decider row). */
+  status: z.enum(["armed", "fired", "cancelled"]),
+  /** boundary: host activity element id; null otherwise. */
+  attachedToRef: z.string().nullable(),
+  /** eventGateway: owning gateway element id; null otherwise. */
+  gatewayId: z.string().nullable(),
+  fireAt: z.string(),
+  firedAt: z.string().nullable(),
+});
+export type TimerInspection = z.infer<typeof timerInspectionSchema>;
+
 export interface ProcessInstanceInspection extends ProcessInstance {
   historySummary: HistoryEvent[];
   diagnostics: Record<string, unknown>;

@@ -736,7 +736,7 @@ async function driveReceiveTask(
     }
     // M3-L1 (TASK-39): the un-guarded receive-task wait cap is 'waitTimeout'
     // (shared with the service-task wait cap), split out of the legacy 'timeout'.
-    await runStep(`recv-timeout:${tag}`, () => createIncident(env, instanceId, elementId, 0, "Receive Task wait timed out.", { messageName }, "waitTimeout"));
+    await runStep(`recv-timeout:${tag}`, () => createIncident(env, instanceId, elementId, 0, `${node.type === "intermediateCatchEvent" ? "Message catch" : "Receive Task"} wait timed out.`, { messageName }, "waitTimeout"));
     return { kind: "incident" };
   }
   const event = parseMessageEvent(outcome.payload);
@@ -756,9 +756,13 @@ type RegisterOutcome =
   | { kind: "applied" }
   | { kind: "incident" };
 
-async function registerReceive(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, messageName: string, elementType: NodeType = "receiveTask"): Promise<RegisterOutcome> {
+async function registerReceive(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, messageName: string, elementType: NodeType): Promise<RegisterOutcome> {
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
+  // Honest operator-visible labels: a standalone message intermediate catch
+  // (M3-L4, TASK-46) is an EVENT, not an activity — its parked-wait marker and
+  // failure wording must NOT read "Receive Task" (design §3 item 3).
+  const isCatch = elementType === "intermediateCatchEvent";
 
   const existing = await getSubscriptionForVisit(env.DB, instanceId, elementId, occ);
   if (existing?.status === "consumed") return { kind: "applied" }; // idempotent re-run guard
@@ -794,7 +798,7 @@ async function registerReceive(env: Env, instanceId: string, graph: ExecutionGra
   })) as RegisterSubscriptionResult;
 
   if (result.status === "rejected") {
-    await createIncident(env, instanceId, elementId, 0, `Receive Task could not register: ${result.reason}`, { existingInstanceId: result.existingInstanceId ?? null }, "serviceTaskFailure");
+    await createIncident(env, instanceId, elementId, 0, `${isCatch ? "Message catch" : "Receive Task"} could not register: ${result.reason}`, { existingInstanceId: result.existingInstanceId ?? null }, "serviceTaskFailure");
     await historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "invariantViolation", diagnostics: { reason: result.reason, messageName, correlationKey: inst.correlation_key } }).run();
     return { kind: "incident" };
   }
@@ -806,7 +810,7 @@ async function registerReceive(env: Env, instanceId: string, graph: ExecutionGra
     // first-registration batch (persist-before-advance); arm the DO after commit.
     const arm = buildBoundaryArm(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: elementId, occ, now });
     await dbBatch(env.DB, [
-      historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "receiveTaskWaiting", diagnostics: { subscriptionId, messageName, correlationKey: inst.correlation_key, expiresAt, occurrence: occ } }),
+      historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: isCatch ? "messageCatchWaiting" : "receiveTaskWaiting", diagnostics: { subscriptionId, messageName, correlationKey: inst.correlation_key, expiresAt, occurrence: occ } }),
       applyTransitionStmt(env.DB, { instanceId, currentElementId: elementId, status: "waiting", now }),
       ...(arm ? arm.stmts : []),
     ]);

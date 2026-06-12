@@ -72,6 +72,17 @@ describe("Message intermediate catch — process level, publish-AFTER (M3-L4 §7
     expect(sub.status).toBe("active");
     expect(await historyTypes(id)).not.toContain("incidentCreated");
 
+    // Honest audit (M3-L4, design §3 item 3): the parked catch surfaces as an
+    // EVENT, not a Receive Task. The `elementEntered` diagnostics carry the
+    // construct, the parked-wait marker is `messageCatchWaiting`, and NO
+    // `receiveTaskWaiting` marker is emitted for this catch.
+    const parkedHist = (await get(`/instances/${id}/history`)).body.events as any[];
+    const entered = parkedHist.find((e) => e.type === "elementEntered" && e.elementId === "catch");
+    expect(entered?.diagnostics?.elementType).toBe("intermediateCatchEvent");
+    const parkedTypes = parkedHist.map((e) => e.type);
+    expect(parkedTypes).toContain("messageCatchWaiting");
+    expect(parkedTypes).not.toContain("receiveTaskWaiting");
+
     // A later message correlates (reusing the receive-task correlation path) and
     // the payload is applied ATOMICALLY with the transition out of the wait.
     const pub = await publishMessage({

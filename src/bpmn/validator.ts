@@ -345,6 +345,33 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     return { defs, only: defs.length === 1 ? defs[0]!.$type : undefined };
   };
 
+  // The shared messageRef rule for a correlated wait — used by BOTH a receiveTask
+  // (the ref on the element) and a standalone message intermediate catch (M3-L4,
+  // TASK-46; the ref on its <messageEventDefinition>). Runs the three checks
+  // (missing/unresolved → empty-name → resolved) via the shared `err`, differing
+  // only in the element label + reason-type string. Returns the resolved name, or
+  // undefined when any check failed (the caller leaves messageName unset).
+  const resolveMessageName = (
+    ref: unknown,
+    opts: { id: string | null | undefined; label: string; reasonType: string },
+  ): string | undefined => {
+    const msgId = refId(ref);
+    const msgName = msgId ? messageNamesById.get(msgId) : undefined;
+    if (!msgId || msgName === undefined) {
+      err(`${opts.label} '${opts.id ?? ""}' must reference a declared <message> via messageRef.`, opts.id, opts.reasonType);
+      return undefined;
+    }
+    if (msgName.trim() === "") {
+      err(
+        `${opts.label} '${opts.id ?? ""}' references a <message> with no name; a non-empty message name is required for correlation.`,
+        opts.id,
+        opts.reasonType,
+      );
+      return undefined;
+    }
+    return msgName;
+  };
+
   const classifyContainer = (
     container: ModdleElement,
     scopeId: string,
@@ -532,19 +559,12 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
           }
           // messageRef resolution — reuse the receiveTask rule (the ref lives on
           // the <messageEventDefinition>, like errorRef on an error boundary).
-          const msgId = refId((defs[0] as ModdleElement).messageRef);
-          const msgName = msgId ? messageNamesById.get(msgId) : undefined;
-          if (!msgId || msgName === undefined) {
-            err(`Intermediate catch event '${id ?? ""}' must reference a declared <message> via messageRef.`, id, "intermediateCatchEvent");
-          } else if (msgName.trim() === "") {
-            err(
-              `Intermediate catch event '${id ?? ""}' references a <message> with no name; a non-empty message name is required for correlation.`,
-              id,
-              "intermediateCatchEvent",
-            );
-          } else {
-            catchInfo.messageName = msgName;
-          }
+          const msgName = resolveMessageName((defs[0] as ModdleElement).messageRef, {
+            id,
+            label: "Intermediate catch event",
+            reasonType: "intermediateCatchEvent",
+          });
+          if (msgName !== undefined) catchInfo.messageName = msgName;
           nodes.push(catchInfo);
           continue;
         }
@@ -662,19 +682,12 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
             "receiveTask",
           );
         }
-        const msgId = refId(el.messageRef);
-        const msgName = msgId ? messageNamesById.get(msgId) : undefined;
-        if (!msgId || msgName === undefined) {
-          err(`Receive task '${id ?? ""}' must reference a declared <message> via messageRef.`, id, "receiveTask");
-        } else if (msgName.trim() === "") {
-          err(
-            `Receive task '${id ?? ""}' references a <message> with no name; a non-empty message name is required for correlation.`,
-            id,
-            "receiveTask",
-          );
-        } else {
-          info.messageName = msgName;
-        }
+        const msgName = resolveMessageName(el.messageRef, {
+          id,
+          label: "Receive task",
+          reasonType: "receiveTask",
+        });
+        if (msgName !== undefined) info.messageName = msgName;
       }
 
       nodes.push(info);

@@ -1513,6 +1513,9 @@ describe("Message intermediate catch (M3-L4, TASK-46)", () => {
     expect(
       r.issues.some((i) => i.elementId === "b" && /attached to intermediate catch event 'catch'/.test(i.reason)),
     ).toBe(true);
+    // Cascade-suppression: the general boundary-on-catch reason `continue`s, so the
+    // per-kind "must be attached to a service task" check must NOT also fire.
+    expect(r.issues.some((i) => /must be attached to a service task/.test(i.reason))).toBe(false);
   });
 
   it("rejects more than one outgoing flow (implicit split)", async () => {

@@ -798,10 +798,10 @@ export const SEND_TASK_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 </bpmn:definitions>`;
 
 /**
- * A MESSAGE intermediate catch event — accepted in constitution v2.2.0 but its
- * runtime is not yet implemented (M3 — not yet implemented, deferred to TASK-46);
- * still rejected before publish. (The TIMER intermediate catch IS opened — M3-L4,
- * TASK-45 — and is exercised in its own validator + integration tests.)
+ * A STANDALONE message intermediate catch event — a token-path node with
+ * receive-task wait/correlation/resume semantics, OPENED in M3-L4 (TASK-46).
+ * Accepted before publish (validator + integration tests exercise it). (The
+ * TIMER intermediate catch was opened earlier in M3-L4, TASK-45.)
  */
 export const INTERMEDIATE_CATCH_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D" targetNamespace="x">

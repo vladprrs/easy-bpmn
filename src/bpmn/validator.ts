@@ -485,11 +485,10 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         continue;
       }
 
-      // M3-L4 (TASK-45): a TIMER intermediateCatchEvent is a delay step on the
-      // token path (design §4.4) — opened here. A MESSAGE intermediateCatchEvent
-      // and the eventBasedGateway stay rejected with reason `M3 — not yet
-      // implemented` until TASK-46. Event-definition-aware, like the boundary
-      // branch above, so only the timer variant becomes a token node.
+      // M3-L4: an intermediateCatchEvent is a token-path catch — event-definition
+      // aware (like the boundary branch above), so the TIMER variant (TASK-45,
+      // §4.4) and the MESSAGE variant (TASK-46, §3 item 3) each become a token
+      // node and the eventBasedGateway stays rejected via DEFERRED_GATEWAY_REASONS.
       if ($type === "bpmn:IntermediateCatchEvent") {
         const { defs, only } = classifyEventDefinition(el);
         if (only === TIMER_EVENT_DEFINITION) {
@@ -507,11 +506,46 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
           continue;
         }
         if (only === MESSAGE_EVENT_DEFINITION) {
-          err(
-            `Intermediate catch event '${id ?? ""}' carries a messageEventDefinition. Message intermediate catch events are accepted in constitution v2.2.0 but their runtime is not yet implemented (M3 — not yet implemented); use a timer intermediate catch, or a receiveTask.`,
-            id,
-            "intermediateCatchEvent",
-          );
+          // M3-L4 (TASK-46): a STANDALONE message intermediate catch — a
+          // token-path node with IDENTICAL wait/correlation/resume semantics to a
+          // receiveTask (the <message> carries only its name; the correlation key
+          // is supplied at instance start). But it is an EVENT, not an activity:
+          // no easy-bpmn:taskDefinition, and no boundary events attach (the
+          // boundary-attachment rules below reject boundary-on-catch). Exactly one
+          // incoming + one outgoing flow is enforced by the per-scope linearity +
+          // the >1-incoming join rule shared with the timer catch.
+          const catchInfo: NodeInfo = {
+            id: id ?? "",
+            type: "intermediateCatchEvent",
+            name: (el.name as string) ?? undefined,
+            scopeId,
+          };
+          // An event carries no worker routing — reject an easy-bpmn:taskDefinition.
+          const ext = el.extensionElements as ModdleElement | undefined;
+          const hasTaskDef = asArray<ModdleElement>(ext?.values).some((v) => v.$type === TASK_DEFINITION_TYPE);
+          if (hasTaskDef) {
+            err(
+              `Intermediate catch event '${id ?? ""}' carries an easy-bpmn:taskDefinition. A message intermediate catch is an event, not a service task; remove the taskDefinition (events route no worker).`,
+              id,
+              "intermediateCatchEvent",
+            );
+          }
+          // messageRef resolution — reuse the receiveTask rule (the ref lives on
+          // the <messageEventDefinition>, like errorRef on an error boundary).
+          const msgId = refId((defs[0] as ModdleElement).messageRef);
+          const msgName = msgId ? messageNamesById.get(msgId) : undefined;
+          if (!msgId || msgName === undefined) {
+            err(`Intermediate catch event '${id ?? ""}' must reference a declared <message> via messageRef.`, id, "intermediateCatchEvent");
+          } else if (msgName.trim() === "") {
+            err(
+              `Intermediate catch event '${id ?? ""}' references a <message> with no name; a non-empty message name is required for correlation.`,
+              id,
+              "intermediateCatchEvent",
+            );
+          } else {
+            catchInfo.messageName = msgName;
+          }
+          nodes.push(catchInfo);
           continue;
         }
         const what = defs.length === 0
@@ -520,7 +554,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
             ? "multiple event definitions"
             : `a ${localTypeName(defs[0]!.$type)}`;
         err(
-          `Intermediate catch event '${id ?? ""}' has ${what}. Only a timer intermediate catch (a single timerEventDefinition) is supported; the message intermediate catch is accepted in v2.2.0 but not yet implemented (M3 — not yet implemented).`,
+          `Intermediate catch event '${id ?? ""}' has ${what}. Only a timer intermediate catch (a single timerEventDefinition) or a message intermediate catch (a single messageEventDefinition) is supported.`,
           id,
           "intermediateCatchEvent",
         );
@@ -924,6 +958,21 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       err(
         `Boundary event '${n.id}' is attached to compensation handler '${attached.id}' (isForCompensation). ` +
           "Boundary events cannot attach to a compensation handler — it is off the token path, reached only via its compensation <association>.",
+        n.id,
+        "boundaryEvent",
+      );
+      continue;
+    }
+    // A boundary event on an intermediate catch (timer OR message, M3-L4) is
+    // invalid: the catch is an EVENT, not an activity — its only continuation is
+    // its single outgoing flow, and a boundary's outgoing flow would leak a second
+    // path off an event. Reject generally (one event-specific reason) so the
+    // per-kind "must be attached to a service task / receive task" checks below do
+    // not cascade noise onto the same broken attachment. `continue`.
+    if (attached.type === "intermediateCatchEvent") {
+      err(
+        `Boundary event '${n.id}' is attached to intermediate catch event '${attached.id}'. ` +
+          "Boundary events attach to an activity (service/receive task) or a transaction, never to an intermediate catch event (it is an event, not an activity).",
         n.id,
         "boundaryEvent",
       );

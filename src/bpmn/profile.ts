@@ -16,10 +16,12 @@ export const SUPPORTED_NODE_TYPES: Record<string, NodeType> = {
   // carry FEEL conditions + an optional gateway-owned default; the validator
   // enforces the split/default/condition rules (validator.ts).
   "bpmn:ExclusiveGateway": "exclusiveGateway",
-  // M3-L4 (TASK-45): a TIMER intermediateCatchEvent is a delay step on the token
-  // path. The validator handles it in its own branch (event-definition aware:
-  // timer opens here, message stays "M3 — not yet implemented") before this
-  // lookup, so this entry is the type mapping, not the accept gate.
+  // M3-L4: an intermediateCatchEvent is a token-path catch — a TIMER delay
+  // (TASK-45) or a MESSAGE correlation wait (TASK-46, receive-task semantics).
+  // The validator handles it in its own event-definition-aware branch (timer +
+  // message both open; eventBasedGateway stays rejected via
+  // DEFERRED_GATEWAY_REASONS) before this lookup, so this entry is the type
+  // mapping, not the accept gate.
   "bpmn:IntermediateCatchEvent": "intermediateCatchEvent",
 };
 
@@ -54,7 +56,7 @@ export const ERROR_EVENT_DEFINITION = "bpmn:ErrorEventDefinition";
 export const CANCEL_EVENT_DEFINITION = "bpmn:CancelEventDefinition";
 /** M3-L3: an interrupting boundary timer carries a single timerEventDefinition. */
 export const TIMER_EVENT_DEFINITION = "bpmn:TimerEventDefinition";
-/** M3-L4: a message intermediate catch / EBG message branch carries this (still M3 — not yet implemented). */
+/** M3-L4: a message intermediate catch (TASK-46, opened) / EBG message branch (EBG follow-up) carries this. */
 export const MESSAGE_EVENT_DEFINITION = "bpmn:MessageEventDefinition";
 
 /** Human-friendly element type name, e.g. "bpmn:UserTask" → "userTask". */

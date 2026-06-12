@@ -54,7 +54,7 @@
 
 import type { Env } from "../env";
 import type { MessageEventPayload } from "../contracts/workflow-events";
-import type { ExecutionGraph, Flow, GraphNode } from "../bpmn/graph";
+import type { ExecutionGraph, Flow, GraphNode, NodeType } from "../bpmn/graph";
 import { workflowEventTypeFor } from "../bpmn/profile";
 import { ExpressionEvaluationError, evaluateCondition, normalizeFeelValue } from "./expressions";
 import { brokerKeyOf, type RegisterSubscriptionResult } from "./broker-types";
@@ -261,6 +261,23 @@ async function loop(
     }
 
     if (node.type === "intermediateCatchEvent") {
+      if (node.messageName) {
+        // M3-L4 (TASK-46): a STANDALONE message intermediate catch — IDENTICAL
+        // wait/correlation/resume semantics to a receiveTask, so it is driven by
+        // the SAME driveReceiveTask path (registerReceive/applyMessage — the
+        // subscription/correlation/broker machinery, NOT a parallel copy). It is
+        // an EVENT: the validator guarantees no boundary timer attaches, so
+        // driveReceiveTask's timer-boundary branches are inert (timerBoundaryFor
+        // → null). Occurrence keying + the atomic apply + duplicate-publish dedup
+        // are all inherited unchanged.
+        const r = await driveReceiveTask(env, instanceId, graph, cur, occ, node, runStep, waitFor, pending);
+        if (r.kind === "waiting") return { status: "waiting" };
+        if (r.kind === "incident") return { status: "incident" };
+        // Consumed at the LIVE visit only (same as the receiveTask branch).
+        if (r.consumedPending) pending = undefined;
+        cur = r.next;
+        continue;
+      }
       // M3-L4 (TASK-45): a timer delay on the token path — its OWN visit
       // occurrence (`timer:el#occ`). Arms + parks; the DO alarm (fireTimer)
       // claims the `timer_outcomes` decider in the same batch as the advance
@@ -621,6 +638,13 @@ export async function decideGateway(
 // re-subscription on the same key is the already-supported broker pattern.
 // The subscription row's `consumed` status (set atomically with the
 // transition out of the wait) IS the write-free fast-forward predicate.
+//
+// M3-L4 (TASK-46): a STANDALONE message `intermediateCatchEvent` shares THIS
+// exact driver (design §3 item 3 — "identical wait/correlation/resume semantics
+// to a receiveTask"). It is dispatched here from loop() with the same signature;
+// `timerBoundaryFor` returns null for an event (no boundary attaches to a catch),
+// so the timer-boundary branches below are inert and the path collapses to the
+// plain register → park → apply machinery — NOT a parallel copy.
 // ---------------------------------------------------------------------------
 
 type ReceiveOutcome =
@@ -664,7 +688,7 @@ async function driveReceiveTask(
     return { kind: "next", next: r.next, consumedPending: true };
   }
 
-  const reg = await runStep(`recv:${tag}`, () => registerReceive(env, instanceId, graph, elementId, occ, messageName));
+  const reg = await runStep(`recv:${tag}`, () => registerReceive(env, instanceId, graph, elementId, occ, messageName, node.type));
   if (reg.kind === "incident") return { kind: "incident" };
   if (reg.kind === "applied") return { kind: "next", next };
   if (reg.kind === "correlated") {
@@ -732,7 +756,7 @@ type RegisterOutcome =
   | { kind: "applied" }
   | { kind: "incident" };
 
-async function registerReceive(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, messageName: string): Promise<RegisterOutcome> {
+async function registerReceive(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, messageName: string, elementType: NodeType = "receiveTask"): Promise<RegisterOutcome> {
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
 
@@ -743,7 +767,10 @@ async function registerReceive(env: Env, instanceId: string, graph: ExecutionGra
   if (!active) {
     // First registration for this visit — exactly one audit entry per occurrence
     // (a rewalk that lands on an already-active wait re-registers WRITE-FREE).
-    await historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "elementEntered", diagnostics: { elementType: "receiveTask", messageName, occurrence: occ } }).run();
+    // `elementType` is the honest audit label: "receiveTask" or, when the SAME
+    // wait machinery drives a standalone message intermediate catch (M3-L4,
+    // TASK-46), "intermediateCatchEvent".
+    await historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "elementEntered", diagnostics: { elementType, messageName, occurrence: occ } }).run();
   }
 
   const subscriptionId = active?.subscription_id ?? newId("sub");

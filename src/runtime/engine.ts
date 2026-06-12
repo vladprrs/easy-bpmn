@@ -103,6 +103,7 @@ import {
   buildBoundaryArm,
   buildBoundaryCancelSettle,
   convertOnFire,
+  settleOverdueBoundaryTimerOnWake,
   timerBoundaryFor,
   timerGuardedTimeout,
   timerHasFired,
@@ -678,11 +679,24 @@ async function driveReceiveTask(
     const fresh = await getSubscriptionForVisit(env.DB, instanceId, elementId, occ);
     if (fresh?.status === "consumed") return { kind: "next", next };
     if (tb) {
-      // A wait guarded by a modeled timer NEVER raises waitTimeout (design §4.2).
-      // The DO alarm is the primary firing mechanism; this sized timeout is the
-      // lost-alarm backstop — re-park so the next drive re-arms/re-sizes.
-      // (Workflow-mode-only; the alarm fire path is the CI-tested mechanism.)
-      return { kind: "waiting" };
+      // Lost-alarm backstop (design §4.2, risk R5). A wait guarded by a modeled
+      // timer NEVER raises waitTimeout. The DO alarm is the PRIMARY firing
+      // mechanism; this timer-SIZED timeout doubles as the backstop for a lost/
+      // failed alarm: on this wake re-read D1 and settle an OVERDUE timer INLINE
+      // exactly as the alarm path would (superseding the subscription), RETURNING
+      // the boundary path to THIS drive loop. We are already inside a drive, so
+      // there is no executor wake here — that is what avoids the runtime/timers →
+      // executor → engine import cycle. (Workflow-mode-only; the DO-alarm fire path
+      // is the CI-tested mechanism.)
+      const settled = await settleOverdueBoundaryTimerOnWake(env, graph, instanceId, elementId, occ);
+      if (settled.kind === "fired") return { kind: "next", next: settled.next };
+      if (settled.kind === "reparked") return { kind: "waiting" }; // armed-but-early → re-armed; re-park
+      // fallThrough: a concurrent message apply settled the timer 'cancelled' (its
+      // transition rode the same batch) — re-read and advance if consumed, so a
+      // swallowed wake is not stranded.
+      const reread = await getSubscriptionForVisit(env.DB, instanceId, elementId, occ);
+      if (reread?.status === "consumed") return { kind: "next", next };
+      return { kind: "waiting" }; // still parked (e.g. a concurrent /cancel terminal) — re-park
     }
     // M3-L1 (TASK-39): the un-guarded receive-task wait cap is 'waitTimeout'
     // (shared with the service-task wait cap), split out of the legacy 'timeout'.

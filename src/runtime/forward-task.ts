@@ -30,6 +30,7 @@ import {
   convertOnFire,
   isUniqueConstraintViolation,
   settleBoundaryTimerCancel,
+  settleOverdueBoundaryTimerOnWake,
   timerBoundaryFor,
   timerGuardedTimeout,
   timerHasFired,
@@ -194,15 +195,30 @@ export async function driveForwardServiceTask(
   }
   if (outcome.kind === "timeout") {
     if (tb) {
-      // A wait guarded by a modeled timer NEVER raises waitTimeout (design §4.2).
-      // The DO alarm is the primary firing mechanism; this sized timeout is only
-      // the lost-alarm backstop — re-read the decider (fired → boundary path) and
-      // otherwise re-park so the next drive re-arms/re-sizes. (Workflow-mode-only;
-      // the DO-alarm fire path is the CI-tested mechanism.)
-      if (await timerHasFired(env, instanceId, tb, occ)) {
-        return { kind: "next", next: tb.node.next! };
+      // Lost-alarm backstop (design §4.2, risk R5). A wait guarded by a modeled
+      // timer NEVER raises waitTimeout. The DO alarm is the PRIMARY firing
+      // mechanism; this timer-SIZED timeout doubles as the backstop for a lost/
+      // failed alarm: on this wake re-read D1 and settle an OVERDUE timer INLINE
+      // exactly as the alarm path would, RETURNING the boundary path to THIS drive
+      // loop. We are already inside a drive, so there is no executor wake here —
+      // that is what avoids the runtime/timers → executor → engine import cycle.
+      // (Workflow-mode-only; the DO-alarm fire path is the CI-tested mechanism.)
+      const settled = await settleOverdueBoundaryTimerOnWake(env, graph, instanceId, elementId, occ);
+      if (settled.kind === "fired") return { kind: "next", next: settled.next };
+      if (settled.kind === "reparked") return { kind: "waiting" }; // armed-but-early → re-armed; re-park
+      // fallThrough: a concurrent normal resolution settled the timer 'cancelled'
+      // (its transition rode the same batch) — re-read and run the normal completed/
+      // failed/applied handling so a swallowed wake is not stranded.
+      const settledJob = (await getForwardJob(env.DB, instanceId, elementId, occ)) ?? fresh;
+      const appliedAfterSettle = appliedForwardOutcome(graph, elementId, node, settledJob);
+      if (appliedAfterSettle) return appliedAfterSettle;
+      if (settledJob.status === "completed") {
+        return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, settledJob));
       }
-      return { kind: "waiting" };
+      if (settledJob.status === "failed") {
+        return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, settledJob));
+      }
+      return { kind: "waiting" }; // still parked (e.g. a concurrent /cancel terminal) — re-park
     }
     // A genuine UN-GUARDED wait-cap: nobody completed the job (still created/locked).
     // M3-L1 (TASK-39): the un-guarded service-task wait cap is 'waitTimeout', split
@@ -392,6 +408,11 @@ async function applyForwardCompletion(
         type: "poisonJob",
         diagnostics: { jobId: job.job_id, strikes: strike, mergedSize: payloadByteSize(merged) },
       }).run();
+      // Like the DLQ jobActivationTimeout race, this poison terminal does NOT settle
+      // the host's boundary timer (no decider claim) — it is left `armed` on a now-
+      // terminal instance, harmlessly: triple-guarded (fireTimer's terminal-instance
+      // guard + the host job is no longer created/locked + the operator /cancel
+      // sweep), so a stray alarm never fires and never compensates.
       return createIncident(
         env,
         instanceId,

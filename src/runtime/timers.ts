@@ -16,28 +16,12 @@
 import type { Env } from "../env";
 import type { ExecutionGraph } from "../bpmn/graph";
 import { isTerminalInstanceStatus, isoIsBefore, nowIso } from "../util";
-import { workflowJobEventTypeFor } from "../bpmn/profile";
 import { dbBatch } from "../persistence/db";
 import { getVersionGraph } from "../persistence/definitions";
-import { historyStmt } from "../persistence/history";
-import {
-  applyTransitionStmt,
-  getForwardJob,
-  getInstanceRow,
-  getSubscriptionForVisit,
-  subscriptionSupersededStmt,
-  type InstanceRow,
-} from "../persistence/instances";
-import { abandonJobOnTimerFireStmt } from "../persistence/jobs";
-import {
-  flipTimerFiredStmt,
-  getTimer,
-  getTimerOutcome,
-  insertTimerOutcomeStmt,
-  type TimerView,
-} from "../persistence/timers";
+import { getInstanceRow, type InstanceRow } from "../persistence/instances";
+import { getTimer, getTimerOutcome, type TimerView } from "../persistence/timers";
 import { getExecutor } from "./executor";
-import { isUniqueConstraintViolation, supersedeBrokerSubscription } from "./boundary-timer";
+import { isUniqueConstraintViolation, planBoundaryTimerFire, supersedeBrokerSubscription } from "./boundary-timer";
 
 /**
  * Settle a fired model timer (design §4.3). Re-reads D1 and NO-OPS unless every
@@ -74,69 +58,28 @@ export async function fireTimer(env: Env, timerId: string): Promise<void> {
 }
 
 /**
- * The winning-fire batch for an interrupting boundary timer (design §4.3.3/4.3.5).
- * Resolves the host's live wait (service-task job OR receive-task subscription),
- * GUARDS that it is still the current wait, then commits the decider claim +
- * transition atomically and wakes the instance.
+ * The DO-alarm fire path for an interrupting boundary timer (design §4.3.3/4.3.5).
+ * Composes the winning-fire batch via the SHARED builder `planBoundaryTimerFire`
+ * (boundary-timer.ts) — which resolves the host's live wait, GUARDS that it is still
+ * the current wait, and assembles the decider claim + transition — then commits it
+ * and WAKES the instance via the executor. The Workflow-mode lost-alarm backstop
+ * (`settleOverdueBoundaryTimerOnWake`) commits the IDENTICAL batch but returns the
+ * next step instead of waking; keeping the builder in boundary-timer.ts (which never
+ * imports the executor) is what lets both share it without an import cycle.
  */
 async function fireBoundaryTimer(env: Env, timer: TimerView, inst: InstanceRow): Promise<void> {
   const graph: ExecutionGraph | null = await getVersionGraph(env.DB, inst.definition_version_id);
   if (!graph) return;
-  const boundary = graph.nodes[timer.elementId];
-  if (!boundary || boundary.type !== "boundaryEvent" || boundary.boundaryKind !== "timer") return;
-  const hostId = boundary.attachedToRef;
-  const next = boundary.next;
-  if (!hostId || !next) return; // validator guarantees a host + one outgoing; defensive
-  const host = graph.nodes[hostId];
-  const occ = timer.occurrence;
-  const instanceId = timer.instanceId;
-  const workspaceId = inst.workspace_id;
-  const now = nowIso();
-
-  if (host?.type === "serviceTask") {
-    const job = await getForwardJob(env.DB, instanceId, hostId, occ);
-    // GUARD: the timer's visit must still be the live wait — a completed/failed
-    // job means the worker already resolved it (completion won the race → no-op).
-    if (!job || (job.status !== "created" && job.status !== "locked")) return;
-    const workflowEventType = workflowJobEventTypeFor(job.job_id);
-    try {
-      await dbBatch(env.DB, [
-        insertTimerOutcomeStmt(env.DB, { timerId: timer.timerId, outcome: "fired", now }), // THE CLAIM
-        flipTimerFiredStmt(env.DB, { timerId: timer.timerId, firedAt: now, now }),
-        abandonJobOnTimerFireStmt(env.DB, job.job_id, now), // created/locked → failed (late complete no-ops)
-        historyStmt(env.DB, { workspaceId, instanceId, elementId: timer.elementId, type: "timerFired", diagnostics: { attachedToRef: hostId, jobId: job.job_id, occurrence: occ, boundaryTarget: next } }),
-        applyTransitionStmt(env.DB, { instanceId, currentElementId: next, status: "running", now }),
-      ]);
-    } catch (err) {
-      if (isUniqueConstraintViolation(err)) return; // a competing exit claimed the decider first → no-op
-      throw err;
-    }
-    await getExecutor(env).wakeTimer({ instanceId, workflowEventType, timerId: timer.timerId });
-    return;
+  const plan = await planBoundaryTimerFire(env, graph, timer, inst);
+  if (plan.kind !== "fire") return; // host wait already resolved (completion won the race) → no-op
+  try {
+    await dbBatch(env.DB, plan.stmts);
+  } catch (err) {
+    if (isUniqueConstraintViolation(err)) return; // a competing exit claimed the decider first → no-op
+    throw err;
   }
-
-  if (host?.type === "receiveTask") {
-    const sub = await getSubscriptionForVisit(env.DB, instanceId, hostId, occ);
-    // GUARD: the timer's visit must still be the live wait — a consumed/superseded
-    // subscription means the message (or a prior fire) already resolved it.
-    if (!sub || sub.status !== "active") return;
-    const workflowEventType = sub.workflow_event_type;
-    try {
-      await dbBatch(env.DB, [
-        insertTimerOutcomeStmt(env.DB, { timerId: timer.timerId, outcome: "fired", now }), // THE CLAIM
-        flipTimerFiredStmt(env.DB, { timerId: timer.timerId, firedAt: now, now }),
-        subscriptionSupersededStmt(env.DB, sub.subscription_id, now), // active → superseded
-        historyStmt(env.DB, { workspaceId, instanceId, elementId: timer.elementId, type: "timerFired", diagnostics: { attachedToRef: hostId, subscriptionId: sub.subscription_id, occurrence: occ, boundaryTarget: next } }),
-        applyTransitionStmt(env.DB, { instanceId, currentElementId: next, status: "running", now }),
-      ]);
-    } catch (err) {
-      if (isUniqueConstraintViolation(err)) return;
-      throw err;
-    }
-    // Best-effort: drop the broker's active subscription so a late publish gets the
-    // stable buffered/no-match outcome (preserves at-most-one-active-subscription).
-    await supersedeBrokerSubscription(env, sub);
-    await getExecutor(env).wakeTimer({ instanceId, workflowEventType, timerId: timer.timerId });
-    return;
-  }
+  // Receive-task fire: best-effort drop the broker's active subscription so a late
+  // publish gets the stable buffered/no-match outcome (at-most-one-active-subscription).
+  if (plan.brokerSub) await supersedeBrokerSubscription(env, plan.brokerSub);
+  await getExecutor(env).wakeTimer(plan.wake);
 }

@@ -12,25 +12,43 @@
 // converts to the recorded outcome (never double-advances).
 //
 // This module owns: finding the timer boundary, composing the arm + cancel-settle
-// statements, arming/cancelling the Scheduler DO, and the operator-cancel sweep.
-// The winning-FIRE batch lives in timers.ts (it needs the host job/subscription).
+// statements, the shared winning-FIRE batch BUILDER (`planBoundaryTimerFire`),
+// arming/cancelling the Scheduler DO, and the operator-cancel sweep. The builder is
+// shared by the DO-alarm path (timers.ts `fireBoundaryTimer`, which commits then
+// WAKES via the executor) and the Workflow-mode lost-alarm backstop wake path
+// (`settleOverdueBoundaryTimerOnWake`, called from inside a drive, which RETURNS the
+// next step — no executor). Keeping the builder HERE (this module never imports the
+// executor) is what lets the wake path reuse the identical batch without the
+// runtime/timers → executor → engine → forward-task import cycle.
 
 import type { Env } from "../env";
 import type { ExecutionGraph, GraphNode, TimerTriggerSpec } from "../bpmn/graph";
-import { ONE_HOUR_MS, nowIso } from "../util";
+import { ONE_HOUR_MS, isTerminalInstanceStatus, isoIsBefore, nowIso } from "../util";
+import { workflowJobEventTypeFor } from "../bpmn/profile";
 import { dbBatch } from "../persistence/db";
 import { historyStmt } from "../persistence/history";
-import { getInstanceRow, type SubscriptionRow } from "../persistence/instances";
+import {
+  applyTransitionStmt,
+  getForwardJob,
+  getInstanceRow,
+  getSubscriptionForVisit,
+  subscriptionSupersededStmt,
+  type InstanceRow,
+  type SubscriptionRow,
+} from "../persistence/instances";
+import { abandonJobOnTimerFireStmt } from "../persistence/jobs";
 import { brokerKeyOf } from "./broker-types";
 import { computeFireAt } from "./iso8601";
 import {
   flipTimerCancelledStmt,
+  flipTimerFiredStmt,
   getTimer,
   getTimerOutcome,
   insertTimerArmedStmt,
   insertTimerOutcomeStmt,
   listTimersForInstance,
   timerIdFor,
+  type TimerView,
 } from "../persistence/timers";
 
 export interface TimerBoundary {
@@ -283,4 +301,179 @@ export async function supersedeBrokerSubscription(env: Env, sub: SubscriptionRow
       JSON.stringify({ level: "warn", message: "supersedeSubscription failed", subscriptionId: sub.subscription_id, error: err instanceof Error ? err.message : String(err) }),
     );
   }
+}
+
+/** The Workflow-mode wake target for a fired boundary timer (the wait's `sendEvent` type). */
+export interface TimerWake {
+  instanceId: string;
+  workflowEventType: string;
+  timerId: string;
+}
+
+/**
+ * The WINNING-FIRE plan for an interrupting boundary timer (design §4.3.3/4.3.5) —
+ * the SHARED batch builder. Resolves the host's live wait (service-task job OR
+ * receive-task subscription), GUARDS that it is still the current wait, and composes
+ * the IDENTICAL fire batch both fire paths commit: the PLAIN `timer_outcomes 'fired'`
+ * claim (the race decider) + the bookkeeping flip + the job-abandon / subscription-
+ * supersede + the `timerFired` history + the transition down the boundary path. It
+ * does NOT commit or wake — the caller does, and ONLY the wake differs:
+ *   - timers.ts `fireBoundaryTimer` (DO-alarm path): commit → executor `wakeTimer`;
+ *   - `settleOverdueBoundaryTimerOnWake` (Workflow-mode backstop): commit → RETURN
+ *     the next step to the drive loop (no executor — avoids the import cycle).
+ * Returns `kind:"skip"` when the host wait already resolved (completion won the race
+ * → the timer must NOT fire), mirroring `fireBoundaryTimer`'s old guards.
+ */
+export type BoundaryFirePlan =
+  | { kind: "fire"; stmts: D1PreparedStatement[]; next: string; wake: TimerWake; brokerSub?: SubscriptionRow }
+  | { kind: "skip" };
+
+export async function planBoundaryTimerFire(
+  env: Env,
+  graph: ExecutionGraph,
+  timer: TimerView,
+  inst: InstanceRow,
+): Promise<BoundaryFirePlan> {
+  const boundary = graph.nodes[timer.elementId];
+  if (!boundary || boundary.type !== "boundaryEvent" || boundary.boundaryKind !== "timer") return { kind: "skip" };
+  const hostId = boundary.attachedToRef;
+  const next = boundary.next;
+  if (!hostId || !next) return { kind: "skip" }; // validator guarantees a host + one outgoing; defensive
+  const host = graph.nodes[hostId];
+  const occ = timer.occurrence;
+  const instanceId = timer.instanceId;
+  const workspaceId = inst.workspace_id;
+  const now = nowIso();
+
+  if (host?.type === "serviceTask") {
+    const job = await getForwardJob(env.DB, instanceId, hostId, occ);
+    // GUARD: the timer's visit must still be the live wait — a completed/failed
+    // job means the worker already resolved it (completion won the race → skip).
+    if (!job || (job.status !== "created" && job.status !== "locked")) return { kind: "skip" };
+    return {
+      kind: "fire",
+      next,
+      wake: { instanceId, workflowEventType: workflowJobEventTypeFor(job.job_id), timerId: timer.timerId },
+      stmts: [
+        insertTimerOutcomeStmt(env.DB, { timerId: timer.timerId, outcome: "fired", now }), // THE CLAIM
+        flipTimerFiredStmt(env.DB, { timerId: timer.timerId, firedAt: now, now }),
+        abandonJobOnTimerFireStmt(env.DB, job.job_id, now), // created/locked → failed (late complete no-ops)
+        historyStmt(env.DB, { workspaceId, instanceId, elementId: timer.elementId, type: "timerFired", diagnostics: { attachedToRef: hostId, jobId: job.job_id, occurrence: occ, boundaryTarget: next } }),
+        applyTransitionStmt(env.DB, { instanceId, currentElementId: next, status: "running", now }),
+      ],
+    };
+  }
+
+  if (host?.type === "receiveTask") {
+    const sub = await getSubscriptionForVisit(env.DB, instanceId, hostId, occ);
+    // GUARD: the timer's visit must still be the live wait — a consumed/superseded
+    // subscription means the message (or a prior fire) already resolved it.
+    if (!sub || sub.status !== "active") return { kind: "skip" };
+    return {
+      kind: "fire",
+      next,
+      wake: { instanceId, workflowEventType: sub.workflow_event_type, timerId: timer.timerId },
+      brokerSub: sub,
+      stmts: [
+        insertTimerOutcomeStmt(env.DB, { timerId: timer.timerId, outcome: "fired", now }), // THE CLAIM
+        flipTimerFiredStmt(env.DB, { timerId: timer.timerId, firedAt: now, now }),
+        subscriptionSupersededStmt(env.DB, sub.subscription_id, now), // active → superseded
+        historyStmt(env.DB, { workspaceId, instanceId, elementId: timer.elementId, type: "timerFired", diagnostics: { attachedToRef: hostId, subscriptionId: sub.subscription_id, occurrence: occ, boundaryTarget: next } }),
+        applyTransitionStmt(env.DB, { instanceId, currentElementId: next, status: "running", now }),
+      ],
+    };
+  }
+
+  return { kind: "skip" };
+}
+
+/**
+ * Outcome of the Workflow-mode lost-alarm backstop settle:
+ *   - `fired`        the overdue timer was settled inline (or a concurrent real
+ *                    alarm already fired/won) → take the boundary path;
+ *   - `reparked`     still armed but NOT yet due (a genuine early/spurious wake) →
+ *                    the DO was re-armed (self-heal); the caller re-parks;
+ *   - `fallThrough`  the timer was already decided `cancelled` (a concurrent normal
+ *                    resolution), the row is gone, or the host wait already resolved
+ *                    → the caller re-reads and runs its normal completed/failed/
+ *                    applied (service) or consumed (receive) handling.
+ */
+export type WakeSettleOutcome =
+  | { kind: "fired"; next: string }
+  | { kind: "reparked" }
+  | { kind: "fallThrough" };
+
+/**
+ * Lost-alarm backstop (design §4.2 "the timeout … doubles as the lost-alarm
+ * backstop: on any wake the engine re-reads D1 and settles overdue timers
+ * (fire_at <= now) exactly as the alarm path would"; risk R5). Invoked from the
+ * TIMEOUT-wake branch of a timer-guarded wait (forward-task.ts / engine.ts), i.e.
+ * we are ALREADY inside a drive — so when the timer is overdue we settle the fire
+ * INLINE (the IDENTICAL `planBoundaryTimerFire` batch the alarm path commits) and
+ * RETURN the boundary path to the drive loop instead of calling the executor wake.
+ * That is what avoids the runtime/timers → executor → engine → forward-task import
+ * cycle the implementer hit (this module never imports the executor).
+ *
+ * Workflow-mode-only: CI forces EXECUTION_MODE=direct, where `waitFor` is null and a
+ * wait never times out, so this path never runs under the suite. It is verified by
+ * reading, mirroring the M1/M2 manually-verified Workflow-mode lists (design §7).
+ *
+ * Decision logic (design §4.2):
+ *   1. decided already → `fired` → boundary path; `cancelled` → fall through.
+ *   2. armed AND overdue (`fire_at <= now`) → settle the fire INLINE; on a decider
+ *      PK conflict (a concurrent REAL alarm claimed it) convert to the recorded
+ *      outcome via `convertOnFire` (no double-advance).
+ *   3. armed but NOT yet due (`fire_at > now`) → idempotently re-arm the DO
+ *      (self-heal) and re-park.
+ */
+export async function settleOverdueBoundaryTimerOnWake(
+  env: Env,
+  graph: ExecutionGraph,
+  instanceId: string,
+  hostElementId: string,
+  occ: number,
+): Promise<WakeSettleOutcome> {
+  const tb = timerBoundaryFor(graph, hostElementId);
+  if (!tb) return { kind: "fallThrough" }; // no timer boundary → caller handles normally
+  const timerId = timerIdFor(instanceId, tb.boundaryId, occ);
+
+  // (1) Already decided → convert: fired → boundary path; cancelled → fall through.
+  const decided = await getTimerOutcome(env.DB, timerId);
+  if (decided?.outcome === "fired") return tb.node.next ? { kind: "fired", next: tb.node.next } : { kind: "fallThrough" };
+  if (decided?.outcome === "cancelled") return { kind: "fallThrough" };
+
+  const trow = await getTimer(env.DB, timerId);
+  if (!trow || trow.status !== "armed") return { kind: "fallThrough" }; // settled/missing → re-read
+
+  // (3) Still armed but NOT yet due (a genuine early/spurious wake): re-arm + re-park.
+  if (isoIsBefore(nowIso(), trow.fireAt)) {
+    await armTimerDO(env, trow.timerId, trow.fireAt);
+    return { kind: "reparked" };
+  }
+
+  // A settled instance never fires a timer (mirrors fireTimer's guard) — should not
+  // happen mid-drive, but a concurrent /cancel could have terminated it.
+  const inst = await getInstanceRow(env.DB, instanceId);
+  if (!inst || isTerminalInstanceStatus(inst.status)) return { kind: "fallThrough" };
+
+  // (2) Armed AND overdue: settle the fire INLINE — the IDENTICAL batch the alarm
+  // path commits — then RETURN the boundary path (no executor wake → no cycle).
+  const plan = await planBoundaryTimerFire(env, graph, trow, inst);
+  if (plan.kind !== "fire") return { kind: "fallThrough" }; // host wait already resolved → re-read
+  try {
+    await dbBatch(env.DB, plan.stmts);
+  } catch (err) {
+    if (isUniqueConstraintViolation(err)) {
+      // A concurrent REAL alarm claimed the decider first → convert to the recorded
+      // outcome (never double-advance), reusing the existing conflict helper.
+      const converted = await convertOnFire(env, graph, instanceId, hostElementId, occ);
+      if (converted) return { kind: "fired", next: converted };
+      return { kind: "fallThrough" }; // cancelled won the conflict → re-read
+    }
+    throw err;
+  }
+  // Receive-task fire: drop the broker's active subscription so a late publish gets
+  // the stable buffered/no-match outcome (at-most-one-active-subscription invariant).
+  if (plan.brokerSub) await supersedeBrokerSubscription(env, plan.brokerSub);
+  return { kind: "fired", next: plan.next };
 }

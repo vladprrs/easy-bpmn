@@ -127,6 +127,15 @@ describe("JobScheduler — one-shot scheduler DO (TASK-43)", () => {
     const tStub = timerStub("M");
     await tStub.armTimer("M", FUTURE_1);
     await expect(runDurableObjectAlarm(tStub)).rejects.toThrow(/TASK-44/);
+    // The throw must skip the one-shot `deleteAll()`, leaving the marker intact so
+    // the timer is re-dispatchable when the platform RE-DELIVERS the alarm (workerd
+    // auto-reschedules an alarm whose handler threw — that reschedule is runtime
+    // behavior `runDurableObjectAlarm` does not model, so we assert the property we
+    // CAN observe: the marker survived = `deleteAll()` was skipped). A
+    // `try/finally { deleteAll() }` around dispatch would silently break this.
+    await runInDurableObject(tStub, async (_i, state) => {
+      expect(await state.storage.get(TIMER_KEY)).toBe("M");
+    });
 
     // Job marker with the SAME underlying id "M" → terminateUnleasableJob (no job
     // row "M" exists) → clean no-op. Had it mis-dispatched to fireTimer, the

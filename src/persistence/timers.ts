@@ -61,7 +61,10 @@ export function mapTimer(row: TimerRow): TimerView {
 
 export interface TimerOutcomeRow {
   timer_id: string;
-  outcome: string;
+  // The column is written ONLY by insertTimerOutcomeStmt with a TimerOutcomeValue,
+  // so the narrowed type is sound at the read boundary (unlike TimerRow.kind/status,
+  // this read returns the raw row, so callers get the narrowing directly).
+  outcome: TimerOutcomeValue;
   decided_at: string;
 }
 

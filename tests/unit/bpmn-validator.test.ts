@@ -125,10 +125,14 @@ describe("BPMN-lite profile validator", () => {
     expect(r.issues.some((i) => i.elementId === "T" && /sendTask/.test(i.reason))).toBe(true);
   });
 
-  it("rejects an intermediate catch event", async () => {
+  it("rejects a MESSAGE intermediate catch event (M3 — not yet implemented, TASK-46)", async () => {
     const r = await parseAndValidate(INTERMEDIATE_CATCH_BPMN);
     expect(r.ok).toBe(false);
-    expect(r.issues.some((i) => i.elementId === "IC" && /intermediateCatchEvent/.test(i.reason))).toBe(true);
+    expect(
+      r.issues.some(
+        (i) => i.elementId === "IC" && /messageEventDefinition/.test(i.reason) && /not yet implemented/i.test(i.reason),
+      ),
+    ).toBe(true);
   });
 
   it("rejects malformed XML before validation", async () => {
@@ -1234,5 +1238,154 @@ describe("Interrupting boundary timers (M3-L3, TASK-44)", () => {
     );
     expect(r.ok).toBe(false);
     expect(r.issues.some((i) => i.elementId === "tb_on_handler" && /attached to compensation handler 'undoA'/.test(i.reason))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M3-L4 (TASK-45): the TIMER intermediate catch — a delay step on the token path
+// (design §4.4). Exactly one incoming + one outgoing sequence flow; allowed at
+// process level AND inside a transaction; the same timerEventDefinition
+// well-formedness as boundary timers (reuses readTimerTrigger). A MESSAGE
+// intermediate catch stays "M3 — not yet implemented" (TASK-46).
+// ---------------------------------------------------------------------------
+describe("Timer intermediate catch (M3-L4, TASK-45)", () => {
+  /** S → catch (timer) → svc → E, with the catch as a token-path delay node. */
+  function catchBpmn(o: { def?: string; flows?: string } = {}): string {
+    const def = o.def ?? `<bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition>`;
+    const flows = o.flows ??
+      `<bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="catch"/>
+       <bpmn:sequenceFlow id="s1" sourceRef="catch" targetRef="after"/>
+       <bpmn:sequenceFlow id="s2" sourceRef="after" targetRef="E"/>`;
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:camunda="http://camunda.org/schema/1.0/bpmn" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_ic" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:intermediateCatchEvent id="catch">${def}</bpmn:intermediateCatchEvent>
+    <bpmn:serviceTask id="after"><bpmn:extensionElements><easy-bpmn:taskDefinition type="after"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:endEvent id="E"/>
+    ${flows}
+  </bpmn:process>
+</bpmn:definitions>`;
+  }
+
+  it("accepts a timer intermediate catch at process level (timeDuration)", async () => {
+    const r = await parseAndValidate(catchBpmn());
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    const c = r.graph!.nodes["catch"];
+    expect(c?.type).toBe("intermediateCatchEvent");
+    expect(c?.next).toBe("after");
+    expect(c?.timerTrigger).toEqual({ kind: "timeDuration", value: "PT5M" });
+  });
+
+  it("accepts a static timeDate trigger", async () => {
+    const r = await parseAndValidate(
+      catchBpmn({ def: `<bpmn:timerEventDefinition><bpmn:timeDate>2026-12-31T23:59:00Z</bpmn:timeDate></bpmn:timerEventDefinition>` }),
+    );
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["catch"]?.timerTrigger).toEqual({ kind: "timeDate", value: "2026-12-31T23:59:00Z" });
+  });
+
+  it("accepts a timer intermediate catch INSIDE a transaction (scope stays open across the delay)", async () => {
+    const TX_CATCH = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_txic" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:transaction id="Tx">
+      <bpmn:startEvent id="TxS"/>
+      <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="a"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:intermediateCatchEvent id="catch"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent>
+      <bpmn:endEvent id="TxE"/>
+      <bpmn:sequenceFlow id="t1" sourceRef="TxS" targetRef="A"/>
+      <bpmn:sequenceFlow id="t2" sourceRef="A" targetRef="catch"/>
+      <bpmn:sequenceFlow id="t3" sourceRef="catch" targetRef="TxE"/>
+    </bpmn:transaction>
+    <bpmn:endEvent id="Done"/>
+    <bpmn:sequenceFlow id="g1" sourceRef="S" targetRef="Tx"/>
+    <bpmn:sequenceFlow id="g2" sourceRef="Tx" targetRef="Done"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const r = await parseAndValidate(TX_CATCH);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["catch"]?.scopeId).toBe("Tx");
+    expect(r.graph!.nodes["catch"]?.next).toBe("TxE");
+  });
+
+  it("rejects a MESSAGE intermediate catch (M3 — not yet implemented, TASK-46)", async () => {
+    const r = await parseAndValidate(
+      catchBpmn({ def: `<bpmn:messageEventDefinition/>` }),
+    );
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some((i) => i.elementId === "catch" && /messageEventDefinition/.test(i.reason) && /not yet implemented/i.test(i.reason)),
+    ).toBe(true);
+  });
+
+  it("rejects an intermediate catch with no event definition", async () => {
+    const r = await parseAndValidate(catchBpmn({ def: `` }));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "catch" && /no event definition/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a timeCycle trigger", async () => {
+    const r = await parseAndValidate(
+      catchBpmn({ def: `<bpmn:timerEventDefinition><bpmn:timeCycle>R3/PT10M</bpmn:timeCycle></bpmn:timerEventDefinition>` }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "catch" && /timeCycle/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects BOTH timeDate and timeDuration", async () => {
+    const r = await parseAndValidate(
+      catchBpmn({ def: `<bpmn:timerEventDefinition><bpmn:timeDate>2026-01-01T00:00:00Z</bpmn:timeDate><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition>` }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "catch" && /both a timeDate and a timeDuration/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a non-parsing timeDuration literal (incl. a FEEL expression)", async () => {
+    for (const bad of ["PT5X", "${dueIn}", "soon"]) {
+      const r = await parseAndValidate(
+        catchBpmn({ def: `<bpmn:timerEventDefinition><bpmn:timeDuration>${bad}</bpmn:timeDuration></bpmn:timerEventDefinition>` }),
+      );
+      expect(r.ok).toBe(false);
+      expect(r.issues.some((i) => i.elementId === "catch" && /not a static ISO-8601 duration literal/.test(i.reason))).toBe(true);
+    }
+  });
+
+  it("rejects more than one outgoing flow (implicit split)", async () => {
+    const r = await parseAndValidate(
+      catchBpmn({
+        flows: `<bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="catch"/>
+                <bpmn:sequenceFlow id="s1" sourceRef="catch" targetRef="after"/>
+                <bpmn:sequenceFlow id="s1b" sourceRef="catch" targetRef="E"/>
+                <bpmn:sequenceFlow id="s2" sourceRef="after" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "catch" && /outgoing sequence flows/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects more than one incoming flow (a catch is a single-token delay, not a join)", async () => {
+    const r = await parseAndValidate(
+      catchBpmn({
+        flows: `<bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="after"/>
+                <bpmn:sequenceFlow id="s0b" sourceRef="after" targetRef="catch"/>
+                <bpmn:sequenceFlow id="s0c" sourceRef="S" targetRef="catch"/>
+                <bpmn:sequenceFlow id="s1" sourceRef="catch" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "catch" && /incoming sequence flows/.test(i.reason) && /not a join/.test(i.reason))).toBe(true);
+  });
+
+  it("tolerates ignorable content (foreign extension/documentation) on a timer-catch model", async () => {
+    const r = await parseAndValidate(
+      catchBpmn({
+        def: `<bpmn:documentation>delay</bpmn:documentation><bpmn:extensionElements><camunda:properties><camunda:property name="x" value="y"/></camunda:properties></bpmn:extensionElements><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition>`,
+      }),
+    );
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
   });
 });

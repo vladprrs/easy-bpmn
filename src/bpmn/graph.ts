@@ -20,7 +20,9 @@ export type ElementType =
   | "association"
   | "error"
   // M2 conditional sagas:
-  | "exclusiveGateway";
+  | "exclusiveGateway"
+  // M3 time & failure taxonomy:
+  | "intermediateCatchEvent";
 
 /** A node in the executable graph (excludes sequence flows, messages, associations, errors). */
 export type NodeType =
@@ -32,7 +34,9 @@ export type NodeType =
   | "transaction"
   | "boundaryEvent"
   // M2 conditional sagas:
-  | "exclusiveGateway";
+  | "exclusiveGateway"
+  // M3 time & failure taxonomy — a timer delay on the token path (M3-L4):
+  | "intermediateCatchEvent";
 
 /** Discriminator for end events: a plain (commit) end vs a transaction Cancel end. */
 export type EndKind = "none" | "cancel";
@@ -131,7 +135,7 @@ export interface GraphNode {
   errorCode?: string | null;
   /** compensate boundaryEvent only — the isForCompensation handler it associates to. */
   compensationHandlerId?: string | null;
-  /** timer boundaryEvent only — the static ISO-8601 trigger (M3-L3); fire_at is computed at arm time. */
+  /** timer boundaryEvent (M3-L3) or timer intermediateCatchEvent (M3-L4) only — the static ISO-8601 trigger; fire_at is computed at arm time. */
   timerTrigger?: TimerTriggerSpec | null;
 }
 

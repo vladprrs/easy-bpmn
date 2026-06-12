@@ -22,6 +22,7 @@ import { getInstanceRow, type InstanceRow } from "../persistence/instances";
 import { getTimer, getTimerOutcome, type TimerView } from "../persistence/timers";
 import { getExecutor } from "./executor";
 import { isUniqueConstraintViolation, planBoundaryTimerFire, supersedeBrokerSubscription } from "./boundary-timer";
+import { planIntermediateCatchFire } from "./intermediate-timer";
 
 /**
  * Settle a fired model timer (design §4.3). Re-reads D1 and NO-OPS unless every
@@ -50,11 +51,11 @@ export async function fireTimer(env: Env, timerId: string): Promise<void> {
   const inst = await getInstanceRow(env.DB, timer.instanceId);
   if (!inst || isTerminalInstanceStatus(inst.status)) return;
 
-  // Only interrupting boundary timers arm in this layer; intermediateCatch /
-  // eventGateway timers land in L4 (TASK-45/46) and decide differently.
-  if (timer.kind !== "boundary") return;
-
-  await fireBoundaryTimer(env, timer, inst);
+  // Dispatch by construct (design §4.3/§4.4). Boundary + intermediateCatch decide
+  // on `timer_outcomes`; the eventGateway timer (TASK-46) decides on
+  // gateway_decisions and is not armed in this layer.
+  if (timer.kind === "boundary") return fireBoundaryTimer(env, timer, inst);
+  if (timer.kind === "intermediateCatch") return fireIntermediateCatchTimer(env, timer, inst);
 }
 
 /**
@@ -81,5 +82,29 @@ async function fireBoundaryTimer(env: Env, timer: TimerView, inst: InstanceRow):
   // Receive-task fire: best-effort drop the broker's active subscription so a late
   // publish gets the stable buffered/no-match outcome (at-most-one-active-subscription).
   if (plan.brokerSub) await supersedeBrokerSubscription(env, plan.brokerSub);
+  await getExecutor(env).wakeTimer(plan.wake);
+}
+
+/**
+ * The DO-alarm fire path for an intermediate timer catch (design §4.4). Composes
+ * the winning-fire batch via the SHARED builder `planIntermediateCatchFire`
+ * (intermediate-timer.ts) — the PLAIN `timer_outcomes 'fired'` decider claim +
+ * the flip + `timerFired` history + the transition down the single outgoing flow,
+ * all in ONE dbBatch — then commits it and WAKES the instance via the executor.
+ * There is NO host job/subscription to abandon (the catch IS the wait). A
+ * competing operator-/cancel settlement that claimed the decider first aborts
+ * this batch WHOLESALE on the PK violation → idempotent no-op.
+ */
+async function fireIntermediateCatchTimer(env: Env, timer: TimerView, inst: InstanceRow): Promise<void> {
+  const graph: ExecutionGraph | null = await getVersionGraph(env.DB, inst.definition_version_id);
+  if (!graph) return;
+  const plan = await planIntermediateCatchFire(env, graph, timer, inst);
+  if (plan.kind !== "fire") return; // not the current park / already resolved → no-op
+  try {
+    await dbBatch(env.DB, plan.stmts);
+  } catch (err) {
+    if (isUniqueConstraintViolation(err)) return; // a competing /cancel claimed the decider first → no-op
+    throw err;
+  }
   await getExecutor(env).wakeTimer(plan.wake);
 }

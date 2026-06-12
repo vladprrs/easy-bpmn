@@ -797,14 +797,20 @@ export const SEND_TASK_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
   </bpmn:process>
 </bpmn:definitions>`;
 
-/** An intermediate catch (timer) event — out of profile. */
+/**
+ * A MESSAGE intermediate catch event — accepted in constitution v2.2.0 but its
+ * runtime is not yet implemented (M3 — not yet implemented, deferred to TASK-46);
+ * still rejected before publish. (The TIMER intermediate catch IS opened — M3-L4,
+ * TASK-45 — and is exercised in its own validator + integration tests.)
+ */
 export const INTERMEDIATE_CATCH_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D" targetNamespace="x">
+  <bpmn:message id="M" name="Ping"/>
   <bpmn:process id="P" isExecutable="true">
     <bpmn:startEvent id="S"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
     <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="IC" />
-    <bpmn:intermediateCatchEvent id="IC" name="Wait 5m">
-      <bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition>
+    <bpmn:intermediateCatchEvent id="IC" name="Await ping">
+      <bpmn:messageEventDefinition messageRef="M"/>
       <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
     </bpmn:intermediateCatchEvent>
     <bpmn:sequenceFlow id="f2" sourceRef="IC" targetRef="E" />

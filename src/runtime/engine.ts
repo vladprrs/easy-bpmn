@@ -109,6 +109,7 @@ import {
   timerHasFired,
 } from "./boundary-timer";
 import { getTimer, timerIdFor } from "../persistence/timers";
+import { driveIntermediateCatch } from "./intermediate-timer";
 
 // Public surface (M3-L0): the node-kind blocks moved to sibling modules, but the
 // engine.ts import path stays the stable façade for every dependent — re-export
@@ -255,6 +256,17 @@ async function loop(
       // frontier would never see it; conversely once applied it must never
       // leak into a later visit of the same (or another) receive task.
       if (r.consumedPending) pending = undefined;
+      cur = r.next;
+      continue;
+    }
+
+    if (node.type === "intermediateCatchEvent") {
+      // M3-L4 (TASK-45): a timer delay on the token path — its OWN visit
+      // occurrence (`timer:el#occ`). Arms + parks; the DO alarm (fireTimer)
+      // claims the `timer_outcomes` decider in the same batch as the advance
+      // down the single outgoing flow, then re-walks here to fast-forward.
+      const r = await driveIntermediateCatch(env, instanceId, graph, cur, occ, node, runStep, waitFor);
+      if (r.kind === "waiting") return { status: "waiting" };
       cur = r.next;
       continue;
     }

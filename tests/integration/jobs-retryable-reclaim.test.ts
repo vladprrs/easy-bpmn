@@ -172,9 +172,14 @@ describe("AC#3 — reclaim exhaustion: lease-expiry alone terminates via the exh
     expect(jf.diagnostics.retryable).toBe(true);
     expect(jf.diagnostics.isCompensation).toBe(false);
 
-    // The exhaustion is terminal: no further lease is handed out.
+    // The exhaustion is terminal: THIS instance's job is never re-leased. Scoped
+    // to instanceId (not an empty-pool assertion) because the worker FIFO lease
+    // pool is workspace-scoped and shared across test files in the pool worker —
+    // a concurrent file's DEMO_BPMN instance parked at its own external-check job
+    // can sit in the same `default`-workspace queue, so a global length-0 check is
+    // a cross-file flake. The instance's own job is already proven `failed` above.
     const reactivate = await authedPost("/jobs/activate", token, { taskType: "external-check", workerId: "w3" });
-    expect(reactivate.body.jobs).toHaveLength(0);
+    expect(reactivate.body.jobs.some((j: any) => j.instanceId === instanceId)).toBe(false);
   });
 });
 

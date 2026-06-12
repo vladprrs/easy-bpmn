@@ -28,6 +28,7 @@ import {
   DEFERRED_GATEWAY_REASONS,
   ERROR_EVENT_DEFINITION,
   ERROR_TYPE,
+  MESSAGE_EVENT_DEFINITION,
   SEQUENCE_FLOW_TYPE,
   SUPPORTED_NODE_TYPES,
   TIMER_EVENT_DEFINITION,
@@ -479,6 +480,48 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
           errorRef,
           timerTrigger,
         });
+        continue;
+      }
+
+      // M3-L4 (TASK-45): a TIMER intermediateCatchEvent is a delay step on the
+      // token path (design §4.4) — opened here. A MESSAGE intermediateCatchEvent
+      // and the eventBasedGateway stay rejected with reason `M3 — not yet
+      // implemented` until TASK-46. Event-definition-aware, like the boundary
+      // branch above, so only the timer variant becomes a token node.
+      if ($type === "bpmn:IntermediateCatchEvent") {
+        const { defs, only } = classifyEventDefinition(el);
+        if (only === TIMER_EVENT_DEFINITION) {
+          const result = readTimerTrigger(defs[0] as ModdleElement);
+          if (!result.ok) {
+            err(`Intermediate catch event '${id ?? ""}' ${result.reason}`, id, "intermediateCatchEvent");
+          }
+          nodes.push({
+            id: id ?? "",
+            type: "intermediateCatchEvent",
+            name: (el.name as string) ?? undefined,
+            scopeId,
+            timerTrigger: result.ok ? result.trigger : undefined,
+          });
+          continue;
+        }
+        if (only === MESSAGE_EVENT_DEFINITION) {
+          err(
+            `Intermediate catch event '${id ?? ""}' carries a messageEventDefinition. Message intermediate catch events are accepted in constitution v2.2.0 but their runtime is not yet implemented (M3 — not yet implemented); use a timer intermediate catch, or a receiveTask.`,
+            id,
+            "intermediateCatchEvent",
+          );
+          continue;
+        }
+        const what = defs.length === 0
+          ? "no event definition"
+          : defs.length > 1
+            ? "multiple event definitions"
+            : `a ${localTypeName(defs[0]!.$type)}`;
+        err(
+          `Intermediate catch event '${id ?? ""}' has ${what}. Only a timer intermediate catch (a single timerEventDefinition) is supported; the message intermediate catch is accepted in v2.2.0 but not yet implemented (M3 — not yet implemented).`,
+          id,
+          "intermediateCatchEvent",
+        );
         continue;
       }
 
@@ -1105,6 +1148,26 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Intermediate timer catch degree (M3-L4, TASK-45, design §4.4): exactly ONE
+  // incoming and ONE outgoing sequence flow. A timer catch is a single-token
+  // delay, never a join. The per-scope linearity rules above already reject 0
+  // incoming (unreachable), 0 outgoing (no successor), and >1 outgoing (implicit
+  // split) with element id + reason; only the >1-incoming JOIN is added here.
+  // -------------------------------------------------------------------------
+  for (const n of nodes) {
+    if (n.type !== "intermediateCatchEvent") continue;
+    const inc = incoming.get(n.id) ?? [];
+    if (inc.length > 1) {
+      err(
+        `Intermediate catch event '${n.id}' has ${inc.length} incoming sequence flows; exactly one is required ` +
+          "(a timer catch is a single-token delay on the token path, not a join).",
+        n.id,
+        "intermediateCatchEvent",
+      );
+    }
+  }
+
   // Compensation handlers must live inside a transaction.
   for (const n of nodes) {
     if (isHandler(n) && scopeKindOf.get(n.scopeId) !== "transaction") {
@@ -1213,6 +1276,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         scopeId: n.scopeId === processId ? null : n.scopeId,
       };
       if (n.type === "serviceTask") node.isForCompensation = n.isForCompensation === true;
+      if (n.type === "intermediateCatchEvent") node.timerTrigger = n.timerTrigger ?? null; // M3-L4: the static ISO-8601 delay
       if (n.type === "endEvent") node.endKind = n.endKind ?? "none";
       if (n.type === "boundaryEvent") {
         node.boundaryKind = n.boundaryKind ?? null;

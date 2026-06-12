@@ -16,6 +16,11 @@ export const SUPPORTED_NODE_TYPES: Record<string, NodeType> = {
   // carry FEEL conditions + an optional gateway-owned default; the validator
   // enforces the split/default/condition rules (validator.ts).
   "bpmn:ExclusiveGateway": "exclusiveGateway",
+  // M3-L4 (TASK-45): a TIMER intermediateCatchEvent is a delay step on the token
+  // path. The validator handles it in its own branch (event-definition aware:
+  // timer opens here, message stays "M3 — not yet implemented") before this
+  // lookup, so this entry is the type mapping, not the accept gate.
+  "bpmn:IntermediateCatchEvent": "intermediateCatchEvent",
 };
 
 export const SEQUENCE_FLOW_TYPE = "bpmn:SequenceFlow";
@@ -49,6 +54,8 @@ export const ERROR_EVENT_DEFINITION = "bpmn:ErrorEventDefinition";
 export const CANCEL_EVENT_DEFINITION = "bpmn:CancelEventDefinition";
 /** M3-L3: an interrupting boundary timer carries a single timerEventDefinition. */
 export const TIMER_EVENT_DEFINITION = "bpmn:TimerEventDefinition";
+/** M3-L4: a message intermediate catch / EBG message branch carries this (still M3 — not yet implemented). */
+export const MESSAGE_EVENT_DEFINITION = "bpmn:MessageEventDefinition";
 
 /** Human-friendly element type name, e.g. "bpmn:UserTask" → "userTask". */
 export function localTypeName($type: string): string {
@@ -84,4 +91,16 @@ export function workflowEventTypeFor(messageName: string): string {
 export function workflowJobEventTypeFor(jobId: string): string {
   const safe = jobId.replace(/[^A-Za-z0-9_-]/g, "_");
   return `bpmn_job_${safe}`.slice(0, 100);
+}
+
+/**
+ * Workflow event type a timer intermediateCatchEvent waits on (M3-L4, design
+ * §4.1/§4.4): a PER-VISIT type derived from `elementId#occurrence` through the
+ * SAME sanitizer (dot-free, ≤100 chars). Applied symmetrically at the catch's
+ * park-wait and at `fireTimer`'s `sendEvent` wake, so the derived type always
+ * matches. Each visit (occurrence) of a cyclic catch gets its own event type.
+ */
+export function workflowTimerEventTypeFor(elementId: string, occurrence: number): string {
+  const safe = `${elementId}#${occurrence}`.replace(/[^A-Za-z0-9_-]/g, "_");
+  return `bpmn_timer_${safe}`.slice(0, 100);
 }

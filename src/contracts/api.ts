@@ -136,7 +136,9 @@ export interface BpmnElement {
     | "association"
     | "error"
     // M2 conditional sagas:
-    | "exclusiveGateway";
+    | "exclusiveGateway"
+    // M3 time & failure taxonomy — a timer delay on the token path (M3-L4):
+    | "intermediateCatchEvent";
   name?: string | null;
   taskType?: string | null;
   messageName?: string | null;

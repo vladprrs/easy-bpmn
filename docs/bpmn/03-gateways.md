@@ -14,7 +14,7 @@ has multiple incoming flows. The same element type is used for both — meaning 
 | **Exclusive (XOR)** | `X` (or empty diamond) | `exclusiveGateway` | Take **exactly one** outgoing flow — the first whose condition is true (else the `default`). | Pass through each arriving token immediately (no waiting). |
 | **Parallel (AND)** | `+` | `parallelGateway` | Take **all** outgoing flows (fork). | **Wait** for a token on *every* incoming flow, then emit one (synchronize). |
 | **Inclusive (OR)** | `O` (circle) | `inclusiveGateway` | Take **all** outgoing flows whose condition is true (≥1; else `default`). | Wait for all tokens that *could still arrive* on incoming flows, then merge. |
-| **Event-based** | pentagon in double circle | `eventBasedGateway` | **Defer**: wait, then take the path of whichever **event** happens *first*. | (Used as a split only.) |
+| **Event-based** | pentagon in double circle | `eventBasedGateway` | **Supported (M3-L4)**: wait, then take the path of whichever **event** (message catch / timer) happens *first*. | (Used as a split only; ≤1 timer branch.) |
 | **Complex** | `*` | `complexGateway` | Custom split/merge via an `activationCondition` expression. | Custom synchronization. Rarely used; poorly supported. |
 
 ### Exclusive (XOR) — `exclusiveGateway`
@@ -102,15 +102,15 @@ Conditions live **only** on flows leaving an `exclusiveGateway`: a `conditionExp
 flow (the "conditional sequence flow from a task" pattern above) and any implicit split (>1 outgoing
 flow on a non-gateway node) are still **rejected** before publish with element id + reason.
 
-The other four gateway types remain out of scope, each rejected before publish with a user-visible
-reason and its roadmap pointer (kept in lockstep with `DEFERRED_GATEWAY_REASONS` in
-`src/bpmn/profile.ts`):
+Of the other gateway types, `eventBasedGateway` is **supported since M3-L4** (the timer/message race,
+below); the remaining three stay out of scope, each rejected before publish with a user-visible reason
+and its roadmap pointer (kept in lockstep with `DEFERRED_GATEWAY_REASONS` in `src/bpmn/profile.ts`):
 
 | Gateway | Status |
 |---------|--------|
 | `parallelGateway` | Deferred to **M4** (concurrency) — AND-splits need multiple concurrent tokens. |
 | `inclusiveGateway` | Deferred to **M4** (concurrency) — OR-splits activate multiple branches at once. |
-| `eventBasedGateway` | Deferred to **M3** (timers & events) — routes on the first event to occur. |
+| `eventBasedGateway` | **Supported since M3-L4** (TASK-46) — races timer/message branch catches and routes on the first event to occur (≥2 branches, every target a single-incoming intermediate catch, ≤1 timer branch, distinct messages). |
 | `complexGateway` | Not on the roadmap; deferred to a later milestone. |
 
 See [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md) for the full profile (validation rules,

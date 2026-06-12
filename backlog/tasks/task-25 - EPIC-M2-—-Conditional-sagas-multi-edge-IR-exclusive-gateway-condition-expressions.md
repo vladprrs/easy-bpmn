@@ -3,10 +3,10 @@ id: TASK-25
 title: >-
   EPIC M2 — Conditional sagas (multi-edge IR, exclusive gateway, condition
   expressions)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-08 08:18'
-updated_date: '2026-06-09 20:31'
+updated_date: '2026-06-11 17:20'
 labels:
   - epic
   - saga
@@ -38,7 +38,7 @@ Epic placeholder for milestone M2 (design §8). Add data-driven branching to the
 <!-- AC:BEGIN -->
 - [x] #1 A follow-up brainstorming/spec pass slices M2 into concrete tasks before implementation starts.
 - [x] #2 The FEEL-vs-restricted-evaluator decision (design §9) is resolved and recorded before M2 implementation.
-- [ ] #3 Branch decisions are persisted in gateway_decisions and replay-deterministic (acceptance defined per concrete task).
+- [x] #3 Branch decisions are persisted in gateway_decisions and replay-deterministic (acceptance defined per concrete task).
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -55,3 +55,9 @@ created: 2026-06-09 20:31
 M2 sliced into TASK-29..TASK-37 (2026-06-09). Expression language resolved: FEEL via feelin. Scope expansion vs the original §8 row: cycles are in (user decision), which adds the occurrence discriminator + rewalk-resume work (TASK-32) and lifts M2 from L toward XL.
 ---
 <!-- COMMENTS:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+M2 shipped to production (bpmn.rntme.com) 2026-06-11: exclusiveGateway + FEEL (feelin) + default flows + token-path cycles on the rewalk/occurrence engine, constitution 2.1.0, migrations 0004+0005 (merge commit cf5c186). AC#3 (gateway_decisions persistence + deterministic replay) was delivered by TASK-34 and is exercised by the M2 quickstart gates. Epic closed during M3 planning (the design doc's backlog-hygiene item, docs/superpowers/specs/2026-06-11-m3-time-failure-taxonomy-design.md §8): all M2 tasks TASK-29..TASK-37 are Done.
+<!-- SECTION:FINAL_SUMMARY:END -->

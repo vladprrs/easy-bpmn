@@ -1,4 +1,4 @@
-# Runtime Contracts: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas)
+# Runtime Contracts: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas; M3 — Time & failure taxonomy)
 
 These contracts extend `specs/001-bpmn-lite-orchestrator-mvp/contracts/runtime-contracts.md`. The
 Process Workflow, Receive Task, Correlation Broker, and D1 Persistence contracts from the MVP carry
@@ -111,11 +111,13 @@ A per-`taskType` Durable Object is **not** required for M1.
 { "lockToken": "lt_abc", "reason": "shipping carrier rejected", "errorCode": "SHIPPING_REJECTED" }
 ```
 
-> **`retryable` is advisory and IGNORED server-side.** The schema accepts it (compatibility), but
-> the server derives the outcome exclusively from `errorCode` (present → business failure, never
-> retried) or the retry budget (`attempt_count < retries` → technical re-lease; exhausted →
-> terminal). A worker cannot force or suppress a retry via `retryable`. (M3 candidate: honor or
-> drop the field.)
+> **`retryable` is HONORED server-side (M3, TASK-40).** For a technical failure (no `errorCode`):
+> omitted/`true` → normal backoff retry until the budget (`attempt_count < retries`) exhausts;
+> `false` → **immediate exhaustion** — the worker declares the failure permanent, so remaining
+> technical retries are skipped and the job goes straight to the terminal exhaustion path. It is
+> ignored when `errorCode` is present (a business failure is never retried). **Behavior change:** a
+> worker already sending `retryable=false` (legal and ignored before M3) now short-circuits its
+> remaining retries instead of being re-leased — called out in the openapi delta / release note.
 
 `complete`/`fail` are `lock_token`-conditional updates (`… WHERE job_id=? AND lock_token=?`) that
 rotate/clear the token:
@@ -139,17 +141,20 @@ rotate/clear the token:
 
 ## Failure Taxonomy
 
-- **Technical failure** — a `fail` with **no `errorCode`** (the body's `retryable` field is
-  advisory/ignored — see above), or a lease-expiry reclaim: the job
+- **Technical failure** — a `fail` with **no `errorCode`** and `retryable` omitted/`true` (see
+  above), or a lease-expiry reclaim with retries remaining: the job
   is **parked behind an exponential-with-full-jitter backoff** (`status='locked'`, `lock_token=NULL`,
   `lock_expires_at = now + computeBackoffMs(attempt)`), so the activate gate re-leases it only after
   the delay — reusing the lease gate without a new column, and **distinct from the lease duration**
   (`leaseMs` bounds one in-flight attempt; backoff spaces attempts apart). A **lease-expiry reclaim**
   (a held lock that lapsed, i.e. a crashed/slow worker) is parked the same way by the activate
-  reclaim pre-pass before it can be re-handed (so reclaims are spaced, not instant). Counts against
-  `retries` via the explicit `/jobs/fail` path. (Terminating a job that exhausts its budget purely
-  through repeated lease-expiry — never an explicit `/jobs/fail` — is a per-step timeout, deferred to
-  **M3**; M1 only spaces such reclaims.)
+  reclaim pre-pass before it can be re-handed (so reclaims are spaced, not instant), each re-lease
+  counting against `retries`. **Exhaustion routes to the terminal exhaustion path regardless of how
+  the budget was spent** (M3, TASK-40): an explicit `/jobs/fail` (or one with `retryable=false`,
+  which exhausts immediately) AND a pure lease-expiry reclaim that reaches `attempt_count >= retries`
+  both terminate via the same path — the reclaim pre-pass flips the lapsed lease to `failed` (guarded
+  on the lapsed-lease predicate, no worker token) and delivers `{outcome:'failed', errorCode:null}`,
+  so a job exhausted purely through lease expiry no longer retries forever.
   Defaults (`src/runtime/retry-policy.ts`): **`baseMs=1000`, `factor=2`, `maxBackoffMs=30_000`**;
   `computeBackoffMs(n) = round(rand() · min(maxBackoffMs, baseMs·factor^(n-1)))`. Exhaustion
   **inside** a transaction is a **Hazard** → terminal incident (`kind=serviceTaskFailure`); an
@@ -160,7 +165,7 @@ rotate/clear the token:
   `JobScheduler` Durable Object alarm armed at job creation fires at expiry, re-reads D1, and if the
   job is still un-leased (`status='created' AND attempt_count=0`) routes a synthetic
   `{ outcome:'failed', retryable:false, kind:'timeout', reason:'un-leasable' }` → terminal incident
-  `kind=timeout` + a `jobActivationExpired` history event. A progressed/late/duplicate alarm is an
+  `kind=jobActivationTimeout` + a `jobActivationExpired` history event. A progressed/late/duplicate alarm is an
   idempotent no-op. **Never** compensates.
 - **Poison job** — a worker that **completes** with output that cannot be applied (the MERGE into
   instance variables would breach the ~1 MiB event-payload limit) is re-opened up to
@@ -170,13 +175,20 @@ rotate/clear the token:
   does not consume the poison budget. (Those strike rows persist across an operator `/retry`, so a
   retry does not grant a fresh poison budget.) The instance does **NOT** enter `compensating` and
   **no** compensation jobs are created.
-- **Business error** — `fail` with an `errorCode` matching a model `bpmn:error/@errorCode`: not
-  retried; raises that BPMN error → caught by the matching error boundary (`errorRef →
-  bpmn:error/@id`) → routed to the cancel end event → transaction cancels → compensation.
+- **Business error** — `fail` with an `errorCode`: not retried; raises that BPMN error → matched
+  against the activity's interrupting error boundaries by **exact `@errorCode`** → else a catch-all
+  boundary → else **Hazard**. The matched boundary's outgoing flow routes the token to any token-path
+  node in the scope (M3 free routing; routing to a cancel end event triggers the transaction's
+  cancel → compensation, the canonical M1 shape). See the M3 Timer/Race-Decider/Failure-Taxonomy
+  contract below.
+- **Un-guarded wait cap / hard condition error** — an un-guarded service-task or receive-task wait
+  hitting the 1-hour safety-net cap raises **`kind=waitTimeout`** (the M3 split of the overloaded
+  `timeout`); a hard FEEL evaluation error raises **`kind=conditionFailure`**. A wait guarded by a
+  modeled timer never raises `waitTimeout`.
 
 `errorRef`/boundary catching is by the Error's **`@id`** (QName); the worker's `fail.errorCode`
-matches the Error's **`@errorCode`** (wire value). Richer error catalogs and per-error routing beyond
-cancel are M3.
+matches the Error's **`@errorCode`** (wire value). Multi-boundary + catch-all routing and richer
+incident kinds shipped in M3 (Constitution v2.2.0).
 
 ## Compensation Contract
 
@@ -288,6 +300,61 @@ deliberately.
   compensation job inheriting its forward occurrence and seeded with **its own** iteration's
   `originalInput` + `capturedOutput`. `compensationStarted`/`compensationCompleted` carry the
   `occurrence` in diagnostics.
+
+## Timer, Race-Decider & Failure-Taxonomy Contract (M3 — timers + eventBasedGateway + error routing)
+
+Design: `docs/superpowers/specs/2026-06-11-m3-time-failure-taxonomy-design.md`. Constitution v2.2.0.
+
+**The `/jobs/*` worker surface is UNCHANGED** (still pinned by `tests/contract/jobs-schema-pin.test.ts`);
+the only behavior change on the surface is that **`retryable` is now honored** (see Failure
+Taxonomy). Model timers, `eventBasedGateway`, intermediate catch events, and free error routing are
+all standard BPMN — no new extension binding.
+
+**Rules**:
+
+- **Arming (persist-before-advance).** A timer row is written `INSERT OR IGNORE` in the **same
+  `dbBatch`** as the wait it guards (the `svc-create` job batch, the subscription-registration
+  batch, or the catch/EBG park batch), paired with the `timerArmed` history row on first arm only;
+  `fire_at` is computed once in code (`timeDate` as-is; `now + timeDuration`) and snapshotted. A
+  rewalk revisiting an `armed` row is a write-free re-park that idempotently re-arms the DO alarm
+  (self-healing).
+- **One deciding row per race, plain-INSERT, in the transition batch.** Boundary / intermediate-catch
+  timers decide on a `timer_outcomes` row; `eventBasedGateway` timers decide on `gateway_decisions`
+  (no `timer_outcomes` row). The decider is a **plain `INSERT`** (never `INSERT OR IGNORE`) composed
+  into the same `dbBatch` as the loser-visible transition, so a losing contender's **whole batch
+  aborts** on the unique-constraint violation and converts to the recorded outcome. This is the
+  normative `src/persistence/gateway-decisions.ts` contract; it holds in **both** execution modes
+  (Workflow first-event-wins memoization is a second guard, not the primary one).
+- **Fire** (`alarm → fireTimer(timerId)`): re-read D1 → no-op unless the instance is non-terminal,
+  the row is `armed` with `fire_at <= now`, **and** the timer's visit is still the instance's current
+  wait. Then one batch = the decider claim (`fired`) + `status → fired` + abandon the in-flight job /
+  supersede the active subscription (status-conditional; a late worker `complete`/`fail` or publish
+  gets the stable superseded/buffered no-op) + `timerFired` history + the transition out of the wait.
+  A fired model timer is **never** an incident.
+- **Every abnormal exit settles the timer.** Normal completion, error-boundary route, retry
+  exhaustion, and operator `/cancel` each carry a plain `INSERT … 'cancelled'` decider + the
+  `armed → cancelled` flip, so a stray alarm afterwards no-ops (no mid-compensation firing). DO
+  disarm is best-effort.
+- **`eventBasedGateway` decides on `gateway_decisions`.** Token arrival registers occurrence-keyed
+  subscriptions for every message branch + a timer row for the timer branch (best-effort broker
+  registrations after the batch, re-registered idempotently on rewalk). Each EBG-branch subscription
+  stores the **gateway visit's** wake event type in the existing
+  `message_subscriptions.workflow_event_type` column — the delivery path **honors the stored value**
+  instead of re-deriving it from the message name (the symmetry contract is relaxed for EBG
+  subscriptions). Message wins / timer wins / early-buffered-message-at-registration / two buffered
+  branches (model-document-order first hit) are all replay-stable via the single decision row.
+- **Free error routing.** An activity may carry multiple interrupting error boundaries with
+  **distinct, non-empty `@errorCode`s** plus at most one catch-all (`errorEventDefinition` without
+  `errorRef`). Matching on a worker `fail` with `errorCode`: exact `@errorCode` → catch-all →
+  (no match) **Hazard** (Constitution VI untouched). The boundary's outgoing flow targets any
+  token-path node in the same scope (the M1 "must target a cancel end" rule is lifted). An error
+  handled by an alternate path inside a transaction leaves the saga ledger untouched — all completed
+  steps stay compensatable until the scope cancels or commits.
+- **Wait cap vs modeled timer.** A wait guarded by an armed modeled timer never raises `waitTimeout`;
+  in Workflow mode its `waitForEvent` timeout is sized to `fire_at` (a 7-day timer costs O(1) steps)
+  and doubles as the lost-alarm backstop — on any wake the engine settles overdue timers
+  (`fire_at <= now`) exactly as the alarm would. Un-guarded waits keep the fixed 1-hour cap →
+  `waitTimeout`.
 
 ## Observability Contract
 

@@ -128,6 +128,21 @@ export class CorrelationBroker extends DurableObject<Env> {
     return { status: "waiting", subscriptionId: req.subscriptionId };
   }
 
+  /**
+   * Supersede the active subscription when a receive-task boundary timer fires
+   * (M3-L3): drop SUB_KEY iff it still belongs to this (instance, element) visit,
+   * so a late publish to this broker key gets the stable buffered/no-match outcome
+   * instead of correlating to the timed-out wait — preserving the
+   * at-most-one-active-subscription invariant. A no-op if a newer subscription (a
+   * different instance/visit) already replaced it.
+   */
+  async supersedeSubscription(instanceId: string, elementId: string): Promise<void> {
+    const existing = await this.ctx.storage.get<StoredSubscription>(SUB_KEY);
+    if (existing && existing.instanceId === instanceId && existing.elementId === elementId) {
+      await this.ctx.storage.delete(SUB_KEY);
+    }
+  }
+
   async publishMessage(req: BrokerPublishRequest): Promise<BrokerPublishResult> {
     await this.expireDue(req.now);
 
@@ -161,6 +176,8 @@ export class CorrelationBroker extends DurableObject<Env> {
         workflowInstanceId: sub.workflowInstanceId,
         elementId: sub.elementId,
         subscriptionId: sub.subscriptionId,
+        // Honor the subscription's STORED wake type on delivery (M3-L4, §4.5).
+        workflowEventType: sub.workflowEventType,
         event: {
           externalMessageId: req.externalMessageId,
           messageName: req.messageName,

@@ -43,17 +43,24 @@
 // the same rewalk — the instance status + the ledger are re-derived from D1
 // each time, so direct-mode resume and crash recovery are the same path.
 // D1 is canonical.
+//
+// M3 (TASK-38, L0) extracts the cohesive node-kind blocks into sibling modules —
+// forward-task.ts (forward Service Task visit), compensation.ts (reverse pass),
+// incidents.ts (terminal/park/incident writes) — plus engine-shared.ts (shared
+// types + loadInst/isTransactionScope). This file is the walk/dispatch core: the
+// rewalk loop, the bookkeeping nodes (start / tx enter / commit), the exclusive
+// gateway, and the Receive Task wait. Behavior-frozen — the extraction changed
+// no step name, history event type, persisted shape, or API response.
 
 import type { Env } from "../env";
 import type { MessageEventPayload } from "../contracts/workflow-events";
-import type { ExecutionGraph, Flow, GraphNode } from "../bpmn/graph";
-import { workflowEventTypeFor, workflowJobEventTypeFor } from "../bpmn/profile";
+import type { ExecutionGraph, Flow, GraphNode, NodeType } from "../bpmn/graph";
+import { workflowEventTypeFor } from "../bpmn/profile";
 import { ExpressionEvaluationError, evaluateCondition, normalizeFeelValue } from "./expressions";
 import { brokerKeyOf, type RegisterSubscriptionResult } from "./broker-types";
 import { MAX_EVENT_PAYLOAD_BYTES, payloadByteSize } from "./payload";
 import {
   ONE_HOUR_MS,
-  isoIsBefore,
   isoPlusMs,
   isTerminalInstanceStatus,
   mergeVariables,
@@ -63,57 +70,54 @@ import {
   traceIdFor,
   type JsonObject,
 } from "../util";
-import { ACTIVATION_TTL_MS, POISON_THRESHOLD } from "./retry-policy";
-import { failUnleasableJobConditional, getJobRowById, reopenJobKeepAttemptStmt } from "../persistence/jobs";
 import { getVersionGraph } from "../persistence/definitions";
 import { dbBatch } from "../persistence/db";
-import { countHistoryEventsOfType, hasHistoryMarkerForOccurrence, historyStmt } from "../persistence/history";
+import { hasHistoryMarkerForOccurrence, historyStmt } from "../persistence/history";
 import {
-  advanceIncidentResolutionStmt,
   applyTransitionStmt,
-  createJobStmt,
-  getCompensationJob,
-  getForwardJob,
-  getInstanceRow,
-  getSubscriptionForVisit,
-  incidentStmt,
-  type InstanceRow,
-  type IncidentKind,
-  type JobRow,
   createSubscription,
-  markFailedJobHandledStmt,
-  markJobOutputAppliedStmt,
+  getSubscriptionForVisit,
   subscriptionConsumedStmt,
-  transitionStatusGuardedStmt,
   variableSnapshotStmt,
 } from "../persistence/instances";
-import {
-  attachCompensationJobStmt,
-  insertSagaStepStmt,
-  markScopeStepsCommittedStmt,
-  selectScopeStepsForCompensation,
-  updateCompensationStatusStmt,
-  type SagaStepView,
-} from "../persistence/saga";
+import { markScopeStepsCommittedStmt } from "../persistence/saga";
 import { messageCorrelatedStmt } from "../persistence/messages";
 import {
   getGatewayDecision,
   insertGatewayDecisionStmt,
   type GatewayFlowEvaluation,
 } from "../persistence/gateway-decisions";
+import {
+  loadInst,
+  isTransactionScope,
+  SVC_WAIT_TIMEOUT,
+  type RunStep,
+  type WaitForEvent,
+  type DriveResult,
+} from "./engine-shared";
+import { createIncident, completeInstance, recordTerminalIncident } from "./incidents";
+import { driveForwardServiceTask, terminateUnleasableJob } from "./forward-task";
+import { beginCompensating, settleAfterCompensation } from "./compensation";
+import {
+  armTimerDO,
+  buildBoundaryArm,
+  buildBoundaryCancelSettle,
+  convertOnFire,
+  settleOverdueBoundaryTimerOnWake,
+  timerBoundaryFor,
+  timerGuardedTimeout,
+  timerHasFired,
+} from "./boundary-timer";
+import { getTimer, timerIdFor } from "../persistence/timers";
+import { driveIntermediateCatch } from "./intermediate-timer";
+import { driveEventBasedGateway } from "./event-gateway";
 
-export type RunStep = <T>(name: string, fn: () => Promise<T>) => Promise<T>;
-export type WaitOutcome = { kind: "event"; payload: unknown } | { kind: "timeout" };
-export type WaitForEvent = (sub: {
-  name: string;
-  workflowEventType: string;
-  timeout: string;
-}) => Promise<WaitOutcome>;
-
-export type DriveStatus = "completed" | "waiting" | "incident";
-export interface DriveResult {
-  status: DriveStatus;
-}
+// Public surface (M3-L0): the node-kind blocks moved to sibling modules, but the
+// engine.ts import path stays the stable façade for every dependent — re-export
+// the shared types and the relocated public helpers so callers need NO edits.
+export type { RunStep, WaitOutcome, WaitForEvent, DriveStatus, DriveResult } from "./engine-shared";
+export { recordTerminalIncident, terminateUnleasableJob };
+export { workflowEventTypeFor };
 
 interface RunOptions {
   runStep: RunStep;
@@ -127,8 +131,6 @@ interface RunOptions {
   startAt?: string;
   incomingEvent?: MessageEventPayload;
 }
-
-const SVC_WAIT_TIMEOUT = "1 hour";
 
 /**
  * Loop-iteration cap (design M2 §5): a walk that would visit the same element
@@ -150,50 +152,11 @@ function nextOccurrence(visits: Map<string, number>, elementId: string): number 
   return occ;
 }
 
-async function loadInst(env: Env, instanceId: string): Promise<InstanceRow> {
-  const row = await getInstanceRow(env.DB, instanceId);
-  if (!row) throw new Error(`Process instance ${instanceId} not found`);
-  return row;
-}
-
 export async function loadGraphForInstance(env: Env, instanceId: string): Promise<ExecutionGraph> {
   const inst = await loadInst(env, instanceId);
   const graph = await getVersionGraph(env.DB, inst.definition_version_id);
   if (!graph) throw new Error(`Definition version ${inst.definition_version_id} has no parsed profile`);
   return graph;
-}
-
-// ---------------------------------------------------------------------------
-// Graph helpers
-// ---------------------------------------------------------------------------
-
-function isTransactionScope(graph: ExecutionGraph, scopeId: string | null | undefined): scopeId is string {
-  return !!scopeId && graph.nodes[scopeId]?.type === "transaction";
-}
-
-/** The cancel end target an error boundary on `elementId` routes to, matching errorCode. */
-function errorBoundaryTarget(graph: ExecutionGraph, elementId: string, errorCode: string | null): string | null {
-  for (const [, node] of Object.entries(graph.nodes)) {
-    if (
-      node.type === "boundaryEvent" &&
-      node.boundaryKind === "error" &&
-      node.attachedToRef === elementId &&
-      (errorCode == null || node.errorCode === errorCode)
-    ) {
-      return node.next ?? null;
-    }
-  }
-  return null;
-}
-
-/** The failure-path target of the cancel boundary attached to transaction `scopeId`. */
-function cancelBoundaryTarget(graph: ExecutionGraph, scopeId: string): string | null {
-  for (const [, node] of Object.entries(graph.nodes)) {
-    if (node.type === "boundaryEvent" && node.boundaryKind === "cancel" && node.attachedToRef === scopeId) {
-      return node.next ?? null;
-    }
-  }
-  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +249,7 @@ async function loop(
     }
 
     if (node.type === "receiveTask") {
-      const r = await driveReceiveTask(env, instanceId, cur, occ, node, runStep, waitFor, pending);
+      const r = await driveReceiveTask(env, instanceId, graph, cur, occ, node, runStep, waitFor, pending);
       if (r.kind === "waiting") return { status: "waiting" };
       if (r.kind === "incident") return { status: "incident" };
       // The delivered event is consumed at the LIVE visit only — a consumed
@@ -294,6 +257,34 @@ async function loop(
       // frontier would never see it; conversely once applied it must never
       // leak into a later visit of the same (or another) receive task.
       if (r.consumedPending) pending = undefined;
+      cur = r.next;
+      continue;
+    }
+
+    if (node.type === "intermediateCatchEvent") {
+      if (node.messageName) {
+        // M3-L4 (TASK-46): a STANDALONE message intermediate catch — IDENTICAL
+        // wait/correlation/resume semantics to a receiveTask, so it is driven by
+        // the SAME driveReceiveTask path (registerReceive/applyMessage — the
+        // subscription/correlation/broker machinery, NOT a parallel copy). It is
+        // an EVENT: the validator guarantees no boundary timer attaches, so
+        // driveReceiveTask's timer-boundary branches are inert (timerBoundaryFor
+        // → null). Occurrence keying + the atomic apply + duplicate-publish dedup
+        // are all inherited unchanged.
+        const r = await driveReceiveTask(env, instanceId, graph, cur, occ, node, runStep, waitFor, pending);
+        if (r.kind === "waiting") return { status: "waiting" };
+        if (r.kind === "incident") return { status: "incident" };
+        // Consumed at the LIVE visit only (same as the receiveTask branch).
+        if (r.consumedPending) pending = undefined;
+        cur = r.next;
+        continue;
+      }
+      // M3-L4 (TASK-45): a timer delay on the token path — its OWN visit
+      // occurrence (`timer:el#occ`). Arms + parks; the DO alarm (fireTimer)
+      // claims the `timer_outcomes` decider in the same batch as the advance
+      // down the single outgoing flow, then re-walks here to fast-forward.
+      const r = await driveIntermediateCatch(env, instanceId, graph, cur, occ, node, runStep, waitFor);
+      if (r.kind === "waiting") return { status: "waiting" };
       cur = r.next;
       continue;
     }
@@ -307,6 +298,21 @@ async function loop(
       // short-circuit on the memoized step name).
       const r = await runStep(`gw:${tag}`, () => decideGateway(env, instanceId, cur, occ, node));
       if (r.kind === "incident") return { status: "incident" };
+      cur = r.next;
+      continue;
+    }
+
+    if (node.type === "eventBasedGateway") {
+      // M3-L4 (TASK-46): the timer/message race. Like the XOR gateway, branch
+      // selection owns the successor and the recorded gateway_decisions row is the
+      // fast-forward predicate — but the decision is claimed by a CONCURRENT writer
+      // (broker message apply vs fireTimer), not check-first. The winning branch's
+      // catch is never re-dispatched: the EBG advances straight to the catch's
+      // single outgoing flow. Reuses the SAME `pending` consume rule as receiveTask.
+      const r = await driveEventBasedGateway(env, instanceId, graph, cur, occ, node, runStep, waitFor, pending);
+      if (r.kind === "waiting") return { status: "waiting" };
+      if (r.kind === "incident") return { status: "incident" };
+      if (r.consumedPending) pending = undefined;
       cur = r.next;
       continue;
     }
@@ -346,388 +352,7 @@ async function loop(
 }
 
 // ---------------------------------------------------------------------------
-// Forward Service Task as a durable pull wait
-// ---------------------------------------------------------------------------
-
-type ForwardOutcome = { kind: "next"; next: string } | { kind: "waiting" } | { kind: "incident" };
-
-/**
- * Write-free fast-forward predicate for a forward Service Task visit
- * (design M2 §5): once a job's terminal outcome has been APPLIED to the
- * instance (output_applied=1, set in the same dbBatch as the advance), the
- * rewalk derives the successor purely from graph + persisted job state —
- * a completed job advances on `node.next`; a business failure re-derives the
- * SAME deterministic boundary target from the persisted error_code. Returns
- * null when the visit still needs driving (the frontier).
- */
-function appliedForwardOutcome(
-  graph: ExecutionGraph,
-  elementId: string,
-  node: GraphNode,
-  job: JobRow | null,
-): ForwardOutcome | null {
-  if (!job || job.output_applied !== 1) return null;
-  if (job.status === "completed") return { kind: "next", next: node.next! };
-  if (job.status === "failed" && job.error_code) {
-    const target = errorBoundaryTarget(graph, elementId, job.error_code);
-    if (target) return { kind: "next", next: target };
-  }
-  // Defensive — unreachable by construction: output_applied=1 is only ever set
-  // on a completed apply or a business-routed failure (whose boundary target is
-  // re-derivable from the immutable graph). Returning a zero-write outcome here
-  // would zombify the instance silently; throw instead so workflow mode lands
-  // in the process-workflow catch-all (recordTerminalIncident) and direct mode
-  // surfaces the broken invariant to the caller.
-  throw new Error(
-    `Invariant violation: job ${job.job_id} (element ${elementId}, occurrence ${job.occurrence}) is marked ` +
-      `output_applied but is '${job.status}' with error_code ${job.error_code ? `'${job.error_code}' (no matching error boundary in the graph)` : "NULL"} — no successor can be derived.`,
-  );
-}
-
-async function driveForwardServiceTask(
-  env: Env,
-  instanceId: string,
-  graph: ExecutionGraph,
-  elementId: string,
-  occ: number,
-  node: GraphNode,
-  runStep: RunStep,
-  waitFor: WaitForEvent | null,
-): Promise<ForwardOutcome> {
-  const tag = `${elementId}#${occ}`;
-  let job = await getForwardJob(env.DB, instanceId, elementId, occ);
-
-  // Already applied → pure in-memory cursor move, NO writes, NO step.
-  const applied = appliedForwardOutcome(graph, elementId, node, job);
-  if (applied) return applied;
-
-  if (job?.status === "completed") {
-    return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, job!));
-  }
-  if (job?.status === "failed") {
-    return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, job!));
-  }
-
-  if (!job) {
-    job = await runStep(`svc-create:${tag}`, () => createForwardJob(env, instanceId, elementId, occ, node));
-    if (!job) return { kind: "incident" }; // oversized input → incident already recorded
-  }
-
-  // Park (direct mode) — the instance resumes by re-running once the worker's
-  // complete/fail mutates the job in D1.
-  if (!waitFor) {
-    await runStep(`svc-park:${tag}`, () => parkWaiting(env, instanceId, elementId, "serviceTask"));
-    return { kind: "waiting" };
-  }
-
-  // Suspend (workflow mode) — re-lease drives retries within this single wait.
-  const outcome = await waitFor({
-    name: `wait-job:${tag}`,
-    workflowEventType: workflowJobEventTypeFor(job.job_id),
-    timeout: SVC_WAIT_TIMEOUT,
-  });
-  // D1 is canonical: re-read the job whether we woke on the event OR on a timeout.
-  // A lost wake-up event (swallowed sendEvent, isolate eviction) for an already
-  // terminal job must be applied here, not masked as a spurious timeout incident.
-  const fresh = (await getForwardJob(env.DB, instanceId, elementId, occ)) ?? job;
-  // A concurrent inline drive may have applied the outcome while we waited.
-  const appliedMeanwhile = appliedForwardOutcome(graph, elementId, node, fresh);
-  if (appliedMeanwhile) return appliedMeanwhile;
-  if (fresh.status === "completed") {
-    return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, fresh));
-  }
-  if (fresh.status === "failed") {
-    return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, fresh));
-  }
-  if (outcome.kind === "timeout") {
-    // A genuine timeout: nobody completed the job (still created/locked).
-    return runStep(`svc-timeout:${tag}`, () =>
-      createIncident(env, instanceId, elementId, node.retries ?? 1, "Service Task timed out waiting for a worker.", { jobId: fresh.job_id }, "timeout"),
-    );
-  }
-  // Defensive: event arrived but job is not terminal — treat as a technical incident.
-  return runStep(`svc-stuck:${tag}`, () =>
-    createIncident(env, instanceId, elementId, fresh.attempt_count, "Service Task resumed with a non-terminal job.", { jobId: fresh.job_id }, "serviceTaskFailure"),
-  );
-}
-
-async function createForwardJob(env: Env, instanceId: string, elementId: string, occ: number, node: GraphNode): Promise<JobRow | null> {
-  // Idempotent re-run (Workflow step retry after a committed batch): this
-  // iteration's row already exists → return it, never re-insert (the unique
-  // index on (instance, element, kind, occurrence) would reject anyway).
-  const existing = await getForwardJob(env.DB, instanceId, elementId, occ);
-  if (existing) return existing;
-
-  const inst = await loadInst(env, instanceId);
-  const variables = parseJson<JsonObject>(inst.variables, {});
-  if (payloadByteSize(variables) > MAX_EVENT_PAYLOAD_BYTES) {
-    await createIncident(env, instanceId, elementId, 0, "Service Task input variables exceed the Workflow event payload limit.", { size: payloadByteSize(variables) }, "serviceTaskFailure");
-    return null;
-  }
-  const jobId = newId("job");
-  const taskType = node.taskType ?? "";
-  const now = nowIso();
-  // Un-leasable-job DLQ (§4.2): a forward job nobody leases within ACTIVATION_TTL_MS
-  // is parked in a DLQ via a per-job JobScheduler alarm armed below.
-  const activationExpiresAt = isoPlusMs(now, ACTIVATION_TTL_MS);
-  await dbBatch(env.DB, [
-    historyStmt(env.DB, {
-      workspaceId: inst.workspace_id,
-      instanceId,
-      elementId,
-      type: "elementEntered",
-      diagnostics: { elementType: "serviceTask", taskType, occurrence: occ },
-    }),
-    createJobStmt(env.DB, {
-      jobId,
-      instanceId,
-      elementId,
-      taskType,
-      retryLimit: Math.max(1, node.retries ?? 1),
-      idempotencyKey: `${instanceId}:${elementId}:0:${occ}`,
-      inputVariables: variables,
-      workspaceId: inst.workspace_id,
-      isCompensation: false,
-      activationExpiresAt,
-      occurrence: occ,
-      now,
-    }),
-    historyStmt(env.DB, {
-      workspaceId: inst.workspace_id,
-      instanceId,
-      elementId,
-      type: "serviceTaskJobCreated",
-      diagnostics: { jobId, taskType, retryLimit: Math.max(1, node.retries ?? 1), activationExpiresAt, occurrence: occ },
-    }),
-  ]);
-  await armJobScheduler(env, jobId, activationExpiresAt);
-  return getForwardJob(env.DB, instanceId, elementId, occ);
-}
-
-/**
- * Arm the per-job DLQ alarm (§4.2). Best-effort + non-fatal: the DLQ is a safety
- * net, never on the job-creation critical path, so a DO hiccup must not fail
- * job creation (it just leaves that job without a timeout, as M0 did for all jobs).
- */
-async function armJobScheduler(env: Env, jobId: string, activationExpiresAt: string): Promise<void> {
-  try {
-    const stub = env.JOB_SCHEDULER.get(env.JOB_SCHEDULER.idFromName(jobId));
-    await stub.arm(jobId, activationExpiresAt);
-  } catch (err) {
-    console.error(JSON.stringify({ level: "warn", message: "JobScheduler arm failed", jobId, error: err instanceof Error ? err.message : String(err) }));
-  }
-}
-
-/**
- * DLQ termination (§4.2), invoked by the JobScheduler alarm at activation_expires_at.
- * D1 is canonical — the DO holds no authoritative state — so this re-reads the job
- * and only acts if it is STILL an un-leased, expired forward job on a non-terminal
- * instance. Otherwise (progressed / already settled / late-or-duplicate alarm) it
- * is an idempotent no-op. The terminal incident kind='timeout' is written directly
- * (never falling through to the process-workflow.ts catch-all), so the DLQ outcome
- * is assertable in direct mode without a live Workflow.
- */
-export async function terminateUnleasableJob(env: Env, jobId: string): Promise<void> {
-  const job = await getJobRowById(env.DB, jobId);
-  if (!job || job.is_compensation === 1) return;
-  if (!(job.status === "created" && job.attempt_count === 0)) return; // leased/completed/failed → no-op
-  const now = nowIso();
-  if (!job.activation_expires_at || isoIsBefore(now, job.activation_expires_at)) return; // not yet expired (early/spurious alarm)
-
-  const inst = await getInstanceRow(env.DB, job.instance_id);
-  if (!inst || isTerminalInstanceStatus(inst.status) || inst.status === "compensating") return;
-
-  // Atomic claim: only ONE of {this DLQ pass, a concurrent /jobs/activate, a worker
-  // completing} can flip created→failed. If the job was leased/advanced in the
-  // window since our re-read, this matches 0 rows and we no-op — never clobbering
-  // an in-flight or already-advanced job (the TOCTOU). This is the race gate; its
-  // result must be checked, so it is the one write outside the settle batch.
-  const claimed = await failUnleasableJobConditional(env.DB, jobId, now);
-  if (claimed === 0) return;
-
-  // Settle the instance ATOMICALLY: the guarded transition + incident + history go
-  // in ONE dbBatch, so an 'incident' status can never exist without its incident
-  // row (chosen over a non-atomic transition-then-incident, which could strand a
-  // terminal 'incident' with no incident row on a partial failure). The transition
-  // is GUARDED (only running/waiting → incident) so a concurrent cancel that already
-  // moved the instance is never regressed (one-way status table). Tradeoff: a 0-row
-  // guarded UPDATE is not a batch error, so in that rare lost-cancel race the
-  // incident + history rows still commit — the incident OBJECT stays hidden
-  // (inspection fetches it only when status='incident') but the jobActivationExpired
-  // / incidentCreated HISTORY events remain visible. Accepted as minor audit noise
-  // (no state/remediation impact) over the worse corrupt-terminal alternative.
-  const incidentId = newId("inc");
-  const reason = "Service Task job expired before any worker leased it (un-leasable taskType).";
-  const payloadContext: JsonObject = { reason, jobId, taskType: job.task_type, activationExpiresAt: job.activation_expires_at, dlq: "un-leasable" };
-  await dbBatch(env.DB, [
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId: inst.instance_id, elementId: job.element_id, type: "jobActivationExpired", diagnostics: { jobId, taskType: job.task_type, activationExpiresAt: job.activation_expires_at } }),
-    incidentStmt(env.DB, { incidentId, instanceId: inst.instance_id, elementId: job.element_id, reason, retryCount: 0, kind: "timeout", resolution: "open", payloadContext, now }),
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId: inst.instance_id, elementId: job.element_id, type: "incidentCreated", diagnostics: { incidentId, reason, kind: "timeout", retryCount: 0 }, payloadSnapshot: payloadContext }),
-    transitionStatusGuardedStmt(env.DB, inst.instance_id, ["running", "waiting"], "incident", now),
-  ]);
-}
-
-async function applyForwardCompletion(
-  env: Env,
-  instanceId: string,
-  graph: ExecutionGraph,
-  elementId: string,
-  occ: number,
-  node: GraphNode,
-  job: JobRow,
-): Promise<ForwardOutcome> {
-  // Apply-once guard (idempotent step body): a Workflow step retry after the
-  // batch below committed must not re-merge the output over newer variables.
-  const live = await getForwardJob(env.DB, instanceId, elementId, occ);
-  const appliedAlready = appliedForwardOutcome(graph, elementId, node, live);
-  if (appliedAlready) return appliedAlready;
-
-  const inst = await loadInst(env, instanceId);
-  const next = node.next!;
-  const input = parseJson<JsonObject>(job.input_variables, {});
-  const output = parseJson<JsonObject>(job.output_variables, {});
-  const merged = mergeVariables(parseJson<JsonObject>(inst.variables, {}), output);
-  const now = nowIso();
-
-  // Poison detection (§4.3): the per-call output already passed the payload limit
-  // at /jobs/complete, but the MERGE into instance variables may still breach it —
-  // an un-applicable completion. Re-open the job up to POISON_THRESHOLD strikes,
-  // then terminate with a DISTINCT kind='poison'. The strike counter is the number
-  // of un-applicable COMPLETIONS (counted from the serviceTaskOutputRejected
-  // history), NOT the lease attempt_count — a technical retry must not consume the
-  // poison budget. Poison NEVER compensates (only a business error → cancel does).
-  //
-  // DECISION (TASK-35, with loops legal): strikes are counted per
-  // (instance, element) ACROSS occurrences — every iteration of a loop shares
-  // ONE poison budget. Deliberate: an element whose completions keep breaching
-  // the merge limit is poisoning the instance regardless of which iteration
-  // produced the output, and should die fast rather than earn a fresh
-  // POISON_THRESHOLD per visit (×1000 under the loop cap). Per-occurrence
-  // budgets are TASK-36+ scope if a real model ever needs them.
-  if (payloadByteSize(merged) > MAX_EVENT_PAYLOAD_BYTES) {
-    const priorRejections = await countHistoryEventsOfType(env.DB, instanceId, elementId, "serviceTaskOutputRejected");
-    const strike = priorRejections + 1;
-    if (strike >= POISON_THRESHOLD) {
-      await historyStmt(env.DB, {
-        workspaceId: inst.workspace_id,
-        instanceId,
-        elementId,
-        type: "poisonJob",
-        diagnostics: { jobId: job.job_id, strikes: strike, mergedSize: payloadByteSize(merged) },
-      }).run();
-      return createIncident(
-        env,
-        instanceId,
-        elementId,
-        strike,
-        `Service Task completed with un-applicable output ${strike} times (merged variables exceed the event payload limit).`,
-        { jobId: job.job_id, mergedSize: payloadByteSize(merged) },
-        "poison",
-      );
-    }
-    // Below threshold → re-open for another attempt and stay parked.
-    await dbBatch(env.DB, [
-      reopenJobKeepAttemptStmt(env.DB, job.job_id, now),
-      historyStmt(env.DB, {
-        workspaceId: inst.workspace_id,
-        instanceId,
-        elementId,
-        type: "serviceTaskOutputRejected",
-        diagnostics: { jobId: job.job_id, strike, mergedSize: payloadByteSize(merged), reason: "merged variables exceed the event payload limit" },
-      }),
-      applyTransitionStmt(env.DB, { instanceId, currentElementId: elementId, status: "waiting", now }),
-    ]);
-    return { kind: "waiting" };
-  }
-
-  const statements: D1PreparedStatement[] = [
-    variableSnapshotStmt(env.DB, { instanceId, source: "serviceTask", sourceId: job.job_id, variables: output, now }),
-    historyStmt(env.DB, {
-      workspaceId: inst.workspace_id,
-      instanceId,
-      elementId,
-      type: "serviceTaskCompleted",
-      diagnostics: { jobId: job.job_id, attempts: job.attempt_count, traceId: traceIdFor(instanceId), occurrence: occ },
-    }),
-    applyTransitionStmt(env.DB, { instanceId, variables: merged, currentElementId: next, status: "running", now }),
-    // The applied marker commits ATOMICALLY with the advance (design M2 §5):
-    // the rewalk treats this visit as write-free fast-forward from here on.
-    markJobOutputAppliedStmt(env.DB, job.job_id, now),
-  ];
-
-  // Ledger write atomic with advance — only for completed compensatable steps in a transaction.
-  if (isTransactionScope(graph, node.scopeId)) {
-    const wiring = graph.transactions?.[node.scopeId!]?.compensations?.[elementId];
-    const handlerNode = wiring ? graph.nodes[wiring.handlerId] : undefined;
-    statements.push(
-      insertSagaStepStmt(env.DB, {
-        stepId: newId("step"),
-        instanceId,
-        scopeId: node.scopeId!,
-        elementId,
-        forwardJobId: job.job_id,
-        capturedInput: input,
-        capturedOutput: output,
-        compensationElementId: wiring?.handlerId ?? null,
-        compensationTaskType: handlerNode?.taskType ?? null,
-        compensationStatus: wiring ? "pending" : "notRequired",
-        traceId: traceIdFor(instanceId),
-        occurrence: occ,
-        now,
-      }),
-    );
-  }
-
-  await dbBatch(env.DB, statements);
-  return { kind: "next", next };
-}
-
-async function handleForwardFailure(
-  env: Env,
-  instanceId: string,
-  graph: ExecutionGraph,
-  elementId: string,
-  occ: number,
-  node: GraphNode,
-  job: JobRow,
-): Promise<ForwardOutcome> {
-  // Route-once guard (idempotent step body): a re-run after the business-error
-  // batch committed fast-forwards to the recorded boundary target instead of
-  // duplicating businessErrorCaught + rewriting the cursor.
-  const live = await getForwardJob(env.DB, instanceId, elementId, occ);
-  const appliedAlready = appliedForwardOutcome(graph, elementId, node, live);
-  if (appliedAlready) return appliedAlready;
-
-  const inst = await loadInst(env, instanceId);
-  if (job.error_code) {
-    // Business error → route to the matching error boundary's cancel end.
-    const target = errorBoundaryTarget(graph, elementId, job.error_code);
-    if (target) {
-      const now = nowIso();
-      await dbBatch(env.DB, [
-        historyStmt(env.DB, {
-          workspaceId: inst.workspace_id,
-          instanceId,
-          elementId,
-          type: "businessErrorCaught",
-          diagnostics: { jobId: job.job_id, errorCode: job.error_code, boundaryTarget: target, occurrence: occ },
-        }),
-        applyTransitionStmt(env.DB, { instanceId, currentElementId: target, status: "running", now }),
-        // Atomic with the route: the rewalk fast-forwards this visit by
-        // re-deriving the same deterministic target from the persisted error_code.
-        markFailedJobHandledStmt(env.DB, job.job_id, now),
-      ]);
-      return { kind: "next", next: target };
-    }
-    // Uncaught business error → Hazard.
-    return createIncident(env, instanceId, elementId, job.attempt_count, `Uncaught business error '${job.error_code}' (no matching error boundary).`, { jobId: job.job_id, errorCode: job.error_code }, "serviceTaskFailure");
-  }
-  // Technical exhaustion → Hazard (terminal incident, never auto-compensation).
-  return createIncident(env, instanceId, elementId, job.attempt_count, "Service Task failed (technical retries exhausted).", { jobId: job.job_id }, "serviceTaskFailure");
-}
-
-// ---------------------------------------------------------------------------
-// Transaction enter / commit
+// Transaction enter / commit + bookkeeping fast-forward predicate
 // ---------------------------------------------------------------------------
 
 /**
@@ -916,6 +541,8 @@ export async function decideGateway(
         evaluation = evaluateCondition(expression, variables);
       } catch (err) {
         if (err instanceof ExpressionEvaluationError) {
+          // M3-L1 (TASK-39): a hard FEEL error is its own taxonomy bucket
+          // ('conditionFailure'), no longer masked as a serviceTaskFailure.
           return createIncident(
             env,
             instanceId,
@@ -923,7 +550,7 @@ export async function decideGateway(
             0,
             `exclusiveGateway '${elementId}' condition on flow '${flow.flowId}' failed to evaluate: ${err.message}`,
             { flowId: flow.flowId, expression, occurrence: occ },
-            "serviceTaskFailure",
+            "conditionFailure",
           );
         }
         throw err;
@@ -1021,170 +648,19 @@ export async function decideGateway(
 }
 
 // ---------------------------------------------------------------------------
-// Reverse-order compensation
-// ---------------------------------------------------------------------------
-
-async function beginCompensating(env: Env, instanceId: string, scopeId: string, cancelEndId: string): Promise<void> {
-  const inst = await loadInst(env, instanceId);
-  // Idempotent re-run: once the cancel transition committed the reverse pass
-  // owns the instance — never duplicate transactionCancelled or regress status.
-  if (inst.status === "compensating" || isTerminalInstanceStatus(inst.status)) return;
-  await dbBatch(env.DB, [
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: scopeId, type: "transactionCancelled", diagnostics: { transaction: scopeId, via: cancelEndId, traceId: traceIdFor(instanceId) } }),
-    applyTransitionStmt(env.DB, { instanceId, currentElementId: cancelEndId, status: "compensating", now: nowIso() }),
-  ]);
-}
-
-/** Run (or resume) the reverse pass for `scopeId`, then settle the saga-failed terminal. */
-async function settleAfterCompensation(
-  env: Env,
-  instanceId: string,
-  graph: ExecutionGraph,
-  scopeId: string,
-  runStep: RunStep,
-  waitFor: WaitForEvent | null,
-): Promise<DriveResult> {
-  const result = await runCompensation(env, instanceId, graph, scopeId, runStep, waitFor);
-  if (result === "waiting") return { status: "waiting" };
-  if (result === "failed") return { status: "incident" }; // compensationFailed terminal (operator-resumable)
-  await runStep(`settle:${scopeId}`, () => settleSagaCompensated(env, instanceId, scopeId, cancelBoundaryTarget(graph, scopeId)));
-  return { status: "completed" };
-}
-
-type CompResult = "compensated" | "waiting" | "failed";
-
-async function runCompensation(
-  env: Env,
-  instanceId: string,
-  graph: ExecutionGraph,
-  scopeId: string,
-  runStep: RunStep,
-  waitFor: WaitForEvent | null,
-): Promise<CompResult> {
-  // Re-derive the cursor from the ledger each pass (crash-safe, resumable).
-  // With loops each iteration is its own ledger row (occurrence-keyed), so the
-  // reverse pass compensates every iteration separately with zero algorithm
-  // change; compensation jobs + step names inherit the forward occurrence.
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const steps = await selectScopeStepsForCompensation(env.DB, instanceId, scopeId);
-    if (steps.length === 0) return "compensated";
-    const step = steps[0]!; // highest seq still needing compensation
-    const ctag = `${step.elementId}#${step.occurrence}`;
-
-    let comp = await getCompensationJob(env.DB, instanceId, step.elementId, step.occurrence);
-    if (!comp) {
-      comp = await runStep(`comp-create:${ctag}`, () => createCompensationJob(env, instanceId, graph, step));
-    }
-    if (comp.status === "completed") {
-      await runStep(`comp-done:${ctag}`, () => markStepCompensated(env, instanceId, step));
-      continue;
-    }
-    if (comp.status === "failed") {
-      await runStep(`comp-fail:${ctag}`, () => markStepCompensationFailed(env, instanceId, step));
-      return "failed";
-    }
-    if (!waitFor) return "waiting"; // direct mode parks at 'compensating'; resume re-runs this pass
-
-    const outcome = await waitFor({ name: `wait-comp:${ctag}`, workflowEventType: workflowJobEventTypeFor(comp.job_id), timeout: SVC_WAIT_TIMEOUT });
-    if (outcome.kind === "timeout") {
-      await runStep(`comp-timeout:${ctag}`, () => markStepCompensationFailed(env, instanceId, step));
-      return "failed";
-    }
-    // loop re-reads the (now terminal) comp job
-  }
-}
-
-async function createCompensationJob(env: Env, instanceId: string, graph: ExecutionGraph, step: SagaStepView): Promise<JobRow> {
-  // Idempotent re-run (Workflow step retry after a committed batch).
-  const existing = await getCompensationJob(env.DB, instanceId, step.elementId, step.occurrence);
-  if (existing) return existing;
-
-  const inst = await loadInst(env, instanceId);
-  const handlerNode = step.compensationElementId ? graph.nodes[step.compensationElementId] : undefined;
-  const jobId = newId("job");
-  const taskType = step.compensationTaskType ?? handlerNode?.taskType ?? "";
-  await dbBatch(env.DB, [
-    createJobStmt(env.DB, {
-      jobId,
-      instanceId,
-      elementId: step.elementId, // forward element id (uq is per kind + occurrence)
-      taskType,
-      retryLimit: Math.max(1, handlerNode?.retries ?? 1),
-      idempotencyKey: `${instanceId}:${step.elementId}:1:${step.occurrence}`,
-      inputVariables: parseJson<JsonObject>(inst.variables, {}),
-      workspaceId: inst.workspace_id,
-      isCompensation: true,
-      compensatesElementId: step.elementId,
-      // A compensation job inherits its forward step's occurrence (design M2 §8).
-      occurrence: step.occurrence,
-      now: nowIso(),
-    }),
-    attachCompensationJobStmt(env.DB, { stepId: step.stepId, compensationJobId: jobId, now: nowIso() }),
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: step.elementId, type: "compensationStarted", diagnostics: { jobId, handler: step.compensationElementId, taskType, traceId: traceIdFor(instanceId), occurrence: step.occurrence } }),
-  ]);
-  return (await getCompensationJob(env.DB, instanceId, step.elementId, step.occurrence))!;
-}
-
-async function markStepCompensated(env: Env, instanceId: string, step: SagaStepView): Promise<void> {
-  const inst = await loadInst(env, instanceId);
-  await dbBatch(env.DB, [
-    updateCompensationStatusStmt(env.DB, { stepId: step.stepId, status: "compensated", now: nowIso() }),
-    // `occurrence` mirrors compensationStarted (TASK-37 carry): without it an
-    // operator could not tell WHICH loop iteration finished compensating.
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: step.elementId, type: "compensationCompleted", diagnostics: { handler: step.compensationElementId, occurrence: step.occurrence } }),
-  ]);
-}
-
-async function markStepCompensationFailed(env: Env, instanceId: string, step: SagaStepView): Promise<void> {
-  const inst = await loadInst(env, instanceId);
-  const now = nowIso();
-  await dbBatch(env.DB, [
-    updateCompensationStatusStmt(env.DB, { stepId: step.stepId, status: "failed", now }),
-    incidentStmt(env.DB, {
-      incidentId: newId("inc"),
-      instanceId,
-      elementId: step.elementId,
-      reason: `Compensation handler exhausted retries for step '${step.elementId}'.`,
-      retryCount: 0,
-      kind: "compensationFailure",
-      resolution: "open",
-      payloadContext: { handler: step.compensationElementId, compensationJobId: step.compensationJobId },
-      now,
-    }),
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: step.elementId, type: "compensationFailed", diagnostics: { handler: step.compensationElementId } }),
-    applyTransitionStmt(env.DB, { instanceId, currentElementId: step.elementId, status: "compensationFailed", now }),
-  ]);
-}
-
-/** Settle the saga-failed terminal WITHOUT completeInstance (keep 'compensated'). */
-async function settleSagaCompensated(env: Env, instanceId: string, scopeId: string, failureTarget: string | null): Promise<void> {
-  const inst = await loadInst(env, instanceId);
-  if (inst.status !== "compensating") return; // already settled / not in pass
-  const now = nowIso();
-  const finalEl = failureTarget ?? scopeId;
-  await dbBatch(env.DB, [
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: scopeId, type: "compensationCompleted", diagnostics: { transaction: scopeId, outcome: "compensated" } }),
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: finalEl, type: "sagaFailed", diagnostics: { settledVia: finalEl } }),
-    // Incident lifecycle (TASK-36 carry): an operator /cancel of a Hazard set
-    // the incident resolution to 'compensating'; the settle is its natural
-    // completion → advance to 'compensated' atomically with the terminal
-    // transition. Guarded on the exact prior value, so the /retry path's
-    // sticky 'operatorResolved' and an 'open' incident are never clobbered,
-    // and instances with no incident (auto cancel-end / operator cancel of a
-    // running saga) no-op.
-    advanceIncidentResolutionStmt(env.DB, { instanceId, from: "compensating", to: "compensated" }),
-    applyTransitionStmt(env.DB, { instanceId, currentElementId: finalEl, status: "compensated", completedAt: now, now }),
-  ]);
-}
-
-// ---------------------------------------------------------------------------
 // Receive Task (durable message wait) — occurrence-keyed subscriptions (M2 §5):
 // a Receive Task inside a loop re-subscribes per visit; the broker key
 // (workspace + messageName + correlationKey) is unchanged — sequential
 // re-subscription on the same key is the already-supported broker pattern.
 // The subscription row's `consumed` status (set atomically with the
 // transition out of the wait) IS the write-free fast-forward predicate.
+//
+// M3-L4 (TASK-46): a STANDALONE message `intermediateCatchEvent` shares THIS
+// exact driver (design §3 item 3 — "identical wait/correlation/resume semantics
+// to a receiveTask"). It is dispatched here from loop() with the same signature;
+// `timerBoundaryFor` returns null for an event (no boundary attaches to a catch),
+// so the timer-boundary branches below are inert and the path collapses to the
+// plain register → park → apply machinery — NOT a parallel copy.
 // ---------------------------------------------------------------------------
 
 type ReceiveOutcome =
@@ -1195,6 +671,7 @@ type ReceiveOutcome =
 async function driveReceiveTask(
   env: Env,
   instanceId: string,
+  graph: ExecutionGraph,
   elementId: string,
   occ: number,
   node: GraphNode,
@@ -1205,6 +682,13 @@ async function driveReceiveTask(
   const tag = `${elementId}#${occ}`;
   const next = node.next!;
   const messageName = node.messageName ?? "";
+  const tb = timerBoundaryFor(graph, elementId);
+
+  // Boundary-timer fast-forward (M3-L3): a fired timer already superseded the
+  // subscription and transitioned the token down the boundary path (write-free).
+  if (tb && (await timerHasFired(env, instanceId, tb, occ))) {
+    return { kind: "next", next: tb.node.next! };
+  }
 
   // Already applied → pure in-memory cursor move, NO writes, NO step. If the
   // in-flight delivery is exactly the message this visit consumed (a racing
@@ -1216,29 +700,63 @@ async function driveReceiveTask(
   }
 
   if (pending) {
-    const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, elementId, occ, next, pending));
+    const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, graph, elementId, occ, next, pending));
     return { kind: "next", next: r.next, consumedPending: true };
   }
 
-  const reg = await runStep(`recv:${tag}`, () => registerReceive(env, instanceId, elementId, occ, messageName));
+  const reg = await runStep(`recv:${tag}`, () => registerReceive(env, instanceId, graph, elementId, occ, messageName, node.type));
   if (reg.kind === "incident") return { kind: "incident" };
   if (reg.kind === "applied") return { kind: "next", next };
   if (reg.kind === "correlated") {
-    const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, elementId, occ, next, reg.event));
+    const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, graph, elementId, occ, next, reg.event));
     return { kind: "next", next: r.next };
   }
   if (!waitFor) return { kind: "waiting" };
-  const outcome = await waitFor({ name: `wait:${tag}`, workflowEventType: reg.workflowEventType, timeout: SVC_WAIT_TIMEOUT });
+  // Self-healing re-arm (design §4.2): a rewalk landing on a still-armed timer
+  // re-arms the DO idempotently so a lost alarm is repaired by the next drive.
+  if (tb) {
+    const trow = await getTimer(env.DB, timerIdFor(instanceId, tb.boundaryId, occ));
+    if (trow?.status === "armed") await armTimerDO(env, trow.timerId, trow.fireAt);
+  }
+  // A timer-guarded wait is SIZED to the timer (so a long timer costs O(1) steps).
+  const timeout = tb ? await timerGuardedTimeout(env, instanceId, tb, occ) : SVC_WAIT_TIMEOUT;
+  const outcome = await waitFor({ name: `wait:${tag}`, workflowEventType: reg.workflowEventType, timeout });
+  // The timer may have fired (its wake, or a concurrent alarm) while we waited.
+  if (tb && (await timerHasFired(env, instanceId, tb, occ))) {
+    return { kind: "next", next: tb.node.next! };
+  }
   if (outcome.kind === "timeout") {
     // D1 is canonical: an inline drive (e.g. after a Workflow handover) may
     // have applied this visit's message while we waited — advance, don't fail.
     const fresh = await getSubscriptionForVisit(env.DB, instanceId, elementId, occ);
     if (fresh?.status === "consumed") return { kind: "next", next };
-    await runStep(`recv-timeout:${tag}`, () => createIncident(env, instanceId, elementId, 0, "Receive Task wait timed out.", { messageName }, "timeout"));
+    if (tb) {
+      // Lost-alarm backstop (design §4.2, risk R5). A wait guarded by a modeled
+      // timer NEVER raises waitTimeout. The DO alarm is the PRIMARY firing
+      // mechanism; this timer-SIZED timeout doubles as the backstop for a lost/
+      // failed alarm: on this wake re-read D1 and settle an OVERDUE timer INLINE
+      // exactly as the alarm path would (superseding the subscription), RETURNING
+      // the boundary path to THIS drive loop. We are already inside a drive, so
+      // there is no executor wake here — that is what avoids the runtime/timers →
+      // executor → engine import cycle. (Workflow-mode-only; the DO-alarm fire path
+      // is the CI-tested mechanism.)
+      const settled = await settleOverdueBoundaryTimerOnWake(env, graph, instanceId, elementId, occ);
+      if (settled.kind === "fired") return { kind: "next", next: settled.next };
+      if (settled.kind === "reparked") return { kind: "waiting" }; // armed-but-early → re-armed; re-park
+      // fallThrough: a concurrent message apply settled the timer 'cancelled' (its
+      // transition rode the same batch) — re-read and advance if consumed, so a
+      // swallowed wake is not stranded.
+      const reread = await getSubscriptionForVisit(env.DB, instanceId, elementId, occ);
+      if (reread?.status === "consumed") return { kind: "next", next };
+      return { kind: "waiting" }; // still parked (e.g. a concurrent /cancel terminal) — re-park
+    }
+    // M3-L1 (TASK-39): the un-guarded receive-task wait cap is 'waitTimeout'
+    // (shared with the service-task wait cap), split out of the legacy 'timeout'.
+    await runStep(`recv-timeout:${tag}`, () => createIncident(env, instanceId, elementId, 0, `${node.type === "intermediateCatchEvent" ? "Message catch" : "Receive Task"} wait timed out.`, { messageName }, "waitTimeout"));
     return { kind: "incident" };
   }
   const event = parseMessageEvent(outcome.payload);
-  const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, elementId, occ, next, event));
+  const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, graph, elementId, occ, next, event));
   return { kind: "next", next: r.next };
 }
 
@@ -1254,9 +772,13 @@ type RegisterOutcome =
   | { kind: "applied" }
   | { kind: "incident" };
 
-async function registerReceive(env: Env, instanceId: string, elementId: string, occ: number, messageName: string): Promise<RegisterOutcome> {
+async function registerReceive(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, messageName: string, elementType: NodeType): Promise<RegisterOutcome> {
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
+  // Honest operator-visible labels: a standalone message intermediate catch
+  // (M3-L4, TASK-46) is an EVENT, not an activity — its parked-wait marker and
+  // failure wording must NOT read "Receive Task" (design §3 item 3).
+  const isCatch = elementType === "intermediateCatchEvent";
 
   const existing = await getSubscriptionForVisit(env.DB, instanceId, elementId, occ);
   if (existing?.status === "consumed") return { kind: "applied" }; // idempotent re-run guard
@@ -1265,7 +787,10 @@ async function registerReceive(env: Env, instanceId: string, elementId: string, 
   if (!active) {
     // First registration for this visit — exactly one audit entry per occurrence
     // (a rewalk that lands on an already-active wait re-registers WRITE-FREE).
-    await historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "elementEntered", diagnostics: { elementType: "receiveTask", messageName, occurrence: occ } }).run();
+    // `elementType` is the honest audit label: "receiveTask" or, when the SAME
+    // wait machinery drives a standalone message intermediate catch (M3-L4,
+    // TASK-46), "intermediateCatchEvent".
+    await historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "elementEntered", diagnostics: { elementType, messageName, occurrence: occ } }).run();
   }
 
   const subscriptionId = active?.subscription_id ?? newId("sub");
@@ -1289,7 +814,7 @@ async function registerReceive(env: Env, instanceId: string, elementId: string, 
   })) as RegisterSubscriptionResult;
 
   if (result.status === "rejected") {
-    await createIncident(env, instanceId, elementId, 0, `Receive Task could not register: ${result.reason}`, { existingInstanceId: result.existingInstanceId ?? null }, "serviceTaskFailure");
+    await createIncident(env, instanceId, elementId, 0, `${isCatch ? "Message catch" : "Receive Task"} could not register: ${result.reason}`, { existingInstanceId: result.existingInstanceId ?? null }, "serviceTaskFailure");
     await historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "invariantViolation", diagnostics: { reason: result.reason, messageName, correlationKey: inst.correlation_key } }).run();
     return { kind: "incident" };
   }
@@ -1297,15 +822,20 @@ async function registerReceive(env: Env, instanceId: string, elementId: string, 
 
   if (!active) {
     await createSubscription(env.DB, { subscriptionId, workspaceId: inst.workspace_id, instanceId, elementId, messageName, correlationKey: inst.correlation_key, brokerKey, workflowEventType, status: "active", expiresAt, occurrence: occ, now });
+    // M3-L3: arm the interrupting boundary timer (if any) in the SAME
+    // first-registration batch (persist-before-advance); arm the DO after commit.
+    const arm = buildBoundaryArm(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: elementId, occ, now });
     await dbBatch(env.DB, [
-      historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "receiveTaskWaiting", diagnostics: { subscriptionId, messageName, correlationKey: inst.correlation_key, expiresAt, occurrence: occ } }),
+      historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: isCatch ? "messageCatchWaiting" : "receiveTaskWaiting", diagnostics: { subscriptionId, messageName, correlationKey: inst.correlation_key, expiresAt, occurrence: occ } }),
       applyTransitionStmt(env.DB, { instanceId, currentElementId: elementId, status: "waiting", now }),
+      ...(arm ? arm.stmts : []),
     ]);
+    if (arm) await armTimerDO(env, arm.timerId, arm.fireAt);
   }
   return { kind: "waiting", workflowEventType, subscriptionId };
 }
 
-async function applyMessage(env: Env, instanceId: string, elementId: string, occ: number, next: string, event: MessageEventPayload): Promise<{ next: string }> {
+async function applyMessage(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, next: string, event: MessageEventPayload): Promise<{ next: string }> {
   const inst = await loadInst(env, instanceId);
   const sub = await getSubscriptionForVisit(env.DB, instanceId, elementId, occ);
   // Apply-once guard (idempotent step body): the payload merge + the transition
@@ -1336,76 +866,32 @@ async function applyMessage(env: Env, instanceId: string, elementId: string, occ
     });
   }
 
-  await dbBatch(env.DB, [
+  const statements: D1PreparedStatement[] = [
     applyTransitionStmt(env.DB, { instanceId, variables: merged, currentElementId: next, status: "running", now }),
     ...(active ? [subscriptionConsumedStmt(env.DB, subscriptionId, event.externalMessageId, now)] : []),
     messageCorrelatedStmt(env.DB, { externalMessageId: event.externalMessageId, instanceId, subscriptionId, now }),
     variableSnapshotStmt(env.DB, { instanceId, source: "message", sourceId: event.externalMessageId, variables: event.payload ?? {}, now }),
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, externalMessageId: event.externalMessageId, type: "messageCorrelated", diagnostics: { subscriptionId, messageName: event.messageName, messageId: event.messageId, occurrence: occ }, payloadSnapshot: event.payload ?? {} }),
-  ]);
+  ];
+  // M3-L3: settle the guarding timer 'cancelled' ATOMICALLY with consuming the
+  // message; on a decider conflict the timer FIRED first → convert to its path.
+  const cancelSettle = buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: elementId, occ, now });
+  if (cancelSettle) statements.push(...cancelSettle.stmts);
+  try {
+    await dbBatch(env.DB, statements);
+  } catch (err) {
+    if (isUniqueConstraintViolation(err)) {
+      const converted = await convertOnFire(env, graph, instanceId, elementId, occ);
+      if (converted) return { next: converted };
+    }
+    throw err;
+  }
   return { next };
 }
 
 // ---------------------------------------------------------------------------
-// Completion + incidents
+// Inline drive (HTTP-side operator cancel/retry)
 // ---------------------------------------------------------------------------
-
-async function completeInstance(env: Env, instanceId: string, elementId: string): Promise<void> {
-  const inst = await loadInst(env, instanceId);
-  if (isTerminalInstanceStatus(inst.status)) return;
-  const now = nowIso();
-  await dbBatch(env.DB, [
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "elementEntered", diagnostics: { elementType: "endEvent" } }),
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "instanceCompleted", diagnostics: {} }),
-    applyTransitionStmt(env.DB, { instanceId, currentElementId: elementId, status: "completed", completedAt: now, now }),
-  ]);
-}
-
-async function parkWaiting(env: Env, instanceId: string, elementId: string, kind: "serviceTask" | "receiveTask"): Promise<void> {
-  const inst = await loadInst(env, instanceId);
-  // Idempotent re-park: a rewalk that lands on an already-parked wait frontier
-  // (operator resume, duplicate drive) is WRITE-FREE — never duplicate the
-  // serviceTaskWaiting audit event or touch the cursor it would re-set.
-  if (inst.status === "waiting" && inst.current_element_id === elementId) return;
-  await dbBatch(env.DB, [
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "serviceTaskWaiting", diagnostics: { kind } }),
-    applyTransitionStmt(env.DB, { instanceId, currentElementId: elementId, status: "waiting", now: nowIso() }),
-  ]);
-}
-
-async function createIncident(
-  env: Env,
-  instanceId: string,
-  elementId: string,
-  retryCount: number,
-  reason: string,
-  diagnostics: JsonObject,
-  kind: IncidentKind,
-): Promise<{ kind: "incident" }> {
-  const inst = await loadInst(env, instanceId);
-  // One-way status table (§4.6): never regress a terminal or compensating
-  // instance back to 'incident' (e.g. a 1-hour-late forward-wait timeout
-  // resuming after an operator /cancel already moved the saga on).
-  if (isTerminalInstanceStatus(inst.status) || inst.status === "compensating") {
-    return { kind: "incident" };
-  }
-  const now = nowIso();
-  const incidentId = newId("inc");
-  const payloadContext: JsonObject = { reason, ...diagnostics };
-  await dbBatch(env.DB, [
-    incidentStmt(env.DB, { incidentId, instanceId, elementId, reason, retryCount, kind, resolution: "open", payloadContext, now }),
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "incidentCreated", diagnostics: { incidentId, reason, retryCount, kind }, payloadSnapshot: payloadContext }),
-    applyTransitionStmt(env.DB, { instanceId, currentElementId: elementId, status: "incident", now }),
-  ]);
-  return { kind: "incident" };
-}
-
-/** Workflow-driver fallback: a terminal/uncaught failure becomes a view-only incident. */
-export async function recordTerminalIncident(env: Env, instanceId: string, reason: string): Promise<void> {
-  const inst = await getInstanceRow(env.DB, instanceId);
-  if (!inst || isTerminalInstanceStatus(inst.status)) return;
-  await createIncident(env, instanceId, inst.current_element_id ?? "unknown", 0, reason, {}, "serviceTaskFailure");
-}
 
 /**
  * Drive the engine inline (HTTP-side), e.g. for operator cancel/retry: it creates
@@ -1418,5 +904,3 @@ export async function resumeInline(env: Env, instanceId: string, startAt?: strin
   const inline = <T>(_name: string, fn: () => Promise<T>): Promise<T> => fn();
   return runInstance(env, instanceId, { runStep: inline, waitFor: null, startAt });
 }
-
-export { workflowEventTypeFor };

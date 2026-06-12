@@ -620,27 +620,32 @@ export interface SubscriptionRow {
   occurrence: number;
 }
 
-export async function createSubscription(
-  db: D1Database,
-  input: {
-    subscriptionId: string;
-    workspaceId: string;
-    instanceId: string;
-    elementId: string;
-    messageName: string;
-    correlationKey: string;
-    brokerKey: string;
-    workflowEventType: string;
-    status: "active" | "consumed";
-    expiresAt: string;
-    consumedAt?: string | null;
-    externalMessageId?: string | null;
-    /** CONDITIONAL (0004) — keys the subscription to its loop iteration; defaults to 0. */
-    occurrence?: number;
-    now: string;
-  },
-): Promise<void> {
-  await dbRun(
+interface CreateSubscriptionInput {
+  subscriptionId: string;
+  workspaceId: string;
+  instanceId: string;
+  elementId: string;
+  messageName: string;
+  correlationKey: string;
+  brokerKey: string;
+  workflowEventType: string;
+  status: "active" | "consumed";
+  expiresAt: string;
+  consumedAt?: string | null;
+  externalMessageId?: string | null;
+  /** CONDITIONAL (0004) — keys the subscription to its loop iteration; defaults to 0. */
+  occurrence?: number;
+  now: string;
+}
+
+/**
+ * INSERT statement for one message subscription row. The statement form lets an
+ * eventBasedGateway compose ALL its branch subscriptions into the SAME park batch
+ * as the timer arm + transition (M3-L4, TASK-46, design §4.5.1 — persist-before-
+ * advance, atomic so a parked EBG always has its full subscription set).
+ */
+export function createSubscriptionStmt(db: D1Database, input: CreateSubscriptionInput): D1PreparedStatement {
+  return stmt(
     db,
     `INSERT INTO message_subscriptions
        (subscription_id, workspace_id, instance_id, element_id, message_name, correlation_key, broker_key, workflow_event_type, status, created_at, expires_at, consumed_at, external_message_id, occurrence)
@@ -662,6 +667,10 @@ export async function createSubscription(
       input.occurrence ?? 0,
     ],
   );
+}
+
+export async function createSubscription(db: D1Database, input: CreateSubscriptionInput): Promise<void> {
+  await createSubscriptionStmt(db, input).run();
 }
 
 /**
@@ -702,6 +711,29 @@ export function subscriptionConsumedStmt(
   );
 }
 
+/**
+ * Supersede the ACTIVE subscription guarding a receive-task visit when its
+ * boundary timer fires (M3-L3): a status-conditional flip `active → superseded`
+ * composed into the winning fireTimer batch, so the rewalk's getSubscriptionForVisit
+ * no longer treats it as the live wait. Distinct from `consumed` (which the engine
+ * fast-forwards down the NORMAL path) — a superseded subscription resolved via the
+ * timer path instead. Paired with a best-effort broker supersede so a late publish
+ * to the broker key gets the stable buffered/no-match outcome.
+ */
+export function subscriptionSupersededStmt(
+  db: D1Database,
+  subscriptionId: string,
+  now: string,
+): D1PreparedStatement {
+  return stmt(
+    db,
+    `UPDATE message_subscriptions
+       SET status = 'superseded', consumed_at = ?
+     WHERE subscription_id = ? AND status = 'active'`,
+    [now, subscriptionId],
+  );
+}
+
 export async function markSubscriptionExpired(
   db: D1Database,
   subscriptionId: string,
@@ -721,36 +753,53 @@ export async function markSubscriptionExpired(
 export type IncidentKind =
   | "serviceTaskFailure"
   | "compensationFailure"
+  // LEGACY (M1) — the overloaded original timeout kind. Retained in the persisted
+  // taxonomy + API enum for backward compatibility, but NEVER written by current
+  // code: M3-L1 (TASK-39) split it into jobActivationTimeout + waitTimeout below.
   | "timeout"
   | "poison"
   // CONDITIONAL (M2 §9) — loop-iteration cap exceeded | XOR with no true condition and no default.
   | "loopLimit"
-  | "noPath";
+  | "noPath"
+  // TIME / FAILURE TAXONOMY (M3-L1 §, TASK-39):
+  //   jobActivationTimeout — an un-leasable forward job parked past its activation
+  //     TTL by the per-job JobScheduler DLQ.
+  //   waitTimeout — an un-guarded service-task OR receive-task durable-wait CAP
+  //     elapsed (no worker completed / no message correlated). NOT the
+  //     compensation-wait cap, which stays compensationFailure (a Hazard, not a timeout).
+  //   conditionFailure — a hard FEEL evaluation error on an exclusiveGateway flow
+  //     (previously masked as serviceTaskFailure).
+  | "jobActivationTimeout"
+  | "waitTimeout"
+  | "conditionFailure";
 /**
  * Incident remediation lifecycle (one-way):
  *
  *   open → compensating       operator /cancel of a Hazard initiates the reverse pass
  *   compensating → compensated  the reverse pass settles (engine settle batch, TASK-36)
  *   open|compensating → operatorResolved  operator /retry — STICKY, never overwritten
- *                                          (setIncidentResolution guards on it; the settle
- *                                          advance is keyed on 'compensating' only)
+ *                                          (resolveIncident / resolveAllOpenIncidents
+ *                                          guard on it; the settle advance is keyed on
+ *                                          'compensating' only)
  *
  * The AUTO-compensation path (business error → cancel end) raises no incident,
  * so 'compensating'/'compensated' resolutions only ever appear on operator-
  * cancelled Hazards.
  *
- * Known terminal-'open' state: /cancel of an incident instance with an EMPTY
- * ledger (nothing compensatable, e.g. a noPath or gateway-only loopLimit
- * Hazard) settles the instance 'cancelled' without touching the incident —
- * the incident stays 'open' forever on a terminal instance. Candidate fix
- * (M3): advance to 'operatorResolved' in the pending===0 cancel branch.
+ * Empty-ledger cancel (FIXED M3-L1, TASK-39): /cancel of an incident instance
+ * with an EMPTY ledger (nothing compensatable, e.g. a noPath or gateway-only
+ * loopLimit Hazard) settles the instance 'cancelled'. The pending===0 cancel
+ * branch now closes ALL open incidents as 'operatorResolved' so none is left
+ * dangling 'open' on a terminal instance.
  *
- * Caveat: setIncidentResolution below updates ALL non-operatorResolved
- * incidents of the instance (no incident_id filter) — with multiple incidents
- * (Hazard 'compensating' + a later compensationFailure 'open'), an operator
- * /retry flips BOTH to 'operatorResolved', so the Hazard never reaches its
- * natural 'compensated'. Audit-attribution wart only; incident_id filter is
- * an M3 candidate (callers hold the id).
+ * Targeted resolution (FIXED M3-L1, TASK-39): resolveIncident below takes a
+ * REQUIRED incidentId — an operator /retry flips ONLY the targeted incident, so
+ * with multiple incidents (a Hazard 'compensating' + a later compensationFailure
+ * 'open') the Hazard still reaches its natural 'compensated' instead of being
+ * collaterally flipped. The unfiltered form is the separate, explicit
+ * resolveAllOpenIncidents, reserved for the empty-ledger cancel above, where
+ * closing every open incident IS correct. (The two were split from a single
+ * optional-id function to remove the silent "missing id ⇒ flip ALL" footgun.)
  */
 export type IncidentResolution = "open" | "compensating" | "compensated" | "operatorResolved";
 
@@ -804,8 +853,35 @@ export function advanceIncidentResolutionStmt(
   );
 }
 
-/** Set an incident's remediation resolution (operator retry / compensation). */
-export async function setIncidentResolution(
+/**
+ * Resolve ONE incident's remediation lifecycle by REQUIRED id (M3-L1, TASK-39) —
+ * an operator /retry or a cancel-from-Hazard flips ONLY the targeted incident,
+ * so a sibling Hazard mid-compensation is never collaterally moved. Always
+ * filtered; never overwrites the sticky 'operatorResolved'. (Split from the old
+ * optional-id setIncidentResolution so a missing id can no longer silently fall
+ * through to flipping ALL incidents — see resolveAllOpenIncidents for that.)
+ */
+export async function resolveIncident(
+  db: D1Database,
+  instanceId: string,
+  incidentId: string,
+  resolution: IncidentResolution,
+  now: string,
+): Promise<void> {
+  await dbRun(
+    db,
+    `UPDATE incidents SET resolution = ? WHERE instance_id = ? AND incident_id = ? AND resolution != 'operatorResolved'`,
+    [resolution, instanceId, incidentId],
+  );
+}
+
+/**
+ * Resolve EVERY not-yet-resolved incident of an instance (M3-L1, TASK-39) — the
+ * explicit "all" form, reserved for the empty-ledger /cancel terminal cleanup
+ * where closing every open incident IS correct (none should be left dangling
+ * 'open' on a terminal instance). Never overwrites the sticky 'operatorResolved'.
+ */
+export async function resolveAllOpenIncidents(
   db: D1Database,
   instanceId: string,
   resolution: IncidentResolution,
@@ -822,23 +898,29 @@ export async function getIncidentForInstance(
   db: D1Database,
   instanceId: string,
 ): Promise<Incident | null> {
-  const row = await dbFirst<{
-    incident_id: string;
-    instance_id: string;
-    element_id: string;
-    reason: string;
-    status: string;
-    retry_count: number;
-    payload_context: string | null;
-    kind: string | null;
-    resolution: string | null;
-    created_at: string;
-  }>(
+  const row = await dbFirst<IncidentRow>(
     db,
     `SELECT * FROM incidents WHERE instance_id = ? ORDER BY rowid DESC LIMIT 1`,
     [instanceId],
   );
   if (!row) return null;
+  return rowToIncident(row);
+}
+
+interface IncidentRow {
+  incident_id: string;
+  instance_id: string;
+  element_id: string;
+  reason: string;
+  status: string;
+  retry_count: number;
+  payload_context: string | null;
+  kind: string | null;
+  resolution: string | null;
+  created_at: string;
+}
+
+function rowToIncident(row: IncidentRow): Incident {
   return {
     incidentId: row.incident_id,
     instanceId: row.instance_id,
@@ -851,4 +933,24 @@ export async function getIncidentForInstance(
     resolution: (row.resolution as IncidentResolution | null) ?? "open",
     createdAt: row.created_at,
   };
+}
+
+/**
+ * All not-yet-resolved incidents of an instance, newest-first (M3-L1, TASK-39).
+ * "Open" = resolution IN ('open','compensating') — i.e. NOT a terminal
+ * 'operatorResolved' / 'compensated'. Surfaced by instance inspection so an
+ * operator sees every live incident, not just the latest (LIMIT 1) one.
+ */
+export async function getOpenIncidentsForInstance(
+  db: D1Database,
+  instanceId: string,
+): Promise<Incident[]> {
+  const rows = await dbAll<IncidentRow>(
+    db,
+    `SELECT * FROM incidents
+       WHERE instance_id = ? AND resolution IN ('open', 'compensating')
+       ORDER BY rowid DESC`,
+    [instanceId],
+  );
+  return rows.map(rowToIncident);
 }

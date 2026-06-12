@@ -125,10 +125,15 @@ describe("BPMN-lite profile validator", () => {
     expect(r.issues.some((i) => i.elementId === "T" && /sendTask/.test(i.reason))).toBe(true);
   });
 
-  it("rejects an intermediate catch event", async () => {
+  it("accepts a STANDALONE message intermediate catch event (M3-L4, TASK-46)", async () => {
     const r = await parseAndValidate(INTERMEDIATE_CATCH_BPMN);
-    expect(r.ok).toBe(false);
-    expect(r.issues.some((i) => i.elementId === "IC" && /intermediateCatchEvent/.test(i.reason))).toBe(true);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    const ic = r.graph!.nodes["IC"];
+    expect(ic?.type).toBe("intermediateCatchEvent");
+    expect(ic?.messageName).toBe("Ping");
+    expect(ic?.timerTrigger ?? null).toBeNull();
+    expect(ic?.next).toBe("E");
   });
 
   it("rejects malformed XML before validation", async () => {
@@ -717,10 +722,11 @@ describe("Exclusive-gateway reject matrix (TASK-33, M2 design §3)", () => {
     expect(r.issues.some((i) => i.elementId === "bad_b" && /gateway/i.test(i.reason))).toBe(true);
   });
 
+  // eventBasedGateway is IN since M3-L4 (TASK-46) — it has its own accept/reject
+  // matrix below, no longer a DEFERRED_GATEWAY_REASONS milestone pointer.
   it.each([
     ["parallelGateway", /concurrency \(M4\)/],
     ["inclusiveGateway", /concurrency \(M4\)/],
-    ["eventBasedGateway", /timers & events \(M3\)/],
     ["complexGateway", /later milestone/],
   ] as const)("rejects %s with a milestone pointer", async (tag, pointer) => {
     const r = await parseAndValidate(deferredGatewayBpmn(tag));
@@ -838,5 +844,892 @@ describe("Token-path flows into non-token nodes (M2 final review)", () => {
     ).toBe(true);
     // the model is otherwise valid — the incoming flow is the only gate failure
     expect(r.issues).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Free error-boundary routing (M3-L2, TASK-42, design §3 + §7 gates 7-8).
+//
+// Lifts the M1 "an error boundary's single outgoing flow must target a cancel
+// end event" restriction. An activity may now carry any number of interrupting
+// error boundaries with DISTINCT, NON-EMPTY @errorCode values, plus at most one
+// catch-all (errorEventDefinition with no errorRef), each routing to any
+// token-path node in the same scope. These are process-level models (no
+// transaction) precisely to prove free routing no longer requires a cancel end.
+// ---------------------------------------------------------------------------
+describe("Free error-boundary routing (M3-L2, TASK-42)", () => {
+  const svc = (id: string, type: string) =>
+    `<bpmn:serviceTask id="${id}"><bpmn:extensionElements><easy-bpmn:taskDefinition type="${type}"/></bpmn:extensionElements></bpmn:serviceTask>`;
+
+  /** Process-level error-routing model: S → router → E, plus injectable error
+   *  boundaries on `router`, their alternate-path targets, and the wiring flows.
+   *  Valid (accept) by default: two distinct-code boundaries + one catch-all. */
+  function errRouteBpmn(o: { errors?: string; boundaries?: string; targets?: string; flows?: string } = {}): string {
+    const errors = o.errors ??
+      `<bpmn:error id="Err_A" name="A failed" errorCode="CODE_A"/><bpmn:error id="Err_B" name="B failed" errorCode="CODE_B"/>`;
+    const boundaries = o.boundaries ??
+      `<bpmn:boundaryEvent id="b_a" attachedToRef="router"><bpmn:errorEventDefinition errorRef="Err_A"/></bpmn:boundaryEvent>
+       <bpmn:boundaryEvent id="b_b" attachedToRef="router"><bpmn:errorEventDefinition errorRef="Err_B"/></bpmn:boundaryEvent>
+       <bpmn:boundaryEvent id="b_c" attachedToRef="router"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>`;
+    const targets = o.targets ?? `${svc("svcA", "svc-a")}${svc("svcB", "svc-b")}${svc("svcC", "svc-c")}`;
+    const flows = o.flows ??
+      `<bpmn:sequenceFlow id="fa" sourceRef="b_a" targetRef="svcA"/>
+       <bpmn:sequenceFlow id="fb" sourceRef="b_b" targetRef="svcB"/>
+       <bpmn:sequenceFlow id="fc" sourceRef="b_c" targetRef="svcC"/>
+       <bpmn:sequenceFlow id="fa2" sourceRef="svcA" targetRef="E"/>
+       <bpmn:sequenceFlow id="fb2" sourceRef="svcB" targetRef="E"/>
+       <bpmn:sequenceFlow id="fc2" sourceRef="svcC" targetRef="E"/>`;
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_er" targetNamespace="x">
+  ${errors}
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    ${svc("router", "router")}
+    ${targets}
+    ${boundaries}
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="router"/>
+    <bpmn:sequenceFlow id="s1" sourceRef="router" targetRef="E"/>
+    ${flows}
+  </bpmn:process>
+</bpmn:definitions>`;
+  }
+
+  it("accepts multi-boundary + catch-all routing to alternate token-path nodes", async () => {
+    const r = await parseAndValidate(errRouteBpmn());
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    const n = r.graph!.nodes;
+    // coded boundaries carry their resolved @errorCode and route to their alt path
+    expect(n["b_a"]?.boundaryKind).toBe("error");
+    expect(n["b_a"]?.errorCode).toBe("CODE_A");
+    expect(n["b_a"]?.next).toBe("svcA");
+    expect(n["b_b"]?.errorCode).toBe("CODE_B");
+    expect(n["b_b"]?.next).toBe("svcB");
+    // the catch-all (no errorRef) builds with errorCode === null and a next —
+    // null unambiguously means catch-all (empty-coded boundaries are rejected)
+    expect(n["b_c"]?.boundaryKind).toBe("error");
+    expect(n["b_c"]?.errorRef ?? null).toBeNull();
+    expect(n["b_c"]?.errorCode ?? null).toBeNull();
+    expect(n["b_c"]?.next).toBe("svcC");
+  });
+
+  it("rejects two error boundaries on one activity sharing an @errorCode", async () => {
+    const r = await parseAndValidate(
+      errRouteBpmn({
+        errors: `<bpmn:error id="Err_A" errorCode="CODE_A"/><bpmn:error id="Err_A2" errorCode="CODE_A"/>`,
+        boundaries: `<bpmn:boundaryEvent id="b_a" attachedToRef="router"><bpmn:errorEventDefinition errorRef="Err_A"/></bpmn:boundaryEvent>
+          <bpmn:boundaryEvent id="b_a2" attachedToRef="router"><bpmn:errorEventDefinition errorRef="Err_A2"/></bpmn:boundaryEvent>`,
+        targets: `${svc("svcA", "svc-a")}${svc("svcA2", "svc-a2")}`,
+        flows: `<bpmn:sequenceFlow id="fa" sourceRef="b_a" targetRef="svcA"/>
+          <bpmn:sequenceFlow id="fa2" sourceRef="b_a2" targetRef="svcA2"/>
+          <bpmn:sequenceFlow id="ea" sourceRef="svcA" targetRef="E"/>
+          <bpmn:sequenceFlow id="ea2" sourceRef="svcA2" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "b_a2" && /CODE_A/.test(i.reason) && /distinct/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects an errorRef to an Error with an empty/missing @errorCode (hidden catch-all)", async () => {
+    const r = await parseAndValidate(
+      errRouteBpmn({
+        errors: `<bpmn:error id="Err_empty" name="No code"/>`,
+        boundaries: `<bpmn:boundaryEvent id="b_e" attachedToRef="router"><bpmn:errorEventDefinition errorRef="Err_empty"/></bpmn:boundaryEvent>`,
+        targets: svc("svcA", "svc-a"),
+        flows: `<bpmn:sequenceFlow id="fe" sourceRef="b_e" targetRef="svcA"/>
+          <bpmn:sequenceFlow id="ea" sourceRef="svcA" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "b_e" && /@errorCode/.test(i.reason) && /catch-all/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a second catch-all error boundary on one activity", async () => {
+    const r = await parseAndValidate(
+      errRouteBpmn({
+        errors: ``,
+        boundaries: `<bpmn:boundaryEvent id="b_c1" attachedToRef="router"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>
+          <bpmn:boundaryEvent id="b_c2" attachedToRef="router"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>`,
+        targets: `${svc("svcA", "svc-a")}${svc("svcB", "svc-b")}`,
+        flows: `<bpmn:sequenceFlow id="fc1" sourceRef="b_c1" targetRef="svcA"/>
+          <bpmn:sequenceFlow id="fc2" sourceRef="b_c2" targetRef="svcB"/>
+          <bpmn:sequenceFlow id="ea" sourceRef="svcA" targetRef="E"/>
+          <bpmn:sequenceFlow id="eb" sourceRef="svcB" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "b_c2" && /catch-all/.test(i.reason) && /more than one/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects an error-boundary flow targeting a start event", async () => {
+    const r = await parseAndValidate(
+      errRouteBpmn({
+        errors: `<bpmn:error id="Err_A" errorCode="CODE_A"/>`,
+        boundaries: `<bpmn:boundaryEvent id="b_a" attachedToRef="router"><bpmn:errorEventDefinition errorRef="Err_A"/></bpmn:boundaryEvent>`,
+        targets: ``,
+        flows: `<bpmn:sequenceFlow id="fa" sourceRef="b_a" targetRef="S"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "fa" && /start event 'S'/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects an error-boundary flow targeting another boundary event", async () => {
+    const r = await parseAndValidate(
+      errRouteBpmn({
+        errors: `<bpmn:error id="Err_A" errorCode="CODE_A"/><bpmn:error id="Err_B" errorCode="CODE_B"/>`,
+        boundaries: `<bpmn:boundaryEvent id="b_a" attachedToRef="router"><bpmn:errorEventDefinition errorRef="Err_A"/></bpmn:boundaryEvent>
+          <bpmn:boundaryEvent id="b_b" attachedToRef="router"><bpmn:errorEventDefinition errorRef="Err_B"/></bpmn:boundaryEvent>`,
+        targets: svc("svcB", "svc-b"),
+        flows: `<bpmn:sequenceFlow id="fa" sourceRef="b_a" targetRef="b_b"/>
+          <bpmn:sequenceFlow id="fb" sourceRef="b_b" targetRef="svcB"/>
+          <bpmn:sequenceFlow id="eb" sourceRef="svcB" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "fa" && /targets boundary event 'b_b'/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a boundary event attached to an isForCompensation handler", async () => {
+    const r = await parseAndValidate(
+      sagaBpmn({ innerExtra: `<bpmn:boundaryEvent id="bad_on_handler" attachedToRef="undoA"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>` }),
+    );
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some((i) => i.elementId === "bad_on_handler" && /attached to compensation handler 'undoA'/.test(i.reason)),
+    ).toBe(true);
+    // The `continue` after the handler-attachment rejection must suppress the
+    // misleading per-kind reasons (a handler IS a serviceTask, and this boundary
+    // has no outgoing flow) — exactly ONE reason fires.
+    expect(r.issues).toHaveLength(1);
+  });
+
+  it("rejects an error-boundary flow targeting a compensation handler", async () => {
+    const r = await parseAndValidate(
+      sagaBpmn({ errBoundaryFlow: `<bpmn:sequenceFlow id="fe" sourceRef="stepB_err" targetRef="undoA"/>` }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "fe" && /targets compensation handler 'undoA'/.test(i.reason))).toBe(true);
+  });
+
+  it("still tolerates ignorable content on a saga carrying an error boundary (regression)", async () => {
+    const r = await parseAndValidate(SAGA_TOLERANT_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Interrupting boundary timers (M3-L3, TASK-44, design §3 + §7 validator matrix).
+//
+// `boundaryEvent` + `timerEventDefinition`, interrupting (cancelActivity absent
+// or true), attachable to a serviceTask/receiveTask, AT MOST ONE per activity,
+// NEVER on a transaction or compensation handler, exactly one outgoing flow to a
+// token-path node in the same scope, and exactly ONE of timeDate|timeDuration as
+// a static ISO-8601 literal.
+// ---------------------------------------------------------------------------
+describe("Interrupting boundary timers (M3-L3, TASK-44)", () => {
+  /** S → task → E, with a timer boundary `tb` on `task` routing to onTimeout → E. */
+  function timerBpmn(o: { boundary?: string; flows?: string; alt?: string; hostExtra?: string } = {}): string {
+    const boundary = o.boundary ??
+      `<bpmn:boundaryEvent id="tb" attachedToRef="task"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>`;
+    const alt = o.alt ??
+      `<bpmn:serviceTask id="onTimeout"><bpmn:extensionElements><easy-bpmn:taskDefinition type="timeout-handler"/></bpmn:extensionElements></bpmn:serviceTask>`;
+    const flows = o.flows ??
+      `<bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="onTimeout"/>
+       <bpmn:sequenceFlow id="af" sourceRef="onTimeout" targetRef="E"/>`;
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:camunda="http://camunda.org/schema/1.0/bpmn" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_tim" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:serviceTask id="task">${o.hostExtra ?? ""}<bpmn:extensionElements><easy-bpmn:taskDefinition type="t"/></bpmn:extensionElements></bpmn:serviceTask>
+    ${alt}
+    ${boundary}
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="task"/>
+    <bpmn:sequenceFlow id="s1" sourceRef="task" targetRef="E"/>
+    ${flows}
+  </bpmn:process>
+</bpmn:definitions>`;
+  }
+
+  it("accepts an interrupting boundary timer on a service task (timeDuration)", async () => {
+    const r = await parseAndValidate(timerBpmn());
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    const tb = r.graph!.nodes["tb"];
+    expect(tb?.boundaryKind).toBe("timer");
+    expect(tb?.attachedToRef).toBe("task");
+    expect(tb?.next).toBe("onTimeout");
+    expect(tb?.timerTrigger).toEqual({ kind: "timeDuration", value: "PT5M" });
+  });
+
+  it("accepts a static timeDate trigger", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        boundary: `<bpmn:boundaryEvent id="tb" attachedToRef="task"><bpmn:timerEventDefinition><bpmn:timeDate>2026-12-31T23:59:00Z</bpmn:timeDate></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+      }),
+    );
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["tb"]?.timerTrigger).toEqual({ kind: "timeDate", value: "2026-12-31T23:59:00Z" });
+  });
+
+  it("rejects a non-interrupting (cancelActivity=false) boundary timer", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        boundary: `<bpmn:boundaryEvent id="tb" attachedToRef="task" cancelActivity="false"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tb" && /non-interrupting/i.test(i.reason) && /M4/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a timeCycle trigger", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        boundary: `<bpmn:boundaryEvent id="tb" attachedToRef="task"><bpmn:timerEventDefinition><bpmn:timeCycle>R3/PT10M</bpmn:timeCycle></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tb" && /timeCycle/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a definition carrying BOTH timeDate and timeDuration", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        boundary: `<bpmn:boundaryEvent id="tb" attachedToRef="task"><bpmn:timerEventDefinition><bpmn:timeDate>2026-01-01T00:00:00Z</bpmn:timeDate><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tb" && /both a timeDate and a timeDuration/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a timerEventDefinition with no time child", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        boundary: `<bpmn:boundaryEvent id="tb" attachedToRef="task"><bpmn:timerEventDefinition/></bpmn:boundaryEvent>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tb" && /no timeDate or timeDuration/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a non-parsing timeDuration literal (incl. a FEEL expression)", async () => {
+    for (const bad of ["PT5X", "${dueIn}", "5 minutes"]) {
+      const r = await parseAndValidate(
+        timerBpmn({
+          boundary: `<bpmn:boundaryEvent id="tb" attachedToRef="task"><bpmn:timerEventDefinition><bpmn:timeDuration>${bad}</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+        }),
+      );
+      expect(r.ok).toBe(false);
+      expect(r.issues.some((i) => i.elementId === "tb" && /not a static ISO-8601 duration literal/.test(i.reason))).toBe(true);
+    }
+  });
+
+  it("rejects a non-parsing timeDate literal", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        boundary: `<bpmn:boundaryEvent id="tb" attachedToRef="task"><bpmn:timerEventDefinition><bpmn:timeDate>not-a-date</bpmn:timeDate></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tb" && /not a static ISO-8601 date/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a boundary timer with more than one outgoing flow", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        flows: `<bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="onTimeout"/>
+                <bpmn:sequenceFlow id="tf2" sourceRef="tb" targetRef="E"/>
+                <bpmn:sequenceFlow id="af" sourceRef="onTimeout" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tb" && /exactly one outgoing sequence flow/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a boundary-timer flow targeting a start event (reuses the M3-L2 endpoint rule)", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        alt: ``,
+        flows: `<bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="S"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tf" && /start event 'S'/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects more than one boundary timer on a single activity", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        boundary: `<bpmn:boundaryEvent id="tb" attachedToRef="task"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+                   <bpmn:boundaryEvent id="tb2" attachedToRef="task"><bpmn:timerEventDefinition><bpmn:timeDuration>PT9M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+        flows: `<bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="onTimeout"/>
+                <bpmn:sequenceFlow id="tf2" sourceRef="tb2" targetRef="onTimeout"/>
+                <bpmn:sequenceFlow id="af" sourceRef="onTimeout" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tb2" && /more than one boundary timer/.test(i.reason))).toBe(true);
+  });
+
+  it("tolerates ignorable content (foreign extension/documentation) on a boundary-timer model", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        hostExtra: `<bpmn:documentation>host task</bpmn:documentation>`,
+        boundary: `<bpmn:boundaryEvent id="tb" attachedToRef="task"><bpmn:extensionElements><camunda:properties><camunda:property name="x" value="y"/></camunda:properties></bpmn:extensionElements><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+      }),
+    );
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+  });
+
+  it("accepts a boundary timer on a RECEIVE task", async () => {
+    const RECV_TIMER_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_rt" targetNamespace="x">
+  <bpmn:message id="M" name="Approval"/>
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:receiveTask id="wait" messageRef="M"/>
+    <bpmn:serviceTask id="onTimeout"><bpmn:extensionElements><easy-bpmn:taskDefinition type="timeout-handler"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:boundaryEvent id="tb" attachedToRef="wait"><bpmn:timerEventDefinition><bpmn:timeDuration>PT1H</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="wait"/>
+    <bpmn:sequenceFlow id="s1" sourceRef="wait" targetRef="E"/>
+    <bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="onTimeout"/>
+    <bpmn:sequenceFlow id="af" sourceRef="onTimeout" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const r = await parseAndValidate(RECV_TIMER_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["tb"]?.attachedToRef).toBe("wait");
+  });
+
+  it("rejects a boundary timer attached to a transaction (deferred to M5)", async () => {
+    const TX_TIMER_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_txt" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:transaction id="Tx">
+      <bpmn:startEvent id="TxS"/>
+      <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="a"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:endEvent id="TxE"/>
+      <bpmn:sequenceFlow id="t1" sourceRef="TxS" targetRef="A"/>
+      <bpmn:sequenceFlow id="t2" sourceRef="A" targetRef="TxE"/>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="tb" attachedToRef="Tx"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+    <bpmn:serviceTask id="onTimeout"><bpmn:extensionElements><easy-bpmn:taskDefinition type="timeout-handler"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:endEvent id="Done"/>
+    <bpmn:sequenceFlow id="g1" sourceRef="S" targetRef="Tx"/>
+    <bpmn:sequenceFlow id="g2" sourceRef="Tx" targetRef="Done"/>
+    <bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="onTimeout"/>
+    <bpmn:sequenceFlow id="af" sourceRef="onTimeout" targetRef="Done"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const r = await parseAndValidate(TX_TIMER_BPMN);
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tb" && /attached to transaction/.test(i.reason) && /M5/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a boundary timer attached to an isForCompensation handler", async () => {
+    const r = await parseAndValidate(
+      sagaBpmn({
+        innerExtra: `<bpmn:boundaryEvent id="tb_on_handler" attachedToRef="undoA"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tb_on_handler" && /attached to compensation handler 'undoA'/.test(i.reason))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M3-L4 (TASK-45): the TIMER intermediate catch — a delay step on the token path
+// (design §4.4). Exactly one incoming + one outgoing sequence flow; allowed at
+// process level AND inside a transaction; the same timerEventDefinition
+// well-formedness as boundary timers (reuses readTimerTrigger). A MESSAGE
+// intermediate catch stays "M3 — not yet implemented" (TASK-46).
+// ---------------------------------------------------------------------------
+describe("Timer intermediate catch (M3-L4, TASK-45)", () => {
+  /** S → catch (timer) → svc → E, with the catch as a token-path delay node. */
+  function catchBpmn(o: { def?: string; flows?: string } = {}): string {
+    const def = o.def ?? `<bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition>`;
+    const flows = o.flows ??
+      `<bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="catch"/>
+       <bpmn:sequenceFlow id="s1" sourceRef="catch" targetRef="after"/>
+       <bpmn:sequenceFlow id="s2" sourceRef="after" targetRef="E"/>`;
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:camunda="http://camunda.org/schema/1.0/bpmn" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_ic" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:intermediateCatchEvent id="catch">${def}</bpmn:intermediateCatchEvent>
+    <bpmn:serviceTask id="after"><bpmn:extensionElements><easy-bpmn:taskDefinition type="after"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:endEvent id="E"/>
+    ${flows}
+  </bpmn:process>
+</bpmn:definitions>`;
+  }
+
+  it("accepts a timer intermediate catch at process level (timeDuration)", async () => {
+    const r = await parseAndValidate(catchBpmn());
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    const c = r.graph!.nodes["catch"];
+    expect(c?.type).toBe("intermediateCatchEvent");
+    expect(c?.next).toBe("after");
+    expect(c?.timerTrigger).toEqual({ kind: "timeDuration", value: "PT5M" });
+  });
+
+  it("accepts a static timeDate trigger", async () => {
+    const r = await parseAndValidate(
+      catchBpmn({ def: `<bpmn:timerEventDefinition><bpmn:timeDate>2026-12-31T23:59:00Z</bpmn:timeDate></bpmn:timerEventDefinition>` }),
+    );
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["catch"]?.timerTrigger).toEqual({ kind: "timeDate", value: "2026-12-31T23:59:00Z" });
+  });
+
+  it("accepts a timer intermediate catch INSIDE a transaction (scope stays open across the delay)", async () => {
+    const TX_CATCH = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_txic" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:transaction id="Tx">
+      <bpmn:startEvent id="TxS"/>
+      <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="a"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:intermediateCatchEvent id="catch"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent>
+      <bpmn:endEvent id="TxE"/>
+      <bpmn:sequenceFlow id="t1" sourceRef="TxS" targetRef="A"/>
+      <bpmn:sequenceFlow id="t2" sourceRef="A" targetRef="catch"/>
+      <bpmn:sequenceFlow id="t3" sourceRef="catch" targetRef="TxE"/>
+    </bpmn:transaction>
+    <bpmn:endEvent id="Done"/>
+    <bpmn:sequenceFlow id="g1" sourceRef="S" targetRef="Tx"/>
+    <bpmn:sequenceFlow id="g2" sourceRef="Tx" targetRef="Done"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const r = await parseAndValidate(TX_CATCH);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["catch"]?.scopeId).toBe("Tx");
+    expect(r.graph!.nodes["catch"]?.next).toBe("TxE");
+  });
+
+  it("rejects a MESSAGE intermediate catch with no messageRef (TASK-46)", async () => {
+    // A messageEventDefinition without a messageRef is now the MESSAGE variant
+    // (opened in TASK-46) failing its receive-task-shaped messageRef rule — not
+    // the old "M3 — not yet implemented" deferral.
+    const r = await parseAndValidate(
+      catchBpmn({ def: `<bpmn:messageEventDefinition/>` }),
+    );
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some((i) => i.elementId === "catch" && /must reference a declared <message> via messageRef/.test(i.reason)),
+    ).toBe(true);
+    // No stale "not yet implemented" wording survives for the message catch.
+    expect(r.issues.some((i) => i.elementId === "catch" && /not yet implemented/i.test(i.reason))).toBe(false);
+  });
+
+  it("rejects an intermediate catch with no event definition", async () => {
+    const r = await parseAndValidate(catchBpmn({ def: `` }));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "catch" && /no event definition/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a timeCycle trigger", async () => {
+    const r = await parseAndValidate(
+      catchBpmn({ def: `<bpmn:timerEventDefinition><bpmn:timeCycle>R3/PT10M</bpmn:timeCycle></bpmn:timerEventDefinition>` }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "catch" && /timeCycle/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects an empty timerEventDefinition with a construct-neutral reason (no 'boundary' leak)", async () => {
+    const r = await parseAndValidate(catchBpmn({ def: `<bpmn:timerEventDefinition/>` }));
+    expect(r.ok).toBe(false);
+    const issue = r.issues.find((i) => i.elementId === "catch" && /no timeDate or timeDuration/.test(i.reason));
+    expect(issue).toBeDefined();
+    // The shared readTimerTrigger reason must NOT call a catch a "boundary timer".
+    expect(issue!.reason).toMatch(/Intermediate catch event 'catch'/);
+    expect(issue!.reason).not.toMatch(/boundary/);
+  });
+
+  it("rejects BOTH timeDate and timeDuration", async () => {
+    const r = await parseAndValidate(
+      catchBpmn({ def: `<bpmn:timerEventDefinition><bpmn:timeDate>2026-01-01T00:00:00Z</bpmn:timeDate><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition>` }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "catch" && /both a timeDate and a timeDuration/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a non-parsing timeDuration literal (incl. a FEEL expression)", async () => {
+    for (const bad of ["PT5X", "${dueIn}", "soon"]) {
+      const r = await parseAndValidate(
+        catchBpmn({ def: `<bpmn:timerEventDefinition><bpmn:timeDuration>${bad}</bpmn:timeDuration></bpmn:timerEventDefinition>` }),
+      );
+      expect(r.ok).toBe(false);
+      expect(r.issues.some((i) => i.elementId === "catch" && /not a static ISO-8601 duration literal/.test(i.reason))).toBe(true);
+    }
+  });
+
+  it("rejects more than one outgoing flow (implicit split)", async () => {
+    const r = await parseAndValidate(
+      catchBpmn({
+        flows: `<bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="catch"/>
+                <bpmn:sequenceFlow id="s1" sourceRef="catch" targetRef="after"/>
+                <bpmn:sequenceFlow id="s1b" sourceRef="catch" targetRef="E"/>
+                <bpmn:sequenceFlow id="s2" sourceRef="after" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "catch" && /outgoing sequence flows/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects more than one incoming flow (a catch is a single-token delay, not a join)", async () => {
+    const r = await parseAndValidate(
+      catchBpmn({
+        flows: `<bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="after"/>
+                <bpmn:sequenceFlow id="s0b" sourceRef="after" targetRef="catch"/>
+                <bpmn:sequenceFlow id="s0c" sourceRef="S" targetRef="catch"/>
+                <bpmn:sequenceFlow id="s1" sourceRef="catch" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "catch" && /incoming sequence flows/.test(i.reason) && /not a join/.test(i.reason))).toBe(true);
+  });
+
+  it("tolerates ignorable content (foreign extension/documentation) on a timer-catch model", async () => {
+    const r = await parseAndValidate(
+      catchBpmn({
+        def: `<bpmn:documentation>delay</bpmn:documentation><bpmn:extensionElements><camunda:properties><camunda:property name="x" value="y"/></camunda:properties></bpmn:extensionElements><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition>`,
+      }),
+    );
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M3-L4 (TASK-46): the STANDALONE message intermediate catch — a token-path node
+// with IDENTICAL wait/correlation/resume semantics to a receiveTask (the
+// <message> carries only its name), but an EVENT, not an activity: no
+// easy-bpmn:taskDefinition, no boundary events attach. Exactly one incoming + one
+// outgoing flow; allowed at process level AND inside a transaction. The
+// eventBasedGateway accept/reject matrix follows in its own describe block.
+// ---------------------------------------------------------------------------
+describe("Message intermediate catch (M3-L4, TASK-46)", () => {
+  /** S → catch (messageEventDefinition → <message> "Approval") → after → E. */
+  function msgCatchBpmn(o: { def?: string; flows?: string; extra?: string; message?: string } = {}): string {
+    const def = o.def ?? `<bpmn:messageEventDefinition messageRef="M"/>`;
+    const message = o.message ?? `<bpmn:message id="M" name="Approval"/>`;
+    const flows = o.flows ??
+      `<bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="catch"/>
+       <bpmn:sequenceFlow id="s1" sourceRef="catch" targetRef="after"/>
+       <bpmn:sequenceFlow id="s2" sourceRef="after" targetRef="E"/>`;
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:camunda="http://camunda.org/schema/1.0/bpmn" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_mic" targetNamespace="x">
+  ${message}
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:intermediateCatchEvent id="catch">${def}</bpmn:intermediateCatchEvent>
+    <bpmn:serviceTask id="after"><bpmn:extensionElements><easy-bpmn:taskDefinition type="after"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:endEvent id="E"/>
+    ${o.extra ?? ""}
+    ${flows}
+  </bpmn:process>
+</bpmn:definitions>`;
+  }
+
+  it("accepts a standalone message intermediate catch at process level", async () => {
+    const r = await parseAndValidate(msgCatchBpmn());
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    const c = r.graph!.nodes["catch"];
+    expect(c?.type).toBe("intermediateCatchEvent");
+    expect(c?.messageName).toBe("Approval");
+    expect(c?.timerTrigger ?? null).toBeNull();
+    expect(c?.next).toBe("after");
+  });
+
+  it("accepts a message intermediate catch INSIDE a transaction (scope stays open across the wait)", async () => {
+    const TX_MSG_CATCH = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_txmic" targetNamespace="x">
+  <bpmn:message id="M" name="Approval"/>
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:transaction id="Tx">
+      <bpmn:startEvent id="TxS"/>
+      <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="a"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:intermediateCatchEvent id="catch"><bpmn:messageEventDefinition messageRef="M"/></bpmn:intermediateCatchEvent>
+      <bpmn:endEvent id="TxE"/>
+      <bpmn:sequenceFlow id="t1" sourceRef="TxS" targetRef="A"/>
+      <bpmn:sequenceFlow id="t2" sourceRef="A" targetRef="catch"/>
+      <bpmn:sequenceFlow id="t3" sourceRef="catch" targetRef="TxE"/>
+    </bpmn:transaction>
+    <bpmn:endEvent id="Done"/>
+    <bpmn:sequenceFlow id="g1" sourceRef="S" targetRef="Tx"/>
+    <bpmn:sequenceFlow id="g2" sourceRef="Tx" targetRef="Done"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const r = await parseAndValidate(TX_MSG_CATCH);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["catch"]?.scopeId).toBe("Tx");
+    expect(r.graph!.nodes["catch"]?.messageName).toBe("Approval");
+    expect(r.graph!.nodes["catch"]?.next).toBe("TxE");
+  });
+
+  it("rejects a missing/unresolved messageRef", async () => {
+    // messageRef names a <message> that does not exist → moddle drops the ref →
+    // the receive-task-shaped rule rejects (it is NOT a hidden catch-all).
+    const r = await parseAndValidate(msgCatchBpmn({ def: `<bpmn:messageEventDefinition messageRef="Missing"/>` }));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "catch" && /must reference a declared <message> via messageRef/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a <message> with no name (correlation needs a non-empty name)", async () => {
+    const r = await parseAndValidate(msgCatchBpmn({ message: `<bpmn:message id="M"/>` }));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "catch" && /no name|non-empty message name/i.test(i.reason))).toBe(true);
+  });
+
+  it("rejects an easy-bpmn:taskDefinition on the catch (an event routes no worker)", async () => {
+    const r = await parseAndValidate(
+      msgCatchBpmn({
+        def: `<bpmn:extensionElements><easy-bpmn:taskDefinition type="nope"/></bpmn:extensionElements><bpmn:messageEventDefinition messageRef="M"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "catch" && /easy-bpmn:taskDefinition/.test(i.reason) && /event, not a service task/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a boundary event attached to a message catch (it is an event, not an activity)", async () => {
+    const r = await parseAndValidate(
+      msgCatchBpmn({
+        extra: `<bpmn:boundaryEvent id="b" attachedToRef="catch"><bpmn:timerEventDefinition><bpmn:timeDuration>PT1M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+        flows: `<bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="catch"/>
+                <bpmn:sequenceFlow id="s1" sourceRef="catch" targetRef="after"/>
+                <bpmn:sequenceFlow id="sb" sourceRef="b" targetRef="after"/>
+                <bpmn:sequenceFlow id="s2" sourceRef="after" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some((i) => i.elementId === "b" && /attached to intermediate catch event 'catch'/.test(i.reason)),
+    ).toBe(true);
+    // Cascade-suppression: the general boundary-on-catch reason `continue`s, so the
+    // per-kind "must be attached to a service task" check must NOT also fire.
+    expect(r.issues.some((i) => /must be attached to a service task/.test(i.reason))).toBe(false);
+  });
+
+  it("rejects more than one outgoing flow (implicit split)", async () => {
+    const r = await parseAndValidate(
+      msgCatchBpmn({
+        flows: `<bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="catch"/>
+                <bpmn:sequenceFlow id="s1" sourceRef="catch" targetRef="after"/>
+                <bpmn:sequenceFlow id="s1b" sourceRef="catch" targetRef="E"/>
+                <bpmn:sequenceFlow id="s2" sourceRef="after" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "catch" && /outgoing sequence flows/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects more than one incoming flow (a catch is a single-token wait, not a join)", async () => {
+    const r = await parseAndValidate(
+      msgCatchBpmn({
+        flows: `<bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="after"/>
+                <bpmn:sequenceFlow id="s0b" sourceRef="after" targetRef="catch"/>
+                <bpmn:sequenceFlow id="s0c" sourceRef="S" targetRef="catch"/>
+                <bpmn:sequenceFlow id="s1" sourceRef="catch" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "catch" && /incoming sequence flows/.test(i.reason) && /not a join/.test(i.reason))).toBe(true);
+  });
+
+  it("tolerates ignorable content (foreign extension/documentation) on a message-catch model", async () => {
+    const r = await parseAndValidate(
+      msgCatchBpmn({
+        def: `<bpmn:documentation>await approval</bpmn:documentation><bpmn:extensionElements><camunda:properties><camunda:property name="x" value="y"/></camunda:properties></bpmn:extensionElements><bpmn:messageEventDefinition messageRef="M"/>`,
+      }),
+    );
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// M3-L4 (TASK-46, design §3 item 4 / §4.5): the eventBasedGateway — a
+// deterministic race over its branch catches. Accept/reject matrix: ≥2 branches,
+// every target a single-incoming intermediate catch (timer or message), ≤1 timer
+// branch, distinct messages; instantiate / eventGatewayType="Parallel" rejected.
+// ---------------------------------------------------------------------------
+describe("Event-based gateway (M3-L4, TASK-46)", () => {
+  /**
+   * S → EBG → { onMsg (message "Approve") , onTimer (timer PT5M) }; each catch
+   * continues to a service task and both converge on the end event. Knobs swap the
+   * gateway attributes, the branch flows, the branch-target elements, and the
+   * <message> declarations.
+   */
+  function ebgBpmn(o: { gwAttrs?: string; branches?: string; targets?: string; messages?: string; extra?: string } = {}): string {
+    const messages = o.messages ?? `<bpmn:message id="MA" name="Approve"/>`;
+    const branches =
+      o.branches ??
+      `<bpmn:sequenceFlow id="e1" sourceRef="EBG" targetRef="onMsg"/>
+       <bpmn:sequenceFlow id="e2" sourceRef="EBG" targetRef="onTimer"/>`;
+    const targets =
+      o.targets ??
+      `<bpmn:intermediateCatchEvent id="onMsg"><bpmn:messageEventDefinition messageRef="MA"/></bpmn:intermediateCatchEvent>
+       <bpmn:intermediateCatchEvent id="onTimer"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent>
+       <bpmn:serviceTask id="afterMsg"><bpmn:extensionElements><easy-bpmn:taskDefinition type="am"/></bpmn:extensionElements></bpmn:serviceTask>
+       <bpmn:serviceTask id="afterTimer"><bpmn:extensionElements><easy-bpmn:taskDefinition type="at"/></bpmn:extensionElements></bpmn:serviceTask>
+       <bpmn:sequenceFlow id="m1" sourceRef="onMsg" targetRef="afterMsg"/>
+       <bpmn:sequenceFlow id="m2" sourceRef="onTimer" targetRef="afterTimer"/>
+       <bpmn:sequenceFlow id="z1" sourceRef="afterMsg" targetRef="E"/>
+       <bpmn:sequenceFlow id="z2" sourceRef="afterTimer" targetRef="E"/>`;
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_ebg" targetNamespace="x">
+  ${messages}
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:eventBasedGateway id="EBG" ${o.gwAttrs ?? ""}/>
+    ${targets}
+    <bpmn:endEvent id="E"/>
+    ${o.extra ?? ""}
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="EBG"/>
+    ${branches}
+  </bpmn:process>
+</bpmn:definitions>`;
+  }
+
+  it("accepts a timer+message event-based gateway and extracts the IR", async () => {
+    const r = await parseAndValidate(ebgBpmn());
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    const g = r.graph!;
+    const ebg = g.nodes["EBG"];
+    expect(ebg?.type).toBe("eventBasedGateway");
+    // Branch selection owns the successor (like an exclusiveGateway): next is null,
+    // the engine reads outgoing[] (document order).
+    expect(ebg?.next).toBeNull();
+    expect(ebg?.outgoing.map((f) => f.targetId)).toEqual(["onMsg", "onTimer"]);
+    expect(g.nodes["onMsg"]?.messageName).toBe("Approve");
+    expect(g.nodes["onTimer"]?.timerTrigger).toEqual({ kind: "timeDuration", value: "PT5M" });
+  });
+
+  it("accepts two distinct-message branches plus a timer branch", async () => {
+    const r = await parseAndValidate(
+      ebgBpmn({
+        messages: `<bpmn:message id="MA" name="Approve"/><bpmn:message id="MR" name="Reject"/>`,
+        branches: `<bpmn:sequenceFlow id="e1" sourceRef="EBG" targetRef="onMsg"/>
+                   <bpmn:sequenceFlow id="e2" sourceRef="EBG" targetRef="onReject"/>
+                   <bpmn:sequenceFlow id="e3" sourceRef="EBG" targetRef="onTimer"/>`,
+        targets: `<bpmn:intermediateCatchEvent id="onMsg"><bpmn:messageEventDefinition messageRef="MA"/></bpmn:intermediateCatchEvent>
+                  <bpmn:intermediateCatchEvent id="onReject"><bpmn:messageEventDefinition messageRef="MR"/></bpmn:intermediateCatchEvent>
+                  <bpmn:intermediateCatchEvent id="onTimer"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent>
+                  <bpmn:serviceTask id="afterMsg"><bpmn:extensionElements><easy-bpmn:taskDefinition type="am"/></bpmn:extensionElements></bpmn:serviceTask>
+                  <bpmn:sequenceFlow id="m1" sourceRef="onMsg" targetRef="afterMsg"/>
+                  <bpmn:sequenceFlow id="m2" sourceRef="onReject" targetRef="afterMsg"/>
+                  <bpmn:sequenceFlow id="m3" sourceRef="onTimer" targetRef="afterMsg"/>
+                  <bpmn:sequenceFlow id="z1" sourceRef="afterMsg" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+  });
+
+  it("rejects fewer than two branches", async () => {
+    const r = await parseAndValidate(
+      ebgBpmn({
+        branches: `<bpmn:sequenceFlow id="e1" sourceRef="EBG" targetRef="onMsg"/>`,
+        targets: `<bpmn:intermediateCatchEvent id="onMsg"><bpmn:messageEventDefinition messageRef="MA"/></bpmn:intermediateCatchEvent>
+                  <bpmn:serviceTask id="afterMsg"><bpmn:extensionElements><easy-bpmn:taskDefinition type="am"/></bpmn:extensionElements></bpmn:serviceTask>
+                  <bpmn:sequenceFlow id="m1" sourceRef="onMsg" targetRef="afterMsg"/>
+                  <bpmn:sequenceFlow id="z1" sourceRef="afterMsg" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "EBG" && /races at least two event branches/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a branch whose target is not an intermediate catch event", async () => {
+    const r = await parseAndValidate(
+      ebgBpmn({
+        branches: `<bpmn:sequenceFlow id="e1" sourceRef="EBG" targetRef="onMsg"/>
+                   <bpmn:sequenceFlow id="e2" sourceRef="EBG" targetRef="task"/>`,
+        targets: `<bpmn:intermediateCatchEvent id="onMsg"><bpmn:messageEventDefinition messageRef="MA"/></bpmn:intermediateCatchEvent>
+                  <bpmn:serviceTask id="task"><bpmn:extensionElements><easy-bpmn:taskDefinition type="t"/></bpmn:extensionElements></bpmn:serviceTask>
+                  <bpmn:sequenceFlow id="m1" sourceRef="onMsg" targetRef="task"/>
+                  <bpmn:sequenceFlow id="z1" sourceRef="task" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "EBG" && /is not an intermediate catch event/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a branch-target catch reached by a second incoming flow (shared catch)", async () => {
+    // onMsg is targeted by the EBG AND by `S` directly → two incoming flows.
+    const r = await parseAndValidate(
+      ebgBpmn({
+        branches: `<bpmn:sequenceFlow id="e1" sourceRef="EBG" targetRef="onMsg"/>
+                   <bpmn:sequenceFlow id="e2" sourceRef="EBG" targetRef="onTimer"/>
+                   <bpmn:sequenceFlow id="e3" sourceRef="S" targetRef="onMsg"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some((i) => i.elementId === "EBG" && /exactly one incoming flow — the one from this gateway/.test(i.reason)),
+    ).toBe(true);
+  });
+
+  it("rejects more than one timer branch", async () => {
+    const r = await parseAndValidate(
+      ebgBpmn({
+        branches: `<bpmn:sequenceFlow id="e1" sourceRef="EBG" targetRef="onTimer"/>
+                   <bpmn:sequenceFlow id="e2" sourceRef="EBG" targetRef="onTimer2"/>`,
+        targets: `<bpmn:intermediateCatchEvent id="onTimer"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent>
+                  <bpmn:intermediateCatchEvent id="onTimer2"><bpmn:timerEventDefinition><bpmn:timeDuration>PT9M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent>
+                  <bpmn:serviceTask id="afterTimer"><bpmn:extensionElements><easy-bpmn:taskDefinition type="at"/></bpmn:extensionElements></bpmn:serviceTask>
+                  <bpmn:sequenceFlow id="m1" sourceRef="onTimer" targetRef="afterTimer"/>
+                  <bpmn:sequenceFlow id="m2" sourceRef="onTimer2" targetRef="afterTimer"/>
+                  <bpmn:sequenceFlow id="z1" sourceRef="afterTimer" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => /more than one timer branch/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects two branches waiting on the same message (one broker key)", async () => {
+    const r = await parseAndValidate(
+      ebgBpmn({
+        branches: `<bpmn:sequenceFlow id="e1" sourceRef="EBG" targetRef="onMsg"/>
+                   <bpmn:sequenceFlow id="e2" sourceRef="EBG" targetRef="onMsg2"/>`,
+        targets: `<bpmn:intermediateCatchEvent id="onMsg"><bpmn:messageEventDefinition messageRef="MA"/></bpmn:intermediateCatchEvent>
+                  <bpmn:intermediateCatchEvent id="onMsg2"><bpmn:messageEventDefinition messageRef="MA"/></bpmn:intermediateCatchEvent>
+                  <bpmn:serviceTask id="afterMsg"><bpmn:extensionElements><easy-bpmn:taskDefinition type="am"/></bpmn:extensionElements></bpmn:serviceTask>
+                  <bpmn:sequenceFlow id="m1" sourceRef="onMsg" targetRef="afterMsg"/>
+                  <bpmn:sequenceFlow id="m2" sourceRef="onMsg2" targetRef="afterMsg"/>
+                  <bpmn:sequenceFlow id="z1" sourceRef="afterMsg" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => /branch waiting on message 'Approve'/.test(i.reason) && /distinct messages/.test(i.reason))).toBe(true);
+  });
+
+  it('rejects instantiate="true" (instances start via the API)', async () => {
+    const r = await parseAndValidate(ebgBpmn({ gwAttrs: `instantiate="true"` }));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "EBG" && /instantiate="true"/.test(i.reason))).toBe(true);
+  });
+
+  it('rejects eventGatewayType="Parallel" (wait-for-all is M4-class)', async () => {
+    const r = await parseAndValidate(ebgBpmn({ gwAttrs: `eventGatewayType="Parallel"` }));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "EBG" && /Parallel event gateway/.test(i.reason))).toBe(true);
+  });
+
+  it("tolerates ignorable content (documentation) on an EBG model", async () => {
+    const r = await parseAndValidate(ebgBpmn({ extra: `<bpmn:documentation>race the events</bpmn:documentation>` }));
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
   });
 });

@@ -1,4 +1,4 @@
-# Data Model: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas)
+# Data Model: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas; M3 — Time & failure taxonomy)
 
 All M1 changes are **additive migrations** (`migrations/0002_saga.sql`); published definition
 versions are never mutated. The MVP entities (Workspace, Process Definition Draft, Validation
@@ -7,7 +7,8 @@ Message, Variable Snapshot, History Event, Idempotency Record) carry forward fro
 `specs/001-bpmn-lite-orchestrator-mvp/data-model.md`; only the deltas and new entities are
 described here. The **M2 deltas** (occurrence discriminator, conditional topology,
 `gateway_decisions` — migrations `0004_conditional.sql` + `0005_output_applied_backfill.sql`) are
-described in their own section at the end.
+described in their own section, followed by the **M3 deltas** (model-level timers + the
+technical-vs-business incident-kind split — migration `0006_timers.sql`).
 
 ## Entity: Transaction Scope (graph IR)
 
@@ -52,8 +53,9 @@ Delta to the parsed-node IR consumed by the scope-aware engine.
   `outgoing[]`). Compensation boundaries + `isForCompensation` handlers carry `outgoing: []`.
 - `kind`: Node kind, now including `transaction` and `boundaryEvent`.
 - `endEvent.kind`: `none | cancel | compensate`.
-- `boundaryEvent.kind`: `error | cancel | compensate | timer` (only `error`/`cancel`/`compensate`
-  accepted in M1).
+- `boundaryEvent.kind`: `error | cancel | compensate | timer` (`error`/`cancel`/`compensate`
+  accepted in M1; the **interrupting** `timer` boundary on a `serviceTask`/`receiveTask` accepted in
+  M3 — see the M3 deltas).
 - `boundaryEvent.attachedToRef`: The activity/transaction the boundary is attached to.
 - `isForCompensation`: Boolean on service-task nodes (handler, off the normal token path).
 - `association`: Map `boundaryId -> handlerId`.
@@ -136,7 +138,7 @@ CREATE INDEX idx_jobs_leasable ON service_task_jobs (task_type, status, lock_exp
 - `worker_id` / `lock_token` / `lock_expires_at`: The pull lease (claimer, conditional-update token,
   lease deadline).
 - `activation_expires_at`: Job-level DLQ TTL — a job whose `taskType` nobody polls expires here →
-  terminal incident (`kind=timeout`).
+  terminal incident (`kind=jobActivationTimeout`).
 - `error_code`: The business error code from a `fail` (matched to `bpmn:error/@errorCode`).
 - `status`: `created | running | completed | failed`, plus the lease state `locked` (a `created`/
   re-leasable job is leased to `locked` with a `lock_token`).
@@ -346,8 +348,9 @@ deep-equal with a fresh parse, conditions included.
   inside a transaction; operator `/retry` re-evaluates the visit fresh (no decision row exists for
   the failed visit).
 
-Full enum (zod + openapi): `serviceTaskFailure | compensationFailure | timeout | poison |
-loopLimit | noPath`.
+Full enum after M2 (zod + openapi): `serviceTaskFailure | compensationFailure | timeout | poison |
+loopLimit | noPath`. **M3** splits the overloaded `timeout` and adds `conditionFailure` — see the
+M3 deltas below.
 
 ### History Event (free-text type absorbs the M2 event)
 
@@ -357,12 +360,133 @@ loopLimit | noPath`.
 - `compensationStarted` **and** `compensationCompleted` diagnostics carry the iteration's
   `occurrence` so each loop iteration's rollback is auditable.
 
+## M3 deltas (time & failure taxonomy — migration `0006_timers.sql`)
+
+Additive over the M2 schema; published versions are never mutated. Source design:
+`docs/superpowers/specs/2026-06-11-m3-time-failure-taxonomy-design.md` (§4.1 tables, §5 taxonomy).
+
+### Entity: Timer (graph IR + runtime)
+
+New token nodes accepted by the validator at **process level and inside a `transaction`** (the only
+extension binding is still `easy-bpmn:taskDefinition` on tasks — nothing new):
+
+- **Interrupting boundary timer** — `boundaryEvent` + `timerEventDefinition` (`cancelActivity`
+  absent/`true`), attachable to a `serviceTask`/`receiveTask`, **at most one per activity**, exactly
+  one outgoing flow; never on a `transaction` (would terminate the scope without compensation) nor on
+  an `isForCompensation` handler. The canonical "saga timeout → compensate" shape is a boundary timer
+  on a task *inside* the transaction routing to the cancel end event.
+- **`intermediateCatchEvent` + `timerEventDefinition`** — a delay step on the token path (one
+  incoming, one outgoing).
+- **`intermediateCatchEvent` + `messageEventDefinition`** — identical wait/correlation/resume
+  semantics to a `receiveTask` (same subscription machinery), but an *event*, not an activity.
+- **`eventBasedGateway`** — ≥2 outgoing flows, each targeting an `intermediateCatchEvent` (timer or
+  message) whose only incoming flow is from the gateway; at most one timer branch; message branches
+  reference distinct messages; no `instantiate="true"`/`eventGatewayType="Parallel"`.
+
+**Timer triggers:** exactly one of `timeDate`|`timeDuration`, each a static ISO-8601 literal
+(`timeCycle`, FEEL expressions, zero/two children → rejected pre-publish with element id + reason).
+`fire_at` is computed **once at arm time in code** (`timeDate` as-is; `now + timeDuration`) and
+snapshotted in D1, never recomputed in SQL — so a rewalk re-park and a Workflow replay see the same
+deadline (replay-safety; the foundation for later FEEL-expression triggers).
+
+### `timers` (canonical, queryable source of record)
+
+One row per armed model timer. The PK is **deterministic** (`instanceId:elementId#occurrence`),
+`occurrence` is the **arming visit's** occurrence — the host activity's visit for a boundary timer,
+the catch's own visit for an intermediate catch, the gateway's visit for an `eventGateway` timer
+branch — never derived from live D1 counts (the M2 rewalk rule). Arming is `INSERT OR IGNORE` in the
+same `dbBatch` as the wait it guards, so a rewalk that revisits an `armed` row is a write-free
+re-park. `status` is bookkeeping / read-model only; the authoritative race outcome lives in
+`timer_outcomes` (boundary / intermediate-catch timers) or `gateway_decisions` (`eventGateway`
+timers).
+
+```sql
+CREATE TABLE timers (
+  timer_id        TEXT PRIMARY KEY,   -- deterministic: instanceId:elementId#occurrence
+  instance_id     TEXT NOT NULL,
+  element_id      TEXT NOT NULL,      -- the timer-event element (boundary | catch | EBG branch)
+  occurrence      INTEGER NOT NULL,   -- the arming visit's occurrence
+  kind            TEXT NOT NULL,      -- boundary | intermediateCatch | eventGateway
+  attached_to_ref TEXT,               -- boundary: host activity element id
+  gateway_id      TEXT,               -- eventGateway: owning gateway element id
+  fire_at         TEXT NOT NULL,      -- snapshotted at arm time (timeDate as-is; now + timeDuration)
+  status          TEXT NOT NULL,      -- armed | fired | cancelled  (bookkeeping/read model)
+  fired_at        TEXT,
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL
+);
+CREATE UNIQUE INDEX uq_timers_visit ON timers (instance_id, element_id, occurrence);
+CREATE INDEX idx_timers_instance_status ON timers (instance_id, status);
+```
+
+### `timer_outcomes` (the race decider for boundary / intermediate-catch timers)
+
+Every race has exactly **one deciding row**, claimed by a **plain `INSERT`** (never
+`INSERT OR IGNORE`) composed into the same `dbBatch` as the loser-visible transition: the loser's
+whole batch aborts on the unique-constraint violation and converts to the recorded outcome (the
+documented `gateway_decisions` contract, `src/persistence/gateway-decisions.ts`). `eventGateway`
+timers decide on `gateway_decisions` instead and have **no** `timer_outcomes` row.
+
+```sql
+CREATE TABLE timer_outcomes (
+  timer_id   TEXT PRIMARY KEY,
+  outcome    TEXT NOT NULL,           -- fired | cancelled
+  decided_at TEXT NOT NULL
+);
+```
+
+**Firing & validation rules:**
+- DO-alarm-first: a per-timer alarm on the generalized one-shot `JobScheduler` DO (timer DOs keyed
+  `timer:<timerId>`, same `JOB_SCHEDULER` binding — no DO-namespace migration) fires it; `step.sleep`
+  is **not** used. Arming is best-effort at write time; every rewalk re-arms `armed` timers it walks
+  past (self-healing). Direct mode tests fire via `runDurableObjectAlarm`.
+- A timer-guarded wait never raises `waitTimeout`; in Workflow mode its `waitForEvent` timeout is
+  sized to `fire_at` and doubles as the lost-alarm backstop (overdue settling on any wake).
+- A **fired model timer is not an incident** — it is a modeled path (history `timerFired`). Every
+  abnormal exit (normal completion, error-boundary route, retry exhaustion, operator `/cancel`)
+  settles the armed timer `cancelled` via the decider, so a stray alarm afterwards no-ops.
+
+### Incident kinds (the `timeout` split)
+
+The overloaded M1/M2 `timeout` kind splits; full enum after M3 (zod + openapi):
+`serviceTaskFailure | compensationFailure | conditionFailure | jobActivationTimeout | waitTimeout |
+poison | loopLimit | noPath` (+ legacy `timeout`, retained for compatibility, never written by new
+code).
+
+- `jobActivationTimeout` — nobody leases the `taskType` before `activation_expires_at` (the DLQ
+  expiry; the lone M1 job-level timer).
+- `waitTimeout` — an **un-guarded** service-task / receive-task wait hits the 1-hour safety-net cap
+  (a wait guarded by a modeled timer never raises it).
+- `conditionFailure` — a hard FEEL evaluation error (deferred from M2; previously masked as
+  `serviceTaskFailure`).
+
+**Incident hygiene (M3):** `setIncidentResolution` takes an `incident_id` filter (no longer flips
+*all* of an instance's open incidents); instance inspection exposes the **list of open incidents**
+(not only the latest); operator `/cancel` on an empty ledger closes all open incidents as
+`operatorResolved` and settles armed timers.
+
+### Jobs API retry policy (M3)
+
+`retryable` is **honored**: a `fail` with `retryable=false` (or a technical failure that exhausts its
+retry budget, including a reclaim re-lease that reaches `retry_limit`) routes to the standard
+exhaustion path (Hazard incident inside a transaction). The request schema is unchanged; this is a
+behavior change for a worker already sending `retryable=false` (legal and ignored before M3). The
+poison budget stays per-(instance, element) across occurrences (the deliberate TASK-35 decision).
+
+### History Event (free-text type; no migration)
+
+New event types: `timerArmed`, `timerFired`, `timerCancelled`, `eventBasedGatewayWaiting`,
+`ebgDecision`. A fired model timer emits `timerFired` (no incident).
+
+### Inspection (`GET /instances/{id}`)
+
+Gains a `timers` block (armed/fired/cancelled with `fire_at`/`fired_at`) read from D1 and the
+**list** of open incidents; Cloudflare Workflow internals stay hidden. No new operator verbs.
+
 ## Roadmap stub tables (named here; created in later milestones)
 
 Named now for the roadmap; **not** created yet:
 
-- `timers` (M3) — boundary timers, per-step timeouts, event deadlines (via `step.sleep` / DO
-  alarms).
 - `execution_tokens` (M4) — the single `current_element_id` becomes one token among many; the
   concurrent token set for parallelism (target semantics:
   `docs/bpmn/07-execution-semantics.md`).

@@ -20,7 +20,10 @@ export type ElementType =
   | "association"
   | "error"
   // M2 conditional sagas:
-  | "exclusiveGateway";
+  | "exclusiveGateway"
+  // M3 time & failure taxonomy:
+  | "intermediateCatchEvent"
+  | "eventBasedGateway";
 
 /** A node in the executable graph (excludes sequence flows, messages, associations, errors). */
 export type NodeType =
@@ -32,13 +35,25 @@ export type NodeType =
   | "transaction"
   | "boundaryEvent"
   // M2 conditional sagas:
-  | "exclusiveGateway";
+  | "exclusiveGateway"
+  // M3 time & failure taxonomy — a timer delay on the token path (M3-L4):
+  | "intermediateCatchEvent"
+  // M3-L4 (TASK-46): a deterministic timer/message race over its branch catches.
+  // Like a gateway, `next` is null — the chosen branch (recorded in
+  // gateway_decisions) owns the successor; the engine reads `outgoing[]`.
+  | "eventBasedGateway";
 
 /** Discriminator for end events: a plain (commit) end vs a transaction Cancel end. */
 export type EndKind = "none" | "cancel";
 
 /** Discriminator for a boundary event, by its single event definition. */
-export type BoundaryKind = "error" | "cancel" | "compensate";
+export type BoundaryKind = "error" | "cancel" | "compensate" | "timer";
+
+/** A static ISO-8601 timer trigger (M3-L3): `timeDate` instant or `timeDuration` delay. */
+export interface TimerTriggerSpec {
+  kind: "timeDate" | "timeDuration";
+  value: string;
+}
 
 /**
  * One outgoing sequence-flow edge of a node (design §4.1 multi-edge IR).
@@ -125,6 +140,8 @@ export interface GraphNode {
   errorCode?: string | null;
   /** compensate boundaryEvent only — the isForCompensation handler it associates to. */
   compensationHandlerId?: string | null;
+  /** timer boundaryEvent (M3-L3) or timer intermediateCatchEvent (M3-L4) only — the static ISO-8601 trigger; fire_at is computed at arm time. */
+  timerTrigger?: TimerTriggerSpec | null;
 }
 
 /** A transaction scope: its inner start, members, ends, and compensation wiring. */

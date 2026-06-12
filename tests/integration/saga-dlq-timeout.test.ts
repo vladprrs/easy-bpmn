@@ -8,8 +8,9 @@ import { failUnleasableJobConditional } from "../../src/persistence/jobs";
 // At creation it gets activation_expires_at = created + ACTIVATION_TTL_MS and a
 // per-job JobScheduler DO alarm is armed. On expiry the alarm re-reads D1 and, if
 // the job is still un-leased, routes a synthetic timeout via terminateUnleasableJob
-// → terminal incident kind='timeout' (NOT a generic 'Workflow terminated:' fall
-// through). A job that progressed (leased/completed) is a no-op.
+// → terminal incident kind='jobActivationTimeout' (NOT a generic 'Workflow
+// terminated:' fall through). A job that progressed (leased/completed) is a no-op.
+// (M3-L1, TASK-39: the DLQ kind was split out of the overloaded legacy 'timeout'.)
 
 async function forwardJob(instanceId: string) {
   return env.DB.prepare(
@@ -25,7 +26,7 @@ function schedulerStub(jobId: string) {
 }
 
 describe("un-leasable-job DLQ timeout (TASK-23 design §4.2)", () => {
-  it("times out a never-leased forward job via the armed alarm → terminal incident kind='timeout'", async () => {
+  it("times out a never-leased forward job via the armed alarm → terminal incident kind='jobActivationTimeout'", async () => {
     const { instance } = await publishAndStart(DEMO_BPMN, { correlationKey: "dlq-1", variables: { amount: 1 } });
     const instanceId = instance.body.instanceId;
     expect(instance.body.status).toBe("waiting"); // parked at the pull Service Task
@@ -41,8 +42,13 @@ describe("un-leasable-job DLQ timeout (TASK-23 design §4.2)", () => {
 
     const inst = await get(`/instances/${instanceId}`);
     expect(inst.body.status).toBe("incident");
-    expect(inst.body.incident.kind).toBe("timeout");
+    expect(inst.body.incident.kind).toBe("jobActivationTimeout");
     expect(inst.body.incident.elementId).toBe("Task_check");
+    // the incidentCreated history event carries the same split kind
+    const created = (await get(`/instances/${instanceId}/history`)).body.events.find(
+      (e: any) => e.type === "incidentCreated",
+    );
+    expect(created.diagnostics.kind).toBe("jobActivationTimeout");
     // a SPECIFIC reason, not the process-workflow catch-all 'Workflow terminated:'
     expect(inst.body.incident.reason).toMatch(/un-leasable/i);
     expect(inst.body.incident.reason).not.toMatch(/Workflow terminated/);

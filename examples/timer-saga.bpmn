@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  timer-saga — the M3 canonical "timeout -> compensate" transaction-saga example
+  (design 2026-06-11-m3-time-failure-taxonomy §3 / exit criterion 2; §7 gate 2).
+
+  A bpmn:transaction with two compensatable forward Service Tasks followed by a
+  long-running step guarded by an interrupting boundary TIMER:
+
+    * reserveStock (reserve-stock) — compensated by releaseStock (release-stock)
+    * chargeCard   (charge-card)   — compensated by refundCard  (refund-card)
+    * awaitShipment (await-shipment) — a long-running fulfilment step carrying an
+      interrupting boundary timer (PT30M). If the shipment does not confirm in
+      time the timer fires, routing the token to the transaction's cancel end
+      event, which cancels the transaction -> reverse-order compensation
+      (refundCard, then releaseStock) -> the transaction's cancel boundary takes
+      the SagaFailed path. If awaitShipment completes first, the armed timer is
+      settled `cancelled` and the saga commits down SagaDone.
+
+  This is the M3 analogue of order-saga.bpmn: the trip into compensation is a
+  MODELED timer (a drawn boundary event with a drawn outgoing path), not a
+  business error — there is no easy-bpmn timeout attribute (design decision #2,
+  "canonical timers only"). A boundary timer is attachable to a task INSIDE the
+  transaction (never to the transaction itself, which would terminate the scope
+  without compensation — design §3).
+
+  Like order-saga.bpmn this is the executable/reference form: no Diagram
+  Interchange (bpmndi) section, so a visual modeler needs auto-layout; the
+  semantic round-trip (parse -> re-export -> re-validate) is what the
+  constitution requires and what tests/integration/sample-m3-models.test.ts
+  verifies against the live validator.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+                  id="Definitions_timer_saga" targetNamespace="http://easy-bpmn/example/timer-saga">
+  <bpmn:process id="TimerSaga" isExecutable="true">
+    <bpmn:startEvent id="Start"/>
+    <bpmn:transaction id="Tx_fulfil" name="Fulfil order">
+      <bpmn:startEvent id="Tx_start"/>
+      <bpmn:serviceTask id="reserveStock" name="Reserve stock">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="reserve-stock" retries="3"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="reserveStock_comp" attachedToRef="reserveStock">
+        <bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="releaseStock" name="Release stock" isForCompensation="true">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="release-stock" retries="5"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:association id="a1" associationDirection="One" sourceRef="reserveStock_comp" targetRef="releaseStock"/>
+      <bpmn:serviceTask id="chargeCard" name="Charge card">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="charge-card" retries="2"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="chargeCard_comp" attachedToRef="chargeCard">
+        <bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="refundCard" name="Refund card" isForCompensation="true">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="refund-card" retries="5"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:association id="a2" associationDirection="One" sourceRef="chargeCard_comp" targetRef="refundCard"/>
+      <bpmn:serviceTask id="awaitShipment" name="Await shipment">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="await-shipment" retries="1"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="shipment_timeout" attachedToRef="awaitShipment">
+        <bpmn:timerEventDefinition><bpmn:timeDuration>PT30M</bpmn:timeDuration></bpmn:timerEventDefinition>
+      </bpmn:boundaryEvent>
+      <bpmn:endEvent id="Tx_ok"/>
+      <bpmn:endEvent id="Tx_cancel"><bpmn:cancelEventDefinition/></bpmn:endEvent>
+      <bpmn:sequenceFlow id="f1" sourceRef="Tx_start"         targetRef="reserveStock"/>
+      <bpmn:sequenceFlow id="f2" sourceRef="reserveStock"     targetRef="chargeCard"/>
+      <bpmn:sequenceFlow id="f3" sourceRef="chargeCard"       targetRef="awaitShipment"/>
+      <bpmn:sequenceFlow id="f4" sourceRef="awaitShipment"    targetRef="Tx_ok"/>
+      <bpmn:sequenceFlow id="f5" sourceRef="shipment_timeout" targetRef="Tx_cancel"/>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="Tx_cancelled" attachedToRef="Tx_fulfil">
+      <bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:endEvent id="SagaFailed"/>
+    <bpmn:endEvent id="SagaDone"/>
+    <bpmn:sequenceFlow id="g1" sourceRef="Start"        targetRef="Tx_fulfil"/>
+    <bpmn:sequenceFlow id="g2" sourceRef="Tx_fulfil"    targetRef="SagaDone"/>
+    <bpmn:sequenceFlow id="g3" sourceRef="Tx_cancelled" targetRef="SagaFailed"/>
+  </bpmn:process>
+</bpmn:definitions>

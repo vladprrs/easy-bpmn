@@ -45,12 +45,14 @@ import {
 } from "./persistence/worker-credentials";
 import {
   completeJobConditional,
+  failExpiredLeaseConditional,
   failJobConditional,
   getJobInWorkspace,
   leaseJobs,
   parkExpiredLease,
   parkJobForBackoffConditional,
   selectExpiredInFlightLeases,
+  type ExpiredLeaseRow,
 } from "./persistence/jobs";
 import { computeBackoffMs } from "./runtime/retry-policy";
 import { getSagaStep } from "./persistence/saga";
@@ -70,15 +72,19 @@ import {
   getIncidentForInstance,
   getInstance,
   getInstanceRow,
+  getOpenIncidentsForInstance,
   listInstances,
   mergeInstanceVariables,
-  setIncidentResolution,
+  resolveAllOpenIncidents,
+  resolveIncident,
   transitionStatusGuarded,
 } from "./persistence/instances";
 import { getExternalMessage, insertExternalMessage } from "./persistence/messages";
 import { listInstanceHistory, recordHistory } from "./persistence/history";
 import { getIdempotentResult, putIdempotentResult } from "./persistence/idempotency";
 import { resumeInline } from "./runtime/engine";
+import { cancelArmedTimersForInstance } from "./runtime/boundary-timer";
+import { listTimersForInstance } from "./persistence/timers";
 import { abandonActiveForwardJobs, resetJobForRetry } from "./persistence/jobs";
 import {
   countPendingSteps,
@@ -261,6 +267,10 @@ async function handleGetInstance(env: Env, instanceId: string): Promise<Response
     instance.status === "incident" || instance.status === "compensationFailed"
       ? await getIncidentForInstance(env.DB, instanceId)
       : null;
+  // M3-L1 (TASK-39): expose ALL open incidents, not just the latest — an
+  // instance can carry several live incidents (e.g. a Hazard mid-compensation
+  // plus a later compensationFailure).
+  const openIncidents = await getOpenIncidentsForInstance(env.DB, instanceId);
 
   // Saga view — present once the instance has a transaction ledger.
   const steps = await getSagaStepsForInstance(env.DB, instanceId);
@@ -283,6 +293,20 @@ async function handleGetInstance(env: Env, instanceId: string): Promise<Response
     };
   }
 
+  // M3-L3 (TASK-44): the model-timer block, read from D1 (Workflow internals hidden).
+  const timerRows = await listTimersForInstance(env.DB, instanceId);
+  const timers = timerRows.map((t) => ({
+    timerId: t.timerId,
+    elementId: t.elementId,
+    occurrence: t.occurrence,
+    kind: t.kind,
+    status: t.status,
+    attachedToRef: t.attachedToRef,
+    gatewayId: t.gatewayId,
+    fireAt: t.fireAt,
+    firedAt: t.firedAt,
+  }));
+
   const inspection: ProcessInstanceInspection = {
     ...instance,
     historySummary: history,
@@ -293,7 +317,9 @@ async function handleGetInstance(env: Env, instanceId: string): Promise<Response
       traceId: traceIdFor(instanceId),
     },
     incident,
+    openIncidents,
     saga,
+    ...(timers.length > 0 ? { timers } : {}),
   };
   return json(inspection, 200);
 }
@@ -338,12 +364,19 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
   // suspended Workflow (if any) so subsequent job callbacks drive compensation
   // inline rather than sendEvent-ing a Workflow that is waiting on the wrong job.
   await abandonActiveForwardJobs(env.DB, instanceId, now);
+  // M3-L3 (TASK-44, design §4.3.2 exit d): settle every armed boundary timer so a
+  // stray alarm afterwards is a decided no-op — no mid-compensation firing (gate 10).
+  await cancelArmedTimersForInstance(env, instanceId);
   await getExecutor(env).terminate(instanceId);
 
   const pending = await countPendingSteps(env.DB, instanceId);
   if (pending === 0) {
     const changed = await transitionStatusGuarded(env.DB, instanceId, [...CANCELLABLE_FROM], "cancelled", now);
     if (changed > 0) {
+      // M3-L1 (TASK-39): a terminal empty-ledger cancel closes ALL open incidents
+      // (here "all" is correct) so none is left dangling 'open' on a terminal
+      // instance — the previously-known terminal-'open' wart.
+      await resolveAllOpenIncidents(env.DB, instanceId, "operatorResolved", now);
       await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, type: "instanceCancelled", diagnostics: { by: "operator", emptyLedger: true } });
     }
     return json(await getInstance(env.DB, instanceId), 200);
@@ -352,7 +385,16 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
   // Status-conditional → only the first cancel initiates one reverse pass.
   const changed = await transitionStatusGuarded(env.DB, instanceId, [...CANCELLABLE_FROM], "compensating", now);
   if (changed > 0) {
-    if (inst.status === "incident") await setIncidentResolution(env.DB, instanceId, "compensating", now);
+    if (inst.status === "incident") {
+      // Target ONLY the current Hazard incident (M3-L1, TASK-39) so a sibling
+      // incident is never collaterally moved into the compensation lifecycle. An
+      // 'incident' status implies a Hazard row exists; if it is somehow absent we
+      // skip rather than silently flip ALL incidents.
+      const hazard = await getIncidentForInstance(env.DB, instanceId);
+      if (hazard?.incidentId) {
+        await resolveIncident(env.DB, instanceId, hazard.incidentId, "compensating", now);
+      }
+    }
     await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, type: "transactionCancelled", diagnostics: { by: "operator", fromHazard: inst.status === "incident" } });
     await resumeInline(env, instanceId);
   }
@@ -371,9 +413,15 @@ async function handleRetryInstance(env: Env, instanceId: string, request: Reques
   if (inst.status === "compensationFailed") {
     const failed = await getFailedStep(env.DB, instanceId);
     if (!failed) throw new ConflictError(`Instance ${instanceId} has no failed compensation step to retry.`);
+    const incident = await getIncidentForInstance(env.DB, instanceId);
     await resetJobForRetry(env.DB, { instanceId, elementId: failed.elementId, isCompensation: true, inputVariables: variablesJson, now });
     await updateCompensationStatusStmt(env.DB, { stepId: failed.stepId, status: "pending", now }).run();
-    await setIncidentResolution(env.DB, instanceId, "operatorResolved", now);
+    // Resolve ONLY this compensationFailure incident (M3-L1, TASK-39) so a sibling
+    // Hazard 'compensating' is not collaterally flipped to operatorResolved. If no
+    // incident row is present we skip rather than fall through to flipping ALL.
+    if (incident?.incidentId) {
+      await resolveIncident(env.DB, instanceId, incident.incidentId, "operatorResolved", now);
+    }
     const changed = await transitionStatusGuarded(env.DB, instanceId, ["compensationFailed"], "compensating", now);
     if (changed === 0) throw new ConflictError(`Instance ${instanceId} is no longer retryable.`);
     await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, elementId: failed.elementId, type: "operatorRetry", diagnostics: { target: "compensation" } });
@@ -390,7 +438,12 @@ async function handleRetryInstance(env: Env, instanceId: string, request: Reques
     // re-walks, and the failed visit (which recorded no decision row) is
     // re-evaluated fresh against the patched variables.
     await resetJobForRetry(env.DB, { instanceId, elementId, isCompensation: false, inputVariables: variablesJson, now });
-    await setIncidentResolution(env.DB, instanceId, "operatorResolved", now);
+    // Resolve ONLY the targeted incident (M3-L1, TASK-39). The elementId guard
+    // above already proves an incident row is present; the explicit id guard keeps
+    // the absence path from ever falling through to flipping ALL.
+    if (incident?.incidentId) {
+      await resolveIncident(env.DB, instanceId, incident.incidentId, "operatorResolved", now);
+    }
     const changed = await transitionStatusGuarded(env.DB, instanceId, ["incident"], "running", now);
     if (changed === 0) throw new ConflictError(`Instance ${instanceId} is no longer retryable.`);
     await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, elementId, type: "operatorRetry", diagnostics: { target: "forward" } });
@@ -536,6 +589,7 @@ async function handlePublishMessage(env: Env, request: Request): Promise<Respons
     workflowInstanceId: result.workflowInstanceId,
     instanceId: result.instanceId,
     elementId: result.elementId,
+    workflowEventType: result.workflowEventType,
     event: result.event,
   });
 
@@ -629,10 +683,16 @@ async function leaseOnce(
   // Reclaim pre-pass (design §4.1 reclaim leg): an EXPIRED in-flight lease (a
   // crashed/slow worker's lapsed lock) is parked behind backoff before it can be
   // re-leased, so a reclaim is spaced like a retryable fail rather than re-handed
-  // instantly. (Terminating a reclaim once retries are exhausted is a per-step
-  // timeout — deferred to M3; backoff just spaces the attempts here.)
+  // instantly. Reclaim re-leases bump attempt_count, so once the retry budget is
+  // exhausted (TASK-40) the lapsed lease is routed to the SAME exhaustion path as
+  // an explicit /jobs/fail — otherwise a job exhausted purely through lease expiry
+  // would retry forever.
   for (const j of await selectExpiredInFlightLeases(env.DB, workspaceId, taskType, now)) {
-    await parkExpiredLease(env.DB, j.job_id, isoPlusMs(now, computeBackoffMs(j.attempt_count)), now);
+    if (j.attempt_count >= j.retry_limit) {
+      await exhaustExpiredLease(env, workspaceId, j, now);
+    } else {
+      await parkExpiredLease(env.DB, j.job_id, isoPlusMs(now, computeBackoffMs(j.attempt_count)), now);
+    }
   }
 
   const leaseUntil = isoPlusMs(now, leaseMs);
@@ -679,6 +739,91 @@ async function leaseOnce(
     });
   }
   return jobs;
+}
+
+/**
+ * Shared terminal-failure tail (TASK-40 review): every producer that settles a job
+ * to `failed` writes the SAME `jobFailed` audit row and delivers the SAME
+ * `{outcome:'failed'}` engine event, so the operator-visible history shape
+ * (`/instances/{id}/history`) and the wire shape stay identical across routes —
+ * worker `/jobs/fail` exhaustion + business error, the reclaim/lease-expiry route,
+ * and (M3-L3) timer-driven exhaustion. The engine refetches the job row and routes
+ * on its `error_code`, so the event's `retryable` is diagnostics-only; it is kept on
+ * the wire (and mirrored in the audit row) for observability. The audit `retryable`
+ * convention here is "the failure was of retryable (technical) class AND was not
+ * declared non-retryable": a naturally budget-exhausted technical failure is still
+ * `retryable: true`; only an explicit worker `retryable:false` or a business error
+ * (errorCode set) logs `false`.
+ */
+async function deliverJobFailed(
+  env: Env,
+  args: {
+    workspaceId: string;
+    instanceId: string;
+    elementId: string;
+    jobId: string;
+    errorCode: string | null;
+    retryable: boolean;
+    reason: string;
+    isCompensation: boolean;
+  },
+): Promise<void> {
+  await recordHistory(env.DB, {
+    workspaceId: args.workspaceId,
+    instanceId: args.instanceId,
+    elementId: args.elementId,
+    type: "jobFailed",
+    diagnostics: {
+      jobId: args.jobId,
+      errorCode: args.errorCode,
+      retryable: args.retryable,
+      reason: args.reason,
+      isCompensation: args.isCompensation,
+    },
+  });
+  await getExecutor(env).deliverJobResult({
+    workflowInstanceId: args.instanceId,
+    instanceId: args.instanceId,
+    elementId: args.elementId,
+    event: { outcome: "failed", jobId: args.jobId, retryable: args.retryable, errorCode: args.errorCode, reason: args.reason },
+  });
+}
+
+/**
+ * Reclaim exhaustion (TASK-40): a lapsed in-flight lease whose retry budget is
+ * spent terminates via the SAME exhaustion path as an explicit `/jobs/fail` with
+ * the budget exhausted. The transition is guarded on the lapsed-lease predicate
+ * (no worker token exists — the lease lapsed), so a concurrent complete/re-lease
+ * wins the 0-row race and we DELIVER NOTHING in that case. On a 1-row win we write
+ * the audit `jobFailed` row and deliver `{outcome:'failed', errorCode:null}` so the
+ * engine runs its exhaustion path: a FORWARD job → serviceTaskFailure Hazard
+ * (`handleForwardFailure` re-reads the row and routes on error_code=null); a
+ * COMPENSATION job → compensationFailure (the engine resumes the reverse pass and
+ * reads the now-`failed` comp job), exactly as a worker `fail` of either would.
+ * The event's `retryable`/`errorCode` are informational — the engine refetches the
+ * job row and never branches on them for correctness.
+ */
+async function exhaustExpiredLease(
+  env: Env,
+  workspaceId: string,
+  j: ExpiredLeaseRow,
+  now: string,
+): Promise<void> {
+  const changed = await failExpiredLeaseConditional(env.DB, j.job_id, now);
+  if (changed === 0) return; // a concurrent complete/re-lease won — do not deliver
+  // A reclaim/lease-expiry exhaustion is a TECHNICAL-class failure whose budget is
+  // merely spent — no worker declared it non-retryable — so the audit convention
+  // logs it `retryable: true`, matching handleFailJob's naturally-exhausted case.
+  await deliverJobFailed(env, {
+    workspaceId,
+    instanceId: j.instance_id,
+    elementId: j.element_id,
+    jobId: j.job_id,
+    errorCode: null,
+    retryable: true,
+    reason: "Reclaim retries exhausted (lease expiry).",
+    isCompensation: j.is_compensation === 1,
+  });
 }
 
 async function handleCompleteJob(env: Env, jobId: string, request: Request): Promise<Response> {
@@ -756,8 +901,12 @@ async function handleFailJob(env: Env, jobId: string, request: Request): Promise
   // and then only AFTER an exponential backoff park (design §4.1): the job stays
   // 'locked' with no lock_token and lock_expires_at = now + backoff, so the
   // activate gate re-leases it only once the delay has elapsed.
+  // `retryable` is HONORED (TASK-40): omitted/true ⇒ retryable (default); false ⇒
+  // the worker declares the technical failure permanent, so remaining retries are
+  // skipped and the job is exhausted immediately (the standard exhaustion path).
   const isBusiness = !!body.errorCode;
-  const willRetry = !isBusiness && job.attempt_count < job.retry_limit;
+  const retryable = body.retryable !== false;
+  const willRetry = !isBusiness && retryable && job.attempt_count < job.retry_limit;
   const targetStatus: "created" | "failed" = isBusiness ? "failed" : willRetry ? "created" : "failed";
 
   let parkUntil: string | null = null;
@@ -782,23 +931,32 @@ async function handleFailJob(env: Env, jobId: string, request: Request): Promise
 
   const ack: JobCallbackAck = { jobId, outcome: "failed", disposition: "applied" };
   await putIdempotentResult(env.DB, "workerCallback", idemKey, ack, now);
-  await recordHistory(env.DB, {
-    workspaceId,
-    instanceId: job.instance_id,
-    elementId: job.element_id,
-    type: "jobFailed",
-    diagnostics: { jobId, errorCode: body.errorCode ?? null, retryable: !isBusiness, targetStatus, reason: body.reason, ...(parkUntil ? { backoffUntil: parkUntil } : {}) },
-  });
 
-  // Only deliver when the step has reached a terminal-for-the-step state the
-  // engine must act on. A technical retry stays parked (backoff) and is re-handed
-  // by the next activate once the delay elapses — no event is sent.
-  if (targetStatus === "failed") {
-    await getExecutor(env).deliverJobResult({
-      workflowInstanceId: job.instance_id,
+  if (willRetry) {
+    // Technical retry: the job stays parked behind backoff and is re-handed by the
+    // next activate once the delay elapses — NO event is sent. Audit the park (with
+    // the backoff window) rather than the shared terminal-failure tail.
+    await recordHistory(env.DB, {
+      workspaceId,
       instanceId: job.instance_id,
       elementId: job.element_id,
-      event: { outcome: "failed", jobId, retryable: !isBusiness, errorCode: body.errorCode ?? null, reason: body.reason },
+      type: "jobFailed",
+      diagnostics: { jobId, errorCode: body.errorCode ?? null, retryable: !isBusiness && retryable, targetStatus, reason: body.reason, ...(parkUntil ? { backoffUntil: parkUntil } : {}) },
+    });
+  } else {
+    // Terminal for the step — a business error (errorCode set) OR a technical
+    // exhaustion. Both flow through the shared tail: write the `jobFailed` audit
+    // row + deliver `{outcome:'failed'}` so the engine runs its exhaustion path
+    // (forward → serviceTaskFailure Hazard, compensation → compensationFailure).
+    await deliverJobFailed(env, {
+      workspaceId,
+      instanceId: job.instance_id,
+      elementId: job.element_id,
+      jobId,
+      errorCode: body.errorCode ?? null,
+      retryable: !isBusiness && retryable,
+      reason: body.reason,
+      isCompensation: job.is_compensation === 1,
     });
   }
   return json(ack, 200);

@@ -1,48 +1,68 @@
 <!--
 Sync Impact Report
-Version change: 2.0.0 -> 2.1.0
+Version change: 2.1.0 -> 2.2.0
 Rationale (MINOR): materially expands Principle I's accepted construct set with
-the M2 conditional-saga constructs while preserving every existing principle
-(per the versioning policy: "MINOR = ... materially expand guidance while
-preserving existing principles"). The M2 set shipped behind this amendment:
-`bpmn:exclusiveGateway` (data-driven XOR split + pass-through join), FEEL
-`conditionExpression` (via `feelin`) on sequence flows leaving an
-exclusiveGateway, the gateway-owned `default` flow, and cycles (loops) on the
-token path. Source: M2 conditional-sagas design
-(docs/superpowers/specs/2026-06-09-m2-conditional-sagas-design.md §2, §3).
+the M3 time-&-failure-taxonomy constructs while preserving every existing
+principle (per the versioning policy: "MINOR = ... materially expand guidance
+while preserving existing principles"). Same MINOR class as the 2.0.0 -> 2.1.0
+M2 bump. Unlike M2 — which amended the constitution AFTER the validator opened
+the constructs and recorded no Constitution Check — M3 amends FIRST, as the
+opening governance item before any M3 construct's runtime ships (the
+Principle-I-compliant ordering). The M3 set is declared accepted here; the
+validator opens each construct only together with its own runtime layer (L3
+boundary timers, L4 intermediate catch + eventBasedGateway), rejecting a
+not-yet-shipped construct with the reason "M3 — not yet implemented" in the
+interim — documented behavior (docs/bpmn/09-easy-bpmn-profile.md), not drift.
+Source: M3 time-&-failure-taxonomy design
+(docs/superpowers/specs/2026-06-11-m3-time-failure-taxonomy-design.md §3, §8).
 Modified principles:
-- I. Standard BPMN Profile Only (accepted construct set widened with the M2
-  conditional set; the no-custom-notation / XSD-valid / round-trippable /
-  reject-unsupported-flow-node-with-element-id-and-reason clause is unchanged)
+- I. Standard BPMN Profile Only (accepted construct set widened with the M3 set:
+  an interrupting boundary `timerEventDefinition` on a `serviceTask`/`receiveTask`,
+  a timer or message `intermediateCatchEvent`, the `bpmn:eventBasedGateway`, and
+  free error-boundary routing; the no-custom-notation / XSD-valid /
+  round-trippable / reject-unsupported-flow-node-with-element-id-and-reason
+  clause is unchanged)
 Modified sections:
-- MVP Scope and Platform Constraints (exclusion list trimmed by the M2
-  gateway/condition constructs: `exclusiveGateway`, FEEL conditionExpression on
-  flows leaving it, and default flows. Cycles on the token path are newly
-  accepted explicitly — previously implicitly excluded by the linear profile,
-  never a listed exclusion; the `multiInstanceLoopCharacteristics` /
-  `standardLoopCharacteristics` markers were the listed loop exclusions and
-  remain excluded. Parallel / inclusive /
-  event-based / complex gateways, conditional or default flows NOT leaving an
-  exclusiveGateway, timers, non-transaction subprocesses, multi-instance/loop
-  characteristics, user task/forms, migration, full Camunda/Zeebe compat, and
-  the visual modeler all remain excluded.)
+- MVP Scope and Platform Constraints (exclusion list requalified: `event-based`
+  dropped from the gateway line; the events line now keeps timer START events,
+  non-interrupting boundary timers, `timeCycle`, signal / escalation /
+  conditional events, and non-catch message events excluded, but no longer
+  excludes interrupting boundary timers, timer/message intermediate catch
+  events, or the eventBasedGateway. Milestone parenthetical updated — M3 timers/
+  intermediate-catch/eventBasedGateway/free-error-routing is added by THIS
+  amendment; M4 parallelism and M5 composition remain pending. In-scope recap
+  extended with the M3 accepted set and the per-layer interim note.)
 Unchanged principles:
-- II-V verbatim; VI (SAGA / Compensation Integrity) untouched — compensation
-  semantics are independent of how the token reached a step (M2 only adds
-  per-iteration ledger rows under the same reverse-order contract).
+- II-V verbatim; VI (SAGA / Compensation Integrity) untouched — every M3 timer
+  routes a drawn token down a modeled path; a boundary timer that cancels a
+  transaction does so only via a modeled cancel end event (standard reverse-order
+  compensation), and an interrupting timer boundary is NOT attachable to a
+  `transaction` (no silent rollback loss).
 Templates requiring updates:
 - updated: .specify/templates/plan-template.md (Constitution Check BPMN-profile
-  gate names the M2 conditional set)
+  gate names the M3 set)
 - updated: .specify/templates/spec-template.md (BPMN Profile Impact prompt
-  covers the gateway/conditional constructs)
+  covers the M3 constructs)
 - checked: .specify/templates/tasks-template.md (no construct list; generic
   saga/compensation test guidance still accurate)
 - checked: AGENTS.md
-- updated: CLAUDE.md (profile-lockstep line -> v2.1.0; reject-list invariant
-  carves out the M2 set)
+- updated: CLAUDE.md (profile-lockstep line -> v2.2.0; reject-list invariant
+  notes the M3 set is accepted-but-staged)
+Constitution-impacting file changes (this amendment):
+- .specify/memory/constitution.md (Principle I, MVP Scope, version footer)
+- .specify/templates/plan-template.md, .specify/templates/spec-template.md
+- CLAUDE.md (profile-lockstep line + reject-list invariant)
+- docs/bpmn/09-easy-bpmn-profile.md (version pin, deferred table -> interim
+  marking, lockstep sentence)
+- docs/bpmn/01-events.md (scope section corrected for M1/M2/M3)
+- scripts/check-docs.mjs (01-events stale-phrase guards)
+- specs/002-saga-orchestrator/m3-constitution-check.md (recorded Constitution Check)
 Follow-up TODOs:
-- M3 (timers/event taxonomy), M4 (parallelism), M5 (composition) each still
-  require their own amendment before widening the profile further.
+- M3 validator layers (L3 boundary timers; L4 intermediate catch +
+  eventBasedGateway; free error routing) open each accepted construct as its
+  runtime ships.
+- M4 (parallelism), M5 (composition) each still require their own amendment
+  before widening the profile further.
 -->
 
 # easy-bpmn Constitution
@@ -63,8 +83,22 @@ profile. The currently accepted construct set is:
 - the conditional set (M2) — `bpmn:exclusiveGateway` (data-driven XOR split and
   pass-through join), FEEL `conditionExpression` (evaluated in document order)
   on sequence flows leaving an exclusiveGateway, the gateway-owned `default`
-  flow, and cycles (loops) on the token path. Conditions appear ONLY on flows
-  leaving an exclusiveGateway; every other gateway type remains excluded.
+  flow, and cycles (loops) on the token path (conditions appear ONLY on flows
+  leaving an exclusiveGateway); and
+- the time-&-failure-taxonomy set (M3) — an **interrupting** boundary
+  `timerEventDefinition` on a `serviceTask`/`receiveTask` (never on a
+  `transaction`), a timer or message `intermediateCatchEvent` on the token path,
+  the `bpmn:eventBasedGateway` (a deterministic race over its timer/message
+  catch-event branches), and **free error-boundary routing** (any number of
+  distinct-`errorCode` interrupting error boundaries plus at most one catch-all
+  per activity, each routing to any token-path node in the same scope). Timer
+  triggers are static ISO-8601 `timeDate`/`timeDuration` literals only. This set
+  is declared **accepted** by this amendment; the validator opens each construct
+  only when its runtime layer ships (boundary timers, then intermediate catch +
+  eventBasedGateway), and until then rejects it with the reason "M3 — not yet
+  implemented" — the interim state defined in
+  `docs/bpmn/09-easy-bpmn-profile.md`. Every gateway type other than
+  `exclusiveGateway` and `eventBasedGateway` remains excluded.
 
 A saga is modeled in **canonical BPMN**: the only additive binding is
 `easy-bpmn:taskDefinition` carried inside the standard `<bpmn:extensionElements>`
@@ -79,8 +113,9 @@ reason; ignorable extension content (foreign-namespace `<extensionElements>`,
 Diagram Interchange, `documentation`, text annotations) MUST be tolerated and
 ignored, never rejected.
 
-Each later milestone (timers, parallelism, composition) widens this profile
-only by amending this constitution first.
+Each later milestone (parallelism, composition) widens this profile only by
+amending this constitution first — exactly as this M3 amendment does for timers,
+intermediate catch events, the `eventBasedGateway`, and the failure taxonomy.
 
 Rationale: the product promise depends on making standard BPMN executable without
 inventing a notation or pretending to support the full BPMN ecosystem at once.
@@ -167,16 +202,21 @@ invocation, external event waiting, event correlation, and basic execution
 history.
 
 The platform MUST NOT include built-in tasklists, BPMN User Task, forms,
-assignment, parallel / inclusive / event-based / complex gateways, conditional
-or default sequence flows that do not leave an `exclusiveGateway`, timer /
-signal / escalation / conditional / message events, non-transaction
+assignment, parallel / inclusive / complex gateways, conditional
+or default sequence flows that do not leave an `exclusiveGateway`, timer
+**start** events, non-interrupting boundary timers, `timeCycle` triggers,
+signal / escalation / conditional events, non-catch message events (message
+**throw**/end — the only accepted message-shaped waits are the Receive Task and
+the M3 message `intermediateCatchEvent`), non-transaction
 subprocesses, `callActivity`, ad-hoc subprocesses, multi-instance / loop
 characteristics (`multiInstanceLoopCharacteristics` /
 `standardLoopCharacteristics` markers — distinct from the accepted cycles on
 the token path), process migration, full Zeebe/Camunda compatibility, a visual
 BPMN modeler, or advanced Operate-style UI unless this constitution is amended
 first. (Each of these is added only by its own later milestone amendment —
-M3 timers/event taxonomy, M4 parallelism, M5 composition.)
+M4 parallelism, M5 composition; the M3 time-&-failure-taxonomy set — interrupting
+boundary timers, timer/message intermediate catch events, the `eventBasedGateway`,
+and free error routing — is added by THIS amendment.)
 
 The accepted saga set — the `bpmn:transaction` scope, compensation / error /
 cancel boundary events, the `isForCompensation` handler, `bpmn:association`, the
@@ -184,7 +224,14 @@ cancel end event, and root `bpmn:error` — is in scope (Principle I); only thos
 specific constructs were removed from this exclusion list. The accepted
 conditional set — `bpmn:exclusiveGateway`, FEEL `conditionExpression` on flows
 leaving it, the gateway-owned `default` flow, and cycles on the token path —
-is likewise in scope (Principle I, the M2 amendment); nothing else was removed.
+is likewise in scope (Principle I, the M2 amendment). The accepted M3
+time-&-failure-taxonomy set — an interrupting boundary `timerEventDefinition` on
+a `serviceTask`/`receiveTask`, a timer/message `intermediateCatchEvent`, the
+`bpmn:eventBasedGateway`, and free error-boundary routing (static ISO-8601 timer
+triggers only) — is in scope as of this M3 amendment (Principle I); the validator
+opens each construct as its runtime layer ships and rejects it with
+"M3 — not yet implemented" until then (the interim state in
+`docs/bpmn/09-easy-bpmn-profile.md`). Nothing else was removed.
 
 The first demo flow MUST run without requiring users to deploy their own workflow
 cluster, broker, BPMN engine, or dedicated operations stack.
@@ -229,4 +276,4 @@ Plans with unresolved constitution violations MUST NOT proceed to implementation
 until the violation is either removed or explicitly accepted through the
 Complexity Tracking section.
 
-**Version**: 2.1.0 | **Ratified**: 2026-06-07 | **Last Amended**: 2026-06-11
+**Version**: 2.2.0 | **Ratified**: 2026-06-07 | **Last Amended**: 2026-06-11

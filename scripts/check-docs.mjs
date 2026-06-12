@@ -23,6 +23,10 @@
 //      specs/002-saga-orchestrator/ matches the engine constant in
 //      src/runtime/engine.ts (the value is repeated in ~5 docs and would rot
 //      silently if M3 retunes it).
+//   5. The incident-kind taxonomy is single-sourced (M3-L1, TASK-39): the
+//      `IncidentKind` union in src/persistence/instances.ts and the
+//      `Incident.kind` enum in contracts/openapi.yaml are the SAME SET — a new
+//      kind can't be persisted without being documented, nor vice versa.
 //
 // Scope note: the negative-phrase checks target docs/bpmn/ ONLY. The design
 // artifacts under docs/superpowers/specs/ intentionally *quote* stale phrasing
@@ -95,6 +99,11 @@ const stalePatterns = [
   [/plain, no conditions/i, "stale pre-M2 scope claim (FEEL conditions on XOR-gateway flows are IN since M2)"],
   [/no expression language is required yet/i, "stale pre-M2 scope claim (FEEL via feelin is IN since M2)"],
   [/none are in the MVP/i, "stale pre-M1 scope claim (error/compensation/transaction are IN since M1)"],
+  // 01-events.md scope section (fixed M3-L2, TASK-41): the pre-M1 events-scope
+  // claims were already false for the shipped saga set and now also for the
+  // M3-accepted set. Match the OLD sentences precisely so reintroducing them fails.
+  [/In scope: None Start Event and None End Event only/i, "stale pre-M1 events-scope claim in 01-events (compensation/error/cancel boundary events are IN since M1; M3 timer/message intermediate catch + boundary timers + eventBasedGateway are accepted in constitution v2.2.0, opened per validator layer)"],
+  [/all intermediate events, all boundary events, and terminate/i, "stale pre-M1 events-scope claim in 01-events (boundary events are IN since M1; M3 adds timer/message intermediate catch + boundary timers + eventBasedGateway, accepted in v2.2.0)"],
 ];
 for (const file of readdirSync(bpmnDir).filter((f) => f.endsWith(".md"))) {
   const text = readFileSync(join(bpmnDir, file), "utf8");
@@ -138,6 +147,9 @@ if (!/Cloudflare Workflow per process instance/i.test(profileText)) {
 
 // 5) The gateway reference names the M2 constructs/incidents and keeps the
 //    deferred-gateway milestone pointers (emphasis-stripped, same-line).
+//    parallel/inclusive stay M4-deferred; eventBasedGateway is IN since M3-L4
+//    (TASK-46) — its DEFERRED_GATEWAY_REASONS pointer (src/bpmn/profile.ts) and
+//    this guard entry flipped together when the EBG runtime shipped (design §8).
 const gatewaysText = readFileSync(gateways, "utf8");
 for (const needle of ["exclusiveGateway", "noPath", "loopLimit"]) {
   if (!gatewaysText.includes(needle)) {
@@ -148,7 +160,6 @@ const gatewayLines = gatewaysText.split("\n").map(stripEmphasis);
 for (const [gateway, milestone] of [
   ["parallelGateway", "M4"],
   ["inclusiveGateway", "M4"],
-  ["eventBasedGateway", "M3"],
 ]) {
   const pointer = gatewayLines.some(
     (l) => l.includes(gateway) && new RegExp(`\\b${milestone}\\b`).test(l),
@@ -176,6 +187,34 @@ if (!engineMatch) {
         }
       }
     });
+  }
+}
+
+// 7) Incident-kind taxonomy single-source: IncidentKind union == openapi enum set.
+const incidentSrc = readFileSync(join(repoRoot, "src", "persistence", "instances.ts"), "utf8");
+const openapiSrc = readFileSync(join(sagaSpecDir, "contracts", "openapi.yaml"), "utf8");
+const unionMatch = incidentSrc.match(/export type IncidentKind =([\s\S]*?);/);
+const kindEnumMatch = openapiSrc.match(/enum:\s*\[([^\]]*serviceTaskFailure[^\]]*)\]/);
+if (!unionMatch) {
+  failures.push(`src/persistence/instances.ts no longer defines "export type IncidentKind = …;" — update this check.`);
+} else if (!kindEnumMatch) {
+  failures.push(`openapi.yaml no longer has the Incident.kind enum (containing serviceTaskFailure) — update this check.`);
+} else {
+  // Only union-member lines count — strip `//` comments first so a future
+  // `// see "foo"` inside the union can't be misread as an incident kind.
+  const unionKinds = new Set(
+    unionMatch[1]
+      .split("\n")
+      .map((line) => line.replace(/\/\/.*$/, "").match(/^\s*\|?\s*"(\w+)"/))
+      .filter((m) => m)
+      .map((m) => m[1]),
+  );
+  const enumKinds = new Set(kindEnumMatch[1].split(",").map((s) => s.trim()).filter(Boolean));
+  for (const k of unionKinds) {
+    if (!enumKinds.has(k)) failures.push(`openapi.yaml Incident.kind enum is missing IncidentKind member "${k}".`);
+  }
+  for (const k of enumKinds) {
+    if (!unionKinds.has(k)) failures.push(`src/persistence/instances.ts IncidentKind union is missing openapi enum member "${k}".`);
   }
 }
 

@@ -12,13 +12,19 @@
 // the gateway's own outgoing flows), and cycles on the token path are legal.
 // Conditions anywhere else, defaults on non-gateways, implicit multi-out
 // splits, boundary events on gateways, and the other gateway types
-// (parallel/inclusive/eventBased/complex) stay rejected with element id +
-// reason.
+// (parallel/inclusive/complex) stay rejected with element id + reason.
+//
+// M3-L4 (TASK-46) opens the eventBasedGateway: a deterministic race over its
+// timer/message branch catches (≥2 branches, every target a single-incoming
+// intermediate catch, ≤1 timer branch, distinct messages; instantiate /
+// eventGatewayType="Parallel" rejected). Its branches are message/timer
+// intermediate catches whose only incoming flow is the gateway's.
 
 import type { ModdleElement } from "bpmn-moddle";
 import { parseBpmnXml } from "./parser";
 import { TASK_DEFINITION_TYPE } from "./moddle-extension";
 import { parseCondition } from "../runtime/expressions";
+import { isValidIso8601DateTime, parseIso8601DurationMs } from "../runtime/iso8601";
 import {
   ASSOCIATION_TYPE,
   CANCEL_EVENT_DEFINITION,
@@ -27,8 +33,10 @@ import {
   DEFERRED_GATEWAY_REASONS,
   ERROR_EVENT_DEFINITION,
   ERROR_TYPE,
+  MESSAGE_EVENT_DEFINITION,
   SEQUENCE_FLOW_TYPE,
   SUPPORTED_NODE_TYPES,
+  TIMER_EVENT_DEFINITION,
   localTypeName,
 } from "./profile";
 import type {
@@ -41,6 +49,7 @@ import type {
   GraphElement,
   GraphNode,
   NodeType,
+  TimerTriggerSpec,
   TransactionScope,
   ValidationIssueData,
   ValidationResult,
@@ -75,6 +84,45 @@ function readTaskDefinition(
   return { type: type && type.length > 0 ? type : undefined, attempts };
 }
 
+/**
+ * Validate a model timer's `<timerEventDefinition>` (boundary or intermediate
+ * catch — M3-L3/L4 design §3/§4.4): it MUST carry exactly ONE of
+ * `timeDate`|`timeDuration`, each a STATIC ISO-8601 literal that parses. Zero/two
+ * time children, a `timeCycle`, a FEEL expression, or a non-parsing literal are
+ * each rejected with a reason (the caller adds element id + construct name, so the
+ * reason text stays construct-neutral).
+ */
+function readTimerTrigger(
+  def: ModdleElement,
+): { ok: true; trigger: TimerTriggerSpec } | { ok: false; reason: string } {
+  const bodyOf = (x: unknown): string | undefined => {
+    const e = x as ModdleElement | undefined | null;
+    return e != null && typeof e.body === "string" && e.body.trim() !== "" ? e.body.trim() : undefined;
+  };
+  if (def.timeCycle != null) {
+    return { ok: false, reason: "uses a timeCycle (repetition needs extra tokens — M4+); use a single static timeDate or timeDuration." };
+  }
+  const date = bodyOf(def.timeDate);
+  const duration = bodyOf(def.timeDuration);
+  const present = (date !== undefined ? 1 : 0) + (duration !== undefined ? 1 : 0);
+  if (present === 0) {
+    return { ok: false, reason: "has no timeDate or timeDuration; a timer needs exactly one static ISO-8601 timeDate or timeDuration." };
+  }
+  if (present === 2) {
+    return { ok: false, reason: "declares both a timeDate and a timeDuration; exactly one is required." };
+  }
+  if (duration !== undefined) {
+    if (parseIso8601DurationMs(duration) == null) {
+      return { ok: false, reason: `has a timeDuration '${duration}' that is not a static ISO-8601 duration literal (FEEL expressions are not supported).` };
+    }
+    return { ok: true, trigger: { kind: "timeDuration", value: duration } };
+  }
+  if (!isValidIso8601DateTime(date!)) {
+    return { ok: false, reason: `has a timeDate '${date}' that is not a static ISO-8601 date/datetime literal (FEEL expressions are not supported).` };
+  }
+  return { ok: true, trigger: { kind: "timeDate", value: date! } };
+}
+
 // ---------------------------------------------------------------------------
 // Internal classification model
 // ---------------------------------------------------------------------------
@@ -94,6 +142,8 @@ interface NodeInfo {
   attachedToRef?: string;
   errorRef?: string;
   errorCode?: string;
+  /** timer boundaryEvent only — the validated static ISO-8601 trigger (M3-L3). */
+  timerTrigger?: TimerTriggerSpec;
   /** exclusiveGateway only — the sequence-flow id named by the `default` attribute. */
   defaultFlowId?: string;
 }
@@ -192,6 +242,34 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     }
   }
 
+  // An `errorRef` on an <errorEventDefinition> that names a non-existent <error>
+  // is DROPPED by bpmn-moddle (exactly like an unresolved `default`), leaving the
+  // parsed boundary indistinguishable from a genuine catch-all (no errorRef).
+  // Recover those dangling refs from the parser warnings — keyed by the OWNING
+  // boundary event id (the warning's element is the errorEventDefinition; its
+  // $parent is the boundary) — so the error-boundary rules can reject them with
+  // an element id instead of silently accepting a hidden catch-all (M3-L2).
+  //
+  // CAUTION: like the `bpmn:default` block above, the warning shape
+  // (`property: "bpmn:errorRef"`, the `$parent` boundary id) is moddle-INTERNAL
+  // and version-coupled, not a public contract — it is pinned by the "rejects an
+  // error boundary whose errorRef does not resolve" unit test, which must break
+  // loudly on a bpmn-moddle upgrade that reshapes it.
+  const danglingErrorRef = new Map<string, string>();
+  for (const w of parsed.warnings as Array<{
+    message?: string;
+    property?: string;
+    value?: unknown;
+    element?: { $parent?: { id?: string; $type?: string } };
+  }>) {
+    if (w?.property === "bpmn:errorRef" && typeof w.message === "string" && /unresolved reference/i.test(w.message)) {
+      const owner = w.element?.$parent;
+      if (owner?.$type === "bpmn:BoundaryEvent" && typeof owner.id === "string") {
+        danglingErrorRef.set(owner.id, String(w.value));
+      }
+    }
+  }
+
   const definitions = parsed.definitions;
   const rootElements = asArray<ModdleElement>(definitions.rootElements);
 
@@ -270,6 +348,33 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
   } => {
     const defs = asArray<ModdleElement>(el.eventDefinitions);
     return { defs, only: defs.length === 1 ? defs[0]!.$type : undefined };
+  };
+
+  // The shared messageRef rule for a correlated wait — used by BOTH a receiveTask
+  // (the ref on the element) and a standalone message intermediate catch (M3-L4,
+  // TASK-46; the ref on its <messageEventDefinition>). Runs the three checks
+  // (missing/unresolved → empty-name → resolved) via the shared `err`, differing
+  // only in the element label + reason-type string. Returns the resolved name, or
+  // undefined when any check failed (the caller leaves messageName unset).
+  const resolveMessageName = (
+    ref: unknown,
+    opts: { id: string | null | undefined; label: string; reasonType: string },
+  ): string | undefined => {
+    const msgId = refId(ref);
+    const msgName = msgId ? messageNamesById.get(msgId) : undefined;
+    if (!msgId || msgName === undefined) {
+      err(`${opts.label} '${opts.id ?? ""}' must reference a declared <message> via messageRef.`, opts.id, opts.reasonType);
+      return undefined;
+    }
+    if (msgName.trim() === "") {
+      err(
+        `${opts.label} '${opts.id ?? ""}' references a <message> with no name; a non-empty message name is required for correlation.`,
+        opts.id,
+        opts.reasonType,
+      );
+      return undefined;
+    }
+    return msgName;
   };
 
   const classifyContainer = (
@@ -361,6 +466,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         if (only === COMPENSATE_EVENT_DEFINITION) boundaryKind = "compensate";
         else if (only === ERROR_EVENT_DEFINITION) boundaryKind = "error";
         else if (only === CANCEL_EVENT_DEFINITION) boundaryKind = "cancel";
+        else if (only === TIMER_EVENT_DEFINITION) boundaryKind = "timer";
 
         if (!boundaryKind) {
           const what = defs.length === 0
@@ -369,14 +475,35 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
               ? "multiple event definitions"
               : `a ${localTypeName(defs[0]!.$type)}`;
           err(
-            `Boundary event '${id ?? ""}' has ${what}. Only compensation, error, and cancel boundary events are supported ` +
-              "(timer/signal/escalation/conditional/message boundary events are deferred).",
+            `Boundary event '${id ?? ""}' has ${what}. Only timer, compensation, error, and cancel boundary events are supported ` +
+              "(signal/escalation/conditional/message boundary events are deferred).",
             id,
             "boundaryEvent",
           );
           continue;
         }
         const errorRef = boundaryKind === "error" ? refId((defs[0] as ModdleElement).errorRef) : undefined;
+
+        // M3-L3: an interrupting boundary timer carries a single STATIC ISO-8601
+        // trigger. cancelActivity="false" (non-interrupting) and a malformed /
+        // FEEL / timeCycle trigger are each rejected with element id + reason.
+        let timerTrigger: TimerTriggerSpec | undefined;
+        if (boundaryKind === "timer") {
+          if (el.cancelActivity === false) {
+            err(
+              `Boundary timer '${id ?? ""}' has cancelActivity="false". A non-interrupting boundary needs a second token — deferred to concurrency (M4); only interrupting boundary timers are supported.`,
+              id,
+              "boundaryEvent",
+            );
+          }
+          const result = readTimerTrigger(defs[0] as ModdleElement);
+          if (!result.ok) {
+            err(`Boundary timer '${id ?? ""}' ${result.reason}`, id, "boundaryEvent");
+          } else {
+            timerTrigger = result.trigger;
+          }
+        }
+
         nodes.push({
           id: id ?? "",
           type: "boundaryEvent",
@@ -385,7 +512,104 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
           boundaryKind,
           attachedToRef,
           errorRef,
+          timerTrigger,
         });
+        continue;
+      }
+
+      // M3-L4: an intermediateCatchEvent is a token-path catch — event-definition
+      // aware (like the boundary branch above), so the TIMER variant (TASK-45,
+      // §4.4) and the MESSAGE variant (TASK-46, §3 item 3) each become a token
+      // node (standalone, or an eventBasedGateway branch target — same shape).
+      if ($type === "bpmn:IntermediateCatchEvent") {
+        const { defs, only } = classifyEventDefinition(el);
+        if (only === TIMER_EVENT_DEFINITION) {
+          const result = readTimerTrigger(defs[0] as ModdleElement);
+          if (!result.ok) {
+            err(`Intermediate catch event '${id ?? ""}' ${result.reason}`, id, "intermediateCatchEvent");
+          }
+          nodes.push({
+            id: id ?? "",
+            type: "intermediateCatchEvent",
+            name: (el.name as string) ?? undefined,
+            scopeId,
+            timerTrigger: result.ok ? result.trigger : undefined,
+          });
+          continue;
+        }
+        if (only === MESSAGE_EVENT_DEFINITION) {
+          // M3-L4 (TASK-46): a STANDALONE message intermediate catch — a
+          // token-path node with IDENTICAL wait/correlation/resume semantics to a
+          // receiveTask (the <message> carries only its name; the correlation key
+          // is supplied at instance start). But it is an EVENT, not an activity:
+          // no easy-bpmn:taskDefinition, and no boundary events attach (the
+          // boundary-attachment rules below reject boundary-on-catch). Exactly one
+          // incoming + one outgoing flow is enforced by the per-scope linearity +
+          // the >1-incoming join rule shared with the timer catch.
+          const catchInfo: NodeInfo = {
+            id: id ?? "",
+            type: "intermediateCatchEvent",
+            name: (el.name as string) ?? undefined,
+            scopeId,
+          };
+          // An event carries no worker routing — reject an easy-bpmn:taskDefinition.
+          const ext = el.extensionElements as ModdleElement | undefined;
+          const hasTaskDef = asArray<ModdleElement>(ext?.values).some((v) => v.$type === TASK_DEFINITION_TYPE);
+          if (hasTaskDef) {
+            err(
+              `Intermediate catch event '${id ?? ""}' carries an easy-bpmn:taskDefinition. A message intermediate catch is an event, not a service task; remove the taskDefinition (events route no worker).`,
+              id,
+              "intermediateCatchEvent",
+            );
+          }
+          // messageRef resolution — reuse the receiveTask rule (the ref lives on
+          // the <messageEventDefinition>, like errorRef on an error boundary).
+          const msgName = resolveMessageName((defs[0] as ModdleElement).messageRef, {
+            id,
+            label: "Intermediate catch event",
+            reasonType: "intermediateCatchEvent",
+          });
+          if (msgName !== undefined) catchInfo.messageName = msgName;
+          nodes.push(catchInfo);
+          continue;
+        }
+        const what = defs.length === 0
+          ? "no event definition"
+          : defs.length > 1
+            ? "multiple event definitions"
+            : `a ${localTypeName(defs[0]!.$type)}`;
+        err(
+          `Intermediate catch event '${id ?? ""}' has ${what}. Only a timer intermediate catch (a single timerEventDefinition) or a message intermediate catch (a single messageEventDefinition) is supported.`,
+          id,
+          "intermediateCatchEvent",
+        );
+        continue;
+      }
+
+      // M3-L4 (TASK-46, design §3 item 4 / §4.5): an eventBasedGateway races its
+      // branch catches, deciding deterministically on a gateway_decisions row. The
+      // two non-token variants are rejected here; the branch-target rules (≥2
+      // branches, every target a single-incoming intermediate catch, ≤1 timer
+      // branch, distinct messages) run after adjacency is built (a dedicated block
+      // below). Like an exclusiveGateway, it carries no `default` and no condition
+      // on its outgoing flows (the condition rule rejects those generally).
+      if ($type === "bpmn:EventBasedGateway") {
+        if (el.instantiate === true) {
+          err(
+            `Event-based gateway '${id ?? ""}' has instantiate="true". Instances start via the API only; remove instantiate.`,
+            id,
+            "eventBasedGateway",
+          );
+        }
+        const gatewayType = typeof el.eventGatewayType === "string" ? el.eventGatewayType : undefined;
+        if (gatewayType != null && gatewayType !== "Exclusive") {
+          err(
+            `Event-based gateway '${id ?? ""}' has eventGatewayType="${gatewayType}". A Parallel event gateway waits for ALL events at once (extra concurrent tokens — deferred to M4); only the default exclusive event gateway (first event wins) is supported.`,
+            id,
+            "eventBasedGateway",
+          );
+        }
+        nodes.push({ id: id ?? "", type: "eventBasedGateway", name: (el.name as string) ?? undefined, scopeId });
         continue;
       }
 
@@ -490,19 +714,12 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
             "receiveTask",
           );
         }
-        const msgId = refId(el.messageRef);
-        const msgName = msgId ? messageNamesById.get(msgId) : undefined;
-        if (!msgId || msgName === undefined) {
-          err(`Receive task '${id ?? ""}' must reference a declared <message> via messageRef.`, id, "receiveTask");
-        } else if (msgName.trim() === "") {
-          err(
-            `Receive task '${id ?? ""}' references a <message> with no name; a non-empty message name is required for correlation.`,
-            id,
-            "receiveTask",
-          );
-        } else {
-          info.messageName = msgName;
-        }
+        const msgName = resolveMessageName(el.messageRef, {
+          id,
+          label: "Receive task",
+          reasonType: "receiveTask",
+        });
+        if (msgName !== undefined) info.messageName = msgName;
       }
 
       nodes.push(info);
@@ -570,6 +787,16 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     // LEAVING a boundary event stays legal — error/cancel boundaries route
     // their escalation path that way (degree-checked per kind below); the
     // compensate boundary's zero-outgoing rule also lives below.
+    if (tgt.type === "startEvent") {
+      // A start event begins a scope; routing a token INTO it (e.g. an error
+      // boundary's free-routing target — M3-L2) is rejected generally so timer
+      // boundary targets (L3) inherit the same constraint.
+      err(
+        `Sequence flow '${f.id}' targets start event '${tgt.id}'. A start event begins a scope and takes no incoming sequence flow.`,
+        f.id,
+        "sequenceFlow",
+      );
+    }
     if (isBoundary(tgt)) {
       err(
         `Sequence flow '${f.id}' targets boundary event '${tgt.id}'. Boundary events attach to activities ` +
@@ -637,9 +864,11 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       if (n.type === "endEvent") {
         if (out.length > 0) err(`End event '${n.id}' must not have outgoing sequence flows.`, n.id, "endEvent");
       } else {
-        // Only an exclusiveGateway may split the token (M2); cycles are legal,
-        // so this is a degree check, not an acyclicity check.
-        if (out.length > 1 && n.type !== "exclusiveGateway") {
+        // Only a gateway may have >1 outgoing token edge — an exclusiveGateway
+        // (M2, FEEL branch) or an eventBasedGateway (M3-L4, the timer/message
+        // race). Cycles are legal, so this is a degree check, not an acyclicity
+        // check.
+        if (out.length > 1 && n.type !== "exclusiveGateway" && n.type !== "eventBasedGateway") {
           err(
             `Element '${n.id}' has ${out.length} outgoing sequence flows. ` +
               "Implicit splits are not supported — route branching through an exclusiveGateway.",
@@ -765,6 +994,37 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       );
       continue;
     }
+    // A boundary event on a compensation handler (isForCompensation) would leak a
+    // token out of the compensation lane: the handler is off the token path,
+    // reached only via its <association>, so its boundary's outgoing flow has no
+    // valid token semantics. Reject generally (M3-L2, TASK-42) so L3 timer
+    // boundaries inherit it. NOTE: a handler IS a serviceTask, so the per-kind
+    // "must be attached to a service task" checks would PASS it — this rule is
+    // what catches it. `continue` so only this reason fires for the attachment.
+    if (isHandler(attached)) {
+      err(
+        `Boundary event '${n.id}' is attached to compensation handler '${attached.id}' (isForCompensation). ` +
+          "Boundary events cannot attach to a compensation handler — it is off the token path, reached only via its compensation <association>.",
+        n.id,
+        "boundaryEvent",
+      );
+      continue;
+    }
+    // A boundary event on an intermediate catch (timer OR message, M3-L4) is
+    // invalid: the catch is an EVENT, not an activity — its only continuation is
+    // its single outgoing flow, and a boundary's outgoing flow would leak a second
+    // path off an event. Reject generally (one event-specific reason) so the
+    // per-kind "must be attached to a service task / receive task" checks below do
+    // not cascade noise onto the same broken attachment. `continue`.
+    if (attached.type === "intermediateCatchEvent") {
+      err(
+        `Boundary event '${n.id}' is attached to intermediate catch event '${attached.id}'. ` +
+          "Boundary events attach to an activity (service/receive task) or a transaction, never to an intermediate catch event (it is an event, not an activity).",
+        n.id,
+        "boundaryEvent",
+      );
+      continue;
+    }
     if (attached.scopeId !== n.scopeId) {
       err(`Boundary event '${n.id}' is attached to an element in a different scope.`, n.id, "boundaryEvent");
     }
@@ -814,30 +1074,56 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       if (attached.type !== "serviceTask") {
         err(`Error boundary event '${n.id}' must be attached to a service task.`, n.id, "boundaryEvent");
       }
-      if (!n.errorRef || !errorsById.has(n.errorRef)) {
+      // errorRef handling (M3-L2, TASK-42):
+      //  - PRESENT-but-unresolved (moddle dropped it; recovered via the dangling
+      //    map) → reject. It is NOT a catch-all — a typo must not silently widen
+      //    to "match any code".
+      //  - PRESENT-and-resolved → its <bpmn:error> @errorCode must be NON-EMPTY.
+      //    An empty/absent code would silently act as a catch-all (the engine
+      //    matches errorCode==null to any code), so it is rejected.
+      //  - ABSENT → this IS the catch-all: leave n.errorCode undefined so the
+      //    graph carries errorCode:null, the unambiguous "match any code" marker.
+      const danglingRef = danglingErrorRef.get(n.id);
+      if (danglingRef !== undefined) {
         err(
-          `Error boundary event '${n.id}' has an errorRef that does not resolve to a declared <bpmn:error>.`,
+          `Error boundary event '${n.id}' has an errorRef '${danglingRef}' that does not resolve to a declared <bpmn:error>.`,
           n.id,
           "boundaryEvent",
         );
-      } else {
-        n.errorCode = errorsById.get(n.errorRef)!.errorCode ?? undefined;
-      }
-      if (outs.length !== 1) {
-        err(
-          `Error boundary event '${n.id}' must have exactly one outgoing sequence flow (routing to a cancel end event); found ${outs.length}.`,
-          n.id,
-          "boundaryEvent",
-        );
-      } else {
-        const tgt = nodeById.get(outs[0]!);
-        if (!tgt || tgt.type !== "endEvent" || tgt.endKind !== "cancel") {
+      } else if (n.errorRef != null) {
+        if (!errorsById.has(n.errorRef)) {
           err(
-            `Error boundary event '${n.id}' must route to a cancel end event (so the transaction cancels and compensates).`,
+            `Error boundary event '${n.id}' has an errorRef that does not resolve to a declared <bpmn:error>.`,
             n.id,
             "boundaryEvent",
           );
+        } else {
+          const code = errorsById.get(n.errorRef)!.errorCode;
+          if (code == null || code.trim() === "") {
+            err(
+              `Error boundary event '${n.id}' references error '${n.errorRef}', which has no (or an empty) @errorCode. ` +
+                "A coded error boundary needs a non-empty @errorCode; omit the errorRef to make this a catch-all boundary.",
+              n.id,
+              "boundaryEvent",
+            );
+          } else {
+            n.errorCode = code;
+          }
         }
+      }
+      // Lifted target rule (M3-L2): exactly ONE outgoing flow, to any token-path
+      // node in the SAME scope (no longer "a cancel end event"). The forbidden
+      // targets are already rejected by the per-flow endpoint rules above — a
+      // flow into a boundaryEvent, a compensation handler, a startEvent, or
+      // across a transaction boundary — so only the single-outgoing degree is
+      // checked here. The recorded branch then walks forward like any token: it
+      // triggers compensation only if it reaches a cancel end, else it continues.
+      if (outs.length !== 1) {
+        err(
+          `Error boundary event '${n.id}' must have exactly one outgoing sequence flow (routing to a token-path node in the same scope); found ${outs.length}.`,
+          n.id,
+          "boundaryEvent",
+        );
       }
     } else if (n.boundaryKind === "cancel") {
       if (attached.type !== "transaction") {
@@ -854,6 +1140,201 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
           "boundaryEvent",
         );
       }
+    } else if (n.boundaryKind === "timer") {
+      // M3-L3 (TASK-44): an interrupting boundary timer attaches to a serviceTask
+      // or receiveTask (inside or outside a transaction) — NEVER to a transaction
+      // itself (it would terminate the scope WITHOUT compensation, the
+      // silent-rollback-loss trap, deferred to M5). Attachment to a gateway /
+      // compensation handler is already rejected above (those `continue`). Exactly
+      // one outgoing flow, to any token-path node in the same scope — the forbidden
+      // targets are rejected by the per-flow endpoint rules (reused from M3-L2), so
+      // only the single-outgoing degree is checked here.
+      if (attached.type === "transaction") {
+        err(
+          `Boundary timer '${n.id}' is attached to transaction '${attached.id}'. A timer on a transaction would terminate the scope without compensation (deferred to M5) — attach it to a task INSIDE the transaction routing to a cancel end instead.`,
+          n.id,
+          "boundaryEvent",
+        );
+      } else if (attached.type !== "serviceTask" && attached.type !== "receiveTask") {
+        err(
+          `Boundary timer '${n.id}' must be attached to a service task or a receive task; '${attached.id}' is a ${attached.type}.`,
+          n.id,
+          "boundaryEvent",
+        );
+      }
+      if (outs.length !== 1) {
+        err(
+          `Boundary timer '${n.id}' must have exactly one outgoing sequence flow (routing to a token-path node in the same scope); found ${outs.length}.`,
+          n.id,
+          "boundaryEvent",
+        );
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Per-activity error-boundary aggregation (M3-L2, TASK-42): on one activity
+  // the coded boundaries must carry DISTINCT @errorCodes and there may be at
+  // most ONE catch-all (errorEventDefinition with no errorRef). Grouped by
+  // attachedToRef so the reject names the offending (second) boundary by id.
+  // -------------------------------------------------------------------------
+  const errBoundariesByActivity = new Map<string, NodeInfo[]>();
+  for (const n of nodes) {
+    if (n.type === "boundaryEvent" && n.boundaryKind === "error" && n.attachedToRef) {
+      const arr = errBoundariesByActivity.get(n.attachedToRef);
+      if (arr) arr.push(n);
+      else errBoundariesByActivity.set(n.attachedToRef, [n]);
+    }
+  }
+  for (const [activityId, boundaries] of errBoundariesByActivity) {
+    const seenCodes = new Set<string>();
+    let catchAllCount = 0;
+    for (const b of boundaries) {
+      // A dangling errorRef already errored above and is neither a catch-all nor
+      // a coded boundary — exclude it so it neither counts as a second catch-all
+      // nor masks a real one.
+      if (danglingErrorRef.has(b.id)) continue;
+      if (b.errorRef == null) {
+        // Catch-all (no errorRef): at most one per activity.
+        if (++catchAllCount > 1) {
+          err(
+            `Activity '${activityId}' has more than one catch-all error boundary (an errorEventDefinition with no errorRef). ` +
+              "At most one catch-all error boundary is allowed per activity.",
+            b.id,
+            "boundaryEvent",
+          );
+        }
+      } else if (b.errorCode != null) {
+        // A coded boundary that resolved to a non-empty @errorCode (unresolved /
+        // empty-code boundaries already errored above and carry no errorCode).
+        if (seenCodes.has(b.errorCode)) {
+          err(
+            `Activity '${activityId}' has more than one error boundary catching @errorCode '${b.errorCode}'. ` +
+              "An activity's coded error boundaries must have distinct @errorCode values.",
+            b.id,
+            "boundaryEvent",
+          );
+        }
+        seenCodes.add(b.errorCode);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Per-activity timer-boundary multiplicity (M3-L3, TASK-44): AT MOST ONE timer
+  // boundary per activity. Two static durations/dates make one statically dead;
+  // a date+duration pair makes the winner arrival-time-dependent — both restricted
+  // in M3 for determinism (honest wording, not "dead branch"). Grouped by
+  // attachedToRef so the reject names the offending (second) boundary by id.
+  // -------------------------------------------------------------------------
+  const timerBoundariesByActivity = new Map<string, NodeInfo[]>();
+  for (const n of nodes) {
+    if (n.type === "boundaryEvent" && n.boundaryKind === "timer" && n.attachedToRef) {
+      const arr = timerBoundariesByActivity.get(n.attachedToRef);
+      if (arr) arr.push(n);
+      else timerBoundariesByActivity.set(n.attachedToRef, [n]);
+    }
+  }
+  for (const [activityId, boundaries] of timerBoundariesByActivity) {
+    for (const b of boundaries.slice(1)) {
+      err(
+        `Activity '${activityId}' has more than one boundary timer. At most one timer boundary is allowed per activity ` +
+          "(multiple static timers make one statically dead or arrival-time-dependent — restricted in M3 for determinism).",
+        b.id,
+        "boundaryEvent",
+      );
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Intermediate timer catch degree (M3-L4, TASK-45, design §4.4): exactly ONE
+  // incoming and ONE outgoing sequence flow. A timer catch is a single-token
+  // delay, never a join. The per-scope linearity rules above already reject 0
+  // incoming (unreachable), 0 outgoing (no successor), and >1 outgoing (implicit
+  // split) with element id + reason; only the >1-incoming JOIN is added here.
+  // -------------------------------------------------------------------------
+  for (const n of nodes) {
+    if (n.type !== "intermediateCatchEvent") continue;
+    const inc = incoming.get(n.id) ?? [];
+    if (inc.length > 1) {
+      err(
+        `Intermediate catch event '${n.id}' has ${inc.length} incoming sequence flows; exactly one is required ` +
+          "(a timer catch is a single-token delay on the token path, not a join).",
+        n.id,
+        "intermediateCatchEvent",
+      );
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // eventBasedGateway branch rules (M3-L4, TASK-46, design §3 item 4 / §4.5):
+  //   * ≥2 outgoing flows — the gateway races at least two event branches;
+  //   * every target is an intermediateCatchEvent (timer OR message) whose ONLY
+  //     incoming flow is the one from this gateway (a shared catch would let two
+  //     tokens race the same event);
+  //   * AT MOST ONE timer branch (same determinism rationale + honest wording as
+  //     the boundary-timer multiplicity rule — NOT "dead branch", false for a
+  //     date+duration mix);
+  //   * message branches reference DISTINCT messages (two branches on one
+  //     messageName collapse to a single broker key and would hit the broker's
+  //     one-active-subscription invariant at publish).
+  // (instantiate / eventGatewayType="Parallel" are rejected at classification.)
+  // The catch-degree + linearity rules above also reject a shared/non-event
+  // target shape; these are the EBG-specific reasons that name the gateway.
+  // -------------------------------------------------------------------------
+  for (const n of nodes) {
+    if (n.type !== "eventBasedGateway") continue;
+    const branchTargets = outgoing.get(n.id) ?? [];
+    if (branchTargets.length < 2) {
+      err(
+        `Event-based gateway '${n.id}' has ${branchTargets.length} outgoing flow(s); an event-based gateway races at least two event branches.`,
+        n.id,
+        "eventBasedGateway",
+      );
+    }
+    let timerBranches = 0;
+    const messageNamesSeen = new Set<string>();
+    for (const targetId of branchTargets) {
+      const target = nodeById.get(targetId);
+      if (!target || target.type !== "intermediateCatchEvent") {
+        err(
+          `Event-based gateway '${n.id}' has a branch to '${targetId}', which is not an intermediate catch event. ` +
+            "Every branch of an event-based gateway must target a timer or message intermediateCatchEvent.",
+          n.id,
+          "eventBasedGateway",
+        );
+        continue;
+      }
+      const inc = incoming.get(targetId) ?? [];
+      if (inc.length !== 1 || inc[0] !== n.id) {
+        err(
+          `Event-based gateway '${n.id}' branch target '${targetId}' must have exactly one incoming flow — the one from this gateway; found ${inc.length}.`,
+          n.id,
+          "eventBasedGateway",
+        );
+      }
+      if (target.timerTrigger) {
+        if (++timerBranches > 1) {
+          err(
+            `Event-based gateway '${n.id}' has more than one timer branch. At most one timer branch is allowed ` +
+              "(multiple static timers make one statically dead or arrival-time-dependent — restricted in M3 for determinism).",
+            target.id,
+            "eventBasedGateway",
+          );
+        }
+      } else if (target.messageName) {
+        if (messageNamesSeen.has(target.messageName)) {
+          err(
+            `Event-based gateway '${n.id}' has more than one branch waiting on message '${target.messageName}'. ` +
+              "Message branches must reference distinct messages (two branches on one message collapse to a single broker key, which the broker rejects as a second active subscription).",
+            target.id,
+            "eventBasedGateway",
+          );
+        }
+        messageNamesSeen.add(target.messageName);
+      }
+      // A catch that is neither a timer nor a (resolved) message catch already
+      // errored in the intermediateCatchEvent classification — no double-count.
     }
   }
 
@@ -961,10 +1442,15 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         retries: n.attempts ?? null,
         messageName: n.messageName ?? null,
         outgoing: nodeOutgoing,
-        next: n.type === "exclusiveGateway" ? null : nodeOutgoing[0]?.targetId ?? null,
+        // A gateway never linearly advances: branch selection owns the successor
+        // (exclusiveGateway = FEEL conditions; eventBasedGateway = the timer/
+        // message race recorded in gateway_decisions). The IR makes no `.next`
+        // promise for either — the engine reads `outgoing[]`.
+        next: n.type === "exclusiveGateway" || n.type === "eventBasedGateway" ? null : nodeOutgoing[0]?.targetId ?? null,
         scopeId: n.scopeId === processId ? null : n.scopeId,
       };
       if (n.type === "serviceTask") node.isForCompensation = n.isForCompensation === true;
+      if (n.type === "intermediateCatchEvent") node.timerTrigger = n.timerTrigger ?? null; // M3-L4: the static ISO-8601 delay
       if (n.type === "endEvent") node.endKind = n.endKind ?? "none";
       if (n.type === "boundaryEvent") {
         node.boundaryKind = n.boundaryKind ?? null;
@@ -976,6 +1462,9 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         if (n.boundaryKind === "compensate") {
           const assoc = associations.find((a) => a.source === n.id);
           node.compensationHandlerId = assoc?.target ?? null;
+        }
+        if (n.boundaryKind === "timer") {
+          node.timerTrigger = n.timerTrigger ?? null;
         }
       }
       graphNodes[n.id] = node;

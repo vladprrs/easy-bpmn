@@ -83,13 +83,20 @@ export async function leaseJobs(
 export interface ExpiredLeaseRow {
   job_id: string;
   attempt_count: number;
+  /** Retry budget — once attempt_count reaches it, the reclaim EXHAUSTS instead of parking (TASK-40). */
+  retry_limit: number;
+  /** For routing the reclaim-exhaustion delivery to the engine (forward vs compensation). */
+  instance_id: string;
+  element_id: string;
+  is_compensation: number;
 }
 
 /**
  * Select in-flight leases (lock_token held) whose lease has lapsed, for the given
  * taskType + workspace — the reclaim candidates a crashed/slow worker left behind.
- * The reclaim pre-pass parks each behind backoff (design §4.1) instead of letting
- * the bulk lease re-hand it instantly.
+ * The reclaim pre-pass parks each behind backoff (design §4.1) UNLESS its retry
+ * budget is exhausted, in which case it routes to the exhaustion path (TASK-40) —
+ * so `retry_limit` + the engine-routing columns travel with each candidate.
  */
 export async function selectExpiredInFlightLeases(
   db: D1Database,
@@ -99,7 +106,8 @@ export async function selectExpiredInFlightLeases(
 ): Promise<ExpiredLeaseRow[]> {
   const res = await stmt(
     db,
-    `SELECT j.job_id, j.attempt_count FROM service_task_jobs j
+    `SELECT j.job_id, j.attempt_count, j.retry_limit, j.instance_id, j.element_id, j.is_compensation
+       FROM service_task_jobs j
        JOIN process_instances pi ON pi.instance_id = j.instance_id
       WHERE j.task_type = ? AND pi.workspace_id = ?
         AND j.status = 'locked' AND j.lock_token IS NOT NULL AND j.lock_expires_at < ?`,
@@ -126,6 +134,30 @@ export async function parkExpiredLease(
         SET lock_token = NULL, lock_expires_at = ?, worker_id = NULL, updated_at = ?
       WHERE job_id = ? AND status = 'locked' AND lock_token IS NOT NULL AND lock_expires_at < ?`,
     [parkUntil, now, jobId, now],
+  ).run();
+  return res.meta?.changes ?? 0;
+}
+
+/**
+ * Reclaim-exhaustion transition (TASK-40): flip a LAPSED in-flight lease whose
+ * retry budget is exhausted straight to `failed`. The guard mirrors
+ * parkExpiredLease's predicate (`status='locked' AND lock_token IS NOT NULL AND
+ * lock_expires_at < now`) — the lease lapsed, so there is NO worker token to match
+ * (failJobConditional, guarded on the worker's `lock_token = ?`, cannot be used
+ * here). It is race-safe by exactly that guard: a concurrent complete/re-lease (or
+ * a sibling activate's reclaim pre-pass) clears/rotates lock_token or moves the
+ * row terminal first, so this matches 0 rows and the caller MUST NOT deliver. On a
+ * 1-row win the job is terminal (`failed`) and selectExpiredInFlightLeases — which
+ * filters `status='locked'` — will never re-pick it, so the pre-pass cannot
+ * double-deliver. Returns rows changed.
+ */
+export async function failExpiredLeaseConditional(db: D1Database, jobId: string, now: string): Promise<number> {
+  const res = await stmt(
+    db,
+    `UPDATE service_task_jobs
+        SET status = 'failed', lock_token = NULL, lock_expires_at = NULL, worker_id = NULL, updated_at = ?
+      WHERE job_id = ? AND status = 'locked' AND lock_token IS NOT NULL AND lock_expires_at < ?`,
+    [now, jobId, now],
   ).run();
   return res.meta?.changes ?? 0;
 }
@@ -361,6 +393,23 @@ export async function resetJobForRetry(
     [input.inputVariables, input.now, input.instanceId, input.elementId, input.isCompensation ? 1 : 0],
   ).run();
   return res.meta?.changes ?? 0;
+}
+
+/**
+ * Abandon a forward job in the SAME batch as a winning timer fire (M3-L3): a
+ * status-conditional flip of a still-in-flight (`created`|`locked`) forward job
+ * to `failed`, clearing its lock_token so a late worker complete/fail matches 0
+ * rows on its token and gets the existing stable no-op ack. Statement form so it
+ * rides the fireTimer dbBatch atomically with the `timer_outcomes 'fired'` claim
+ * (the decider) — a job already terminal (completion won the race) matches 0 rows.
+ */
+export function abandonJobOnTimerFireStmt(db: D1Database, jobId: string, now: string): D1PreparedStatement {
+  return stmt(
+    db,
+    `UPDATE service_task_jobs SET status = 'failed', lock_token = NULL, lock_expires_at = NULL, updated_at = ?
+      WHERE job_id = ? AND status IN ('created', 'locked')`,
+    [now, jobId],
+  );
 }
 
 /** On operator cancel, abandon any in-flight FORWARD job so a late worker callback no-ops. */

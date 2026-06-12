@@ -1,9 +1,12 @@
-# Quickstart: SAGA Orchestrator Validation (M1 + M2)
+# Quickstart: SAGA Orchestrator Validation (M1 + M2 + M3)
 
 This guide describes the end-to-end validation scenarios for the transaction-saga implementation:
 scenarios 1–9 are the named M1 constitution-critical gates; scenarios 10–14 are the M2
-conditional-saga gates (exclusiveGateway + FEEL + cycles), each mapping to a green integration
-test named next to it.
+conditional-saga gates (exclusiveGateway + FEEL + cycles); scenarios 15–26 are the M3
+time-&-failure-taxonomy gates (boundary/intermediate timers, `eventBasedGateway`, free error
+routing, the incident-kind split + `retryable`) — each mapping to a green integration test named
+next to it. The M3 design source is
+`docs/superpowers/specs/2026-06-11-m3-time-failure-taxonomy-design.md` (§7 gates).
 
 ## Prerequisites
 
@@ -19,7 +22,7 @@ test named next to it.
 
 ```bash
 npm install
-npx wrangler d1 migrations apply easy_bpmn --local   # applies 0001 … 0005 (MVP, saga, topology, conditional, backfill)
+npx wrangler d1 migrations apply easy_bpmn --local   # applies 0001 … 0006 (MVP, saga, topology, conditional, backfill, timers)
 npm run test
 npm run dev
 ```
@@ -30,7 +33,8 @@ Expected setup outcome:
 - Local Worker API is available at `http://localhost:8787`.
 - Local D1 database has the MVP schema plus the saga ledger, jobs lease/DLQ columns, worker
   credentials, incident `kind`/`resolution`, the `(workspace_id, status)` list index, the M2
-  `occurrence`/`output_applied` columns, conditional topology columns, and `gateway_decisions`.
+  `occurrence`/`output_applied` columns, conditional topology columns, `gateway_decisions`, and the
+  M3 `timers` + `timer_outcomes` tables (migration `0006_timers.sql`).
 - Workflow and Durable Object bindings are available in local development.
 
 ## Scenario 1: Happy Saga Commits (gate: happy-saga-commit)
@@ -199,7 +203,7 @@ armed. At expiry the alarm re-reads D1 and, the job still un-leased, terminates 
 
 Expected outcome:
 
-- The instance settles to a **terminal incident** with `kind=timeout`; a `jobActivationExpired`
+- The instance settles to a **terminal incident** with `kind=jobActivationTimeout`; a `jobActivationExpired`
   history event is written and the reason is specific (`un-leasable`), **not** the
   `process-workflow` catch-all `Workflow terminated:`.
 - A job that was **leased before** `activation_expires_at` is **not** timed out (the alarm no-ops).
@@ -304,25 +308,175 @@ keeps the recorded branch"` (Workflow memoization), `"rewalk fast-forward is wri
 - Rewalk fast-forward over applied steps is **write-free** (no duplicate jobs, history events, or
   variable merges); resuming mid-loop lands on the exact frontier occurrence.
 
+---
+
+The M3 scenarios below add model-level timers, the `eventBasedGateway`, free error routing, and the
+failure-taxonomy split on top of the rewalk/occurrence engine. Two shipped sample models —
+`examples/timer-saga.bpmn` (boundary timer inside a transaction → cancel end → compensation) and
+`examples/event-gateway-saga.bpmn` (message-vs-timer race) — are publish-validated AND semantically
+round-tripped from disk by `tests/integration/sample-m3-models.test.ts` (the R4 canonicity gate).
+The runtime firing path is exercised in **direct mode** (the only mode CI runs) by triggering the
+Scheduler Durable Object alarm deterministically via `runDurableObjectAlarm` — no real sleeps
+anywhere. Every design §7 gate maps to a green test named in its heading.
+
+## Scenario 15: Boundary Timer on a Service Task → Alternate Path (gate: boundary-timer-alt-path — `tests/integration/boundary-timer.test.ts`)
+
+A service task carries an interrupting boundary timer (`timerEventDefinition`/`timeDuration`). When
+the deadline elapses the timer fires and the token takes the boundary's outgoing flow; a late worker
+callback to the abandoned job gets the stable no-op ack.
+
+Expected outcome (design §7 gate 1): the `timers` row flips `armed → fired` with a `timer_outcomes`
+`fired` decider row; a `timerFired` history event (NOT an incident) is written; the token advances
+down the modeled alternate path; the in-flight job is abandoned and a late `complete`/`fail` returns
+the superseded no-op ack.
+
+## Scenario 16: Boundary Timer Inside a Transaction → Reverse Compensation (gate: timer-saga-compensation — `tests/integration/boundary-timer.test.ts`, `tests/integration/sample-m3-models.test.ts`)
+
+The canonical "saga timeout → compensate" shape, the M3 analogue of Scenario 2:
+`examples/timer-saga.bpmn` reserves stock + charges the card, then a long-running `awaitShipment`
+step times out.
+
+Expected outcome (design exit criterion 2, §7 gate 2): the boundary timer fires → routes to the
+transaction's cancel end event → the instance enters `compensating`; completed steps compensate in
+**reverse order** (`refund-card` before `release-stock`); the instance settles `compensated` via the
+cancel boundary's `SagaFailed` path. There is **no** `easy-bpmn` timeout attribute — the trip is a
+drawn boundary timer with a drawn path (design decision #2).
+
+## Scenario 17: Timer-vs-Completion Race, Both Orders (gate: timer-completion-race — `tests/integration/boundary-timer.test.ts`)
+
+Drive a timer-guarded service task two ways: worker `complete` first, then the alarm; and the alarm
+first, then a late `complete`.
+
+Expected outcome (design §7 gate 3): exactly one of the two batches commits its decider
+(`timer_outcomes`) — complete-first settles the timer `cancelled` and a stray alarm no-ops;
+fire-first claims `fired` and the late `complete` aborts on the unique constraint and converts to the
+superseded no-op ack. No double advance in either order.
+
+## Scenario 18: Intermediate Timer Catch — Process Level and Inside a Transaction (gate: intermediate-timer-catch — `tests/integration/intermediate-timer.test.ts`)
+
+An `intermediateCatchEvent` + `timerEventDefinition` is a delay step on the token path.
+
+Expected outcome (design §7 gate 4): the token parks (timer armed), and on fire advances along the
+single outgoing flow with a `timerFired` history event. Inside a `transaction` the saga scope stays
+open across the delay (completed steps remain compensatable).
+
+## Scenario 19: eventBasedGateway Race — Message / Timer / Buffered (gate: ebg-race — `tests/integration/event-gateway.test.ts`, `tests/integration/sample-m3-models.test.ts`)
+
+`examples/event-gateway-saga.bpmn` parks on an `eventBasedGateway` racing a message branch
+(`ApprovalGranted`) against a timer branch (`PT24H`).
+
+Expected outcome (design §4.5, §7 gate 5): the winner is whichever occurs first, decided on a single
+`gateway_decisions` row (plain INSERT, same batch as the transition); the loser's batch aborts and
+converts. Message wins → token down the fulfil branch, timer settled `cancelled` (bookkeeping, no
+`timer_outcomes` row); timer wins → token down the escalate branch, message subscription superseded;
+an early-buffered message is claimed at registration; with two buffered message branches the
+**model-document-order first hit** wins. The decision is replay-stable.
+
+## Scenario 20: Boundary Timer on a Receive Task → Subscription Superseded (gate: receive-task-timer — `tests/integration/boundary-timer.test.ts`)
+
+A `receiveTask` guarded by a boundary timer.
+
+Expected outcome (design §7 gate 6): on fire the active broker subscription is superseded (preserving
+the at-most-one-active-subscription invariant); a late publish to that broker key gets the stable
+buffered/no-match outcome, not a second advance.
+
+## Scenario 21: Multi-Error-Boundary Routing (gate: free-error-routing — `tests/integration/error-routing.test.ts`)
+
+One activity carries several interrupting error boundaries with **distinct, non-empty** `@errorCode`s
+plus at most one catch-all.
+
+Expected outcome (design §7 gate 7): a worker `fail` with a given `errorCode` reaches the boundary
+whose Error's `@errorCode` matches **exactly**; the catch-all catches any business code including one
+not declared as a `bpmn:error` in the model; an unmatched code with no catch-all stays a **Hazard**
+(Constitution VI untouched). The boundary's outgoing flow may target any token-path node in the
+scope (the M1 "must target a cancel end" restriction is lifted).
+
+## Scenario 22: Error → Alternate Path → Saga Continues → Later Cancel (gate: error-path-then-compensate — `tests/integration/error-routing.test.ts`)
+
+A business error is handled by an alternate path **inside** a transaction; the saga continues and is
+cancelled later.
+
+Expected outcome (design §7 gate 8): the alternate path leaves the saga ledger untouched —
+**all** completed forward steps (both pre- and post-error) compensate in reverse when the saga
+cancels (standard compensation semantics; handlers stay registered until the scope settles).
+
+## Scenario 23: Standalone Message Intermediate Catch (gate: message-intermediate-catch — `tests/integration/message-intermediate-catch.test.ts`)
+
+A standalone `intermediateCatchEvent` + `messageEventDefinition` (no gateway).
+
+Expected outcome (design §7 gate 9): it correlates and advances exactly like a `receiveTask` (same
+subscription machinery), in both publish-before and publish-after orders.
+
+## Scenario 24: Abnormal-Exit Timer Settlement (gate: timer-abnormal-exit — `tests/integration/boundary-timer.test.ts`)
+
+Exit a timer-guarded visit via an error-boundary route, a retry exhaustion, and an operator
+`/cancel`.
+
+Expected outcome (design §7 gate 10): each exit settles the armed timer `cancelled` via the decider;
+a stray alarm afterwards is a no-op — no mid-compensation or post-incident firing.
+
+## Scenario 25: retryable=false and Lease-Expiry Exhaustion (gate: retryable-reclaim — `tests/integration/jobs-retryable-reclaim.test.ts`)
+
+A worker fails a job with `retryable=false`; separately, a job is left to exhaust its retry budget
+purely through lease expiry (reclaim re-leases).
+
+Expected outcome (design §7 gate 11): `retryable=false` short-circuits remaining attempts → immediate
+exhaustion incident (Hazard inside a transaction); lease-expiry exhaustion now terminates via the
+**same** exhaustion path (the previously-missing reclaim termination check). A worker omitting
+`retryable` is unchanged.
+
+## Scenario 26: Incident Kinds + Hygiene (gate: incident-taxonomy — `tests/integration/incident-hygiene.test.ts`, `tests/integration/wait-cap-incidents.test.ts`, `tests/integration/service-task-incident.test.ts`)
+
+Exercise the `timeout` split and the hygiene fixes.
+
+Expected outcome (design §7 gate 12, §5): an un-leasable job → `jobActivationTimeout`; an un-guarded
+service-task / receive-task wait cap → `waitTimeout`; a hard FEEL error → `conditionFailure`;
+`setIncidentResolution` resolves a single incident by id (no longer all of the instance's open
+incidents); inspection lists **all** open incidents; an empty-ledger `/cancel` closes them all as
+`operatorResolved`. A fired model timer never creates an incident.
+
+## Workflow-mode-only paths (manual validation)
+
+Direct mode (the CI mode) covers the alarm → `fireTimer` → claim/abort → D1 path — the **primary**
+race mechanism in both execution modes. The following are exercised only when a real Cloudflare
+Workflow drives the instance, so they are verified manually / via `wrangler dev` (mirroring the
+M1/M2 manual lists), not in CI:
+
+- **`sendEvent` discriminated wake** — `fireTimer` waking the Workflow with a discriminated payload
+  (`{outcome:'timerFired', timerId}`) on the wait's event type; the engine routes the token down the
+  timer path on resume.
+- **First-event-wins memoization as the secondary race guard** — Workflow step memoization makes the
+  losing wake a no-op; this is a *second* guard behind the D1 decider, not the primary one.
+- **Timer-sized `waitForEvent` backstop** — the `waitForEvent` timeout sized to `fire_at` so a 7-day
+  timer costs O(1) steps; on any wake the engine re-reads D1 and settles overdue timers
+  (`fire_at <= now`) exactly as the alarm path would (the lost-alarm backstop).
+
 ## Validation Commands
 
 ```bash
-npm run test:unit          # bpmn validator (saga + conditional accept/reject, FEEL parse/null semantics), graph scope, reverse-order ledger, retry backoff curve
+npm run test:unit          # bpmn validator (saga + conditional + M3 accept/reject, FEEL parse/null semantics), graph scope, reverse-order ledger, retry backoff curve, timers persistence, fire-timer, job-scheduler DO
 npm run test:contract      # /jobs/* + operator verbs + list + saga view vs contracts/openapi.yaml; job-result union (incl. timeout/poison kind); lease SQL; the M2 /jobs/* schema pin (tests/contract/jobs-schema-pin.test.ts)
-npm run test:integration   # the nine M1 gates + the five M2 gates above (D1 + DO + Workflow + pull workers)
-npm run check:docs         # docs/bpmn/ consistency guard
+npm run test:integration   # the nine M1 gates + the five M2 gates + the M3 gates above (D1 + DO + Workflow + pull workers); timer firing via runDurableObjectAlarm, no real sleeps
+npm run check:docs         # docs/bpmn/ consistency guard (incl. the M3 incident-kind + eventBasedGateway guards)
 npx wrangler deploy --dry-run
 ```
 
 Expected validation outcome:
 
-- The §3 canonical order-saga AND the conditional sample publish; each still-unsupported construct
-  is rejected with element id + reason (deferred gateways with their milestone pointers);
-  foreign-ns / DI / `documentation` are tolerated.
+- The §3 canonical order-saga, the conditional sample, AND the two M3 samples
+  (`examples/timer-saga.bpmn`, `examples/event-gateway-saga.bpmn`) publish and semantically
+  round-trip; each still-unsupported construct is rejected with element id + reason (deferred
+  gateways/events with their milestone pointers); foreign-ns / DI / `documentation` are tolerated.
 - The nine M1 integration gates pass: happy commit; business-error reverse compensation;
   compensator-fail remediation; duplicate complete/fail idempotency; terminal-instance no-op ack;
   cross-tenant activate reject; version binding through compensation; un-leasable-job DLQ timeout;
   poison-job termination.
 - The five M2 gates pass: branch-by-data; loop-N-iterations-then-compensate-each; noPath Hazard +
   operator remediation; loopLimit guard; decision-replay stability.
+- The M3 gates pass (Scenarios 15–26): boundary-timer alternate path + timer-saga compensation;
+  timer-vs-completion race both orders; intermediate timer catch; `eventBasedGateway` race
+  (message/timer/buffered/tie-break); receive-task boundary timer; multi-error-boundary + catch-all
+  routing; error-path-then-compensate ledger integrity; standalone message catch; abnormal-exit timer
+  settlement; `retryable=false` + lease-expiry exhaustion; the incident-kind split + hygiene. The
+  Workflow-mode-only paths above are validated manually.
 - No external workflow infrastructure (Camunda/Zeebe/broker/cluster) is deployed.

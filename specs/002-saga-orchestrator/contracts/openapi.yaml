@@ -317,8 +317,10 @@ paths:
         returns the prior outcome and does not re-count an attempt). No errorCode = a technical
         failure (re-lease until the retry budget is exhausted); an errorCode matching a model
         bpmn:error/@errorCode raises that BPMN error -> error boundary -> cancel. The `retryable`
-        field is accepted but advisory/IGNORED server-side - terminality is decided only by
-        errorCode (business) or retry-budget exhaustion (technical).
+        field is HONORED (M3): omitted/true = normal backoff retry; false = immediate exhaustion
+        (skip remaining technical retries) -> the standard exhaustion path (a Hazard incident
+        inside a transaction). BEHAVIOR CHANGE (M3): a worker already sending `retryable=false`
+        (legal and IGNORED before M3) now short-circuits its retries instead of being re-leased.
       parameters:
         - $ref: "#/components/parameters/JobId"
       requestBody:
@@ -755,6 +757,56 @@ components:
             incident:
               $ref: "#/components/schemas/Incident"
               nullable: true
+            openIncidents:
+              type: array
+              description: >
+                All not-yet-resolved incidents (resolution open|compensating),
+                newest-first (M3-L1). The `incident` field above is the latest one.
+              items:
+                $ref: "#/components/schemas/Incident"
+            timers:
+              type: array
+              description: >
+                Model timers (M3-L3): armed/fired/cancelled with fire_at/fired_at,
+                read from D1. Present when the instance has any timer.
+              items:
+                $ref: "#/components/schemas/TimerView"
+    TimerView:
+      type: object
+      required: [timerId, elementId, occurrence, kind, status, attachedToRef, gatewayId, fireAt, firedAt]
+      properties:
+        timerId:
+          type: string
+          description: "Deterministic id: instanceId:elementId#occurrence."
+        elementId:
+          type: string
+          description: The timer-event element id (boundary | intermediate catch | EBG branch).
+        occurrence:
+          type: integer
+          description: The arming visit's occurrence (the host activity's visit for a boundary timer).
+        kind:
+          type: string
+          enum: [boundary, intermediateCatch, eventGateway]
+        status:
+          type: string
+          description: Bookkeeping/read-model status; the authoritative race outcome is the decider row.
+          enum: [armed, fired, cancelled]
+        attachedToRef:
+          type: string
+          nullable: true
+          description: "boundary: the host activity element id; null otherwise."
+        gatewayId:
+          type: string
+          nullable: true
+          description: "eventGateway: the owning gateway element id; null otherwise."
+        fireAt:
+          type: string
+          format: date-time
+          description: Computed once at arm time (timeDate as-is; now + timeDuration).
+        firedAt:
+          type: string
+          format: date-time
+          nullable: true
     ActivateJobsRequest:
       type: object
       required: [taskType, workerId]
@@ -858,10 +910,13 @@ components:
           type: boolean
           nullable: true
           description: >
-            Advisory and IGNORED server-side: the outcome is derived exclusively from errorCode
-            (present = business failure, never retried) or the retry budget (no errorCode =
-            technical failure, re-leased until attempts exhaust). Kept in the schema for worker
-            compatibility; M3 will either honor or drop it.
+            HONORED (M3). For a technical failure (no errorCode): omitted or true = normal
+            exponential-backoff retry until the retry budget exhausts; false = immediate
+            exhaustion (the worker declares the failure permanent, so remaining technical
+            retries are skipped) -> the standard exhaustion path (a Hazard incident inside a
+            transaction). Ignored when errorCode is present (a business failure is never retried).
+            BEHAVIOR CHANGE: a worker already sending `retryable=false` (legal and IGNORED before
+            M3) now short-circuits its remaining retries instead of being re-leased.
       additionalProperties: false
     JobCallbackResponse:
       type: object
@@ -995,7 +1050,14 @@ components:
         kind:
           type: string
           nullable: true
-          enum: [serviceTaskFailure, compensationFailure, timeout, poison, loopLimit, noPath]
+          description: >
+            Incident taxonomy. `timeout` is LEGACY (M1) — retained for backward
+            compatibility but never written by current code: M3-L1 split it into
+            `jobActivationTimeout` (un-leasable-job DLQ) and `waitTimeout`
+            (un-guarded service-task / receive-task wait caps). `conditionFailure`
+            is a hard FEEL evaluation error on an exclusiveGateway flow. The
+            compensation-wait cap deliberately stays `compensationFailure`.
+          enum: [serviceTaskFailure, compensationFailure, timeout, poison, loopLimit, noPath, jobActivationTimeout, waitTimeout, conditionFailure]
         resolution:
           type: string
           nullable: true

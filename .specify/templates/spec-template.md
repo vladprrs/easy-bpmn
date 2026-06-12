@@ -18,10 +18,16 @@
 
 **BPMN Profile Impact**: [Supported BPMN elements touched — including any saga
 constructs (`bpmn:transaction`, compensation/error/cancel boundary events,
-`isForCompensation` handler, `bpmn:association`, cancel end event, `bpmn:error`)
-or conditional constructs (`exclusiveGateway`, FEEL `conditionExpression` on its
-outgoing flows, `default` flow, token-path cycles) — unsupported elements that
-must be rejected before publish with element id + reason, or N/A with rationale]
+`isForCompensation` handler, `bpmn:association`, cancel end event, `bpmn:error`),
+conditional constructs (`exclusiveGateway`, FEEL `conditionExpression` on its
+outgoing flows, `default` flow, token-path cycles), or M3 time-&-failure-taxonomy
+constructs (interrupting boundary `timerEventDefinition` on a
+`serviceTask`/`receiveTask`, timer/message `intermediateCatchEvent`,
+`eventBasedGateway`, free error-boundary routing; static ISO-8601 timer triggers
+only — accepted in constitution v2.2.0, opened per validator layer with
+"M3 — not yet implemented" rejection until each layer ships) — unsupported
+elements that must be rejected before publish with element id + reason, or N/A
+with rationale]
 
 **SAGA / Compensation Impact**: [If sagas/compensation are touched: reverse-order
 compensation, transaction scoping, idempotent + at-least-once compensators,

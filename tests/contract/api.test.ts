@@ -155,6 +155,78 @@ describe("Public API contract (openapi.yaml)", () => {
     expect(history.body.events.length).toBeGreaterThan(0);
   });
 
+  // M3-L1 (TASK-39): the documented Incident.kind enum (openapi.yaml). Legacy
+  // 'timeout' is retained but never written by current code; the un-leasable-job
+  // DLQ writes 'jobActivationTimeout', wait caps write 'waitTimeout', and a hard
+  // FEEL error writes 'conditionFailure'.
+  const DOCUMENTED_INCIDENT_KINDS = [
+    "serviceTaskFailure",
+    "compensationFailure",
+    "timeout",
+    "poison",
+    "loopLimit",
+    "noPath",
+    "jobActivationTimeout",
+    "waitTimeout",
+    "conditionFailure",
+  ];
+
+  it("instance inspection emits a documented incident kind and an openIncidents list", async () => {
+    const draft = await createDraft(DEMO_BPMN);
+    const version = await publishDraft(draft.body.draftId);
+    const r = await startInstance(version.body.definitionVersionId, {
+      correlationKey: "inc-contract",
+      variables: { amount: 1, forceFail: true },
+    });
+    await drainSampleWorkers({ taskTypes: ["external-check"] });
+
+    const inspect = await get(`/instances/${r.body.instanceId}`);
+    expect(inspect.status).toBe(200);
+    expect(inspect.body.status).toBe("incident");
+    // The latest-incident field stays for backward compatibility …
+    expect(DOCUMENTED_INCIDENT_KINDS).toContain(inspect.body.incident.kind);
+    // … and the new openIncidents list is an array of the same documented shape.
+    expect(Array.isArray(inspect.body.openIncidents)).toBe(true);
+    expect(inspect.body.openIncidents.length).toBeGreaterThan(0);
+    for (const i of inspect.body.openIncidents) {
+      expect(DOCUMENTED_INCIDENT_KINDS).toContain(i.kind);
+      expect(i.resolution).toBe("open");
+    }
+  });
+
+  it("instance inspection emits the documented timers block (M3-L3)", async () => {
+    const TIMER_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_tc" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:serviceTask id="slow"><bpmn:extensionElements><easy-bpmn:taskDefinition type="contract-slow"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:serviceTask id="onTimeout"><bpmn:extensionElements><easy-bpmn:taskDefinition type="contract-timeout"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:boundaryEvent id="tb" attachedToRef="slow"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="slow"/>
+    <bpmn:sequenceFlow id="s1" sourceRef="slow" targetRef="E"/>
+    <bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="onTimeout"/>
+    <bpmn:sequenceFlow id="af" sourceRef="onTimeout" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const draft = await createDraft(TIMER_BPMN);
+    const version = await publishDraft(draft.body.draftId);
+    const r = await startInstance(version.body.definitionVersionId, { correlationKey: "timer-contract", variables: {} });
+
+    const inspect = await get(`/instances/${r.body.instanceId}`);
+    expect(inspect.status).toBe(200);
+    expect(Array.isArray(inspect.body.timers)).toBe(true);
+    const tb = inspect.body.timers.find((t: any) => t.elementId === "tb");
+    expect(tb).toBeTruthy();
+    expect(tb.kind).toBe("boundary");
+    expect(["armed", "fired", "cancelled"]).toContain(tb.status);
+    expect(tb.attachedToRef).toBe("slow");
+    expect(tb.gatewayId).toBeNull();
+    expect(typeof tb.timerId).toBe("string");
+    expect(typeof tb.fireAt).toBe("string");
+    expect(typeof tb.occurrence).toBe("number");
+  });
+
   it("404s starting from an unknown version", async () => {
     const r = await startInstance("pdv_missing", { correlationKey: "c", variables: {} });
     expect(r.status).toBe(404);

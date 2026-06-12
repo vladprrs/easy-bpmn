@@ -2,6 +2,11 @@
 // types. zod is the validation boundary for untrusted input.
 
 import { z } from "zod";
+// Single source of the incident-kind taxonomy (M3-L1, TASK-39). Type-only, so it
+// erases at compile time — no runtime cycle despite instances.ts importing Incident
+// from here. The check:docs guard keeps IncidentKind ↔ the openapi enum in sync;
+// linking the interface here puts the API surface under that same single source.
+import type { IncidentKind } from "../persistence/instances";
 
 export const createDraftRequestSchema = z.object({
   workspaceId: z.string().min(1),
@@ -131,7 +136,11 @@ export interface BpmnElement {
     | "association"
     | "error"
     // M2 conditional sagas:
-    | "exclusiveGateway";
+    | "exclusiveGateway"
+    // M3 time & failure taxonomy — a timer/message delay on the token path and
+    // the eventBasedGateway timer/message race over branch catches (M3-L4):
+    | "intermediateCatchEvent"
+    | "eventBasedGateway";
   name?: string | null;
   taskType?: string | null;
   messageName?: string | null;
@@ -200,8 +209,13 @@ export interface Incident {
   status: "open";
   retryCount: number;
   payloadContext?: Record<string, unknown>;
-  /** SAGA (M1) incident taxonomy + remediation linkage; M2 adds loopLimit | noPath. */
-  kind?: "serviceTaskFailure" | "compensationFailure" | "timeout" | "poison" | "loopLimit" | "noPath";
+  /**
+   * Incident taxonomy + remediation linkage. SAGA (M1) base + M2 (loopLimit |
+   * noPath) + M3-L1 (TASK-39) split: jobActivationTimeout (DLQ) | waitTimeout
+   * (service/receive wait caps) | conditionFailure (hard FEEL error). `timeout`
+   * is LEGACY — retained for compatibility, never written by current code.
+   */
+  kind?: IncidentKind;
   resolution?: "open" | "compensating" | "compensated" | "operatorResolved";
   createdAt: string;
 }
@@ -220,12 +234,47 @@ export interface SagaInspection {
   steps: SagaStepInspection[];
 }
 
+/**
+ * One model timer in the instance-inspection `timers` block (M3-L3 design §6) —
+ * read straight from D1 (the `timers` table), so Workflow internals stay hidden.
+ * The schema lands here now (TASK-43) as the contract/validation boundary; the
+ * inspection endpoint that POPULATES the block is TASK-44 (M3-L3 runtime).
+ */
+export const timerInspectionSchema = z.object({
+  timerId: z.string(),
+  elementId: z.string(),
+  occurrence: z.number().int(),
+  /** boundary | intermediateCatch | eventGateway — the arming construct. */
+  kind: z.enum(["boundary", "intermediateCatch", "eventGateway"]),
+  /** Bookkeeping/read-model status (the authoritative outcome is the decider row). */
+  status: z.enum(["armed", "fired", "cancelled"]),
+  /** boundary: host activity element id; null otherwise. */
+  attachedToRef: z.string().nullable(),
+  /** eventGateway: owning gateway element id; null otherwise. */
+  gatewayId: z.string().nullable(),
+  fireAt: z.string(),
+  firedAt: z.string().nullable(),
+});
+export type TimerInspection = z.infer<typeof timerInspectionSchema>;
+
 export interface ProcessInstanceInspection extends ProcessInstance {
   historySummary: HistoryEvent[];
   diagnostics: Record<string, unknown>;
+  /** The latest incident (LIMIT 1) — kept for backward compatibility. */
   incident?: Incident | null;
+  /**
+   * All not-yet-resolved incidents, newest-first (M3-L1, TASK-39). Lets an
+   * operator see every live incident, not just the latest one.
+   */
+  openIncidents?: Incident[];
   /** Saga view — present when the instance has a transaction ledger. */
   saga?: SagaInspection | null;
+  /**
+   * Model timers (M3-L3, TASK-44): armed/fired/cancelled with fire_at/fired_at,
+   * read straight from D1 (the `timers` table). Present when the instance has any
+   * timer; Workflow internals stay hidden.
+   */
+  timers?: TimerInspection[];
 }
 
 // ---- Operator remediation verbs ----

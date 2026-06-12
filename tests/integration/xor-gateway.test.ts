@@ -401,7 +401,9 @@ describe("exclusiveGateway edge semantics (injected graphs)", () => {
     const inst = await get(`/instances/${id}`);
     expect(inst.body.status).toBe("incident");
     expect(inst.body.incident.elementId).toBe("GW");
-    // Distinguished from noPath: the reason names the flow + the FEEL failure.
+    // A hard FEEL error is its OWN taxonomy bucket (M3-L1, TASK-39) — no longer
+    // masked as a serviceTaskFailure, and distinct from noPath.
+    expect(inst.body.incident.kind).toBe("conditionFailure");
     expect(inst.body.incident.kind).not.toBe("noPath");
     expect(inst.body.incident.reason).toMatch(/f_bad/);
     expect(inst.body.incident.reason).toMatch(/failed to evaluate/i);

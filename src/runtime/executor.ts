@@ -4,12 +4,20 @@
 import type { Env } from "../env";
 import type { JobResultEvent, MessageEventPayload, ProcessWorkflowParams } from "../contracts/workflow-events";
 import { recordTerminalIncident, runInstance } from "./engine";
-import { workflowEventTypeFor, workflowJobEventTypeFor } from "../bpmn/profile";
+import { workflowJobEventTypeFor } from "../bpmn/profile";
 
 export interface DeliverArgs {
   workflowInstanceId: string;
   instanceId: string;
   elementId: string;
+  /**
+   * The matched subscription's STORED Workflow wake type (M3-L4, TASK-46, §4.5):
+   * `sendEvent` fires on THIS type rather than re-deriving it from the message
+   * name. For a receiveTask / standalone message catch it equals
+   * workflowEventTypeFor(messageName); for an eventBasedGateway branch it is the
+   * per-visit gateway type, so a single waitForEvent is woken by any branch.
+   */
+  workflowEventType: string;
   event: MessageEventPayload;
 }
 
@@ -17,7 +25,10 @@ export interface DeliverJobArgs {
   workflowInstanceId: string;
   instanceId: string;
   elementId: string;
-  event: JobResultEvent;
+  // Worker-result delivery only (completed|failed). The `timerFired` member of the
+  // wait union (M3-L3) is delivered via wakeTimer, never this path — narrowing it
+  // out keeps `event.jobId` non-optional here.
+  event: Extract<JobResultEvent, { outcome: "completed" | "failed" }>;
 }
 
 export interface Executor {
@@ -27,6 +38,13 @@ export interface Executor {
   deliver(args: DeliverArgs): Promise<void>;
   /** Deliver a pull-worker job result to a Service-Task-as-wait instance. */
   deliverJobResult(args: DeliverJobArgs): Promise<void>;
+  /**
+   * Wake a timer-guarded wait after `fireTimer` committed the winning batch
+   * (M3-L3): direct mode resumes inline; workflow mode `sendEvent`s the
+   * `timerFired` discriminator on the wait's event type. The decider already
+   * transitioned the token; this only un-parks the driver.
+   */
+  wakeTimer(args: { instanceId: string; workflowEventType: string; timerId: string }): Promise<void>;
   /** End the per-instance Workflow (best-effort) so operator-driven flows resume inline. */
   terminate(instanceId: string): Promise<void>;
 }
@@ -43,8 +61,11 @@ class WorkflowExecutor implements Executor {
 
   async deliver(args: DeliverArgs): Promise<void> {
     const instance = await this.env.PROCESS_WORKFLOW.get(args.workflowInstanceId);
+    // Honor the subscription's STORED wake type (M3-L4, §4.5) — for an EBG branch
+    // it is the per-visit gateway type; for a receiveTask / standalone catch it is
+    // byte-identical to workflowEventTypeFor(messageName).
     await instance.sendEvent({
-      type: workflowEventTypeFor(args.event.messageName),
+      type: args.workflowEventType,
       payload: args.event,
     });
   }
@@ -73,6 +94,29 @@ class WorkflowExecutor implements Executor {
         // log. recordTerminalIncident is status-guarded (never regresses a
         // terminal instance); its own failure must not escape this catch either
         // (the at-least-once worker callback would retry forever on a 500).
+        try {
+          await recordTerminalIncident(this.env, args.instanceId, `Engine drive failed: ${reason}`);
+        } catch (incErr) {
+          console.error(JSON.stringify({ level: "error", message: "recordTerminalIncident failed", instanceId: args.instanceId, error: incErr instanceof Error ? incErr.message : String(incErr) }));
+        }
+      }
+    }
+  }
+
+  async wakeTimer(args: { instanceId: string; workflowEventType: string; timerId: string }): Promise<void> {
+    // The fireTimer batch already committed the transition + `timer_outcomes 'fired'`
+    // decider; this only un-parks the Workflow. A terminated Workflow (incident /
+    // operator cancel) cannot resume the event, so drive inline — the engine
+    // re-reads the decider from D1 and routes down the boundary path either way.
+    try {
+      const instance = await this.env.PROCESS_WORKFLOW.get(args.instanceId);
+      await instance.sendEvent({ type: args.workflowEventType, payload: { outcome: "timerFired", timerId: args.timerId } });
+    } catch {
+      try {
+        await runInstance(this.env, args.instanceId, { runStep: inlineStep, waitFor: null });
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        console.error(JSON.stringify({ level: "error", message: "wakeTimer inline drive failed", instanceId: args.instanceId, error: reason }));
         try {
           await recordTerminalIncident(this.env, args.instanceId, `Engine drive failed: ${reason}`);
         } catch (incErr) {
@@ -131,6 +175,22 @@ class DirectExecutor implements Executor {
       // just a log. recordTerminalIncident is status-guarded (never regresses
       // a terminal instance); its own failure must not escape this catch
       // either (the at-least-once worker would retry forever on a 500).
+      try {
+        await recordTerminalIncident(this.env, args.instanceId, `Engine drive failed: ${reason}`);
+      } catch (incErr) {
+        console.error(JSON.stringify({ level: "error", message: "recordTerminalIncident failed", instanceId: args.instanceId, error: incErr instanceof Error ? incErr.message : String(incErr) }));
+      }
+    }
+  }
+
+  async wakeTimer(args: { instanceId: string; workflowEventType: string; timerId: string }): Promise<void> {
+    // Direct mode: re-run the rewalk; it re-reads the `timer_outcomes 'fired'`
+    // decider committed by fireTimer and routes the token down the boundary path.
+    try {
+      await runInstance(this.env, args.instanceId, { runStep: this.inlineStep, waitFor: null });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(JSON.stringify({ level: "error", message: "wakeTimer resume failed", instanceId: args.instanceId, error: reason }));
       try {
         await recordTerminalIncident(this.env, args.instanceId, `Engine drive failed: ${reason}`);
       } catch (incErr) {

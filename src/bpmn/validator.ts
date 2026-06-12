@@ -12,8 +12,13 @@
 // the gateway's own outgoing flows), and cycles on the token path are legal.
 // Conditions anywhere else, defaults on non-gateways, implicit multi-out
 // splits, boundary events on gateways, and the other gateway types
-// (parallel/inclusive/eventBased/complex) stay rejected with element id +
-// reason.
+// (parallel/inclusive/complex) stay rejected with element id + reason.
+//
+// M3-L4 (TASK-46) opens the eventBasedGateway: a deterministic race over its
+// timer/message branch catches (≥2 branches, every target a single-incoming
+// intermediate catch, ≤1 timer branch, distinct messages; instantiate /
+// eventGatewayType="Parallel" rejected). Its branches are message/timer
+// intermediate catches whose only incoming flow is the gateway's.
 
 import type { ModdleElement } from "bpmn-moddle";
 import { parseBpmnXml } from "./parser";
@@ -515,7 +520,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       // M3-L4: an intermediateCatchEvent is a token-path catch — event-definition
       // aware (like the boundary branch above), so the TIMER variant (TASK-45,
       // §4.4) and the MESSAGE variant (TASK-46, §3 item 3) each become a token
-      // node and the eventBasedGateway stays rejected via DEFERRED_GATEWAY_REASONS.
+      // node (standalone, or an eventBasedGateway branch target — same shape).
       if ($type === "bpmn:IntermediateCatchEvent") {
         const { defs, only } = classifyEventDefinition(el);
         if (only === TIMER_EVENT_DEFINITION) {
@@ -578,6 +583,33 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
           id,
           "intermediateCatchEvent",
         );
+        continue;
+      }
+
+      // M3-L4 (TASK-46, design §3 item 4 / §4.5): an eventBasedGateway races its
+      // branch catches, deciding deterministically on a gateway_decisions row. The
+      // two non-token variants are rejected here; the branch-target rules (≥2
+      // branches, every target a single-incoming intermediate catch, ≤1 timer
+      // branch, distinct messages) run after adjacency is built (a dedicated block
+      // below). Like an exclusiveGateway, it carries no `default` and no condition
+      // on its outgoing flows (the condition rule rejects those generally).
+      if ($type === "bpmn:EventBasedGateway") {
+        if (el.instantiate === true) {
+          err(
+            `Event-based gateway '${id ?? ""}' has instantiate="true". Instances start via the API only; remove instantiate.`,
+            id,
+            "eventBasedGateway",
+          );
+        }
+        const gatewayType = typeof el.eventGatewayType === "string" ? el.eventGatewayType : undefined;
+        if (gatewayType != null && gatewayType !== "Exclusive") {
+          err(
+            `Event-based gateway '${id ?? ""}' has eventGatewayType="${gatewayType}". A Parallel event gateway waits for ALL events at once (extra concurrent tokens — deferred to M4); only the default exclusive event gateway (first event wins) is supported.`,
+            id,
+            "eventBasedGateway",
+          );
+        }
+        nodes.push({ id: id ?? "", type: "eventBasedGateway", name: (el.name as string) ?? undefined, scopeId });
         continue;
       }
 
@@ -832,9 +864,11 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       if (n.type === "endEvent") {
         if (out.length > 0) err(`End event '${n.id}' must not have outgoing sequence flows.`, n.id, "endEvent");
       } else {
-        // Only an exclusiveGateway may split the token (M2); cycles are legal,
-        // so this is a degree check, not an acyclicity check.
-        if (out.length > 1 && n.type !== "exclusiveGateway") {
+        // Only a gateway may have >1 outgoing token edge — an exclusiveGateway
+        // (M2, FEEL branch) or an eventBasedGateway (M3-L4, the timer/message
+        // race). Cycles are legal, so this is a degree check, not an acyclicity
+        // check.
+        if (out.length > 1 && n.type !== "exclusiveGateway" && n.type !== "eventBasedGateway") {
           err(
             `Element '${n.id}' has ${out.length} outgoing sequence flows. ` +
               "Implicit splits are not supported — route branching through an exclusiveGateway.",
@@ -1232,6 +1266,78 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // eventBasedGateway branch rules (M3-L4, TASK-46, design §3 item 4 / §4.5):
+  //   * ≥2 outgoing flows — the gateway races at least two event branches;
+  //   * every target is an intermediateCatchEvent (timer OR message) whose ONLY
+  //     incoming flow is the one from this gateway (a shared catch would let two
+  //     tokens race the same event);
+  //   * AT MOST ONE timer branch (same determinism rationale + honest wording as
+  //     the boundary-timer multiplicity rule — NOT "dead branch", false for a
+  //     date+duration mix);
+  //   * message branches reference DISTINCT messages (two branches on one
+  //     messageName collapse to a single broker key and would hit the broker's
+  //     one-active-subscription invariant at publish).
+  // (instantiate / eventGatewayType="Parallel" are rejected at classification.)
+  // The catch-degree + linearity rules above also reject a shared/non-event
+  // target shape; these are the EBG-specific reasons that name the gateway.
+  // -------------------------------------------------------------------------
+  for (const n of nodes) {
+    if (n.type !== "eventBasedGateway") continue;
+    const branchTargets = outgoing.get(n.id) ?? [];
+    if (branchTargets.length < 2) {
+      err(
+        `Event-based gateway '${n.id}' has ${branchTargets.length} outgoing flow(s); an event-based gateway races at least two event branches.`,
+        n.id,
+        "eventBasedGateway",
+      );
+    }
+    let timerBranches = 0;
+    const messageNamesSeen = new Set<string>();
+    for (const targetId of branchTargets) {
+      const target = nodeById.get(targetId);
+      if (!target || target.type !== "intermediateCatchEvent") {
+        err(
+          `Event-based gateway '${n.id}' has a branch to '${targetId}', which is not an intermediate catch event. ` +
+            "Every branch of an event-based gateway must target a timer or message intermediateCatchEvent.",
+          n.id,
+          "eventBasedGateway",
+        );
+        continue;
+      }
+      const inc = incoming.get(targetId) ?? [];
+      if (inc.length !== 1 || inc[0] !== n.id) {
+        err(
+          `Event-based gateway '${n.id}' branch target '${targetId}' must have exactly one incoming flow — the one from this gateway; found ${inc.length}.`,
+          n.id,
+          "eventBasedGateway",
+        );
+      }
+      if (target.timerTrigger) {
+        if (++timerBranches > 1) {
+          err(
+            `Event-based gateway '${n.id}' has more than one timer branch. At most one timer branch is allowed ` +
+              "(multiple static timers make one statically dead or arrival-time-dependent — restricted in M3 for determinism).",
+            target.id,
+            "eventBasedGateway",
+          );
+        }
+      } else if (target.messageName) {
+        if (messageNamesSeen.has(target.messageName)) {
+          err(
+            `Event-based gateway '${n.id}' has more than one branch waiting on message '${target.messageName}'. ` +
+              "Message branches must reference distinct messages (two branches on one message collapse to a single broker key, which the broker rejects as a second active subscription).",
+            target.id,
+            "eventBasedGateway",
+          );
+        }
+        messageNamesSeen.add(target.messageName);
+      }
+      // A catch that is neither a timer nor a (resolved) message catch already
+      // errored in the intermediateCatchEvent classification — no double-count.
+    }
+  }
+
   // Compensation handlers must live inside a transaction.
   for (const n of nodes) {
     if (isHandler(n) && scopeKindOf.get(n.scopeId) !== "transaction") {
@@ -1336,7 +1442,11 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         retries: n.attempts ?? null,
         messageName: n.messageName ?? null,
         outgoing: nodeOutgoing,
-        next: n.type === "exclusiveGateway" ? null : nodeOutgoing[0]?.targetId ?? null,
+        // A gateway never linearly advances: branch selection owns the successor
+        // (exclusiveGateway = FEEL conditions; eventBasedGateway = the timer/
+        // message race recorded in gateway_decisions). The IR makes no `.next`
+        // promise for either — the engine reads `outgoing[]`.
+        next: n.type === "exclusiveGateway" || n.type === "eventBasedGateway" ? null : nodeOutgoing[0]?.targetId ?? null,
         scopeId: n.scopeId === processId ? null : n.scopeId,
       };
       if (n.type === "serviceTask") node.isForCompensation = n.isForCompensation === true;

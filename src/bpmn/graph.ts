@@ -22,7 +22,8 @@ export type ElementType =
   // M2 conditional sagas:
   | "exclusiveGateway"
   // M3 time & failure taxonomy:
-  | "intermediateCatchEvent";
+  | "intermediateCatchEvent"
+  | "eventBasedGateway";
 
 /** A node in the executable graph (excludes sequence flows, messages, associations, errors). */
 export type NodeType =
@@ -36,7 +37,11 @@ export type NodeType =
   // M2 conditional sagas:
   | "exclusiveGateway"
   // M3 time & failure taxonomy — a timer delay on the token path (M3-L4):
-  | "intermediateCatchEvent";
+  | "intermediateCatchEvent"
+  // M3-L4 (TASK-46): a deterministic timer/message race over its branch catches.
+  // Like a gateway, `next` is null — the chosen branch (recorded in
+  // gateway_decisions) owns the successor; the engine reads `outgoing[]`.
+  | "eventBasedGateway";
 
 /** Discriminator for end events: a plain (commit) end vs a transaction Cancel end. */
 export type EndKind = "none" | "cancel";

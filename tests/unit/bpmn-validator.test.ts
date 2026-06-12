@@ -722,10 +722,11 @@ describe("Exclusive-gateway reject matrix (TASK-33, M2 design §3)", () => {
     expect(r.issues.some((i) => i.elementId === "bad_b" && /gateway/i.test(i.reason))).toBe(true);
   });
 
+  // eventBasedGateway is IN since M3-L4 (TASK-46) — it has its own accept/reject
+  // matrix below, no longer a DEFERRED_GATEWAY_REASONS milestone pointer.
   it.each([
     ["parallelGateway", /concurrency \(M4\)/],
     ["inclusiveGateway", /concurrency \(M4\)/],
-    ["eventBasedGateway", /timers & events \(M3\)/],
     ["complexGateway", /later milestone/],
   ] as const)("rejects %s with a milestone pointer", async (tag, pointer) => {
     const r = await parseAndValidate(deferredGatewayBpmn(tag));
@@ -1412,7 +1413,7 @@ describe("Timer intermediate catch (M3-L4, TASK-45)", () => {
 // <message> carries only its name), but an EVENT, not an activity: no
 // easy-bpmn:taskDefinition, no boundary events attach. Exactly one incoming + one
 // outgoing flow; allowed at process level AND inside a transaction. The
-// eventBasedGateway STAYS rejected (out of scope here, via DEFERRED_GATEWAY_REASONS).
+// eventBasedGateway accept/reject matrix follows in its own describe block.
 // ---------------------------------------------------------------------------
 describe("Message intermediate catch (M3-L4, TASK-46)", () => {
   /** S → catch (messageEventDefinition → <message> "Approval") → after → E. */
@@ -1554,9 +1555,181 @@ describe("Message intermediate catch (M3-L4, TASK-46)", () => {
     expect(r.issues).toHaveLength(0);
   });
 
-  it("keeps the eventBasedGateway rejected (out of scope for TASK-46, deferred to timers & events M3)", async () => {
-    const r = await parseAndValidate(deferredGatewayBpmn("eventBasedGateway"));
+});
+
+// ---------------------------------------------------------------------------
+// M3-L4 (TASK-46, design §3 item 4 / §4.5): the eventBasedGateway — a
+// deterministic race over its branch catches. Accept/reject matrix: ≥2 branches,
+// every target a single-incoming intermediate catch (timer or message), ≤1 timer
+// branch, distinct messages; instantiate / eventGatewayType="Parallel" rejected.
+// ---------------------------------------------------------------------------
+describe("Event-based gateway (M3-L4, TASK-46)", () => {
+  /**
+   * S → EBG → { onMsg (message "Approve") , onTimer (timer PT5M) }; each catch
+   * continues to a service task and both converge on the end event. Knobs swap the
+   * gateway attributes, the branch flows, the branch-target elements, and the
+   * <message> declarations.
+   */
+  function ebgBpmn(o: { gwAttrs?: string; branches?: string; targets?: string; messages?: string; extra?: string } = {}): string {
+    const messages = o.messages ?? `<bpmn:message id="MA" name="Approve"/>`;
+    const branches =
+      o.branches ??
+      `<bpmn:sequenceFlow id="e1" sourceRef="EBG" targetRef="onMsg"/>
+       <bpmn:sequenceFlow id="e2" sourceRef="EBG" targetRef="onTimer"/>`;
+    const targets =
+      o.targets ??
+      `<bpmn:intermediateCatchEvent id="onMsg"><bpmn:messageEventDefinition messageRef="MA"/></bpmn:intermediateCatchEvent>
+       <bpmn:intermediateCatchEvent id="onTimer"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent>
+       <bpmn:serviceTask id="afterMsg"><bpmn:extensionElements><easy-bpmn:taskDefinition type="am"/></bpmn:extensionElements></bpmn:serviceTask>
+       <bpmn:serviceTask id="afterTimer"><bpmn:extensionElements><easy-bpmn:taskDefinition type="at"/></bpmn:extensionElements></bpmn:serviceTask>
+       <bpmn:sequenceFlow id="m1" sourceRef="onMsg" targetRef="afterMsg"/>
+       <bpmn:sequenceFlow id="m2" sourceRef="onTimer" targetRef="afterTimer"/>
+       <bpmn:sequenceFlow id="z1" sourceRef="afterMsg" targetRef="E"/>
+       <bpmn:sequenceFlow id="z2" sourceRef="afterTimer" targetRef="E"/>`;
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_ebg" targetNamespace="x">
+  ${messages}
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:eventBasedGateway id="EBG" ${o.gwAttrs ?? ""}/>
+    ${targets}
+    <bpmn:endEvent id="E"/>
+    ${o.extra ?? ""}
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="EBG"/>
+    ${branches}
+  </bpmn:process>
+</bpmn:definitions>`;
+  }
+
+  it("accepts a timer+message event-based gateway and extracts the IR", async () => {
+    const r = await parseAndValidate(ebgBpmn());
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    const g = r.graph!;
+    const ebg = g.nodes["EBG"];
+    expect(ebg?.type).toBe("eventBasedGateway");
+    // Branch selection owns the successor (like an exclusiveGateway): next is null,
+    // the engine reads outgoing[] (document order).
+    expect(ebg?.next).toBeNull();
+    expect(ebg?.outgoing.map((f) => f.targetId)).toEqual(["onMsg", "onTimer"]);
+    expect(g.nodes["onMsg"]?.messageName).toBe("Approve");
+    expect(g.nodes["onTimer"]?.timerTrigger).toEqual({ kind: "timeDuration", value: "PT5M" });
+  });
+
+  it("accepts two distinct-message branches plus a timer branch", async () => {
+    const r = await parseAndValidate(
+      ebgBpmn({
+        messages: `<bpmn:message id="MA" name="Approve"/><bpmn:message id="MR" name="Reject"/>`,
+        branches: `<bpmn:sequenceFlow id="e1" sourceRef="EBG" targetRef="onMsg"/>
+                   <bpmn:sequenceFlow id="e2" sourceRef="EBG" targetRef="onReject"/>
+                   <bpmn:sequenceFlow id="e3" sourceRef="EBG" targetRef="onTimer"/>`,
+        targets: `<bpmn:intermediateCatchEvent id="onMsg"><bpmn:messageEventDefinition messageRef="MA"/></bpmn:intermediateCatchEvent>
+                  <bpmn:intermediateCatchEvent id="onReject"><bpmn:messageEventDefinition messageRef="MR"/></bpmn:intermediateCatchEvent>
+                  <bpmn:intermediateCatchEvent id="onTimer"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent>
+                  <bpmn:serviceTask id="afterMsg"><bpmn:extensionElements><easy-bpmn:taskDefinition type="am"/></bpmn:extensionElements></bpmn:serviceTask>
+                  <bpmn:sequenceFlow id="m1" sourceRef="onMsg" targetRef="afterMsg"/>
+                  <bpmn:sequenceFlow id="m2" sourceRef="onReject" targetRef="afterMsg"/>
+                  <bpmn:sequenceFlow id="m3" sourceRef="onTimer" targetRef="afterMsg"/>
+                  <bpmn:sequenceFlow id="z1" sourceRef="afterMsg" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+  });
+
+  it("rejects fewer than two branches", async () => {
+    const r = await parseAndValidate(
+      ebgBpmn({
+        branches: `<bpmn:sequenceFlow id="e1" sourceRef="EBG" targetRef="onMsg"/>`,
+        targets: `<bpmn:intermediateCatchEvent id="onMsg"><bpmn:messageEventDefinition messageRef="MA"/></bpmn:intermediateCatchEvent>
+                  <bpmn:serviceTask id="afterMsg"><bpmn:extensionElements><easy-bpmn:taskDefinition type="am"/></bpmn:extensionElements></bpmn:serviceTask>
+                  <bpmn:sequenceFlow id="m1" sourceRef="onMsg" targetRef="afterMsg"/>
+                  <bpmn:sequenceFlow id="z1" sourceRef="afterMsg" targetRef="E"/>`,
+      }),
+    );
     expect(r.ok).toBe(false);
-    expect(r.issues.some((i) => i.elementId === "G" && /timers & events \(M3\)/.test(i.reason))).toBe(true);
+    expect(r.issues.some((i) => i.elementId === "EBG" && /races at least two event branches/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a branch whose target is not an intermediate catch event", async () => {
+    const r = await parseAndValidate(
+      ebgBpmn({
+        branches: `<bpmn:sequenceFlow id="e1" sourceRef="EBG" targetRef="onMsg"/>
+                   <bpmn:sequenceFlow id="e2" sourceRef="EBG" targetRef="task"/>`,
+        targets: `<bpmn:intermediateCatchEvent id="onMsg"><bpmn:messageEventDefinition messageRef="MA"/></bpmn:intermediateCatchEvent>
+                  <bpmn:serviceTask id="task"><bpmn:extensionElements><easy-bpmn:taskDefinition type="t"/></bpmn:extensionElements></bpmn:serviceTask>
+                  <bpmn:sequenceFlow id="m1" sourceRef="onMsg" targetRef="task"/>
+                  <bpmn:sequenceFlow id="z1" sourceRef="task" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "EBG" && /is not an intermediate catch event/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a branch-target catch reached by a second incoming flow (shared catch)", async () => {
+    // onMsg is targeted by the EBG AND by `S` directly → two incoming flows.
+    const r = await parseAndValidate(
+      ebgBpmn({
+        branches: `<bpmn:sequenceFlow id="e1" sourceRef="EBG" targetRef="onMsg"/>
+                   <bpmn:sequenceFlow id="e2" sourceRef="EBG" targetRef="onTimer"/>
+                   <bpmn:sequenceFlow id="e3" sourceRef="S" targetRef="onMsg"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some((i) => i.elementId === "EBG" && /exactly one incoming flow — the one from this gateway/.test(i.reason)),
+    ).toBe(true);
+  });
+
+  it("rejects more than one timer branch", async () => {
+    const r = await parseAndValidate(
+      ebgBpmn({
+        branches: `<bpmn:sequenceFlow id="e1" sourceRef="EBG" targetRef="onTimer"/>
+                   <bpmn:sequenceFlow id="e2" sourceRef="EBG" targetRef="onTimer2"/>`,
+        targets: `<bpmn:intermediateCatchEvent id="onTimer"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent>
+                  <bpmn:intermediateCatchEvent id="onTimer2"><bpmn:timerEventDefinition><bpmn:timeDuration>PT9M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent>
+                  <bpmn:serviceTask id="afterTimer"><bpmn:extensionElements><easy-bpmn:taskDefinition type="at"/></bpmn:extensionElements></bpmn:serviceTask>
+                  <bpmn:sequenceFlow id="m1" sourceRef="onTimer" targetRef="afterTimer"/>
+                  <bpmn:sequenceFlow id="m2" sourceRef="onTimer2" targetRef="afterTimer"/>
+                  <bpmn:sequenceFlow id="z1" sourceRef="afterTimer" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => /more than one timer branch/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects two branches waiting on the same message (one broker key)", async () => {
+    const r = await parseAndValidate(
+      ebgBpmn({
+        branches: `<bpmn:sequenceFlow id="e1" sourceRef="EBG" targetRef="onMsg"/>
+                   <bpmn:sequenceFlow id="e2" sourceRef="EBG" targetRef="onMsg2"/>`,
+        targets: `<bpmn:intermediateCatchEvent id="onMsg"><bpmn:messageEventDefinition messageRef="MA"/></bpmn:intermediateCatchEvent>
+                  <bpmn:intermediateCatchEvent id="onMsg2"><bpmn:messageEventDefinition messageRef="MA"/></bpmn:intermediateCatchEvent>
+                  <bpmn:serviceTask id="afterMsg"><bpmn:extensionElements><easy-bpmn:taskDefinition type="am"/></bpmn:extensionElements></bpmn:serviceTask>
+                  <bpmn:sequenceFlow id="m1" sourceRef="onMsg" targetRef="afterMsg"/>
+                  <bpmn:sequenceFlow id="m2" sourceRef="onMsg2" targetRef="afterMsg"/>
+                  <bpmn:sequenceFlow id="z1" sourceRef="afterMsg" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => /branch waiting on message 'Approve'/.test(i.reason) && /distinct messages/.test(i.reason))).toBe(true);
+  });
+
+  it('rejects instantiate="true" (instances start via the API)', async () => {
+    const r = await parseAndValidate(ebgBpmn({ gwAttrs: `instantiate="true"` }));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "EBG" && /instantiate="true"/.test(i.reason))).toBe(true);
+  });
+
+  it('rejects eventGatewayType="Parallel" (wait-for-all is M4-class)', async () => {
+    const r = await parseAndValidate(ebgBpmn({ gwAttrs: `eventGatewayType="Parallel"` }));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "EBG" && /Parallel event gateway/.test(i.reason))).toBe(true);
+  });
+
+  it("tolerates ignorable content (documentation) on an EBG model", async () => {
+    const r = await parseAndValidate(ebgBpmn({ extra: `<bpmn:documentation>race the events</bpmn:documentation>` }));
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
   });
 });

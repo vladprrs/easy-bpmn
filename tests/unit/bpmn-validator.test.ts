@@ -1013,3 +1013,226 @@ describe("Free error-boundary routing (M3-L2, TASK-42)", () => {
     expect(r.issues).toHaveLength(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Interrupting boundary timers (M3-L3, TASK-44, design §3 + §7 validator matrix).
+//
+// `boundaryEvent` + `timerEventDefinition`, interrupting (cancelActivity absent
+// or true), attachable to a serviceTask/receiveTask, AT MOST ONE per activity,
+// NEVER on a transaction or compensation handler, exactly one outgoing flow to a
+// token-path node in the same scope, and exactly ONE of timeDate|timeDuration as
+// a static ISO-8601 literal.
+// ---------------------------------------------------------------------------
+describe("Interrupting boundary timers (M3-L3, TASK-44)", () => {
+  /** S → task → E, with a timer boundary `tb` on `task` routing to onTimeout → E. */
+  function timerBpmn(o: { boundary?: string; flows?: string; alt?: string; hostExtra?: string } = {}): string {
+    const boundary = o.boundary ??
+      `<bpmn:boundaryEvent id="tb" attachedToRef="task"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>`;
+    const alt = o.alt ??
+      `<bpmn:serviceTask id="onTimeout"><bpmn:extensionElements><easy-bpmn:taskDefinition type="timeout-handler"/></bpmn:extensionElements></bpmn:serviceTask>`;
+    const flows = o.flows ??
+      `<bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="onTimeout"/>
+       <bpmn:sequenceFlow id="af" sourceRef="onTimeout" targetRef="E"/>`;
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:camunda="http://camunda.org/schema/1.0/bpmn" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_tim" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:serviceTask id="task">${o.hostExtra ?? ""}<bpmn:extensionElements><easy-bpmn:taskDefinition type="t"/></bpmn:extensionElements></bpmn:serviceTask>
+    ${alt}
+    ${boundary}
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="task"/>
+    <bpmn:sequenceFlow id="s1" sourceRef="task" targetRef="E"/>
+    ${flows}
+  </bpmn:process>
+</bpmn:definitions>`;
+  }
+
+  it("accepts an interrupting boundary timer on a service task (timeDuration)", async () => {
+    const r = await parseAndValidate(timerBpmn());
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    const tb = r.graph!.nodes["tb"];
+    expect(tb?.boundaryKind).toBe("timer");
+    expect(tb?.attachedToRef).toBe("task");
+    expect(tb?.next).toBe("onTimeout");
+    expect(tb?.timerTrigger).toEqual({ kind: "timeDuration", value: "PT5M" });
+  });
+
+  it("accepts a static timeDate trigger", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        boundary: `<bpmn:boundaryEvent id="tb" attachedToRef="task"><bpmn:timerEventDefinition><bpmn:timeDate>2026-12-31T23:59:00Z</bpmn:timeDate></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+      }),
+    );
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["tb"]?.timerTrigger).toEqual({ kind: "timeDate", value: "2026-12-31T23:59:00Z" });
+  });
+
+  it("rejects a non-interrupting (cancelActivity=false) boundary timer", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        boundary: `<bpmn:boundaryEvent id="tb" attachedToRef="task" cancelActivity="false"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tb" && /non-interrupting/i.test(i.reason) && /M4/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a timeCycle trigger", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        boundary: `<bpmn:boundaryEvent id="tb" attachedToRef="task"><bpmn:timerEventDefinition><bpmn:timeCycle>R3/PT10M</bpmn:timeCycle></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tb" && /timeCycle/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a definition carrying BOTH timeDate and timeDuration", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        boundary: `<bpmn:boundaryEvent id="tb" attachedToRef="task"><bpmn:timerEventDefinition><bpmn:timeDate>2026-01-01T00:00:00Z</bpmn:timeDate><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tb" && /both a timeDate and a timeDuration/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a timerEventDefinition with no time child", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        boundary: `<bpmn:boundaryEvent id="tb" attachedToRef="task"><bpmn:timerEventDefinition/></bpmn:boundaryEvent>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tb" && /no timeDate or timeDuration/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a non-parsing timeDuration literal (incl. a FEEL expression)", async () => {
+    for (const bad of ["PT5X", "${dueIn}", "5 minutes"]) {
+      const r = await parseAndValidate(
+        timerBpmn({
+          boundary: `<bpmn:boundaryEvent id="tb" attachedToRef="task"><bpmn:timerEventDefinition><bpmn:timeDuration>${bad}</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+        }),
+      );
+      expect(r.ok).toBe(false);
+      expect(r.issues.some((i) => i.elementId === "tb" && /not a static ISO-8601 duration literal/.test(i.reason))).toBe(true);
+    }
+  });
+
+  it("rejects a non-parsing timeDate literal", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        boundary: `<bpmn:boundaryEvent id="tb" attachedToRef="task"><bpmn:timerEventDefinition><bpmn:timeDate>not-a-date</bpmn:timeDate></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tb" && /not a static ISO-8601 date/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a boundary timer with more than one outgoing flow", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        flows: `<bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="onTimeout"/>
+                <bpmn:sequenceFlow id="tf2" sourceRef="tb" targetRef="E"/>
+                <bpmn:sequenceFlow id="af" sourceRef="onTimeout" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tb" && /exactly one outgoing sequence flow/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a boundary-timer flow targeting a start event (reuses the M3-L2 endpoint rule)", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        alt: ``,
+        flows: `<bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="S"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tf" && /start event 'S'/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects more than one boundary timer on a single activity", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        boundary: `<bpmn:boundaryEvent id="tb" attachedToRef="task"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+                   <bpmn:boundaryEvent id="tb2" attachedToRef="task"><bpmn:timerEventDefinition><bpmn:timeDuration>PT9M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+        flows: `<bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="onTimeout"/>
+                <bpmn:sequenceFlow id="tf2" sourceRef="tb2" targetRef="onTimeout"/>
+                <bpmn:sequenceFlow id="af" sourceRef="onTimeout" targetRef="E"/>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tb2" && /more than one boundary timer/.test(i.reason))).toBe(true);
+  });
+
+  it("tolerates ignorable content (foreign extension/documentation) on a boundary-timer model", async () => {
+    const r = await parseAndValidate(
+      timerBpmn({
+        hostExtra: `<bpmn:documentation>host task</bpmn:documentation>`,
+        boundary: `<bpmn:boundaryEvent id="tb" attachedToRef="task"><bpmn:extensionElements><camunda:properties><camunda:property name="x" value="y"/></camunda:properties></bpmn:extensionElements><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+      }),
+    );
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+  });
+
+  it("accepts a boundary timer on a RECEIVE task", async () => {
+    const RECV_TIMER_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_rt" targetNamespace="x">
+  <bpmn:message id="M" name="Approval"/>
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:receiveTask id="wait" messageRef="M"/>
+    <bpmn:serviceTask id="onTimeout"><bpmn:extensionElements><easy-bpmn:taskDefinition type="timeout-handler"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:boundaryEvent id="tb" attachedToRef="wait"><bpmn:timerEventDefinition><bpmn:timeDuration>PT1H</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="wait"/>
+    <bpmn:sequenceFlow id="s1" sourceRef="wait" targetRef="E"/>
+    <bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="onTimeout"/>
+    <bpmn:sequenceFlow id="af" sourceRef="onTimeout" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const r = await parseAndValidate(RECV_TIMER_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["tb"]?.attachedToRef).toBe("wait");
+  });
+
+  it("rejects a boundary timer attached to a transaction (deferred to M5)", async () => {
+    const TX_TIMER_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_txt" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:transaction id="Tx">
+      <bpmn:startEvent id="TxS"/>
+      <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="a"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:endEvent id="TxE"/>
+      <bpmn:sequenceFlow id="t1" sourceRef="TxS" targetRef="A"/>
+      <bpmn:sequenceFlow id="t2" sourceRef="A" targetRef="TxE"/>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="tb" attachedToRef="Tx"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+    <bpmn:serviceTask id="onTimeout"><bpmn:extensionElements><easy-bpmn:taskDefinition type="timeout-handler"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:endEvent id="Done"/>
+    <bpmn:sequenceFlow id="g1" sourceRef="S" targetRef="Tx"/>
+    <bpmn:sequenceFlow id="g2" sourceRef="Tx" targetRef="Done"/>
+    <bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="onTimeout"/>
+    <bpmn:sequenceFlow id="af" sourceRef="onTimeout" targetRef="Done"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const r = await parseAndValidate(TX_TIMER_BPMN);
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tb" && /attached to transaction/.test(i.reason) && /M5/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a boundary timer attached to an isForCompensation handler", async () => {
+    const r = await parseAndValidate(
+      sagaBpmn({
+        innerExtra: `<bpmn:boundaryEvent id="tb_on_handler" attachedToRef="undoA"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>`,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "tb_on_handler" && /attached to compensation handler 'undoA'/.test(i.reason))).toBe(true);
+  });
+});

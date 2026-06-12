@@ -194,6 +194,39 @@ describe("Public API contract (openapi.yaml)", () => {
     }
   });
 
+  it("instance inspection emits the documented timers block (M3-L3)", async () => {
+    const TIMER_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_tc" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:serviceTask id="slow"><bpmn:extensionElements><easy-bpmn:taskDefinition type="contract-slow"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:serviceTask id="onTimeout"><bpmn:extensionElements><easy-bpmn:taskDefinition type="contract-timeout"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:boundaryEvent id="tb" attachedToRef="slow"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="slow"/>
+    <bpmn:sequenceFlow id="s1" sourceRef="slow" targetRef="E"/>
+    <bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="onTimeout"/>
+    <bpmn:sequenceFlow id="af" sourceRef="onTimeout" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const draft = await createDraft(TIMER_BPMN);
+    const version = await publishDraft(draft.body.draftId);
+    const r = await startInstance(version.body.definitionVersionId, { correlationKey: "timer-contract", variables: {} });
+
+    const inspect = await get(`/instances/${r.body.instanceId}`);
+    expect(inspect.status).toBe(200);
+    expect(Array.isArray(inspect.body.timers)).toBe(true);
+    const tb = inspect.body.timers.find((t: any) => t.elementId === "tb");
+    expect(tb).toBeTruthy();
+    expect(tb.kind).toBe("boundary");
+    expect(["armed", "fired", "cancelled"]).toContain(tb.status);
+    expect(tb.attachedToRef).toBe("slow");
+    expect(tb.gatewayId).toBeNull();
+    expect(typeof tb.timerId).toBe("string");
+    expect(typeof tb.fireAt).toBe("string");
+    expect(typeof tb.occurrence).toBe("number");
+  });
+
   it("404s starting from an unknown version", async () => {
     const r = await startInstance("pdv_missing", { correlationKey: "c", variables: {} });
     expect(r.status).toBe(404);

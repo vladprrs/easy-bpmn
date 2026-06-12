@@ -19,6 +19,7 @@ import type { ModdleElement } from "bpmn-moddle";
 import { parseBpmnXml } from "./parser";
 import { TASK_DEFINITION_TYPE } from "./moddle-extension";
 import { parseCondition } from "../runtime/expressions";
+import { isValidIso8601DateTime, parseIso8601DurationMs } from "../runtime/iso8601";
 import {
   ASSOCIATION_TYPE,
   CANCEL_EVENT_DEFINITION,
@@ -29,6 +30,7 @@ import {
   ERROR_TYPE,
   SEQUENCE_FLOW_TYPE,
   SUPPORTED_NODE_TYPES,
+  TIMER_EVENT_DEFINITION,
   localTypeName,
 } from "./profile";
 import type {
@@ -41,6 +43,7 @@ import type {
   GraphElement,
   GraphNode,
   NodeType,
+  TimerTriggerSpec,
   TransactionScope,
   ValidationIssueData,
   ValidationResult,
@@ -75,6 +78,43 @@ function readTaskDefinition(
   return { type: type && type.length > 0 ? type : undefined, attempts };
 }
 
+/**
+ * Validate a boundary timer's `<timerEventDefinition>` (M3-L3 design §3): it MUST
+ * carry exactly ONE of `timeDate`|`timeDuration`, each a STATIC ISO-8601 literal
+ * that parses. Zero/two time children, a `timeCycle`, a FEEL expression, or a
+ * non-parsing literal are each rejected with a reason (the caller adds element id).
+ */
+function readTimerTrigger(
+  def: ModdleElement,
+): { ok: true; trigger: TimerTriggerSpec } | { ok: false; reason: string } {
+  const bodyOf = (x: unknown): string | undefined => {
+    const e = x as ModdleElement | undefined | null;
+    return e != null && typeof e.body === "string" && e.body.trim() !== "" ? e.body.trim() : undefined;
+  };
+  if (def.timeCycle != null) {
+    return { ok: false, reason: "uses a timeCycle (repetition needs extra tokens — M4+); use a single static timeDate or timeDuration." };
+  }
+  const date = bodyOf(def.timeDate);
+  const duration = bodyOf(def.timeDuration);
+  const present = (date !== undefined ? 1 : 0) + (duration !== undefined ? 1 : 0);
+  if (present === 0) {
+    return { ok: false, reason: "has no timeDate or timeDuration; a boundary timer needs exactly one static ISO-8601 timeDate or timeDuration." };
+  }
+  if (present === 2) {
+    return { ok: false, reason: "declares both a timeDate and a timeDuration; exactly one is required." };
+  }
+  if (duration !== undefined) {
+    if (parseIso8601DurationMs(duration) == null) {
+      return { ok: false, reason: `has a timeDuration '${duration}' that is not a static ISO-8601 duration literal (FEEL expressions are not supported).` };
+    }
+    return { ok: true, trigger: { kind: "timeDuration", value: duration } };
+  }
+  if (!isValidIso8601DateTime(date!)) {
+    return { ok: false, reason: `has a timeDate '${date}' that is not a static ISO-8601 date/datetime literal (FEEL expressions are not supported).` };
+  }
+  return { ok: true, trigger: { kind: "timeDate", value: date! } };
+}
+
 // ---------------------------------------------------------------------------
 // Internal classification model
 // ---------------------------------------------------------------------------
@@ -94,6 +134,8 @@ interface NodeInfo {
   attachedToRef?: string;
   errorRef?: string;
   errorCode?: string;
+  /** timer boundaryEvent only — the validated static ISO-8601 trigger (M3-L3). */
+  timerTrigger?: TimerTriggerSpec;
   /** exclusiveGateway only — the sequence-flow id named by the `default` attribute. */
   defaultFlowId?: string;
 }
@@ -389,6 +431,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         if (only === COMPENSATE_EVENT_DEFINITION) boundaryKind = "compensate";
         else if (only === ERROR_EVENT_DEFINITION) boundaryKind = "error";
         else if (only === CANCEL_EVENT_DEFINITION) boundaryKind = "cancel";
+        else if (only === TIMER_EVENT_DEFINITION) boundaryKind = "timer";
 
         if (!boundaryKind) {
           const what = defs.length === 0
@@ -397,14 +440,35 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
               ? "multiple event definitions"
               : `a ${localTypeName(defs[0]!.$type)}`;
           err(
-            `Boundary event '${id ?? ""}' has ${what}. Only compensation, error, and cancel boundary events are supported ` +
-              "(timer/signal/escalation/conditional/message boundary events are deferred).",
+            `Boundary event '${id ?? ""}' has ${what}. Only timer, compensation, error, and cancel boundary events are supported ` +
+              "(signal/escalation/conditional/message boundary events are deferred).",
             id,
             "boundaryEvent",
           );
           continue;
         }
         const errorRef = boundaryKind === "error" ? refId((defs[0] as ModdleElement).errorRef) : undefined;
+
+        // M3-L3: an interrupting boundary timer carries a single STATIC ISO-8601
+        // trigger. cancelActivity="false" (non-interrupting) and a malformed /
+        // FEEL / timeCycle trigger are each rejected with element id + reason.
+        let timerTrigger: TimerTriggerSpec | undefined;
+        if (boundaryKind === "timer") {
+          if (el.cancelActivity === false) {
+            err(
+              `Boundary timer '${id ?? ""}' has cancelActivity="false". A non-interrupting boundary needs a second token — deferred to concurrency (M4); only interrupting boundary timers are supported.`,
+              id,
+              "boundaryEvent",
+            );
+          }
+          const result = readTimerTrigger(defs[0] as ModdleElement);
+          if (!result.ok) {
+            err(`Boundary timer '${id ?? ""}' ${result.reason}`, id, "boundaryEvent");
+          } else {
+            timerTrigger = result.trigger;
+          }
+        }
+
         nodes.push({
           id: id ?? "",
           type: "boundaryEvent",
@@ -413,6 +477,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
           boundaryKind,
           attachedToRef,
           errorRef,
+          timerTrigger,
         });
         continue;
       }
@@ -934,6 +999,35 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
           "boundaryEvent",
         );
       }
+    } else if (n.boundaryKind === "timer") {
+      // M3-L3 (TASK-44): an interrupting boundary timer attaches to a serviceTask
+      // or receiveTask (inside or outside a transaction) — NEVER to a transaction
+      // itself (it would terminate the scope WITHOUT compensation, the
+      // silent-rollback-loss trap, deferred to M5). Attachment to a gateway /
+      // compensation handler is already rejected above (those `continue`). Exactly
+      // one outgoing flow, to any token-path node in the same scope — the forbidden
+      // targets are rejected by the per-flow endpoint rules (reused from M3-L2), so
+      // only the single-outgoing degree is checked here.
+      if (attached.type === "transaction") {
+        err(
+          `Boundary timer '${n.id}' is attached to transaction '${attached.id}'. A timer on a transaction would terminate the scope without compensation (deferred to M5) — attach it to a task INSIDE the transaction routing to a cancel end instead.`,
+          n.id,
+          "boundaryEvent",
+        );
+      } else if (attached.type !== "serviceTask" && attached.type !== "receiveTask") {
+        err(
+          `Boundary timer '${n.id}' must be attached to a service task or a receive task; '${attached.id}' is a ${attached.type}.`,
+          n.id,
+          "boundaryEvent",
+        );
+      }
+      if (outs.length !== 1) {
+        err(
+          `Boundary timer '${n.id}' must have exactly one outgoing sequence flow (routing to a token-path node in the same scope); found ${outs.length}.`,
+          n.id,
+          "boundaryEvent",
+        );
+      }
     }
   }
 
@@ -982,6 +1076,32 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         }
         seenCodes.add(b.errorCode);
       }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Per-activity timer-boundary multiplicity (M3-L3, TASK-44): AT MOST ONE timer
+  // boundary per activity. Two static durations/dates make one statically dead;
+  // a date+duration pair makes the winner arrival-time-dependent — both restricted
+  // in M3 for determinism (honest wording, not "dead branch"). Grouped by
+  // attachedToRef so the reject names the offending (second) boundary by id.
+  // -------------------------------------------------------------------------
+  const timerBoundariesByActivity = new Map<string, NodeInfo[]>();
+  for (const n of nodes) {
+    if (n.type === "boundaryEvent" && n.boundaryKind === "timer" && n.attachedToRef) {
+      const arr = timerBoundariesByActivity.get(n.attachedToRef);
+      if (arr) arr.push(n);
+      else timerBoundariesByActivity.set(n.attachedToRef, [n]);
+    }
+  }
+  for (const [activityId, boundaries] of timerBoundariesByActivity) {
+    for (const b of boundaries.slice(1)) {
+      err(
+        `Activity '${activityId}' has more than one boundary timer. At most one timer boundary is allowed per activity ` +
+          "(multiple static timers make one statically dead or arrival-time-dependent — restricted in M3 for determinism).",
+        b.id,
+        "boundaryEvent",
+      );
     }
   }
 
@@ -1104,6 +1224,9 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         if (n.boundaryKind === "compensate") {
           const assoc = associations.find((a) => a.source === n.id);
           node.compensationHandlerId = assoc?.target ?? null;
+        }
+        if (n.boundaryKind === "timer") {
+          node.timerTrigger = n.timerTrigger ?? null;
         }
       }
       graphNodes[n.id] = node;

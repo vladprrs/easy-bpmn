@@ -83,6 +83,8 @@ import { getExternalMessage, insertExternalMessage } from "./persistence/message
 import { listInstanceHistory, recordHistory } from "./persistence/history";
 import { getIdempotentResult, putIdempotentResult } from "./persistence/idempotency";
 import { resumeInline } from "./runtime/engine";
+import { cancelArmedTimersForInstance } from "./runtime/boundary-timer";
+import { listTimersForInstance } from "./persistence/timers";
 import { abandonActiveForwardJobs, resetJobForRetry } from "./persistence/jobs";
 import {
   countPendingSteps,
@@ -291,6 +293,20 @@ async function handleGetInstance(env: Env, instanceId: string): Promise<Response
     };
   }
 
+  // M3-L3 (TASK-44): the model-timer block, read from D1 (Workflow internals hidden).
+  const timerRows = await listTimersForInstance(env.DB, instanceId);
+  const timers = timerRows.map((t) => ({
+    timerId: t.timerId,
+    elementId: t.elementId,
+    occurrence: t.occurrence,
+    kind: t.kind,
+    status: t.status,
+    attachedToRef: t.attachedToRef,
+    gatewayId: t.gatewayId,
+    fireAt: t.fireAt,
+    firedAt: t.firedAt,
+  }));
+
   const inspection: ProcessInstanceInspection = {
     ...instance,
     historySummary: history,
@@ -303,6 +319,7 @@ async function handleGetInstance(env: Env, instanceId: string): Promise<Response
     incident,
     openIncidents,
     saga,
+    ...(timers.length > 0 ? { timers } : {}),
   };
   return json(inspection, 200);
 }
@@ -347,6 +364,9 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
   // suspended Workflow (if any) so subsequent job callbacks drive compensation
   // inline rather than sendEvent-ing a Workflow that is waiting on the wrong job.
   await abandonActiveForwardJobs(env.DB, instanceId, now);
+  // M3-L3 (TASK-44, design §4.3.2 exit d): settle every armed boundary timer so a
+  // stray alarm afterwards is a decided no-op — no mid-compensation firing (gate 10).
+  await cancelArmedTimersForInstance(env, instanceId);
   await getExecutor(env).terminate(instanceId);
 
   const pending = await countPendingSteps(env.DB, instanceId);

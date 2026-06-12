@@ -764,6 +764,49 @@ components:
                 newest-first (M3-L1). The `incident` field above is the latest one.
               items:
                 $ref: "#/components/schemas/Incident"
+            timers:
+              type: array
+              description: >
+                Model timers (M3-L3): armed/fired/cancelled with fire_at/fired_at,
+                read from D1. Present when the instance has any timer.
+              items:
+                $ref: "#/components/schemas/TimerView"
+    TimerView:
+      type: object
+      required: [timerId, elementId, occurrence, kind, status, attachedToRef, gatewayId, fireAt, firedAt]
+      properties:
+        timerId:
+          type: string
+          description: "Deterministic id: instanceId:elementId#occurrence."
+        elementId:
+          type: string
+          description: The timer-event element id (boundary | intermediate catch | EBG branch).
+        occurrence:
+          type: integer
+          description: The arming visit's occurrence (the host activity's visit for a boundary timer).
+        kind:
+          type: string
+          enum: [boundary, intermediateCatch, eventGateway]
+        status:
+          type: string
+          description: Bookkeeping/read-model status; the authoritative race outcome is the decider row.
+          enum: [armed, fired, cancelled]
+        attachedToRef:
+          type: string
+          nullable: true
+          description: "boundary: the host activity element id; null otherwise."
+        gatewayId:
+          type: string
+          nullable: true
+          description: "eventGateway: the owning gateway element id; null otherwise."
+        fireAt:
+          type: string
+          format: date-time
+          description: Computed once at arm time (timeDate as-is; now + timeDuration).
+        firedAt:
+          type: string
+          format: date-time
+          nullable: true
     ActivateJobsRequest:
       type: object
       required: [taskType, workerId]

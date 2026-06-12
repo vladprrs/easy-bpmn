@@ -395,6 +395,23 @@ export async function resetJobForRetry(
   return res.meta?.changes ?? 0;
 }
 
+/**
+ * Abandon a forward job in the SAME batch as a winning timer fire (M3-L3): a
+ * status-conditional flip of a still-in-flight (`created`|`locked`) forward job
+ * to `failed`, clearing its lock_token so a late worker complete/fail matches 0
+ * rows on its token and gets the existing stable no-op ack. Statement form so it
+ * rides the fireTimer dbBatch atomically with the `timer_outcomes 'fired'` claim
+ * (the decider) — a job already terminal (completion won the race) matches 0 rows.
+ */
+export function abandonJobOnTimerFireStmt(db: D1Database, jobId: string, now: string): D1PreparedStatement {
+  return stmt(
+    db,
+    `UPDATE service_task_jobs SET status = 'failed', lock_token = NULL, lock_expires_at = NULL, updated_at = ?
+      WHERE job_id = ? AND status IN ('created', 'locked')`,
+    [now, jobId],
+  );
+}
+
 /** On operator cancel, abandon any in-flight FORWARD job so a late worker callback no-ops. */
 export async function abandonActiveForwardJobs(db: D1Database, instanceId: string, now: string): Promise<void> {
   await stmt(

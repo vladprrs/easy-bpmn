@@ -1,11 +1,11 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
-// fireTimer GUARD/NO-OP gate (M3-L3 design §4.3, TASK-43). In THIS layer fireTimer
-// implements ONLY the idempotent guard + no-op paths — it re-reads D1 and returns
-// WITHOUT writing whenever firing would be wrong. The winning-fire transition is
-// TASK-44; the fire-eligible branch is therefore an explicit (loud) seam, NOT a
-// silent stub — verified at the bottom. No real model arms a timer in this layer.
+// fireTimer GUARD/NO-OP gate (M3-L3 design §4.3). fireTimer re-reads D1 and returns
+// WITHOUT writing whenever firing would be wrong (missing / already-settled /
+// not-yet-due / terminal / no resolvable host). The WINNING fire — claim + transition
+// + wake — is exercised end-to-end against real graphs in the boundary-timer
+// integration suite (TASK-44); these unit tests pin the guard chain in isolation.
 
 import { createInstance } from "../../src/persistence/instances";
 import {
@@ -106,14 +106,18 @@ describe("fireTimer — guard/no-op paths (TASK-43)", () => {
     expect(await getTimerOutcome(env.DB, id)).toBeNull();
   });
 
-  it("SEAM: a fire-eligible timer throws (loud, NOT a silent stub) — the winning fire is TASK-44", async () => {
+  it("no-ops when the definition graph cannot be resolved (defensive — needs a real host)", async () => {
+    // Past every guard (armed, due, undecided, live instance) but the synthetic
+    // instance points at a non-existent definition version, so fireBoundaryTimer
+    // finds no graph/host to transition — a defensive no-op (no decider written).
+    // The genuine winning fire is covered against real graphs in the integration
+    // suite (boundary-timer.test.ts gates 1-6, 10).
     const id = timerIdFor("pi_eligible", "Timer_boundary", 0);
-    await makeInstance("pi_eligible", "waiting"); // non-terminal
+    await makeInstance("pi_eligible", "waiting"); // non-terminal, definitionVersionId 'ver_1' (no graph)
     await arm(id, "pi_eligible", PAST); // due, armed, undecided
 
-    await expect(fireTimer(env, id)).rejects.toThrow(/TASK-44/);
-    // The seam threw BEFORE writing any decider — no partial fire.
-    expect(await getTimerOutcome(env.DB, id)).toBeNull();
+    await expect(fireTimer(env, id)).resolves.toBeUndefined();
+    expect(await getTimerOutcome(env.DB, id)).toBeNull(); // no graph → no claim written
     expect((await getTimer(env.DB, id))?.status).toBe("armed");
   });
 });

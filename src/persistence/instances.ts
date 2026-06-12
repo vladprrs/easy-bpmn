@@ -702,6 +702,29 @@ export function subscriptionConsumedStmt(
   );
 }
 
+/**
+ * Supersede the ACTIVE subscription guarding a receive-task visit when its
+ * boundary timer fires (M3-L3): a status-conditional flip `active → superseded`
+ * composed into the winning fireTimer batch, so the rewalk's getSubscriptionForVisit
+ * no longer treats it as the live wait. Distinct from `consumed` (which the engine
+ * fast-forwards down the NORMAL path) — a superseded subscription resolved via the
+ * timer path instead. Paired with a best-effort broker supersede so a late publish
+ * to the broker key gets the stable buffered/no-match outcome.
+ */
+export function subscriptionSupersededStmt(
+  db: D1Database,
+  subscriptionId: string,
+  now: string,
+): D1PreparedStatement {
+  return stmt(
+    db,
+    `UPDATE message_subscriptions
+       SET status = 'superseded', consumed_at = ?
+     WHERE subscription_id = ? AND status = 'active'`,
+    [now, subscriptionId],
+  );
+}
+
 export async function markSubscriptionExpired(
   db: D1Database,
   subscriptionId: string,

@@ -98,6 +98,16 @@ import {
 import { createIncident, completeInstance, recordTerminalIncident } from "./incidents";
 import { driveForwardServiceTask, terminateUnleasableJob } from "./forward-task";
 import { beginCompensating, settleAfterCompensation } from "./compensation";
+import {
+  armTimerDO,
+  buildBoundaryArm,
+  buildBoundaryCancelSettle,
+  convertOnFire,
+  timerBoundaryFor,
+  timerGuardedTimeout,
+  timerHasFired,
+} from "./boundary-timer";
+import { getTimer, timerIdFor } from "../persistence/timers";
 
 // Public surface (M3-L0): the node-kind blocks moved to sibling modules, but the
 // engine.ts import path stays the stable façade for every dependent — re-export
@@ -236,7 +246,7 @@ async function loop(
     }
 
     if (node.type === "receiveTask") {
-      const r = await driveReceiveTask(env, instanceId, cur, occ, node, runStep, waitFor, pending);
+      const r = await driveReceiveTask(env, instanceId, graph, cur, occ, node, runStep, waitFor, pending);
       if (r.kind === "waiting") return { status: "waiting" };
       if (r.kind === "incident") return { status: "incident" };
       // The delivered event is consumed at the LIVE visit only — a consumed
@@ -608,6 +618,7 @@ type ReceiveOutcome =
 async function driveReceiveTask(
   env: Env,
   instanceId: string,
+  graph: ExecutionGraph,
   elementId: string,
   occ: number,
   node: GraphNode,
@@ -618,6 +629,13 @@ async function driveReceiveTask(
   const tag = `${elementId}#${occ}`;
   const next = node.next!;
   const messageName = node.messageName ?? "";
+  const tb = timerBoundaryFor(graph, elementId);
+
+  // Boundary-timer fast-forward (M3-L3): a fired timer already superseded the
+  // subscription and transitioned the token down the boundary path (write-free).
+  if (tb && (await timerHasFired(env, instanceId, tb, occ))) {
+    return { kind: "next", next: tb.node.next! };
+  }
 
   // Already applied → pure in-memory cursor move, NO writes, NO step. If the
   // in-flight delivery is exactly the message this visit consumed (a racing
@@ -629,31 +647,50 @@ async function driveReceiveTask(
   }
 
   if (pending) {
-    const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, elementId, occ, next, pending));
+    const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, graph, elementId, occ, next, pending));
     return { kind: "next", next: r.next, consumedPending: true };
   }
 
-  const reg = await runStep(`recv:${tag}`, () => registerReceive(env, instanceId, elementId, occ, messageName));
+  const reg = await runStep(`recv:${tag}`, () => registerReceive(env, instanceId, graph, elementId, occ, messageName));
   if (reg.kind === "incident") return { kind: "incident" };
   if (reg.kind === "applied") return { kind: "next", next };
   if (reg.kind === "correlated") {
-    const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, elementId, occ, next, reg.event));
+    const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, graph, elementId, occ, next, reg.event));
     return { kind: "next", next: r.next };
   }
   if (!waitFor) return { kind: "waiting" };
-  const outcome = await waitFor({ name: `wait:${tag}`, workflowEventType: reg.workflowEventType, timeout: SVC_WAIT_TIMEOUT });
+  // Self-healing re-arm (design §4.2): a rewalk landing on a still-armed timer
+  // re-arms the DO idempotently so a lost alarm is repaired by the next drive.
+  if (tb) {
+    const trow = await getTimer(env.DB, timerIdFor(instanceId, tb.boundaryId, occ));
+    if (trow?.status === "armed") await armTimerDO(env, trow.timerId, trow.fireAt);
+  }
+  // A timer-guarded wait is SIZED to the timer (so a long timer costs O(1) steps).
+  const timeout = tb ? await timerGuardedTimeout(env, instanceId, tb, occ) : SVC_WAIT_TIMEOUT;
+  const outcome = await waitFor({ name: `wait:${tag}`, workflowEventType: reg.workflowEventType, timeout });
+  // The timer may have fired (its wake, or a concurrent alarm) while we waited.
+  if (tb && (await timerHasFired(env, instanceId, tb, occ))) {
+    return { kind: "next", next: tb.node.next! };
+  }
   if (outcome.kind === "timeout") {
     // D1 is canonical: an inline drive (e.g. after a Workflow handover) may
     // have applied this visit's message while we waited — advance, don't fail.
     const fresh = await getSubscriptionForVisit(env.DB, instanceId, elementId, occ);
     if (fresh?.status === "consumed") return { kind: "next", next };
+    if (tb) {
+      // A wait guarded by a modeled timer NEVER raises waitTimeout (design §4.2).
+      // The DO alarm is the primary firing mechanism; this sized timeout is the
+      // lost-alarm backstop — re-park so the next drive re-arms/re-sizes.
+      // (Workflow-mode-only; the alarm fire path is the CI-tested mechanism.)
+      return { kind: "waiting" };
+    }
     // M3-L1 (TASK-39): the un-guarded receive-task wait cap is 'waitTimeout'
     // (shared with the service-task wait cap), split out of the legacy 'timeout'.
     await runStep(`recv-timeout:${tag}`, () => createIncident(env, instanceId, elementId, 0, "Receive Task wait timed out.", { messageName }, "waitTimeout"));
     return { kind: "incident" };
   }
   const event = parseMessageEvent(outcome.payload);
-  const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, elementId, occ, next, event));
+  const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, graph, elementId, occ, next, event));
   return { kind: "next", next: r.next };
 }
 
@@ -669,7 +706,7 @@ type RegisterOutcome =
   | { kind: "applied" }
   | { kind: "incident" };
 
-async function registerReceive(env: Env, instanceId: string, elementId: string, occ: number, messageName: string): Promise<RegisterOutcome> {
+async function registerReceive(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, messageName: string): Promise<RegisterOutcome> {
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
 
@@ -712,15 +749,20 @@ async function registerReceive(env: Env, instanceId: string, elementId: string, 
 
   if (!active) {
     await createSubscription(env.DB, { subscriptionId, workspaceId: inst.workspace_id, instanceId, elementId, messageName, correlationKey: inst.correlation_key, brokerKey, workflowEventType, status: "active", expiresAt, occurrence: occ, now });
+    // M3-L3: arm the interrupting boundary timer (if any) in the SAME
+    // first-registration batch (persist-before-advance); arm the DO after commit.
+    const arm = buildBoundaryArm(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: elementId, occ, now });
     await dbBatch(env.DB, [
       historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "receiveTaskWaiting", diagnostics: { subscriptionId, messageName, correlationKey: inst.correlation_key, expiresAt, occurrence: occ } }),
       applyTransitionStmt(env.DB, { instanceId, currentElementId: elementId, status: "waiting", now }),
+      ...(arm ? arm.stmts : []),
     ]);
+    if (arm) await armTimerDO(env, arm.timerId, arm.fireAt);
   }
   return { kind: "waiting", workflowEventType, subscriptionId };
 }
 
-async function applyMessage(env: Env, instanceId: string, elementId: string, occ: number, next: string, event: MessageEventPayload): Promise<{ next: string }> {
+async function applyMessage(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, next: string, event: MessageEventPayload): Promise<{ next: string }> {
   const inst = await loadInst(env, instanceId);
   const sub = await getSubscriptionForVisit(env.DB, instanceId, elementId, occ);
   // Apply-once guard (idempotent step body): the payload merge + the transition
@@ -751,13 +793,26 @@ async function applyMessage(env: Env, instanceId: string, elementId: string, occ
     });
   }
 
-  await dbBatch(env.DB, [
+  const statements: D1PreparedStatement[] = [
     applyTransitionStmt(env.DB, { instanceId, variables: merged, currentElementId: next, status: "running", now }),
     ...(active ? [subscriptionConsumedStmt(env.DB, subscriptionId, event.externalMessageId, now)] : []),
     messageCorrelatedStmt(env.DB, { externalMessageId: event.externalMessageId, instanceId, subscriptionId, now }),
     variableSnapshotStmt(env.DB, { instanceId, source: "message", sourceId: event.externalMessageId, variables: event.payload ?? {}, now }),
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, externalMessageId: event.externalMessageId, type: "messageCorrelated", diagnostics: { subscriptionId, messageName: event.messageName, messageId: event.messageId, occurrence: occ }, payloadSnapshot: event.payload ?? {} }),
-  ]);
+  ];
+  // M3-L3: settle the guarding timer 'cancelled' ATOMICALLY with consuming the
+  // message; on a decider conflict the timer FIRED first → convert to its path.
+  const cancelSettle = buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: elementId, occ, now });
+  if (cancelSettle) statements.push(...cancelSettle.stmts);
+  try {
+    await dbBatch(env.DB, statements);
+  } catch (err) {
+    if (isUniqueConstraintViolation(err)) {
+      const converted = await convertOnFire(env, graph, instanceId, elementId, occ);
+      if (converted) return { next: converted };
+    }
+    throw err;
+  }
   return { next };
 }
 

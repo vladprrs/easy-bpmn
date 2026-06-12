@@ -47,6 +47,8 @@ export const DEFERRED_GATEWAY_REASONS: Record<string, string> = {
 export const COMPENSATE_EVENT_DEFINITION = "bpmn:CompensateEventDefinition";
 export const ERROR_EVENT_DEFINITION = "bpmn:ErrorEventDefinition";
 export const CANCEL_EVENT_DEFINITION = "bpmn:CancelEventDefinition";
+/** M3-L3: an interrupting boundary timer carries a single timerEventDefinition. */
+export const TIMER_EVENT_DEFINITION = "bpmn:TimerEventDefinition";
 
 /** Human-friendly element type name, e.g. "bpmn:UserTask" → "userTask". */
 export function localTypeName($type: string): string {

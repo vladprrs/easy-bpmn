@@ -23,6 +23,18 @@ import {
 } from "../util";
 import { ACTIVATION_TTL_MS, POISON_THRESHOLD } from "./retry-policy";
 import { failUnleasableJobConditional, getJobRowById, reopenJobKeepAttemptStmt } from "../persistence/jobs";
+import {
+  armTimerDO,
+  buildBoundaryArm,
+  buildBoundaryCancelSettle,
+  convertOnFire,
+  isUniqueConstraintViolation,
+  settleBoundaryTimerCancel,
+  timerBoundaryFor,
+  timerGuardedTimeout,
+  timerHasFired,
+} from "./boundary-timer";
+import { getTimer, timerIdFor } from "../persistence/timers";
 import { dbBatch } from "../persistence/db";
 import { countHistoryEventsOfType, historyStmt } from "../persistence/history";
 import {
@@ -113,6 +125,17 @@ export async function driveForwardServiceTask(
   waitFor: WaitForEvent | null,
 ): Promise<ForwardOutcome> {
   const tag = `${elementId}#${occ}`;
+  const tb = timerBoundaryFor(graph, elementId);
+
+  // Boundary-timer fast-forward (M3-L3, design §4.1): `timer_outcomes` is the
+  // truth for a timer-guarded visit — `fired` → the token already took the
+  // boundary path (write-free advance to its target). `cancelled` falls through;
+  // the normal applied/completed/failed logic (settled atomically with the cancel
+  // claim in those batches) drives it below.
+  if (tb && (await timerHasFired(env, instanceId, tb, occ))) {
+    return { kind: "next", next: tb.node.next! };
+  }
+
   let job = await getForwardJob(env.DB, instanceId, elementId, occ);
 
   // Already applied → pure in-memory cursor move, NO writes, NO step.
@@ -127,23 +150,35 @@ export async function driveForwardServiceTask(
   }
 
   if (!job) {
-    job = await runStep(`svc-create:${tag}`, () => createForwardJob(env, instanceId, elementId, occ, node));
+    job = await runStep(`svc-create:${tag}`, () => createForwardJob(env, instanceId, graph, elementId, occ, node));
     if (!job) return { kind: "incident" }; // oversized input → incident already recorded
+  } else if (tb) {
+    // Self-healing re-arm (design §4.2): a rewalk landing on a still-armed timer
+    // re-arms the DO idempotently, so a lost alarm is repaired by the next drive.
+    const trow = await getTimer(env.DB, timerIdFor(instanceId, tb.boundaryId, occ));
+    if (trow?.status === "armed") await armTimerDO(env, trow.timerId, trow.fireAt);
   }
 
   // Park (direct mode) — the instance resumes by re-running once the worker's
-  // complete/fail mutates the job in D1.
+  // complete/fail mutates the job in D1 (or the timer alarm fires).
   if (!waitFor) {
     await runStep(`svc-park:${tag}`, () => parkWaiting(env, instanceId, elementId, "serviceTask"));
     return { kind: "waiting" };
   }
 
-  // Suspend (workflow mode) — re-lease drives retries within this single wait.
+  // Suspend (workflow mode) — re-lease drives retries within this single wait. A
+  // timer-guarded wait is SIZED to the timer (so a long timer costs O(1) steps).
+  const timeout = tb ? await timerGuardedTimeout(env, instanceId, tb, occ) : SVC_WAIT_TIMEOUT;
   const outcome = await waitFor({
     name: `wait-job:${tag}`,
     workflowEventType: workflowJobEventTypeFor(job.job_id),
-    timeout: SVC_WAIT_TIMEOUT,
+    timeout,
   });
+  // The timer may have fired (its sendEvent wake, or a concurrent alarm) while we
+  // waited — re-read the decider FIRST so an abandoned job is not misread as a fail.
+  if (tb && (await timerHasFired(env, instanceId, tb, occ))) {
+    return { kind: "next", next: tb.node.next! };
+  }
   // D1 is canonical: re-read the job whether we woke on the event OR on a timeout.
   // A lost wake-up event (swallowed sendEvent, isolate eviction) for an already
   // terminal job must be applied here, not masked as a spurious timeout incident.
@@ -158,10 +193,21 @@ export async function driveForwardServiceTask(
     return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, fresh));
   }
   if (outcome.kind === "timeout") {
-    // A genuine wait-cap: nobody completed the job (still created/locked). M3-L1
-    // (TASK-39): the un-guarded service-task wait cap is 'waitTimeout', split out
-    // of the legacy overloaded 'timeout'. NOTE: `outcome.kind === "timeout"` is the
-    // wait-OUTCOME discriminator (a different axis) — only the incident kind changes.
+    if (tb) {
+      // A wait guarded by a modeled timer NEVER raises waitTimeout (design §4.2).
+      // The DO alarm is the primary firing mechanism; this sized timeout is only
+      // the lost-alarm backstop — re-read the decider (fired → boundary path) and
+      // otherwise re-park so the next drive re-arms/re-sizes. (Workflow-mode-only;
+      // the DO-alarm fire path is the CI-tested mechanism.)
+      if (await timerHasFired(env, instanceId, tb, occ)) {
+        return { kind: "next", next: tb.node.next! };
+      }
+      return { kind: "waiting" };
+    }
+    // A genuine UN-GUARDED wait-cap: nobody completed the job (still created/locked).
+    // M3-L1 (TASK-39): the un-guarded service-task wait cap is 'waitTimeout', split
+    // out of the legacy overloaded 'timeout'. NOTE: `outcome.kind === "timeout"` is
+    // the wait-OUTCOME discriminator (a different axis) — only the incident changes.
     return runStep(`svc-timeout:${tag}`, () =>
       createIncident(env, instanceId, elementId, node.retries ?? 1, "Service Task timed out waiting for a worker.", { jobId: fresh.job_id }, "waitTimeout"),
     );
@@ -172,7 +218,7 @@ export async function driveForwardServiceTask(
   );
 }
 
-async function createForwardJob(env: Env, instanceId: string, elementId: string, occ: number, node: GraphNode): Promise<JobRow | null> {
+async function createForwardJob(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, node: GraphNode): Promise<JobRow | null> {
   // Idempotent re-run (Workflow step retry after a committed batch): this
   // iteration's row already exists → return it, never re-insert (the unique
   // index on (instance, element, kind, occurrence) would reject anyway).
@@ -191,6 +237,10 @@ async function createForwardJob(env: Env, instanceId: string, elementId: string,
   // Un-leasable-job DLQ (§4.2): a forward job nobody leases within ACTIVATION_TTL_MS
   // is parked in a DLQ via a per-job JobScheduler alarm armed below.
   const activationExpiresAt = isoPlusMs(now, ACTIVATION_TTL_MS);
+  // M3-L3: arm the interrupting boundary timer (if any) in the SAME visit batch —
+  // persist-before-advance. fire_at is computed once here; the DO alarm is armed
+  // after the batch commits (best-effort, like the DLQ alarm).
+  const arm = buildBoundaryArm(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: elementId, occ, now });
   await dbBatch(env.DB, [
     historyStmt(env.DB, {
       workspaceId: inst.workspace_id,
@@ -220,8 +270,10 @@ async function createForwardJob(env: Env, instanceId: string, elementId: string,
       type: "serviceTaskJobCreated",
       diagnostics: { jobId, taskType, retryLimit: Math.max(1, node.retries ?? 1), activationExpiresAt, occurrence: occ },
     }),
+    ...(arm ? arm.stmts : []),
   ]);
   await armJobScheduler(env, jobId, activationExpiresAt);
+  if (arm) await armTimerDO(env, arm.timerId, arm.fireAt);
   return getForwardJob(env.DB, instanceId, elementId, occ);
 }
 
@@ -403,7 +455,20 @@ async function applyForwardCompletion(
     );
   }
 
-  await dbBatch(env.DB, statements);
+  // M3-L3: settle the guarding timer 'cancelled' ATOMICALLY with the advance (the
+  // decider claim rides this batch). If the timer FIRED first, the plain INSERT
+  // violates the PK and the WHOLE batch aborts — convert to the boundary path.
+  const cancelSettle = buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: elementId, occ, now });
+  if (cancelSettle) statements.push(...cancelSettle.stmts);
+  try {
+    await dbBatch(env.DB, statements);
+  } catch (err) {
+    if (isUniqueConstraintViolation(err)) {
+      const converted = await convertOnFire(env, graph, instanceId, elementId, occ);
+      if (converted) return { kind: "next", next: converted };
+    }
+    throw err;
+  }
   return { kind: "next", next };
 }
 
@@ -432,7 +497,7 @@ async function handleForwardFailure(
     const target = errorBoundaryTarget(graph, elementId, job.error_code);
     if (target) {
       const now = nowIso();
-      await dbBatch(env.DB, [
+      const stmts: D1PreparedStatement[] = [
         historyStmt(env.DB, {
           workspaceId: inst.workspace_id,
           instanceId,
@@ -444,12 +509,32 @@ async function handleForwardFailure(
         // Atomic with the route: the rewalk fast-forwards this visit by
         // re-deriving the same deterministic target from the persisted error_code.
         markFailedJobHandledStmt(env.DB, job.job_id, now),
-      ]);
+      ];
+      // M3-L3: settle the guarding timer 'cancelled' atomically with the error
+      // route; on a decider conflict the timer FIRED first → convert to its path.
+      const cancelSettle = buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: elementId, occ, now });
+      if (cancelSettle) stmts.push(...cancelSettle.stmts);
+      try {
+        await dbBatch(env.DB, stmts);
+      } catch (err) {
+        if (isUniqueConstraintViolation(err)) {
+          const converted = await convertOnFire(env, graph, instanceId, elementId, occ);
+          if (converted) return { kind: "next", next: converted };
+        }
+        throw err;
+      }
       return { kind: "next", next: target };
     }
-    // Uncaught business error → Hazard.
+    // Uncaught business error → Hazard. Settle the guarding timer first (its own
+    // batch — the Hazard terminal is a separate createIncident batch); if the timer
+    // fired in the window, convert to the boundary path instead of a Hazard.
+    const settledUncaught = await settleBoundaryTimerCancel(env, graph, instanceId, inst.workspace_id, elementId, occ);
+    if (typeof settledUncaught === "object") return { kind: "next", next: settledUncaught.converted };
     return createIncident(env, instanceId, elementId, job.attempt_count, `Uncaught business error '${job.error_code}' (no matching error boundary).`, { jobId: job.job_id, errorCode: job.error_code }, "serviceTaskFailure");
   }
   // Technical exhaustion → Hazard (terminal incident, never auto-compensation).
+  // Settle the guarding timer first (gate 10: no stray alarm mid-incident).
+  const settledTech = await settleBoundaryTimerCancel(env, graph, instanceId, inst.workspace_id, elementId, occ);
+  if (typeof settledTech === "object") return { kind: "next", next: settledTech.converted };
   return createIncident(env, instanceId, elementId, job.attempt_count, "Service Task failed (technical retries exhausted).", { jobId: job.job_id }, "serviceTaskFailure");
 }

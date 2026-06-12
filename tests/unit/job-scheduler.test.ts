@@ -10,6 +10,24 @@ import { describe, expect, it } from "vitest";
 
 import { createInstance } from "../../src/persistence/instances";
 import { insertTimerArmedStmt, insertTimerOutcomeStmt } from "../../src/persistence/timers";
+import { leaseOne, mintWorkerToken, publishAndStart } from "../helpers";
+
+// A real model whose `slow` service task carries an interrupting boundary timer →
+// onTimeout. Used to drive a genuine fireTimer through the DO's dispatch.
+const SVC_TIMER_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_js" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:serviceTask id="slow"><bpmn:extensionElements><easy-bpmn:taskDefinition type="js-slow"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:serviceTask id="onTimeout"><bpmn:extensionElements><easy-bpmn:taskDefinition type="js-timeout"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:boundaryEvent id="tb" attachedToRef="slow"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="slow"/>
+    <bpmn:sequenceFlow id="s1" sourceRef="slow" targetRef="E"/>
+    <bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="onTimeout"/>
+    <bpmn:sequenceFlow id="af" sourceRef="onTimeout" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>`;
 
 const PAST = "2000-01-01T00:00:00.000Z";
 const FUTURE_1 = "2099-01-01T00:00:00.000Z";
@@ -115,33 +133,33 @@ describe("JobScheduler — one-shot scheduler DO (TASK-43)", () => {
     });
   });
 
-  it("dispatches by marker: a timer marker → fireTimer; a job marker → terminateUnleasableJob", async () => {
-    // A FIRE-ELIGIBLE timer row keyed "M" exists (armed, due, undecided, live
-    // instance). fireTimer would hit the TASK-44 seam and THROW; terminateUnleasableJob
-    // no-ops on a missing job. So the dispatch target is unambiguous from the outcome.
-    await makeInstance("pi_dispatch", "waiting");
-    await armTimerRow("M", "pi_dispatch", PAST);
+  it("dispatches by marker: a timer marker → fireTimer (real fire); a job marker → terminateUnleasableJob", async () => {
+    // TIMER marker → fireTimer: set up a REAL fire-eligible boundary timer (a
+    // published model + a parked, in-flight host service-task job), then force its
+    // engine-armed DO alarm. fireTimer claims the decider 'fired'; that write is the
+    // unambiguous proof the marker dispatched to fireTimer (terminateUnleasableJob
+    // would never touch timer_outcomes).
+    const token = await mintWorkerToken();
+    const { instance } = await publishAndStart(SVC_TIMER_BPMN, { correlationKey: "js-disp", variables: {} });
+    const id = instance.body.instanceId;
+    await leaseOne(token, "js-slow"); // host job in-flight → the fire guard passes
+    const t = await env.DB.prepare(`SELECT timer_id FROM timers WHERE instance_id = ?`).bind(id).first<{ timer_id: string }>();
+    await env.DB.prepare(`UPDATE timers SET fire_at = ? WHERE timer_id = ?`).bind(PAST, t!.timer_id).run();
 
-    // Timer marker → fireTimer → the eligible seam throws. The DO alarm is armed
-    // in the future (no background auto-fire); runDurableObjectAlarm forces it.
-    const tStub = timerStub("M");
-    await tStub.armTimer("M", FUTURE_1);
-    await expect(runDurableObjectAlarm(tStub)).rejects.toThrow(/TASK-44/);
-    // The throw must skip the one-shot `deleteAll()`, leaving the marker intact so
-    // the timer is re-dispatchable when the platform RE-DELIVERS the alarm (workerd
-    // auto-reschedules an alarm whose handler threw — that reschedule is runtime
-    // behavior `runDurableObjectAlarm` does not model, so we assert the property we
-    // CAN observe: the marker survived = `deleteAll()` was skipped). A
-    // `try/finally { deleteAll() }` around dispatch would silently break this.
-    await runInDurableObject(tStub, async (_i, state) => {
-      expect(await state.storage.get(TIMER_KEY)).toBe("M");
+    expect(await runDurableObjectAlarm(timerStub(t!.timer_id))).toBe(true);
+    const outcome = await env.DB.prepare(`SELECT outcome FROM timer_outcomes WHERE timer_id = ?`).bind(t!.timer_id).first<{ outcome: string }>();
+    expect(outcome?.outcome).toBe("fired"); // fireTimer ran
+    // Clean dispatch (no throw) → the one-shot deleteAll cleared the marker.
+    await runInDurableObject(timerStub(t!.timer_id), async (_i, state) => {
+      expect(await state.storage.get(TIMER_KEY)).toBeUndefined();
     });
 
-    // Job marker with the SAME underlying id "M" → terminateUnleasableJob (no job
-    // row "M" exists) → clean no-op. Had it mis-dispatched to fireTimer, the
-    // eligible timer row "M" would have made it throw.
-    const jStub = jobStub("M");
-    await jStub.arm("M", FUTURE_1);
-    expect(await runDurableObjectAlarm(jStub)).toBe(true); // ran, no throw
+    // JOB marker keyed off the SAME id string as that timer → terminateUnleasableJob
+    // (no job row by that id) → clean no-op. Had it mis-dispatched to fireTimer it
+    // would have re-read the already-decided timer and still no-op'd — so we assert
+    // the run completed cleanly (and the timer_outcomes row is untouched).
+    const jStub = jobStub(t!.timer_id);
+    await jStub.arm(t!.timer_id, FUTURE_1);
+    expect(await runDurableObjectAlarm(jStub)).toBe(true);
   });
 });

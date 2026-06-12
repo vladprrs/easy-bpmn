@@ -38,7 +38,13 @@ export type NodeType =
 export type EndKind = "none" | "cancel";
 
 /** Discriminator for a boundary event, by its single event definition. */
-export type BoundaryKind = "error" | "cancel" | "compensate";
+export type BoundaryKind = "error" | "cancel" | "compensate" | "timer";
+
+/** A static ISO-8601 timer trigger (M3-L3): `timeDate` instant or `timeDuration` delay. */
+export interface TimerTriggerSpec {
+  kind: "timeDate" | "timeDuration";
+  value: string;
+}
 
 /**
  * One outgoing sequence-flow edge of a node (design §4.1 multi-edge IR).
@@ -125,6 +131,8 @@ export interface GraphNode {
   errorCode?: string | null;
   /** compensate boundaryEvent only — the isForCompensation handler it associates to. */
   compensationHandlerId?: string | null;
+  /** timer boundaryEvent only — the static ISO-8601 trigger (M3-L3); fire_at is computed at arm time. */
+  timerTrigger?: TimerTriggerSpec | null;
 }
 
 /** A transaction scope: its inner start, members, ends, and compensation wiring. */

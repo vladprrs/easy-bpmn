@@ -37,6 +37,15 @@ export const jobResultEventSchema = z.discriminatedUnion("outcome", [
     kind: z.enum(["timeout", "poison"]).nullish(),
     reason: z.string(),
   }),
+  // A modeled boundary/intermediate-catch timer fired (M3-L3): the wake the
+  // Scheduler DO's fireTimer sendEvents on the guarded wait's event type. The
+  // engine re-reads the canonical timer_outcomes decider from D1 and routes the
+  // token down the timer path — `timerId` is diagnostics-only, like `retryable`.
+  z.object({
+    outcome: z.literal("timerFired"),
+    timerId: z.string(),
+    jobId: z.string().nullish(),
+  }),
 ]);
 
 export type JobResultEvent = z.infer<typeof jobResultEventSchema>;

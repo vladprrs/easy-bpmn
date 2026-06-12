@@ -5,8 +5,10 @@ operational reading of the [constitution](../../.specify/memory/constitution.md)
 the widened **Principle I — "Standard BPMN Profile Only"** covering the M2 conditional set **and the M3
 time-&-failure-taxonomy set** — interrupting boundary timers, timer/message intermediate catch events,
 the `eventBasedGateway`, and free error-boundary routing — and **Principle VI — "SAGA / Compensation
-Integrity"**). The M3 set is **accepted in v2.2.0 but opened per validator layer**: each construct stays
-rejected with the reason `M3 — not yet implemented` until its runtime ships (the interim state defined in
+Integrity"**). The M3 set is **accepted in v2.2.0 and opened per validator layer**: free error-boundary
+routing and interrupting boundary timers have **shipped (M3-L2/L3)**; the remaining constructs
+(timer/message intermediate catch, the `eventBasedGateway`) stay rejected with the reason
+`M3 — not yet implemented` until their runtime ships (the interim state defined in
 [Explicitly out of scope](#explicitly-out-of-scope-must-be-rejected-before-publish) below). When in doubt,
 the constitution wins. The
 authoritative designs are
@@ -31,8 +33,10 @@ The profile grows one milestone at a time, each guarded by a constitution amendm
 - **M3 (current) → time & failure taxonomy** (timers, per-step timeouts, error catalog):
   [`01-events.md`](./01-events.md). The M3 construct set — interrupting boundary `timerEventDefinition` on
   a `serviceTask`/`receiveTask`, timer/message `intermediateCatchEvent`, the `bpmn:eventBasedGateway`, and
-  free error-boundary routing — is **accepted in constitution v2.2.0** but **opened per validator layer**:
-  see the interim marking under [Explicitly out of scope](#explicitly-out-of-scope-must-be-rejected-before-publish).
+  free error-boundary routing — is **accepted in constitution v2.2.0** and **opened per validator layer**:
+  **interrupting boundary timers** and **free error-boundary routing** have **shipped (M3-L3/L2)**;
+  timer/message `intermediateCatchEvent` and the `bpmn:eventBasedGateway` remain interim — see the marking
+  under [Explicitly out of scope](#explicitly-out-of-scope-must-be-rejected-before-publish).
   **One M1 exception (already shipped):** a single **job-level activation TTL**
   (`service_task_jobs.activation_expires_at`, default 15 min) backs the un-leasable-job DLQ — a job
   nobody leases in time settles to a terminal incident `kind=jobActivationTimeout` via a per-job `JobScheduler`
@@ -221,6 +225,7 @@ The forward path may branch through an **`exclusiveGateway`** (XOR) and **loop b
 | **Compensation Boundary Event** | `boundaryEvent` + `compensateEventDefinition` | A **compensation marker**: it is **neither interrupting nor non-interrupting** (the `cancelActivity` axis does not apply). MUST have **zero outgoing `sequenceFlow`** and **exactly one** outgoing `<association>` to an `isForCompensation` activity **in the same transaction scope**. |
 | **Error Boundary Event** | `boundaryEvent` + `errorEventDefinition` | **Interrupting**; attached to a `serviceTask` (never a compensation handler). Routes its single outgoing flow to **any token-path node in the same scope** (M3-L2) — no longer cancel-end-only. An activity may carry **any number of boundaries with distinct, non-empty `@errorCode`s** plus **at most one catch-all** (`errorEventDefinition` with **no** `errorRef`). A coded boundary's `errorRef` MUST resolve to a declared root `<bpmn:error>` with a non-empty `@errorCode`. Matching on a worker `fail.errorCode`: **exact `@errorCode` → catch-all → uncaught Hazard** (the catch-all catches any business code, even undeclared ones). |
 | **Cancel Boundary Event** | `boundaryEvent` + `cancelEventDefinition` | **Interrupting**; attached **only to the `transaction`**; its single outgoing flow is the "saga failed" path. |
+| **Boundary Timer (M3-L3)** | `boundaryEvent` + `timerEventDefinition` | **Interrupting** (`cancelActivity` absent/`true`); attached to a `serviceTask` **or** `receiveTask` (inside or outside a transaction) — never a `transaction` (M5) or a compensation handler. **At most one** per activity. Exactly **one** static ISO-8601 trigger (`timeDate`\|`timeDuration`; `timeCycle`/FEEL/non-parsing reject). One outgoing flow to any token-path node in the same scope. On fire (a per-timer `JobScheduler` DO alarm; D1 `timers`/`timer_outcomes` are canonical) the token takes that path; the host's in-flight job is abandoned / its message subscription superseded, and a late worker callback / publish gets the stable no-op / buffered outcome. See **rule 14**. |
 | **Compensation Handler** | `serviceTask isForCompensation="true"` | A handler off the token path, reached **only** via compensation (the association from a compensation boundary). Bound by its own `easy-bpmn:taskDefinition type`. Must live inside a transaction. |
 | **Cancel End Event** | `endEvent` + `cancelEventDefinition` | Allowed **only inside a `transaction`**. Reaching it cancels the transaction → reverse-order compensation. |
 | **Association** | `association` | Compensation wiring only: a compensation boundary → its `isForCompensation` handler. |
@@ -266,7 +271,6 @@ both the amendment *and* the validator, and the gap between them is named here.
 
 | Construct | Accepted | Validator layer | Interim rejection |
 |-----------|:--------:|:---------------:|-------------------|
-| Interrupting boundary `timerEventDefinition` on `serviceTask`/`receiveTask` (static ISO-8601 `timeDate`/`timeDuration`; never on a `transaction`) | v2.2.0 | **L3** | reason `M3 — not yet implemented` |
 | `intermediateCatchEvent` + `timerEventDefinition` (token-path delay) | v2.2.0 | **L4** | reason `M3 — not yet implemented` |
 | `intermediateCatchEvent` + `messageEventDefinition` (receive-task-shaped wait; required EBG branch target, also standalone) | v2.2.0 | **L4** | reason `M3 — not yet implemented` |
 | `eventBasedGateway` (deterministic race over timer/message catch branches) | v2.2.0 | **L4** | rejected today via `DEFERRED_GATEWAY_REASONS` ("…deferred to timers & events (M3)…", `src/bpmn/profile.ts`); that pointer and `check:docs` guard 5 flip to accept at L4 |
@@ -275,6 +279,12 @@ both the amendment *and* the validator, and the gap between them is named here.
 catch-all, each targeting any token-path node in the same scope) shipped in **M3-L2 (TASK-42)** — the M1
 "error boundary must target a cancel end event" restriction is lifted; see the supported element set above
 and **rule 11**.
+
+**Shipped:** Interrupting boundary timers (`boundaryEvent` + `timerEventDefinition` on a
+`serviceTask`/`receiveTask`, static ISO-8601 `timeDate`/`timeDuration`, at most one per activity, never on a
+`transaction`) shipped in **M3-L3 (TASK-44)** — the timer fires via a per-timer `JobScheduler` DO alarm,
+claims its `timer_outcomes` decider in the same batch as the transition out of the wait, and routes the
+token down the boundary path; see the supported element set above and **rule 14**.
 
 Once a construct's layer ships, its row moves into the supported element set above and the validator
 accepts-and-validates it. Until then, a constitution-allowed construct staying rejected with the reason
@@ -287,7 +297,7 @@ These remain out of scope; each requires its own later-milestone amendment first
 | Category | Rejected elements |
 |----------|-------------------|
 | Tasks | abstract `task`, `userTask`, `sendTask`, `manualTask`, `scriptTask`, `businessRuleTask` |
-| Events | timer **start** events, `signal` / `escalation` / `conditional` / `link` event definitions; **non-interrupting** boundary timers and `timeCycle` triggers (M4); `intermediateThrowEvent`; **non-catch** message events (message throw/end); terminate end; a non-cancel end-event definition. (The M3-accepted interrupting boundary timers and timer/message intermediate **catch** events are in the interim table above, not here.) |
+| Events | timer **start** events, `signal` / `escalation` / `conditional` / `link` event definitions; **non-interrupting** boundary timers and `timeCycle` triggers (M4); `intermediateThrowEvent`; **non-catch** message events (message throw/end); terminate end; a non-cancel end-event definition. (Interrupting boundary timers are shipped — see the supported set above; the M3-accepted timer/message intermediate **catch** events are in the interim table above — not here.) |
 | Gateways | `parallelGateway` (M4 — concurrent tokens), `inclusiveGateway` (M4 — multi-branch activation), `complexGateway` (not on the roadmap), and any **implicit split (>1 outgoing sequence flow on a non-gateway node)** — pointers in lockstep with `DEFERRED_GATEWAY_REASONS` (`src/bpmn/profile.ts`). (`eventBasedGateway` is M3-accepted — see the interim table above.) |
 | Flow | `conditionExpression` on any flow **not leaving an `exclusiveGateway`**, a `default` attribute on a non-gateway node, `messageFlow`, a sequence flow crossing a transaction boundary |
 | Structure | non-transaction `subProcess`, `adHocSubProcess`, `callActivity`, `collaboration`, `participant` (pools), `laneSet`/`lane`, `choreography` |
@@ -317,7 +327,7 @@ A BPMN document is accepted for publish only if **all** hold:
    split: >1 outgoing sequence flow is allowed **only on an `exclusiveGateway`**.
 4. **Event definitions.** Start events carry **no** event definition. End events are **none** (commit) or
    a **cancel** end **only inside a `transaction`**. Boundary events carry exactly one of
-   `compensate`/`error`/`cancel` and never attach to a gateway.
+   `compensate`/`error`/`cancel`/`timer` and never attach to a gateway.
 5. **Conditions only on gateway splits, flows scoped.** A `conditionExpression` is allowed **only** on a
    flow leaving a multi-out `exclusiveGateway`; there, every **non-default** outgoing flow MUST carry one
    (FEEL; parse-checked at publish — a parse failure rejects with element id + reason), the `default`
@@ -343,6 +353,14 @@ A BPMN document is accepted for publish only if **all** hold:
     event** is attached only to the `transaction`.
 13. **Extensions tolerated, not required.** Foreign-namespace `<extensionElements>`, DI, `documentation`,
     and text annotations are accepted and ignored; the only binding `easy-bpmn` reads is its own.
+14. **Interrupting boundary timer (M3-L3).** A `boundaryEvent` + `timerEventDefinition` is **interrupting**
+    (`cancelActivity` absent or `true`; `cancelActivity="false"` rejects — M4) and attaches to a
+    `serviceTask` **or** `receiveTask` (inside or outside a transaction) — **never a `transaction`** (M5)
+    nor an `isForCompensation` handler. **At most one** timer boundary per activity. Exactly **one outgoing
+    flow** to any token-path node in the same scope (the rule 11 endpoint rules apply). The
+    `timerEventDefinition` carries exactly **one** of `timeDate`|`timeDuration` as a **static ISO-8601
+    literal that parses** — `timeCycle`, a FEEL expression, a non-parsing literal, or zero/two time
+    children each reject with element id + reason.
 
 Every rejection MUST state **what** was wrong, **which BPMN element** (by id), and **what the user can
 do** (constitution V — operator clarity).

@@ -265,6 +265,12 @@ export interface ProcessInstanceInspection extends ProcessInstance {
   openIncidents?: Incident[];
   /** Saga view — present when the instance has a transaction ledger. */
   saga?: SagaInspection | null;
+  /**
+   * Model timers (M3-L3, TASK-44): armed/fired/cancelled with fire_at/fired_at,
+   * read straight from D1 (the `timers` table). Present when the instance has any
+   * timer; Workflow internals stay hidden.
+   */
+  timers?: TimerInspection[];
 }
 
 // ---- Operator remediation verbs ----

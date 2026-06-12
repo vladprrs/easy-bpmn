@@ -1,9 +1,10 @@
 ---
 id: TASK-46
 title: 'M3-L4: Message catch + eventBasedGateway'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-11 17:19'
+updated_date: '2026-06-12 17:55'
 labels:
   - saga
   - engine
@@ -16,6 +17,27 @@ documentation:
   - docs/superpowers/specs/2026-06-11-m3-time-failure-taxonomy-design.md
   - src/persistence/gateway-decisions.ts
   - src/durable-objects/correlation-broker.ts
+modified_files:
+  - src/runtime/event-gateway.ts
+  - src/runtime/engine.ts
+  - src/runtime/timers.ts
+  - src/runtime/executor.ts
+  - src/runtime/boundary-timer.ts
+  - src/bpmn/validator.ts
+  - src/bpmn/graph.ts
+  - src/bpmn/profile.ts
+  - src/contracts/api.ts
+  - src/durable-objects/correlation-broker.ts
+  - src/runtime/broker-types.ts
+  - src/index.ts
+  - src/persistence/instances.ts
+  - scripts/check-docs.mjs
+  - docs/bpmn/09-easy-bpmn-profile.md
+  - docs/bpmn/03-gateways.md
+  - docs/bpmn/01-events.md
+  - tests/integration/event-gateway.test.ts
+  - tests/unit/bpmn-validator.test.ts
+  - tests/unit/correlation-broker.test.ts
 priority: medium
 ordinal: 29000
 ---
@@ -28,10 +50,30 @@ Design §4.5 + §3 items 3–4 (docs/superpowers/specs/2026-06-11-m3-time-failur
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 EBG races: message wins / timer wins / early-buffered message wins at registration / TWO buffered branches resolve by model-document-order tie-break; the decision is replay-stable and losing subscriptions are superseded (§7 gate 5 / exit criterion 3).
-- [ ] #2 Standalone message catch correlates and advances like a receiveTask, in publish-before and publish-after orders (§7 gate 9).
-- [ ] #3 A losing fireTimer aborts on the gateway_decisions conflict and converts; a losing message delivery does the same — both orders tested via runDurableObjectAlarm in direct mode.
-- [ ] #4 Validator accept/reject matrix for every EBG rule (targets, extra incoming flows, second timer branch, duplicate messages, instantiate, Parallel type) with element id + reason.
-- [ ] #5 Broker unit tests: supersede, buffered claims, at-most-one-active-subscription preserved; delivery honors the stored workflow_event_type (receive-task path regression green).
-- [ ] #6 check:docs guard 5 and DEFERRED_GATEWAY_REASONS flipped together; docs/bpmn/09 markings flipped; check:docs green.
+- [x] #1 EBG races: message wins / timer wins / early-buffered message wins at registration / TWO buffered branches resolve by model-document-order tie-break; the decision is replay-stable and losing subscriptions are superseded (§7 gate 5 / exit criterion 3).
+- [x] #2 Standalone message catch correlates and advances like a receiveTask, in publish-before and publish-after orders (§7 gate 9).
+- [x] #3 A losing fireTimer aborts on the gateway_decisions conflict and converts; a losing message delivery does the same — both orders tested via runDurableObjectAlarm in direct mode.
+- [x] #4 Validator accept/reject matrix for every EBG rule (targets, extra incoming flows, second timer branch, duplicate messages, instantiate, Parallel type) with element id + reason.
+- [x] #5 Broker unit tests: supersede, buffered claims, at-most-one-active-subscription preserved; delivery honors the stored workflow_event_type (receive-task path regression green).
+- [x] #6 check:docs guard 5 and DEFERRED_GATEWAY_REASONS flipped together; docs/bpmn/09 markings flipped; check:docs green.
 <!-- AC:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+M3-L4 complete: standalone message intermediate catch (46a, commit 8f7dc36/bcb0373) + eventBasedGateway (46b).
+
+**eventBasedGateway runtime** (`src/runtime/event-gateway.ts`, ~660 lines): a deterministic timer/message race deciding on a single `gateway_decisions` row claimed by a PLAIN INSERT in the same dbBatch as the transition (the M2 decider contract — but with TWO genuine concurrent writers: broker message-apply vs `fireTimer`, so the loser's batch aborts wholesale and converts). Token arrival registers every message branch + arms the timer branch in one atomic park batch (keyed by the GATEWAY's visit occurrence), then best-effort broker registration; early-buffered messages win at registration in model-document-order tie-break. Message-wins consumes the winner + supersedes losers + cancels the timer (bookkeeping flip, NO `timer_outcomes` — `gateway_decisions` is the EBG timer's sole decider); timer-wins supersedes ALL message branches. The winner advances straight to the catch's single outgoing flow (the catch is never re-dispatched). Wired into `engine.ts` dispatch and `timers.ts` `fireTimer`; a Workflow-mode lost-alarm backstop mirrors the catch path.
+
+**Delivery path** (§4.5/R3): `executor.deliver` + the broker correlated result now honor the subscription's STORED `workflow_event_type`, so an EBG's per-visit gateway type wakes one `waitForEvent` for any branch. Byte-identical for the receiveTask/standalone-catch path (regression-green).
+
+**Validator**: full EBG accept/reject matrix — ≥2 branches, every target a single-incoming intermediate catch (timer/message), ≤1 timer branch, distinct messages, `instantiate`/`Parallel` rejected; `next:null` IR; exempt from the implicit-split rule.
+
+**Governance lockstep**: `check:docs` guard 5 dropped the EBG→M3 deferred-pointer requirement together with its removal from `DEFERRED_GATEWAY_REASONS`; docs/bpmn/09 moves EBG into the supported set (+rule 17) and retires the M3 interim section; 03-gateways.md / 01-events.md flipped to "shipped".
+
+**Review**: two-stage adversarial review (spec-compliance + code-quality). Fixed: B1 (early-buffered apply split into its own memoized step so a Workflow-mode crash between broker-consume and decision-commit replays the captured event — the receive-task recv→msg pattern); operator-/cancel sweep no longer writes a `timer_outcomes` row for EBG timers; park-batch UNIQUE guard (S1); rewalk no longer re-opens a resolved branch (S2); decision fast-forward drops a pending message for the decided gateway (S3).
+
+Tests: 9 EBG integration scenarios (message-wins, timer-wins, loser-fireTimer no-op, loser-message superseded, early-buffered, two-buffered document-order tie-break, operator-/cancel settlement, rewalk fast-forward) + the §4.5 stored-type assertion; 11 validator matrix unit tests; 1 broker unit test (stored type on correlate). Full suite 359 green; typecheck / check:docs / wrangler dry-run clean.
+
+Commits: e7405f9 (validator) → runtime → docs → operator-cancel test → review fixes (on branch m3-time-failure-taxonomy).
+<!-- SECTION:FINAL_SUMMARY:END -->

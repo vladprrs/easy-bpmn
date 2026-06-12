@@ -138,13 +138,13 @@ rejected before publish with a user-visible reason.
 handler, an error boundary, and a cancel boundary on the `transaction`). The blanket "boundary events are
 out of scope" claim held only for the original linear MVP.
 
-**M3 — time & failure taxonomy (accepted in constitution v2.2.0, opened per validator layer).** The M3
-amendment adds, as drawn standard BPMN: an **interrupting boundary `timerEventDefinition`** on a
-`serviceTask`/`receiveTask`, a **timer or message `intermediateCatchEvent`** on the token path, the
-**`eventBasedGateway`** (a deterministic race over its catch-event branches), and **free error-boundary
-routing**. Timer triggers are static ISO-8601 `timeDate`/`timeDuration` literals only. These are
-**accepted**, but each stays rejected with the reason `M3 — not yet implemented` until its validator layer
-ships — the interim state documented in [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
+**M3 — time & failure taxonomy (accepted in constitution v2.2.0, opened per validator layer — now
+shipped).** The M3 amendment adds, as drawn standard BPMN: an **interrupting boundary
+`timerEventDefinition`** on a `serviceTask`/`receiveTask`, a **timer or message `intermediateCatchEvent`**
+on the token path, the **`eventBasedGateway`** (a deterministic race over its catch-event branches), and
+**free error-boundary routing**. Timer triggers are static ISO-8601 `timeDate`/`timeDuration` literals
+only. The whole set has now **shipped (M3-L2/L3/L4)** and the validator accepts-and-validates each — see
+[`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
 
 **Still out of scope** (each needs a future amendment): timer **start** events (instances start via API);
 **non-interrupting** boundary timers and `timeCycle` (M4); `signal`/`escalation`/`conditional` events and

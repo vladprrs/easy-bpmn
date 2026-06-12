@@ -147,6 +147,9 @@ if (!/Cloudflare Workflow per process instance/i.test(profileText)) {
 
 // 5) The gateway reference names the M2 constructs/incidents and keeps the
 //    deferred-gateway milestone pointers (emphasis-stripped, same-line).
+//    parallel/inclusive stay M4-deferred; eventBasedGateway is IN since M3-L4
+//    (TASK-46) — its DEFERRED_GATEWAY_REASONS pointer (src/bpmn/profile.ts) and
+//    this guard entry flipped together when the EBG runtime shipped (design §8).
 const gatewaysText = readFileSync(gateways, "utf8");
 for (const needle of ["exclusiveGateway", "noPath", "loopLimit"]) {
   if (!gatewaysText.includes(needle)) {
@@ -157,7 +160,6 @@ const gatewayLines = gatewaysText.split("\n").map(stripEmphasis);
 for (const [gateway, milestone] of [
   ["parallelGateway", "M4"],
   ["inclusiveGateway", "M4"],
-  ["eventBasedGateway", "M3"],
 ]) {
   const pointer = gatewayLines.some(
     (l) => l.includes(gateway) && new RegExp(`\\b${milestone}\\b`).test(l),

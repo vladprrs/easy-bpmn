@@ -5,12 +5,10 @@ operational reading of the [constitution](../../.specify/memory/constitution.md)
 the widened **Principle I — "Standard BPMN Profile Only"** covering the M2 conditional set **and the M3
 time-&-failure-taxonomy set** — interrupting boundary timers, timer/message intermediate catch events,
 the `eventBasedGateway`, and free error-boundary routing — and **Principle VI — "SAGA / Compensation
-Integrity"**). The M3 set is **accepted in v2.2.0 and opened per validator layer**: free error-boundary
-routing, interrupting boundary timers, and **both** the **timer** and the **message** intermediate catch
-have **shipped (M3-L2/L3/L4)**; the only remaining construct, the `eventBasedGateway`, stays rejected with
-the reason `M3 — not yet implemented` until its runtime ships (the interim state defined in
-[Explicitly out of scope](#explicitly-out-of-scope-must-be-rejected-before-publish) below). When in doubt,
-the constitution wins. The
+Integrity"**). The M3 set was **accepted in v2.2.0 and opened per validator layer**, and the whole set has
+now **shipped (M3-L2/L3/L4)**: free error-boundary routing, interrupting boundary timers, **both** the
+**timer** and the **message** intermediate catch, and the `eventBasedGateway` (the timer/message race).
+When in doubt, the constitution wins. The
 authoritative designs are
 [`2026-06-08-saga-orchestrator-design.md`](../superpowers/specs/2026-06-08-saga-orchestrator-design.md)
 (M1) and
@@ -33,11 +31,10 @@ The profile grows one milestone at a time, each guarded by a constitution amendm
 - **M3 (current) → time & failure taxonomy** (timers, per-step timeouts, error catalog):
   [`01-events.md`](./01-events.md). The M3 construct set — interrupting boundary `timerEventDefinition` on
   a `serviceTask`/`receiveTask`, timer/message `intermediateCatchEvent`, the `bpmn:eventBasedGateway`, and
-  free error-boundary routing — is **accepted in constitution v2.2.0** and **opened per validator layer**:
-  **interrupting boundary timers**, **free error-boundary routing**, and **both** the **timer** and the
-  **message** `intermediateCatchEvent` have **shipped (M3-L3/L2/L4)**; only the
-  `bpmn:eventBasedGateway` remains interim — see the marking
-  under [Explicitly out of scope](#explicitly-out-of-scope-must-be-rejected-before-publish).
+  free error-boundary routing — is **accepted in constitution v2.2.0** and was **opened per validator
+  layer**; the whole set has now **shipped (M3-L2/L3/L4)**: **interrupting boundary timers**, **free
+  error-boundary routing**, **both** the **timer** and the **message** `intermediateCatchEvent`, and the
+  `bpmn:eventBasedGateway` (the timer/message race decided on a single `gateway_decisions` row — TASK-46).
   **One M1 exception (already shipped):** a single **job-level activation TTL**
   (`service_task_jobs.activation_expires_at`, default 15 min) backs the un-leasable-job DLQ — a job
   nobody leases in time settles to a terminal incident `kind=jobActivationTimeout` via a per-job `JobScheduler`
@@ -229,6 +226,7 @@ The forward path may branch through an **`exclusiveGateway`** (XOR) and **loop b
 | **Boundary Timer (M3-L3)** | `boundaryEvent` + `timerEventDefinition` | **Interrupting** (`cancelActivity` absent/`true`); attached to a `serviceTask` **or** `receiveTask` (inside or outside a transaction) — never a `transaction` (M5) or a compensation handler. **At most one** per activity. Exactly **one** static ISO-8601 trigger (`timeDate`\|`timeDuration`; `timeCycle`/FEEL/non-parsing reject). One outgoing flow to any token-path node in the same scope. On fire (a per-timer `JobScheduler` DO alarm; D1 `timers`/`timer_outcomes` are canonical) the token takes that path; the host's in-flight job is abandoned / its message subscription superseded, and a late worker callback / publish gets the stable no-op / buffered outcome. See **rule 14**. |
 | **Timer Intermediate Catch (M3-L4)** | `intermediateCatchEvent` + `timerEventDefinition` | A **delay step on the token path** — the catch IS the wait. Exactly **one incoming** and **one outgoing** sequence flow (a single-token delay, not a join). Allowed at process level **and inside a `transaction`** (the saga scope stays open across the delay). Exactly **one** static ISO-8601 trigger (`timeDate`\|`timeDuration`; `timeCycle`/FEEL/non-parsing reject — same well-formedness as a boundary timer). On fire (a per-timer `JobScheduler` DO alarm; D1 `timers`/`timer_outcomes` canonical) the token advances down the single outgoing flow; there is **no** host job/subscription to abandon. See **rule 15**. |
 | **Message Intermediate Catch (M3-L4)** | `intermediateCatchEvent` + `messageEventDefinition` | A **correlation wait on the token path** with **identical** wait/correlation/resume semantics to a `receiveTask` (the **same** subscription/broker machinery; the `<message>` carries only its name; the correlation key is supplied via the **API** at instance start). Exactly **one incoming** and **one outgoing** sequence flow (a single-token wait, not a join). Allowed at process level **and inside a `transaction`** (the saga scope stays open across the wait). It is an **event, not an activity**: **no** `easy-bpmn:taskDefinition`, and **no** boundary events attach. Early/buffered messages are claimed at registration; a correlated message's payload is applied **atomically** with the transition out of the wait; a duplicate publish returns the stable prior outcome (never double-advances). See **rule 16**. |
+| **Event-Based Gateway (M3-L4)** | `eventBasedGateway` | A **deterministic race** over its branch catches. **≥2 outgoing flows**, every target an `intermediateCatchEvent` (timer or message) whose **only** incoming flow is from this gateway; **≤1 timer branch**; message branches reference **distinct** messages; `instantiate="true"` and `eventGatewayType="Parallel"` reject. Token arrival registers every message branch + arms the timer branch, then parks; whichever event resolves **first wins** (early/buffered messages win at registration, document-order tie-break). The race decides on a **single `gateway_decisions` row** claimed by a plain INSERT in the same batch as the transition — two concurrent writers (broker message-apply vs `fireTimer`), so the loser converts. The winner advances straight to the catch's single outgoing flow (the catch is never re-dispatched). See **rule 17**. |
 | **Compensation Handler** | `serviceTask isForCompensation="true"` | A handler off the token path, reached **only** via compensation (the association from a compensation boundary). Bound by its own `easy-bpmn:taskDefinition type`. Must live inside a transaction. |
 | **Cancel End Event** | `endEvent` + `cancelEventDefinition` | Allowed **only inside a `transaction`**. Reaching it cancels the transaction → reverse-order compensation. |
 | **Association** | `association` | Compensation wiring only: a compensation boundary → its `isForCompensation` handler. |
@@ -262,19 +260,20 @@ with `xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"` on `<definitions>`. Notes:
 
 ## Explicitly out of scope (must be rejected before publish)
 
-### Accepted in v2.2.0, opened per validator layer (the M3 interim state)
+### Accepted in v2.2.0, opened per validator layer — now fully shipped
 
-The M3 time-&-failure-taxonomy set is **accepted by the constitution (Principle I, v2.2.0)**, but its
-runtime ships in layers. Each construct below is therefore **still rejected before publish**, with a
-user-visible reason, **until its layer ships** — accepted-in-governance, staged-in-runtime. The
-[M3 design](../superpowers/specs/2026-06-11-m3-time-failure-taxonomy-design.md) (§3, §8, §10) and the
+The M3 time-&-failure-taxonomy set was **accepted by the constitution (Principle I, v2.2.0)** and its
+runtime opened in layers (accepted-in-governance, staged-in-runtime). **The whole set has now shipped** —
+the last construct, the `eventBasedGateway`, landed in **M3-L4 (TASK-46)**; its
+`DEFERRED_GATEWAY_REASONS` pointer and `check:docs` guard 5 flipped together at that point. The
+[M3 design](../superpowers/specs/2026-06-11-m3-time-failure-taxonomy-design.md) (§3, §4.5, §8, §10) and the
 recorded [M3 Constitution Check](../../specs/002-saga-orchestrator/m3-constitution-check.md) are the
-source artifacts. This is the documented interim state, **not drift**: this file stays in lockstep with
-both the amendment *and* the validator, and the gap between them is named here.
+source artifacts. No M3 construct remains in the interim (rejected-until-its-layer-ships) state.
 
-| Construct | Accepted | Validator layer | Interim rejection |
-|-----------|:--------:|:---------------:|-------------------|
-| `eventBasedGateway` (deterministic race over timer/message catch branches) | v2.2.0 | **L4 (EBG follow-up)** | rejected today via `DEFERRED_GATEWAY_REASONS` ("…deferred to timers & events (M3)…", `src/bpmn/profile.ts`); that pointer and `check:docs` guard 5 flip to accept when EBG ships |
+**Shipped:** The `eventBasedGateway` (a deterministic race over timer/message branch catches, deciding on a
+single `gateway_decisions` row claimed by a plain INSERT in the transition batch) shipped in **M3-L4
+(TASK-46)** — ≥2 branches, every target a single-incoming intermediate catch, ≤1 timer branch, distinct
+messages; `instantiate`/`Parallel` reject. See the supported element set above and **rule 17**.
 
 **Shipped:** Free error-boundary routing (any number of distinct-`@errorCode` interrupting boundaries + ≤1
 catch-all, each targeting any token-path node in the same scope) shipped in **M3-L2 (TASK-42)** — the M1
@@ -299,12 +298,10 @@ a correlation wait on the token path with **identical** semantics to a `receiveT
 subscription/correlation/broker machinery (it reuses `registerReceive`/`applyMessage`, not a parallel copy).
 It correlates in both publish orders (early/buffered claimed at registration; later message correlated against
 the active subscription), applies the payload atomically with the transition out of the wait, and dedups
-duplicate publishes. See the supported element set above and **rule 16**. The `eventBasedGateway` remains
-interim (above).
+duplicate publishes. See the supported element set above and **rule 16**.
 
-Once a construct's layer ships, its row moves into the supported element set above and the validator
-accepts-and-validates it. Until then, a constitution-allowed construct staying rejected with the reason
-above is **documented behavior**, not a profile bug.
+Every M3 construct's row has moved into the supported element set above and the validator
+accepts-and-validates it. No construct remains in the interim (rejected-until-its-layer-ships) state.
 
 ### Still deferred (need a future constitution amendment)
 
@@ -314,7 +311,7 @@ These remain out of scope; each requires its own later-milestone amendment first
 |----------|-------------------|
 | Tasks | abstract `task`, `userTask`, `sendTask`, `manualTask`, `scriptTask`, `businessRuleTask` |
 | Events | timer **start** events, `signal` / `escalation` / `conditional` / `link` event definitions; **non-interrupting** boundary timers and `timeCycle` triggers (M4); `intermediateThrowEvent`; **non-catch** message events (message throw/end); terminate end; a non-cancel end-event definition. (Interrupting boundary timers **and both the timer and the message intermediate catch** are shipped — see the supported set above; not here.) |
-| Gateways | `parallelGateway` (M4 — concurrent tokens), `inclusiveGateway` (M4 — multi-branch activation), `complexGateway` (not on the roadmap), and any **implicit split (>1 outgoing sequence flow on a non-gateway node)** — pointers in lockstep with `DEFERRED_GATEWAY_REASONS` (`src/bpmn/profile.ts`). (`eventBasedGateway` is M3-accepted — see the interim table above.) |
+| Gateways | `parallelGateway` (M4 — concurrent tokens), `inclusiveGateway` (M4 — multi-branch activation), `complexGateway` (not on the roadmap), and any **implicit split (>1 outgoing sequence flow on a non-gateway node)** — pointers in lockstep with `DEFERRED_GATEWAY_REASONS` (`src/bpmn/profile.ts`). (`eventBasedGateway` is M3-accepted and **shipped at L4** — see the supported set above.) |
 | Flow | `conditionExpression` on any flow **not leaving an `exclusiveGateway`**, a `default` attribute on a non-gateway node, `messageFlow`, a sequence flow crossing a transaction boundary |
 | Structure | non-transaction `subProcess`, `adHocSubProcess`, `callActivity`, `collaboration`, `participant` (pools), `laneSet`/`lane`, `choreography` |
 | Loops/data | `multiInstanceLoopCharacteristics`, `standardLoopCharacteristics` (the activity **markers** — distinct from the accepted M2 cycles drawn as sequence flows through a gateway), `dataObject`/`dataStore`/`dataInput`/`dataOutput` |
@@ -390,8 +387,16 @@ A BPMN document is accepted for publish only if **all** hold:
     level **and inside a `transaction`**. It is an **event, not an activity**: an `easy-bpmn:taskDefinition`
     on it rejects (events route no worker), and **no boundary events attach** (a boundary on a catch rejects
     with element id + reason). Its `messageEventDefinition` MUST carry a `messageRef` resolving to a declared
-    root `<bpmn:message>` with a non-empty `@name` (a missing/unresolved/empty-name ref rejects). The
-    `eventBasedGateway` stays rejected with reason `M3 — not yet implemented` until its layer ships.
+    root `<bpmn:message>` with a non-empty `@name` (a missing/unresolved/empty-name ref rejects).
+17. **Event-based gateway (M3-L4).** An `eventBasedGateway` races its branch catches and decides on a single
+    `gateway_decisions` row. It needs **≥2 outgoing flows**, every target an `intermediateCatchEvent` (timer
+    or message) whose **only** incoming flow is the one from this gateway; **at most one timer branch**;
+    message branches reference **distinct** messages (two on one message collapse to a single broker key);
+    `instantiate="true"` and `eventGatewayType="Parallel"` reject (each with element id + reason). Like an
+    `exclusiveGateway` it carries `next: null` (branch selection owns the successor) and no `default` /
+    conditions on its outgoing flows. At runtime the winning event (message correlation or timer fire) claims
+    the decision row by a plain INSERT in the same batch as the transition — the loser's batch aborts and
+    converts — and the token advances down the winning catch's single outgoing flow.
 
 Every rejection MUST state **what** was wrong, **which BPMN element** (by id), and **what the user can
 do** (constitution V — operator clarity).
@@ -468,9 +473,9 @@ expression — each with the offending element id.
 
 **Roadmap (per-milestone target semantics):**
 - **M2 — conditional sagas: SHIPPED** (constitution v2.1.0; this profile + [`03-gateways.md`](./03-gateways.md)).
-- **M3 — time & failure taxonomy: ACCEPTED (constitution v2.2.0), opening per validator layer** —
-  interrupting boundary timers, timer/message intermediate catch, `eventBasedGateway`, free error routing,
-  per-step timeouts, error catalog (interim markings above). [`01-events.md`](./01-events.md).
+- **M3 — time & failure taxonomy: SHIPPED** (constitution v2.2.0; opened per validator layer, now complete) —
+  interrupting boundary timers, timer/message intermediate catch, `eventBasedGateway` (the timer/message
+  race), free error routing, per-step timeouts, error catalog. [`01-events.md`](./01-events.md).
 - **M4 — concurrency:** `parallelGateway`, token set, AND-join, parallel-branch compensation.
   [`07-execution-semantics.md`](./07-execution-semantics.md).
 - **M5 — composition:** `callActivity`, non-transaction `subProcess`, `multiInstance`, `signal`/`escalation`.
@@ -479,7 +484,7 @@ expression — each with the offending element id.
 > Any expansion of this profile requires amending the constitution first (Governance & scope). This file
 > is updated in lockstep with that amendment **and** with the `src/bpmn/validator.ts` accept/reject
 > behavior. When the two legitimately disagree — a construct **accepted** by a constitution amendment whose
-> validator runtime ships in a later layer (the M3 interim state) — that gap is **named explicitly** in the
+> validator runtime ships in a later layer — that gap is **named explicitly** in the
 > [Accepted in v2.2.0, opened per validator layer](#explicitly-out-of-scope-must-be-rejected-before-publish)
-> table, so a constitution-allowed construct rejected with `M3 — not yet implemented` until its layer ships
-> is documented behavior, not drift.
+> section, so a constitution-allowed construct rejected until its layer ships is documented behavior, not
+> drift. The full M3 set has now shipped, so no such gap currently exists.

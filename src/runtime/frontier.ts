@@ -186,9 +186,18 @@ export async function driveFrontier(
       // ---- SPLIT (this node is a region's split; reached on the parent token) ----
       const region = graph.regions?.[cur];
       if (region && isGatewayType(node.type)) {
-        const activated = await resolveActivatedFlows(env, graph, instanceId, region, cur, occ);
+        // OR split (design §6): resolve the activated subset + the decision record
+        // it must commit; a noPath / conditionFailure bails the branch (no token
+        // silently dropped). AND returns all branchFlowIds with no record.
+        const { activated, recordStmts, incident: splitIncident } = await resolveActivatedFlows(env, graph, instanceId, region, cur, occ, tokenId);
+        if (splitIncident) {
+          incident = true;
+          return;
+        }
         if (!(await splitAlreadyFannedOut(env, instanceId, cur, occ, activated))) {
-          await fanOutSplit(env, instanceId, graph, region, cur, occ, tokenId, activated);
+          // The OR activation record (recordStmts) commits in the SAME batch as the
+          // branch tokens (shared fan-out claim); empty for AND / an OR rewalk.
+          await fanOutSplit(env, instanceId, graph, region, cur, occ, tokenId, activated, recordStmts);
           advanced = true;
         }
         for (const flowId of activated) {

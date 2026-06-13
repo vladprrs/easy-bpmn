@@ -78,6 +78,12 @@ const SAMPLE_WORKERS: Record<string, SampleWorker> = {
     req.variables.shippingFails === true
       ? { status: "failed", reason: "carrier rejected the shipment", errorCode: "SHIPPING_REJECTED" }
       : { status: "completed", outputVariables: { shipmentId: `shp-${req.instanceId.slice(-6)}` } },
+
+  // --- M4 inclusiveGateway (OR) branch workers — trivial completers used by the
+  // INCLUSIVE_BPMN notification fan-out fixture (send the subset whose conditions hold).
+  "send-email": () => ({ status: "completed", outputVariables: { emailed: true } }),
+  "send-sms": () => ({ status: "completed", outputVariables: { smsed: true } }),
+  "log-only": () => ({ status: "completed", outputVariables: { logged: true } }),
 };
 
 export function hasSampleWorker(taskType: string): boolean {

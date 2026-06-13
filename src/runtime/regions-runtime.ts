@@ -6,11 +6,11 @@
 
 import type { Env } from "../env";
 import type { ExecutionGraph, RegionInfo } from "../bpmn/graph";
-import { mergeVariables, nowIso, parseJson, type JsonObject } from "../util";
+import { mergeVariables, newId, nowIso, parseJson, type JsonObject } from "../util";
 import { dbBatch } from "../persistence/db";
 import { historyStmt } from "../persistence/history";
 import { applyTransitionStmt } from "../persistence/instances";
-import { getGatewayDecision } from "../persistence/gateway-decisions";
+import { getGatewayDecision, insertGatewayDecisionStmt, type GatewayFlowEvaluation } from "../persistence/gateway-decisions";
 import {
   branchTokenId,
   foldTokenOverlayStmt,
@@ -26,6 +26,10 @@ import {
   upsertTokenStmt,
 } from "../persistence/tokens";
 import { loadInst } from "./engine-shared";
+import { evaluateCondition, normalizeFeelValue, ExpressionEvaluationError } from "./expressions";
+import { createIncident } from "./incidents";
+import { resolveScope } from "./frontier";
+import { MAX_EVENT_PAYLOAD_BYTES, payloadByteSize } from "./payload";
 
 /**
  * Deterministic merge (design §5.7): start from the parent overlay, then for each
@@ -49,28 +53,128 @@ export function mergeBranchOverlays(
   return merged;
 }
 
-/**
- * The branch flows ACTIVATED at a split. AND (design §5.4): always all the
- * region's out-flows (the static `branchFlowIds`). OR (L4): the recorded
- * `gateway_decisions.activated_flow_ids` subset — not yet implemented here, so an
- * OR region throws until L4 fills it in.
- */
-export async function resolveActivatedFlows(env: Env, _graph: ExecutionGraph, instanceId: string, region: RegionInfo, splitId: string, occ: number): Promise<string[]> {
-  if (region.type === "and") return region.branchFlowIds;
-  // OR — recorded activation subset (M4-L4). For L3 (AND-only) this is unreachable.
-  const recorded = await getGatewayDecision(env.DB, instanceId, splitId, occ);
-  if (recorded) return recorded.evaluations.length ? region.branchFlowIds.filter((f) => recorded.chosenFlowId === f || recorded.evaluations.some((e) => e.flowId === f && e.result)) : [recorded.chosenFlowId];
-  throw new Error(`inclusiveGateway split '${splitId}' activation is M4-L4 work (OR not yet runtime-enabled).`);
+/** The branch flows activated at a split + the statements that RECORD that decision. */
+export interface ActivationResult {
+  /** The activated out-flows in document order (AND = all branchFlowIds; OR = the true/default subset). */
+  activated: string[];
+  /**
+   * The plain INSERT of the `gateway_decisions` activation row (OR split, first
+   * visit) — composed into the SAME fan-out batch so the activation record +
+   * branch tokens commit atomically (sharing the fan-out's race claim). Empty
+   * for AND, and for an OR rewalk that reused a recorded decision.
+   */
+  recordStmts: D1PreparedStatement[];
+  /** True when the split bailed into a terminal incident (noPath / conditionFailure); the branch must not fan out. */
+  incident?: boolean;
 }
 
 /**
- * The branch flows REQUIRED at the join. AND: all `branchFlowIds`. OR (L4): the
- * recorded activated subset (origin-branch keyed, design §6). For L3 (AND) this
- * is the full set.
+ * The branch flows ACTIVATED at a split (design §6.1).
+ *
+ * AND (design §5.4): always all the region's out-flows (the static
+ * `branchFlowIds`); nothing recorded.
+ *
+ * OR (L4): if a `gateway_decisions` row already exists for `(instance, split,
+ * occurrence)`, its recorded `activatedFlowIds` is reused VERBATIM — conditions
+ * are never re-evaluated even if variables changed (the exact `exclusiveGateway`
+ * contract). Otherwise each non-default out-flow's FEEL condition is evaluated in
+ * DOCUMENT order against the token-resolved scope; the true set is the
+ * activation, falling back to the gateway's `default` when the true set is empty.
+ * No condition true and no default → terminal `noPath` (an inclusive split never
+ * silently drops its token); a hard FEEL failure → terminal `conditionFailure`.
+ * The recorded decision is returned as `recordStmts` for atomic commit inside the
+ * fan-out batch — never written here (so a losing concurrent fan-out aborts
+ * wholesale on the shared claim and re-reads).
  */
-export async function requiredFlowsFor(env: Env, graph: ExecutionGraph, instanceId: string, region: RegionInfo, splitOccurrence: number): Promise<string[]> {
+export async function resolveActivatedFlows(env: Env, graph: ExecutionGraph, instanceId: string, region: RegionInfo, splitId: string, occ: number, activeTokenId: string): Promise<ActivationResult> {
+  if (region.type === "and") return { activated: region.branchFlowIds, recordStmts: [] };
+
+  // Rewalk fast-forward (design §6.1): reuse the recorded subset, never re-evaluate.
+  const recorded = await getGatewayDecision(env.DB, instanceId, splitId, occ);
+  if (recorded?.activatedFlowIds) return { activated: recorded.activatedFlowIds, recordStmts: [] };
+
+  const node = graph.nodes[splitId]!;
+  const inst = await loadInst(env, instanceId);
+  // Branch-scoped reads (design §5.7): evaluate against the active token's resolved
+  // overlay chain (root token ⇒ root variables verbatim).
+  const scope = await resolveScope(env, instanceId, parseJson<JsonObject>(inst.variables, {}), activeTokenId);
+  const activated: string[] = [];
+  const evaluations: GatewayFlowEvaluation[] = [];
+  let defaultFlowId: string | null = null;
+  for (const f of node.outgoing) {
+    if (f.isDefault) {
+      defaultFlowId = f.flowId; // the no-match fallback, never evaluated
+      continue;
+    }
+    const expr = f.conditionExpression;
+    if (expr == null) {
+      // Unreachable by construction: the publish gate requires a condition on
+      // every non-default flow of an inclusive split, and versions are immutable.
+      throw new Error(`Invariant violation: non-default flow '${f.flowId}' of inclusiveGateway '${splitId}' carries no condition expression.`);
+    }
+    let evaluation;
+    try {
+      evaluation = evaluateCondition(expr, scope);
+    } catch (err) {
+      if (err instanceof ExpressionEvaluationError) {
+        await createIncident(env, instanceId, splitId, 0, `inclusiveGateway '${splitId}' condition on flow '${f.flowId}' failed to evaluate: ${err.message}`, { flowId: f.flowId, expression: expr, occurrence: occ }, "conditionFailure");
+        return { activated: [], recordStmts: [], incident: true };
+      }
+      throw err;
+    }
+    evaluations.push({
+      flowId: f.flowId,
+      expression: expr,
+      result: evaluation.taken,
+      value: normalizeFeelValue(evaluation.value),
+      ...(evaluation.warnings.length > 0 ? { warnings: evaluation.warnings } : {}),
+    });
+    if (evaluation.taken) activated.push(f.flowId); // OR: every true flow activates (no short-circuit)
+  }
+  if (activated.length === 0 && defaultFlowId) activated.push(defaultFlowId);
+  if (activated.length === 0) {
+    // noPath — terminal incident (Hazard inside a transaction): an inclusive
+    // split with no true branch and no default never silently drops its token.
+    await createIncident(env, instanceId, splitId, 0, `inclusiveGateway '${splitId}' activated no branch and has no default flow.`, { occurrence: occ, evaluations: evaluations.map((e) => ({ ...e })) }, "noPath");
+    return { activated: [], recordStmts: [], incident: true };
+  }
+
+  // Record the RESOLVED evaluation scope for audit (design §5.7 — a gateway
+  // evaluated inside a branch records its resolved snapshot), size-capped by the
+  // payload limit exactly like the XOR path (engine.ts): an oversized context is
+  // omitted (null) rather than erroring. The fast-forward predicate is
+  // `activatedFlowIds` + `evaluations`, never the snapshot, so the cap is safe.
+  const snapshotFits = payloadByteSize(scope) <= MAX_EVENT_PAYLOAD_BYTES;
+  const recordStmts = [
+    insertGatewayDecisionStmt(env.DB, {
+      decisionId: newId("gwd"),
+      instanceId,
+      elementId: splitId,
+      occurrence: occ,
+      // chosen_flow_id holds the document-order-first activated flow as a sentinel (design §6.2).
+      chosenFlowId: activated[0]!,
+      isDefault: activated.length === 1 && activated[0] === defaultFlowId,
+      evaluations,
+      variablesSnapshot: snapshotFits ? scope : null,
+      activatedFlowIds: activated,
+      now: nowIso(),
+    }),
+  ];
+  return { activated, recordStmts };
+}
+
+/**
+ * The branch flows REQUIRED at the join (design §6.3). AND: all `branchFlowIds`.
+ * OR: the recorded activated subset, keyed by origin branch — the
+ * `gateway_decisions.activatedFlowIds` filtered to (and ordered by) the region's
+ * stored `branchFlowIds` document order. Read directly from the recorded decision
+ * so it never re-evaluates conditions (and never re-creates an incident).
+ */
+export async function requiredFlowsFor(env: Env, _graph: ExecutionGraph, instanceId: string, region: RegionInfo, activation: number): Promise<string[]> {
   if (region.type === "and") return region.branchFlowIds;
-  return resolveActivatedFlows(env, graph, instanceId, region, region.splitId, splitOccurrence);
+  const dec = await getGatewayDecision(env.DB, instanceId, region.splitId, activation);
+  const set = new Set(dec?.activatedFlowIds ?? []);
+  return region.branchFlowIds.filter((f) => set.has(f));
 }
 
 /**
@@ -80,12 +184,17 @@ export async function requiredFlowsFor(env: Env, graph: ExecutionGraph, instance
  * concurrent fan-out aborts wholesale on the PK and re-reads. `region_activation`
  * = the split's walk-local occurrence (`activation`). Branch tokens start with an
  * empty overlay (a delta over the parent scope).
+ *
+ * `extraStmts` (M4-L4) carries the OR split's `gateway_decisions` activation
+ * record, composed into THIS batch so the activation record + the branch tokens
+ * commit atomically and share the fan-out's plain-INSERT race claim. Empty for AND.
  */
-export async function fanOutSplit(env: Env, instanceId: string, graph: ExecutionGraph, region: RegionInfo, splitId: string, activation: number, parentTokenId: string, activatedFlowIds: string[]): Promise<void> {
+export async function fanOutSplit(env: Env, instanceId: string, graph: ExecutionGraph, region: RegionInfo, splitId: string, activation: number, parentTokenId: string, activatedFlowIds: string[], extraStmts: D1PreparedStatement[] = []): Promise<void> {
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
   const splitNode = graph.nodes[splitId]!;
   const stmts: D1PreparedStatement[] = [
+    ...extraStmts,
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: splitId, type: "regionActivated", diagnostics: { splitId, type: region.type, activation, activatedFlowIds } }),
   ];
   for (const flowId of activatedFlowIds) {
@@ -117,7 +226,23 @@ export async function recordJoinArrival(env: Env, instanceId: string, joinId: st
   ]);
 }
 
-/** Are all required branches present for this join activation? AND = all branchFlowIds; OR = the recorded activated subset (passed in). */
+/**
+ * Are all required branches present for this join activation? AND = all
+ * branchFlowIds; OR = the recorded activated subset (passed in).
+ *
+ * Empty-subset note (design §6.4 / L4.3): `[].every(...) === true`, so an empty
+ * required set would satisfy the barrier immediately. This is unreachable by
+ * construction. A `default` is OPTIONAL on an inclusive split (the L1 validator
+ * only requires a condition on each NON-default out-flow). Zero activation —
+ * no true condition and no default (`noPath`), or a hard FEEL error
+ * (`conditionFailure`) — raises a TERMINAL incident and bails with `incident:true`
+ * in `resolveActivatedFlows` BEFORE the split fans out (frontier.ts), so the join
+ * is never reached with an empty required set. Any OR region that actually
+ * reaches its join was fanned out with ≥1 recorded activated branch, hence
+ * `requiredFlowsFor` never returns [] for it. The `[]`-is-true behaviour is the
+ * correct immediate-produce semantics should a future relaxation ever allow zero
+ * activation; no dedicated code branch is added.
+ */
 export async function joinBarrierSatisfied(env: Env, instanceId: string, joinId: string, activation: number, requiredFlowIds: string[]): Promise<boolean> {
   const arrived = new Set(await getJoinArrivals(env.DB, instanceId, joinId, activation));
   return requiredFlowIds.every((f) => arrived.has(f));

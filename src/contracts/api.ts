@@ -140,7 +140,10 @@ export interface BpmnElement {
     // M3 time & failure taxonomy — a timer/message delay on the token path and
     // the eventBasedGateway timer/message race over branch catches (M3-L4):
     | "intermediateCatchEvent"
-    | "eventBasedGateway";
+    | "eventBasedGateway"
+    // M4 concurrency — block-structured AND/OR split/join gateways (M4-L1).
+    | "parallelGateway"
+    | "inclusiveGateway";
   name?: string | null;
   taskType?: string | null;
   messageName?: string | null;

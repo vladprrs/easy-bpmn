@@ -97,6 +97,7 @@ import {
 } from "./engine-shared";
 import { createIncident, completeInstance, recordTerminalIncident } from "./incidents";
 import { reconstructFrontier, syncFrontierReadModel } from "./frontier";
+import { withDriveLock } from "../persistence/drive-lock";
 import { driveForwardServiceTask, terminateUnleasableJob } from "./forward-task";
 import { beginCompensating, settleAfterCompensation } from "./compensation";
 import {
@@ -165,6 +166,18 @@ export async function loadGraphForInstance(env: Env, instanceId: string): Promis
 // ---------------------------------------------------------------------------
 
 export async function runInstance(env: Env, instanceId: string, opts: RunOptions): Promise<DriveResult> {
+  // Direct-mode drives (waitFor === null: the CI harness + production inline-resume)
+  // can race saga_steps.seq when concurrent worker callbacks drive one instance at
+  // once; serialise them with a per-instance advisory lock (design §10). Workflow
+  // mode (a real waitFor) is already serialised by the single Workflow instance, so
+  // leave it unwrapped.
+  if (opts.waitFor === null) {
+    return withDriveLock(env.DB, instanceId, () => runInstanceInner(env, instanceId, opts));
+  }
+  return runInstanceInner(env, instanceId, opts);
+}
+
+async function runInstanceInner(env: Env, instanceId: string, opts: RunOptions): Promise<DriveResult> {
   const graph = await opts.runStep("init", () => loadGraphForInstance(env, instanceId));
   const inst = await loadInst(env, instanceId);
 

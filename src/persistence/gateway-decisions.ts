@@ -36,6 +36,8 @@ export interface GatewayDecisionRow {
   is_default: number;
   evaluations: string;
   variables_snapshot: string | null;
+  /** JSON document-order array of the activated out-flows (inclusiveGateway split); NULL for XOR/EBG/parallel. */
+  activated_flow_ids: string | null;
   created_at: string;
 }
 
@@ -48,6 +50,8 @@ export interface GatewayDecisionView {
   isDefault: boolean;
   evaluations: GatewayFlowEvaluation[];
   variablesSnapshot: JsonObject | null;
+  /** The activated out-flow subset in document order (inclusiveGateway split); null for XOR/EBG/parallel. */
+  activatedFlowIds: string[] | null;
   createdAt: string;
 }
 
@@ -62,6 +66,9 @@ export function mapGatewayDecision(row: GatewayDecisionRow): GatewayDecisionView
     evaluations: parseJson<GatewayFlowEvaluation[]>(row.evaluations, []),
     variablesSnapshot: row.variables_snapshot
       ? parseJson<JsonObject>(row.variables_snapshot, {})
+      : null,
+    activatedFlowIds: row.activated_flow_ids
+      ? parseJson<string[]>(row.activated_flow_ids, [])
       : null,
     createdAt: row.created_at,
   };
@@ -96,14 +103,20 @@ export function insertGatewayDecisionStmt(
     evaluations: GatewayFlowEvaluation[];
     /** Evaluation context snapshot; size-capped by the payload limit. */
     variablesSnapshot: JsonObject | null;
+    /**
+     * The activated out-flow subset in document order — ONLY an inclusiveGateway
+     * (OR) split passes this (M4-L4). XOR/EBG callers omit it ⇒ it binds NULL
+     * (the column default), so XOR/EBG behaviour is unchanged.
+     */
+    activatedFlowIds?: string[] | null;
     now: string;
   },
 ): D1PreparedStatement {
   return stmt(
     db,
     `INSERT INTO gateway_decisions
-       (decision_id, instance_id, element_id, occurrence, chosen_flow_id, is_default, evaluations, variables_snapshot, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (decision_id, instance_id, element_id, occurrence, chosen_flow_id, is_default, evaluations, variables_snapshot, activated_flow_ids, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       input.decisionId,
       input.instanceId,
@@ -113,6 +126,7 @@ export function insertGatewayDecisionStmt(
       input.isDefault ? 1 : 0,
       toJson(input.evaluations),
       input.variablesSnapshot ? toJson(input.variablesSnapshot) : null,
+      input.activatedFlowIds ? toJson(input.activatedFlowIds) : null,
       input.now,
     ],
   );

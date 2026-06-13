@@ -76,7 +76,7 @@ describe("apply-from-D1 (TASK-54)", () => {
       externalMessageId: "em_ebg", workspaceId: "default", messageName: "Go",
       correlationKey: "afd-ebg", messageId: "mid_ebg", payload: { went: 1 }, payloadHash: "h",
       outcome: "correlated", finalOutcome: "correlated",
-      matchedInstanceId: id, matchedSubscriptionId: subs[0].subscription_id, receivedAt: now, correlatedAt: now,
+      matchedInstanceId: id, matchedSubscriptionId: subs[0]!.subscription_id, receivedAt: now, correlatedAt: now,
     });
     await resumeInline(env, id);
     const done = await get(`/instances/${id}`);

@@ -56,8 +56,8 @@ created → active → (waiting ⇄ active)* → completed
 | Gateway | Split (multiple out) | Join (multiple in) |
 |---------|----------------------|--------------------|
 | **Exclusive (XOR)** | consume 1 token, produce 1 on the first flow whose condition is true (else default) | pass each token straight through (no sync) |
-| **Parallel (AND)** | consume 1, produce 1 on *every* out flow | **wait for 1 on every** in flow, then produce 1 |
-| **Inclusive (OR)** | produce 1 on each out flow whose condition holds | wait for all tokens that *can still arrive*, then produce 1 |
+| **Parallel (AND)** | consume 1, produce 1 on *every* out flow | **wait for 1 from every activated branch** of the matching split, then produce 1 |
+| **Inclusive (OR)** | produce 1 on each out flow whose condition holds | wait for 1 from every **activated branch** of the matching split (the recorded subset), then produce 1 |
 | **Event-based** | park; the **first** event to fire wins; cancel the rest | — |
 
 **Deadlock & token-leak hazards** (relevant once gateways are in scope):
@@ -140,11 +140,14 @@ receiveTask → WAIT STATE: persist & park. External system POSTs message.
 none end    → consume token; no tokens left ⇒ instance completed
 ```
 
-The engine stays **single-token through M2**, but the line is no longer straight: **since M1** the
-token may pass through a `bpmn:transaction` whose steps carry **boundary events**
-(error/cancel/compensation — an interrupting boundary *redirects* the token, it never forks it), and
+The engine stays **single-token at runtime through M3**, but the line is no longer straight: **since M1**
+the token may pass through a `bpmn:transaction` whose steps carry **boundary events**
+(error/cancel/compensation — an interrupting boundary *redirects* the token, it never forks it),
 **since M2** it may **branch and loop through an XOR `exclusiveGateway`** (FEEL conditions, default
-flow, occurrence-counted cycles — the token takes exactly one outgoing flow). Still out: parallel
-tokens (M4) and timers (M3). Every arrow is an audited, replay-safe, idempotent transition. That
-constrained model is precisely what makes the engine *provably* durable. See
-[`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
+flow, occurrence-counted cycles — the token takes exactly one outgoing flow), and **since M3** it may
+**wait on timers and message intermediate catches and race them through an `eventBasedGateway`**.
+**Since M4-L1** a block-structured `parallelGateway` (AND) / `inclusiveGateway` (OR) region is
+**accepted and SESE-validated at publish**; genuine **multi-token concurrency** — the token frontier
+that fans branches out and synchronises at the join — ships in the later M4 runtime layers. Every arrow
+is an audited, replay-safe, idempotent transition. That constrained model is precisely what makes the
+engine *provably* durable. See [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).

@@ -203,10 +203,12 @@ export async function planIntermediateCatchFire(
   if (!node || node.type !== "intermediateCatchEvent") return { kind: "skip" };
   const next = node.next;
   if (!next) return { kind: "skip" }; // validator guarantees exactly one outgoing; defensive
-  // GUARD: still the current park. A catch can only exit via fire or operator
-  // /cancel (which settles `cancelled`), so a non-matching cursor means the visit
-  // already resolved — never fire onto a progressed instance.
-  if (inst.current_element_id !== timer.elementId) return { kind: "skip" };
+  // Per-token guard (M4, design §5.3): fire iff this catch visit is still the live
+  // wait — i.e. no timer_outcomes decider claimed it yet. NEVER read the scalar
+  // current_element_id (a concurrent sibling token may have moved it). A catch can
+  // only exit via fire ('fired') or operator /cancel ('cancelled'), so a settled
+  // decider ⇔ the visit already resolved.
+  if (await getTimerOutcome(env.DB, timer.timerId)) return { kind: "skip" };
 
   const occ = timer.occurrence;
   const instanceId = timer.instanceId;

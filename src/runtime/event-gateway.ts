@@ -576,11 +576,11 @@ export async function planEventGatewayTimerFire(
   const occ = timer.occurrence;
   const instanceId = timer.instanceId;
 
-  // Already decided (message won, or a prior fire) → no-op. The EBG timer has no
-  // timer_outcomes row, so gateway_decisions is the authoritative race check.
+  // Per-token guard (M4, design §5.3): the EBG timer has no timer_outcomes row, so
+  // the gateway_decisions row is the SOLE per-(element,occurrence) decider — already
+  // decided (message won, or a prior fire) → no-op. The scalar current_element_id
+  // check is redundant with this and stale-prone under concurrency; dropped.
   if (await getGatewayDecision(env.DB, instanceId, gwId, occ)) return { kind: "skip" };
-  // GUARD: still parked at the EBG (mirrors the catch/boundary current-wait guard).
-  if (inst.current_element_id !== gwId) return { kind: "skip" };
 
   const now = nowIso();
   const next = winnerNextOf(graph, node, branches.timer.flowId);

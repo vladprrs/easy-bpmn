@@ -10,7 +10,7 @@ import type { Env } from "../env";
 import { isTerminalInstanceStatus, newId, nowIso, type JsonObject } from "../util";
 import { dbBatch } from "../persistence/db";
 import { historyStmt } from "../persistence/history";
-import { applyTransitionStmt, getInstanceRow, incidentStmt, type IncidentKind } from "../persistence/instances";
+import { applyTransitionStmt, getForwardJob, getInstanceRow, getSubscriptionForVisit, incidentStmt, type IncidentKind } from "../persistence/instances";
 import { loadInst } from "./engine-shared";
 
 export async function completeInstance(env: Env, instanceId: string, elementId: string): Promise<void> {
@@ -24,12 +24,17 @@ export async function completeInstance(env: Env, instanceId: string, elementId: 
   ]);
 }
 
-export async function parkWaiting(env: Env, instanceId: string, elementId: string, kind: "serviceTask" | "receiveTask"): Promise<void> {
+export async function parkWaiting(env: Env, instanceId: string, elementId: string, occ: number, kind: "serviceTask" | "receiveTask"): Promise<void> {
   const inst = await loadInst(env, instanceId);
-  // Idempotent re-park: a rewalk that lands on an already-parked wait frontier
-  // (operator resume, duplicate drive) is WRITE-FREE — never duplicate the
-  // serviceTaskWaiting audit event or touch the cursor it would re-set.
-  if (inst.status === "waiting" && inst.current_element_id === elementId) return;
+  // Idempotent re-park (M4 per-token): a rewalk landing on an already-parked wait
+  // is WRITE-FREE. Guard on the LIVE per-(element,occurrence) row, never the scalar
+  // current_element_id (a sibling token may have moved it — design §5.3).
+  const job = kind === "serviceTask" ? await getForwardJob(env.DB, instanceId, elementId, occ) : null;
+  const sub = kind === "receiveTask" ? await getSubscriptionForVisit(env.DB, instanceId, elementId, occ) : null;
+  const alreadyParked = inst.status === "waiting" &&
+    ((kind === "serviceTask" && job && (job.status === "created" || job.status === "locked")) ||
+     (kind === "receiveTask" && sub?.status === "active"));
+  if (alreadyParked) return;
   await dbBatch(env.DB, [
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "serviceTaskWaiting", diagnostics: { kind } }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: elementId, status: "waiting", now: nowIso() }),

@@ -163,7 +163,7 @@ export async function driveForwardServiceTask(
   // Park (direct mode) — the instance resumes by re-running once the worker's
   // complete/fail mutates the job in D1 (or the timer alarm fires).
   if (!waitFor) {
-    await runStep(`svc-park:${tag}`, () => parkWaiting(env, instanceId, elementId, "serviceTask"));
+    await runStep(`svc-park:${tag}`, () => parkWaiting(env, instanceId, elementId, occ, "serviceTask"));
     return { kind: "waiting" };
   }
 

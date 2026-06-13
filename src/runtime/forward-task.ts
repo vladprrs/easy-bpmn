@@ -22,7 +22,7 @@ import {
   type JsonObject,
 } from "../util";
 import { ACTIVATION_TTL_MS, POISON_THRESHOLD } from "./retry-policy";
-import { failUnleasableJobConditional, getJobRowById, reopenJobKeepAttemptStmt } from "../persistence/jobs";
+import { failLeasedJobConditional, failUnleasableJobConditional, getJobRowById, listLockedForwardJobs, reopenJobKeepAttemptStmt } from "../persistence/jobs";
 import {
   armTimerDO,
   buildBoundaryArm,
@@ -321,6 +321,22 @@ async function armJobScheduler(env: Env, jobId: string, activationExpiresAt: str
 }
 
 /**
+ * Arm a per-job lease-expiry terminator (design §8.2) for EVERY in-flight cohort
+ * forward job when a scope enters `compensating` — so the quiescence barrier never
+ * depends on a future `/jobs/activate` poll (blocker 8). Re-uses the JobScheduler DLQ
+ * alarm: its fire routes to `terminateUnleasableJob`, whose locked-cohort branch
+ * claims the expired lease `failed` and re-drives. Best-effort (a DO hiccup just
+ * leaves that job to the poll-only reclaim), and a no-op for single-token instances
+ * (no locked forward job survives to a cancel).
+ */
+export async function armCohortLeaseExpiryTerminators(env: Env, instanceId: string): Promise<void> {
+  const locked = await listLockedForwardJobs(env.DB, instanceId);
+  for (const job of locked) {
+    if (job.lock_expires_at) await armJobScheduler(env, job.job_id, job.lock_expires_at);
+  }
+}
+
+/**
  * DLQ termination (§4.2), invoked by the JobScheduler alarm at activation_expires_at.
  * D1 is canonical — the DO holds no authoritative state — so this re-reads the job
  * and only acts if it is STILL an un-leased, expired forward job on a non-terminal
@@ -332,12 +348,38 @@ async function armJobScheduler(env: Env, jobId: string, activationExpiresAt: str
 export async function terminateUnleasableJob(env: Env, jobId: string): Promise<void> {
   const job = await getJobRowById(env.DB, jobId);
   if (!job || job.is_compensation === 1) return;
-  if (!(job.status === "created" && job.attempt_count === 0)) return; // leased/completed/failed → no-op
   const now = nowIso();
+
+  // M4-L5 (design §8.2): the in-flight cohort lease-expiry terminator. While the
+  // instance is COMPENSATING, a still-`locked` cohort forward job whose lease has
+  // expired (its worker vanished) MUST be driven terminal so the quiescence barrier
+  // never depends on a future /jobs/activate poll. Claim it `failed` (race-safe vs a
+  // concurrent straggler complete by the `status='locked'` guard), then re-drive so
+  // the straggler scan discards the now-failed token. Only the compensating cohort
+  // takes this path — a normal leased job on a running instance no-ops here.
+  if (job.status === "locked") {
+    const linst = await getInstanceRow(env.DB, job.instance_id);
+    if (!linst || linst.status !== "compensating") return;
+    if (!job.lock_expires_at || isoIsBefore(now, job.lock_expires_at)) return; // lease not yet expired
+    if ((await failLeasedJobConditional(env.DB, jobId, now)) === 0) return; // a complete won the race
+    // Dynamic import: forward-task.ts is imported BY engine.ts (terminateUnleasableJob),
+    // so a static `import { resumeInline } from "./engine"` would form a cycle.
+    const { resumeInline } = await import("./engine");
+    await resumeInline(env, linst.instance_id);
+    return;
+  }
+
+  if (!(job.status === "created" && job.attempt_count === 0)) return; // leased/completed/failed → no-op
   if (!job.activation_expires_at || isoIsBefore(now, job.activation_expires_at)) return; // not yet expired (early/spurious alarm)
 
+  // M4-L5 (design §8.2): the un-leasable DLQ MUST fire even while the instance is
+  // COMPENSATING (the old `inst.status === "compensating"` early-return is dropped),
+  // so a never-leased cohort forward job goes terminal → its token is discarded by
+  // the next compensating drive's straggler scan and the barrier drains. Safe: the
+  // atomic created→failed claim never regresses a compensating status, and the
+  // guarded transition below (running/waiting → incident) is a 0-row no-op for it.
   const inst = await getInstanceRow(env.DB, job.instance_id);
-  if (!inst || isTerminalInstanceStatus(inst.status) || inst.status === "compensating") return;
+  if (!inst || isTerminalInstanceStatus(inst.status)) return;
 
   // Atomic claim: only ONE of {this DLQ pass, a concurrent /jobs/activate, a worker
   // completing} can flip created→failed. If the job was leased/advanced in the

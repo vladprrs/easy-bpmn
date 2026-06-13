@@ -31,6 +31,7 @@ import {
   type SagaStepView,
 } from "../persistence/saga";
 import { listLiveTokens, setTokenStatusStmt } from "../persistence/tokens";
+import { armCohortLeaseExpiryTerminators } from "./forward-task";
 import { loadInst, SVC_WAIT_TIMEOUT, type RunStep, type WaitForEvent, type DriveResult } from "./engine-shared";
 
 /** The failure-path target of the cancel boundary attached to transaction `scopeId`. */
@@ -52,6 +53,10 @@ export async function beginCompensating(env: Env, instanceId: string, scopeId: s
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: scopeId, type: "transactionCancelled", diagnostics: { transaction: scopeId, via: cancelEndId, traceId: traceIdFor(instanceId) } }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: cancelEndId, status: "compensating", now: nowIso() }),
   ]);
+  // M4-L5 (design §8.2): arm a per-token lease-expiry terminator for every in-flight
+  // cohort forward job so the quiescence barrier drains without a future worker poll.
+  // No-op for single-token instances (no locked forward job survives to a cancel-end).
+  await armCohortLeaseExpiryTerminators(env, instanceId);
 }
 
 /** Run (or resume) the reverse pass for `scopeId`, then settle the saga-failed terminal. */

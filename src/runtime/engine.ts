@@ -81,7 +81,7 @@ import {
   variableSnapshotStmt,
 } from "../persistence/instances";
 import { markScopeStepsCommittedStmt } from "../persistence/saga";
-import { messageCorrelatedStmt } from "../persistence/messages";
+import { messageCorrelatedStmt, getCorrelatedMessageForSubscription } from "../persistence/messages";
 import {
   getGatewayDecision,
   insertGatewayDecisionStmt,
@@ -920,6 +920,19 @@ async function driveReceiveTask(
   if (pending && pending.messageName === messageName) {
     const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, graph, elementId, occ, next, pending, activeTokenId));
     return { kind: "next", next: r.next, consumedPending: true };
+  }
+
+  // Apply-from-D1 (TASK-54): a single-wake re-walk has no in-flight `pending` event.
+  // If the broker correlated a message to THIS active subscription (link recorded in
+  // external_messages at POST time), apply it from D1 — the same merge+transition as
+  // the pending path, sourcing the payload from the canonical store. This makes the
+  // contentless bpmn_wake tickle (and a lost wake) recover the message.
+  if (sub?.status === "active") {
+    const fromD1 = await getCorrelatedMessageForSubscription(env.DB, sub.subscription_id);
+    if (fromD1) {
+      const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, graph, elementId, occ, next, fromD1, activeTokenId));
+      return { kind: "next", next: r.next };
+    }
   }
 
   const reg = await runStep(`recv:${tag}`, () => registerReceive(env, instanceId, graph, elementId, occ, messageName, node.type, activeTokenId));

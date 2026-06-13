@@ -74,6 +74,19 @@ describe("validateRegions — rejections", () => {
     expect(reasons(r)).toMatch(/incoming|merge|matching join/i);
   });
 
+  it("rejects a multi-incoming eventBasedGateway inside a region (EBG is a split, not a synchronising join)", () => {
+    // fork → {A, B, C}; A and B both feed M (an eventBasedGateway, 2 incoming), C
+    // bypasses M straight to join — so M is NOT the post-dominator of fork (join is),
+    // the split↔join pair matches, and M is a region member with 2 incoming. An EBG
+    // is a split, not a join, and is not caught by the bijection check, so rule 6 must
+    // flag this uncontrolled merge (regression: rule 6 must NOT exempt eventBasedGateway).
+    const r = validateRegions(build(
+      [["S", "startEvent"], ["fork", "parallelGateway"], ["A", "serviceTask"], ["B", "serviceTask"], ["C", "serviceTask"], ["M", "eventBasedGateway"], ["join", "parallelGateway"], ["E", "endEvent"]],
+      [["s0", "S", "fork"], ["f1", "fork", "A"], ["f2", "fork", "B"], ["f3", "fork", "C"], ["a", "A", "M"], ["b", "B", "M"], ["m", "M", "join"], ["c", "C", "join"], ["s1", "join", "E"]],
+    ));
+    expect(reasons(r)).toMatch(/incoming|merge/i);
+  });
+
   it("rejects a boundary redirect that escapes the branch (blocker 13)", () => {
     // timer boundary on A inside the region routes to C (outside, past the join)
     const r = validateRegions(build(

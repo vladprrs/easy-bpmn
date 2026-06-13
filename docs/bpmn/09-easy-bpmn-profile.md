@@ -1,14 +1,17 @@
 # 09 — The `easy-bpmn` BPMN Profile
 
 This is the **contract** between the BPMN standard and what `easy-bpmn` actually executes. It is the
-operational reading of the [constitution](../../.specify/memory/constitution.md) (now **v2.2.0**, with
-the widened **Principle I — "Standard BPMN Profile Only"** covering the M2 conditional set **and the M3
+operational reading of the [constitution](../../.specify/memory/constitution.md) (now **v2.3.0**, with
+the widened **Principle I — "Standard BPMN Profile Only"** covering the M2 conditional set, **the M3
 time-&-failure-taxonomy set** — interrupting boundary timers, timer/message intermediate catch events,
-the `eventBasedGateway`, and free error-boundary routing — and **Principle VI — "SAGA / Compensation
-Integrity"**). The M3 set was **accepted in v2.2.0 and opened per validator layer**, and the whole set has
-now **shipped (M3-L2/L3/L4)**: free error-boundary routing, interrupting boundary timers, **both** the
-**timer** and the **message** intermediate catch, and the `eventBasedGateway` (the timer/message race).
-When in doubt, the constitution wins. The
+the `eventBasedGateway`, and free error-boundary routing — **and the M4 in-instance concurrency set**
+(block-structured `parallelGateway` (AND) / `inclusiveGateway` (OR), SESE-only) — and **Principle VI —
+"SAGA / Compensation Integrity"**, redefined per causal chain with a multi-token completion rule). The M3
+set was **accepted in v2.2.0 and opened per validator layer**, and the whole set has now **shipped
+(M3-L2/L3/L4)**: free error-boundary routing, interrupting boundary timers, **both** the **timer** and the
+**message** intermediate catch, and the `eventBasedGateway` (the timer/message race). The M4 concurrency
+set was **accepted in v2.3.0**; **M4-L1** opens **publish-time validation** of block-structured parallel/
+inclusive regions (the concurrency runtime ships in later M4 layers). When in doubt, the constitution wins. The
 authoritative designs are
 [`2026-06-08-saga-orchestrator-design.md`](../superpowers/specs/2026-06-08-saga-orchestrator-design.md)
 (M1) and

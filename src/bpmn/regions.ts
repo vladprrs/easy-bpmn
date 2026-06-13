@@ -173,27 +173,28 @@ export function validateRegions(input: RegionInput): RegionValidationResult {
     // ---- Region members R(S,J) = { X : S dom X and J postdom X }.
     const members = vertexList.filter((x) => x !== VIRTUAL_SOURCE && x !== VIRTUAL_SINK && dom(s.id, x) && postdom(j, x));
 
-    // Rule 6 — no uncontrolled merge: inside the region, only a GATEWAY may have
-    // >1 incoming token flow — the matching join (synchronises), a nested
-    // parallel/inclusive join (synchronises its own inner region), an
-    // exclusiveGateway pass-through merge (single-token by XOR semantics), or an
-    // eventBasedGateway. A non-gateway token node (service/receive task,
-    // intermediate catch, or end event) with >1 incoming flow is rejected —
-    // concurrent branch tokens would execute it twice instead of synchronising
-    // (design §4.1 rule 6 enumerates exactly those node kinds). An UNMATCHED
-    // multi-incoming parallel/inclusive gateway is caught by the bijection
-    // "other half" check below, not here.
+    // Rule 6 — no uncontrolled merge: inside the region, only a MERGE-SAFE gateway
+    // may have >1 incoming token flow — the matching join (synchronises), a nested
+    // parallel/inclusive JOIN (synchronises its own inner region — matched ones are
+    // legitimate; an UNMATCHED multi-incoming parallel/inclusive gateway is caught by
+    // the bijection "other half" check below), or an exclusiveGateway pass-through
+    // merge (single-token by XOR semantics). An `eventBasedGateway` is a SPLIT, never
+    // a synchronising join, and is NOT covered by the bijection check, so a
+    // multi-incoming EBG inside a region IS an uncontrolled merge — it is flagged like
+    // any non-gateway. A service/receive task, intermediate catch, or end event with
+    // >1 incoming flow is likewise rejected — concurrent branch tokens would execute
+    // it twice instead of synchronising (design §4.1 rule 6 exempts only the matching
+    // join + an exclusiveGateway merge).
     for (const x of members) {
       if (x === j || x === s.id) continue;
       const xNode = nodeById.get(x);
       if (xNode?.type === "boundaryEvent") continue;
-      const isGateway =
+      const isMergeSafeGateway =
         xNode?.type === "exclusiveGateway" ||
         xNode?.type === "parallelGateway" ||
-        xNode?.type === "inclusiveGateway" ||
-        xNode?.type === "eventBasedGateway";
+        xNode?.type === "inclusiveGateway";
       const inc = (incoming.get(x) ?? []).filter(inScope);
-      if (inc.length > 1 && !isGateway) {
+      if (inc.length > 1 && !isMergeSafeGateway) {
         errors.push({ reason: `Element '${x}' inside the region of split '${s.id}' has ${inc.length} incoming sequence flows — concurrent branch tokens would execute it twice instead of synchronising at join '${j}'.`, elementId: x });
       }
     }

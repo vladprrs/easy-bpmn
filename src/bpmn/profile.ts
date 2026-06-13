@@ -50,7 +50,8 @@ export const ERROR_TYPE = "bpmn:Error";
 export const DEFERRED_GATEWAY_REASONS: Record<string, string> = {
   "bpmn:ComplexGateway":
     "Complex gateways are not on the roadmap and are deferred to a later milestone. " +
-    "Only exclusiveGateway branching is supported.",
+    "Supported gateways: exclusiveGateway (M2), eventBasedGateway (M3), and the " +
+    "block-structured (SESE) parallelGateway / inclusiveGateway (M4).",
 };
 
 /** Event-definition $types we classify (start/end/boundary discriminators). */

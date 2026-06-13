@@ -57,7 +57,7 @@ import {
   type InstanceRow,
   type SubscriptionRow,
 } from "../persistence/instances";
-import { messageCorrelatedStmt } from "../persistence/messages";
+import { getCorrelatedMessageForSubscription, messageCorrelatedStmt } from "../persistence/messages";
 import { branchHistoryTags, getToken, parseOverlay, readOverlay, rootTokenId, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
 import { insertGatewayDecisionStmt, getGatewayDecision } from "../persistence/gateway-decisions";
 import {
@@ -189,6 +189,20 @@ export async function driveEventBasedGateway(
       return { kind: "next", next: r.next, consumedPending: true };
     }
     // Not for this gateway → fall through to park, leaving the pending for a later node.
+  }
+
+  // Apply-from-D1 (TASK-54): no in-flight `pending` on a single-wake re-walk. If a
+  // message branch's subscription was correlated in D1, apply it (message wins).
+  // `subscriptionIdFor` is the private builder this file already uses to register the
+  // per-branch subscriptions (ebgsub:${instanceId}:${catchId}#${occ}), so the lookup
+  // key matches what parkEventBasedGateway stored.
+  for (const b of branches.message) {
+    const fromD1 = await getCorrelatedMessageForSubscription(env.DB, subscriptionIdFor(instanceId, b.catchId, occ));
+    if (fromD1 && fromD1.messageName === b.messageName) {
+      const r = await runStep(`ebg-msg:${tag}`, () => applyEbgMessage(env, instanceId, graph, elementId, node, occ, b, branches, fromD1, activeTokenId));
+      if (r.kind === "incident") return { kind: "incident" };
+      return { kind: "next", next: r.next };
+    }
   }
 
   // (3) Park (first visit) or self-heal re-register (rewalk past an armed park).

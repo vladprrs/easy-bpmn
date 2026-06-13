@@ -7,9 +7,9 @@
 
 import type { Env } from "../env";
 import type { ExecutionGraph } from "../bpmn/graph";
-import { isTerminalInstanceStatus, nowIso } from "../util";
+import { isTerminalInstanceStatus, nowIso, type JsonObject } from "../util";
 import { dbBatch } from "../persistence/db";
-import { rootTokenId, upsertTokenStmt, setTokenStatusStmt, listLiveTokens } from "../persistence/tokens";
+import { rootTokenId, upsertTokenStmt, setTokenStatusStmt, listLiveTokens, getToken, parseOverlay } from "../persistence/tokens";
 import { loadInst } from "./engine-shared";
 
 export interface Token {
@@ -29,6 +29,31 @@ export async function reconstructFrontier(env: Env, graph: ExecutionGraph, insta
   const pos = inst.current_element_id;
   if (!pos || !graph.nodes[pos]) return [];
   return [{ tokenId: rootTokenId(instanceId), positionElementId: pos, occurrence: 0, regionId: null, regionActivation: 0, branchFlowId: null, parentTokenId: null }];
+}
+
+/**
+ * Resolve a token's effective variable scope (design §5.7): root variables with
+ * each ancestor token's overlay layered on, root→token, NEAREST WINS. The root
+ * token resolves to `rootVars` verbatim (its overlay is conceptually empty — root
+ * vars live in process_instances.variables), preserving the exact M0–M3 read path.
+ * A cycle guard bounds a malformed parent chain.
+ */
+export async function resolveScope(env: Env, instanceId: string, rootVars: JsonObject, tokenId: string): Promise<JsonObject> {
+  if (tokenId === rootTokenId(instanceId)) return rootVars;
+  // Collect overlays token→root, then apply root→token so the nearest overlay wins.
+  const chain: JsonObject[] = [];
+  let cur: string | null = tokenId;
+  const guard = new Set<string>();
+  while (cur && !guard.has(cur)) {
+    guard.add(cur);
+    const row = await getToken(env.DB, cur);
+    if (!row) break;
+    chain.push(parseOverlay(row));
+    cur = row.parent_token_id;
+  }
+  let scope: JsonObject = { ...rootVars };
+  for (let i = chain.length - 1; i >= 0; i--) scope = { ...scope, ...chain[i]! };
+  return scope;
 }
 
 /** Write the read-model after a drive: upsert the frontier's tokens; mark vanished live tokens consumed. */

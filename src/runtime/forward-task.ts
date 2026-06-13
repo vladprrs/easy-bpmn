@@ -53,6 +53,8 @@ import {
 import { insertSagaStepStmt } from "../persistence/saga";
 import { loadInst, isTransactionScope, SVC_WAIT_TIMEOUT, type RunStep, type WaitForEvent } from "./engine-shared";
 import { createIncident, parkWaiting } from "./incidents";
+import { resolveScope } from "./frontier";
+import { getToken, parseOverlay, rootTokenId, setTokenOverlayStmt } from "../persistence/tokens";
 
 /**
  * The token-path node an error boundary on `elementId` routes the failed token
@@ -124,6 +126,7 @@ export async function driveForwardServiceTask(
   node: GraphNode,
   runStep: RunStep,
   waitFor: WaitForEvent | null,
+  activeTokenId?: string,
 ): Promise<ForwardOutcome> {
   const tag = `${elementId}#${occ}`;
   const tb = timerBoundaryFor(graph, elementId);
@@ -144,14 +147,14 @@ export async function driveForwardServiceTask(
   if (applied) return applied;
 
   if (job?.status === "completed") {
-    return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, job!));
+    return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, job!, activeTokenId));
   }
   if (job?.status === "failed") {
     return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, job!));
   }
 
   if (!job) {
-    job = await runStep(`svc-create:${tag}`, () => createForwardJob(env, instanceId, graph, elementId, occ, node));
+    job = await runStep(`svc-create:${tag}`, () => createForwardJob(env, instanceId, graph, elementId, occ, node, activeTokenId));
     if (!job) return { kind: "incident" }; // oversized input → incident already recorded
   } else if (tb) {
     // Self-healing re-arm (design §4.2): a rewalk landing on a still-armed timer
@@ -188,7 +191,7 @@ export async function driveForwardServiceTask(
   const appliedMeanwhile = appliedForwardOutcome(graph, elementId, node, fresh);
   if (appliedMeanwhile) return appliedMeanwhile;
   if (fresh.status === "completed") {
-    return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, fresh));
+    return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, fresh, activeTokenId));
   }
   if (fresh.status === "failed") {
     return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, fresh));
@@ -213,7 +216,7 @@ export async function driveForwardServiceTask(
       const appliedAfterSettle = appliedForwardOutcome(graph, elementId, node, settledJob);
       if (appliedAfterSettle) return appliedAfterSettle;
       if (settledJob.status === "completed") {
-        return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, settledJob));
+        return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, settledJob, activeTokenId));
       }
       if (settledJob.status === "failed") {
         return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, settledJob));
@@ -234,7 +237,7 @@ export async function driveForwardServiceTask(
   );
 }
 
-async function createForwardJob(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, node: GraphNode): Promise<JobRow | null> {
+async function createForwardJob(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, node: GraphNode, activeTokenId?: string): Promise<JobRow | null> {
   // Idempotent re-run (Workflow step retry after a committed batch): this
   // iteration's row already exists → return it, never re-insert (the unique
   // index on (instance, element, kind, occurrence) would reject anyway).
@@ -242,7 +245,13 @@ async function createForwardJob(env: Env, instanceId: string, graph: ExecutionGr
   if (existing) return existing;
 
   const inst = await loadInst(env, instanceId);
-  const variables = parseJson<JsonObject>(inst.variables, {});
+  // Branch-scoped input (design §5.7): a branch token's job sees its resolved
+  // overlay chain (root vars + ancestor overlays, nearest wins); a null/root
+  // token reads root variables verbatim (the exact M0–M3 path).
+  const isBranch = !!activeTokenId && activeTokenId !== rootTokenId(instanceId);
+  const variables = isBranch
+    ? await resolveScope(env, instanceId, parseJson<JsonObject>(inst.variables, {}), activeTokenId!)
+    : parseJson<JsonObject>(inst.variables, {});
   if (payloadByteSize(variables) > MAX_EVENT_PAYLOAD_BYTES) {
     await createIncident(env, instanceId, elementId, 0, "Service Task input variables exceed the Workflow event payload limit.", { size: payloadByteSize(variables) }, "serviceTaskFailure");
     return null;
@@ -368,6 +377,7 @@ async function applyForwardCompletion(
   occ: number,
   node: GraphNode,
   job: JobRow,
+  activeTokenId?: string,
 ): Promise<ForwardOutcome> {
   // Apply-once guard (idempotent step body): a Workflow step retry after the
   // batch below committed must not re-merge the output over newer variables.
@@ -379,7 +389,13 @@ async function applyForwardCompletion(
   const next = node.next!;
   const input = parseJson<JsonObject>(job.input_variables, {});
   const output = parseJson<JsonObject>(job.output_variables, {});
-  const merged = mergeVariables(parseJson<JsonObject>(inst.variables, {}), output);
+  // Branch-scoped output (design §5.7): a branch token's output merges onto its
+  // OWN overlay (not root); root vars mutate only at the join fold-up. A
+  // null/root token keeps the M0–M3 path (merge into process_instances.variables).
+  const isBranch = !!activeTokenId && activeTokenId !== rootTokenId(instanceId);
+  const branchTokenRow = isBranch ? await getToken(env.DB, activeTokenId!) : null;
+  const baseVars = isBranch ? (branchTokenRow ? parseOverlay(branchTokenRow) : {}) : parseJson<JsonObject>(inst.variables, {});
+  const merged = mergeVariables(baseVars, output);
   const now = nowIso();
 
   // Poison detection (§4.3): the per-call output already passed the payload limit
@@ -447,7 +463,16 @@ async function applyForwardCompletion(
       type: "serviceTaskCompleted",
       diagnostics: { jobId: job.job_id, attempts: job.attempt_count, traceId: traceIdFor(instanceId), occurrence: occ },
     }),
-    applyTransitionStmt(env.DB, { instanceId, variables: merged, currentElementId: next, status: "running", now }),
+    // A branch token's output goes to its OWN overlay (design §5.7); the instance
+    // status moves to 'running' WITHOUT touching root vars or pinning a single
+    // current_element_id (NULL = multi-token frontier, §5.3). A root/single-token
+    // token keeps the exact M0–M3 write (merged → process_instances.variables).
+    ...(isBranch
+      ? [
+          setTokenOverlayStmt(env.DB, activeTokenId!, merged, now),
+          applyTransitionStmt(env.DB, { instanceId, currentElementId: null, status: "running", now }),
+        ]
+      : [applyTransitionStmt(env.DB, { instanceId, variables: merged, currentElementId: next, status: "running", now })]),
     // The applied marker commits ATOMICALLY with the advance (design M2 §5):
     // the rewalk treats this visit as write-free fast-forward from here on.
     markJobOutputAppliedStmt(env.DB, job.job_id, now),

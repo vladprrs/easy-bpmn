@@ -96,7 +96,7 @@ import {
   type DriveResult,
 } from "./engine-shared";
 import { createIncident, completeInstance, recordTerminalIncident } from "./incidents";
-import { reconstructFrontier, syncFrontierReadModel } from "./frontier";
+import { reconstructFrontier, syncFrontierReadModel, resolveScope } from "./frontier";
 import { withDriveLock } from "../persistence/drive-lock";
 import { driveForwardServiceTask, terminateUnleasableJob } from "./forward-task";
 import { beginCompensating, settleAfterCompensation } from "./compensation";
@@ -531,6 +531,7 @@ export async function decideGateway(
   elementId: string,
   occ: number,
   node: GraphNode,
+  activeTokenId?: string,
 ): Promise<GatewayOutcome> {
   const recorded = await getGatewayDecision(env.DB, instanceId, elementId, occ);
   if (recorded) {
@@ -538,7 +539,13 @@ export async function decideGateway(
   }
 
   const inst = await loadInst(env, instanceId);
-  const variables = parseJson<JsonObject>(inst.variables, {});
+  // Branch-scoped reads (design §5.7): a gateway inside a region evaluates against
+  // its token's resolved overlay chain; the recorded variables_snapshot then
+  // captures that RESOLVED scope and is never re-evaluated. A null/root token
+  // resolves to root variables verbatim (the exact M0–M3 path).
+  const variables = activeTokenId
+    ? await resolveScope(env, instanceId, parseJson<JsonObject>(inst.variables, {}), activeTokenId)
+    : parseJson<JsonObject>(inst.variables, {});
 
   let chosen: Flow | null = null;
   let isDefault = false;

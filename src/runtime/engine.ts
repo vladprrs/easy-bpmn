@@ -95,7 +95,7 @@ import {
   type WaitForEvent,
   type DriveResult,
 } from "./engine-shared";
-import { createIncident, completeInstance, recordTerminalIncident } from "./incidents";
+import { createIncident, completeInstance, recordTerminalIncident, raiseConcurrencyLimit as raiseConcurrencyLimitIncident, raiseStepBudget as raiseStepBudgetIncident } from "./incidents";
 import {
   reconstructFrontier,
   syncFrontierReadModel,
@@ -104,6 +104,7 @@ import {
   raceParkedWaits,
   matchKeyedEvent,
   WaitCollector,
+  type DriveCaps,
   type LeafDrivers,
   type LeafOutcome,
 } from "./frontier";
@@ -155,6 +156,43 @@ interface RunOptions {
  * retries of one iteration share one occurrence and do not consume it.
  */
 export const MAX_ELEMENT_OCCURRENCES = 1000;
+
+/**
+ * Live-token frontier cap (M4 design §9). Caps execution_tokens in a LIVE status
+ * (active|waiting|arrivedAtJoin); counted from the in-memory reconstructed
+ * frontier during the rewalk (NEVER a live COUNT — that would fire
+ * nondeterministically on replay). Exceeding it at a split fan-out settles a
+ * terminal `concurrencyLimit` incident, so a runaway fan-out (nested splits, or a
+ * split inside a loop accumulating un-merged tokens) degrades into a graceful,
+ * operator-visible incident instead of an opaque errored Workflow.
+ */
+export const MAX_CONCURRENT_TOKENS = 256;
+
+/**
+ * Soft step budget (M4 design §9). The engine maintains a per-drive cumulative
+ * runStep/waitForEvent counter; crossing this settles a graceful `stepBudget`
+ * incident BELOW the platform ceiling (wrangler workflows limits.steps = 25000),
+ * so a hot parallel×loop shape never becomes an opaque errored Workflow. Forward
+ * steps of all live tokens, in-region loops, and the reverse-compensation pass
+ * must jointly fit; the three caps (MAX_CONCURRENT_TOKENS, MAX_ELEMENT_OCCURRENCES,
+ * step budget) enforce this together.
+ */
+export const STEP_BUDGET_SOFT = 20000;
+
+/**
+ * TEST-ONLY cap overrides (design §9 / L6.1). Integration tests lower a cap via an
+ * env var so a bomb fixture trips it without 256 real branches / 20000 real steps;
+ * production never sets these (the `Env` fields are optional + test-only). A
+ * non-positive / non-numeric value falls back to the production constant.
+ */
+function maxConcurrentTokens(env: Env): number {
+  const o = Number((env as { MAX_CONCURRENT_TOKENS_OVERRIDE?: string }).MAX_CONCURRENT_TOKENS_OVERRIDE);
+  return Number.isFinite(o) && o > 0 ? o : MAX_CONCURRENT_TOKENS;
+}
+function stepBudgetSoft(env: Env): number {
+  const o = Number((env as { STEP_BUDGET_SOFT_OVERRIDE?: string }).STEP_BUDGET_SOFT_OVERRIDE);
+  return Number.isFinite(o) && o > 0 ? o : STEP_BUDGET_SOFT;
+}
 
 /**
  * Walk-local visit counter (design M2 §5). Returns the 0-based occurrence of
@@ -236,6 +274,24 @@ async function loop(
   // The delivered event flows to the receive leaf that matches it (consumed at the
   // LIVE visit only); a region re-walk re-points it via matchKeyedEvent.
   let pending = incomingEvent;
+
+  // Concurrency caps (M4-L6, design §9). The per-drive step budget wraps runStep so
+  // EVERY runStep / waitForEvent issuance bumps a shared counter; the region DFS
+  // checks it at the top of the walk and settles a graceful `stepBudget` incident
+  // below the platform step ceiling. The count is replay-stable (the walk is
+  // deterministic), unlike a SQL COUNT. The single-token path uses the same wrapped
+  // runStep but NEVER checks the budget (MAX_ELEMENT_OCCURRENCES already bounds it),
+  // so its behaviour stays byte-identical to pre-M4.
+  const caps: DriveCaps = {
+    maxConcurrentTokens: maxConcurrentTokens(env),
+    stepBudgetSoft: stepBudgetSoft(env),
+    budget: { steps: 0 },
+  };
+  const rawRunStep = runStep;
+  runStep = (name, fn) => {
+    caps.budget.steps++;
+    return rawRunStep(name, fn);
+  };
 
   // The per-node leaf dispatch (design §5.1: `driveLeaf`) — the SINGLE source of
   // node handling for BOTH the single-token scalar walk and the region DFS. It
@@ -377,6 +433,19 @@ async function loop(
         ),
       );
     },
+
+    async raiseConcurrencyLimit(splitId: string, occ: number): Promise<void> {
+      // Terminal concurrencyLimit (M4-L6, design §9): a fan-out would exceed the
+      // live-token cap. Claimed once (createIncident is one-way + idempotent on a
+      // replay re-issuing this uniquely-named step).
+      await runStep(`concurrency-limit:${splitId}#${occ}`, () => raiseConcurrencyLimitIncident(env, instanceId, splitId, caps.maxConcurrentTokens));
+    },
+
+    async raiseStepBudget(elementId: string, occ: number): Promise<void> {
+      // Graceful stepBudget (M4-L6, design §9): the per-drive step counter crossed
+      // the soft budget, BELOW the platform ceiling. Claimed once.
+      await runStep(`step-budget:${elementId}#${occ}`, () => raiseStepBudgetIncident(env, instanceId, elementId, caps.stepBudgetSoft, caps.budget.steps));
+    },
   };
 
   // ---- Single-token graphs (M0–M3): the exact scalar walk, byte-identical ----
@@ -410,13 +479,18 @@ async function loop(
   // walk. One pass per drive in direct mode (the drive lock serialises siblings);
   // workflow mode loops, racing the collected waits and re-walking on each event.
   while (true) {
-    const { result, collector } = await driveFrontier(env, graph, instanceId, drivers, MAX_ELEMENT_OCCURRENCES);
+    const { result, collector } = await driveFrontier(env, graph, instanceId, drivers, MAX_ELEMENT_OCCURRENCES, caps);
     if (result.incident) return { status: "incident" };
     if (result.compensate) return settleAfterCompensation(env, instanceId, graph, result.compensate.scopeId, runStep, waitFor);
     if (result.completed) return { status: "completed" };
     if (result.parked) {
       if (!waitFor) return { status: "waiting" }; // direct mode parks; the next callback re-drives
       // Workflow-mode multi-wait (design §5.2/§14) — manual-matrix-validated, not CI.
+      // Count each collected waitForEvent against the step budget (design §9): a
+      // multi-wait that keeps timing out and re-looping (carried blocker #3) burns
+      // steps each pass, so stepBudget is the natural circuit breaker on the top of
+      // the next walk rather than an unbounded re-race.
+      caps.budget.steps += collector.size;
       const outcome = await raceParkedWaits(collector, waitFor);
       pending = matchKeyedEvent(outcome);
       continue;

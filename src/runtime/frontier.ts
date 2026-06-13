@@ -96,6 +96,24 @@ export interface LeafDrivers {
   driveLeaf(cur: string, occ: number, activeTokenId: string, collector: WaitCollector): Promise<LeafOutcome>;
   /** Raise the terminal loopLimit incident for an element that exceeded the visit cap. */
   raiseLoopLimit(elementId: string, occ: number): Promise<void>;
+  /** Raise the terminal concurrencyLimit incident: a split fan-out would exceed the live-token cap (M4-L6). */
+  raiseConcurrencyLimit(splitId: string, occ: number): Promise<void>;
+  /** Raise the graceful stepBudget incident: the per-drive step counter crossed the soft budget (M4-L6). */
+  raiseStepBudget(elementId: string, occ: number): Promise<void>;
+}
+
+/**
+ * The concurrency caps applied during a drive (M4-L6, design §9). `maxConcurrentTokens`
+ * bounds the live frontier at each split fan-out; `stepBudgetSoft` bounds the
+ * per-drive cumulative runStep/waitForEvent count (`budget.steps`, a shared
+ * in-memory counter the engine's runStep wrapper increments). Both are counted
+ * in-memory during the deterministic rewalk — NEVER a SQL COUNT — so the incident
+ * fires deterministically across Workflow replays.
+ */
+export interface DriveCaps {
+  maxConcurrentTokens: number;
+  stepBudgetSoft: number;
+  budget: { steps: number };
 }
 
 /** A frontier wait registered during the DFS (workflow-mode multi-wait, §5.2). */
@@ -154,6 +172,7 @@ export async function driveFrontier(
   instanceId: string,
   drivers: LeafDrivers,
   maxOccurrences: number,
+  caps: DriveCaps,
 ): Promise<{ result: FrontierResult; collector: WaitCollector }> {
   const visits = new Map<string, number>();
   const collector = new WaitCollector();
@@ -177,6 +196,17 @@ export async function driveFrontier(
       const node = graph.nodes[cur];
       if (!node) return; // off the graph
       const occ = nextOcc(cur);
+      // Step-budget cap (M4-L6, design §9): the per-drive runStep/waitForEvent
+      // counter (incremented by the engine's runStep wrapper) crossing the soft
+      // budget settles a GRACEFUL stepBudget incident below the platform step
+      // ceiling. Checked at the top of the walk so a hot in-region loop (a cycle
+      // burning runSteps within ONE pass) trips it deterministically, in direct
+      // mode too, before it could exhaust the platform budget.
+      if (caps.budget.steps > caps.stepBudgetSoft) {
+        await drivers.raiseStepBudget(cur, occ);
+        incident = true;
+        return;
+      }
       if (occ >= maxOccurrences) {
         await drivers.raiseLoopLimit(cur, occ);
         incident = true;
@@ -195,6 +225,18 @@ export async function driveFrontier(
           return;
         }
         if (!(await splitAlreadyFannedOut(env, instanceId, cur, occ, activated))) {
+          // Live-token cap (M4-L6, design §9): a fan-out that would push the live
+          // frontier past MAX_CONCURRENT_TOKENS settles a terminal concurrencyLimit
+          // BEFORE creating the branch tokens. `liveTokens` is the in-memory count
+          // of frontier tokens parked so far this rewalk (NEVER a SQL COUNT — that
+          // would fire nondeterministically on replay); adding `activated.length`
+          // is the prospective post-fan-out live count. A rewalk that fast-forwards
+          // an already-fanned-out split skips this (no new tokens created).
+          if (liveTokens + activated.length > caps.maxConcurrentTokens) {
+            await drivers.raiseConcurrencyLimit(cur, occ);
+            incident = true;
+            return;
+          }
           // The OR activation record (recordStmts) commits in the SAME batch as the
           // branch tokens (shared fan-out claim); empty for AND / an OR rewalk.
           await fanOutSplit(env, instanceId, graph, region, cur, occ, tokenId, activated, recordStmts);

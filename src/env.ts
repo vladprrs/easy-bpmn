@@ -15,4 +15,11 @@ export interface Env {
   PROCESS_WORKFLOW: Workflow<ProcessWorkflowParams>;
   /** "workflow" (default/prod) or "direct" (deterministic test driver). */
   EXECUTION_MODE: string;
+  /**
+   * TEST-ONLY cap overrides (M4-L6, design §9). Integration tests lower a
+   * concurrency cap via these so a bomb fixture trips it without 256 real branches
+   * / 20000 real steps. Never set in production (wrangler.jsonc declares neither).
+   */
+  MAX_CONCURRENT_TOKENS_OVERRIDE?: string;
+  STEP_BUDGET_SOFT_OVERRIDE?: string;
 }

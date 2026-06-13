@@ -801,7 +801,14 @@ export type IncidentKind =
   //     (previously masked as serviceTaskFailure).
   | "jobActivationTimeout"
   | "waitTimeout"
-  | "conditionFailure";
+  | "conditionFailure"
+  // CONCURRENCY (M4-L6 §9). concurrencyLimit — a split fan-out would exceed
+  // MAX_CONCURRENT_TOKENS live tokens (counted from the in-memory frontier, never
+  // a live SQL COUNT). stepBudget — the per-drive cumulative runStep/waitForEvent
+  // count crossed STEP_BUDGET_SOFT (a graceful incident BELOW the platform step
+  // ceiling, so a hot parallel×loop shape never becomes an opaque errored Workflow).
+  | "concurrencyLimit"
+  | "stepBudget";
 /**
  * Incident remediation lifecycle (one-way):
  *

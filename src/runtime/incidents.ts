@@ -68,6 +68,40 @@ export async function createIncident(
   return { kind: "incident" };
 }
 
+/**
+ * CONCURRENCY caps (M4-L6, design §9). Both are terminal, view-only incidents
+ * (the §8.5 generalised cohort capture freezes any live sibling tokens). They are
+ * claimed once via the one-way `createIncident` (idempotent on replay):
+ *  - concurrencyLimit — a split fan-out would exceed MAX_CONCURRENT_TOKENS live
+ *    tokens (counted from the in-memory frontier, never a SQL COUNT).
+ *  - stepBudget — the per-drive cumulative runStep/waitForEvent counter crossed
+ *    STEP_BUDGET_SOFT, BELOW the platform step ceiling, so a hot parallel×loop
+ *    shape degrades gracefully instead of becoming an opaque errored Workflow.
+ */
+export async function raiseConcurrencyLimit(env: Env, instanceId: string, splitId: string, cap: number): Promise<{ kind: "incident" }> {
+  return createIncident(
+    env,
+    instanceId,
+    splitId,
+    0,
+    `Fan-out at '${splitId}' exceeded the live-token cap (${cap} concurrent tokens).`,
+    { splitId, cap },
+    "concurrencyLimit",
+  );
+}
+
+export async function raiseStepBudget(env: Env, instanceId: string, elementId: string, budget: number, steps: number): Promise<{ kind: "incident" }> {
+  return createIncident(
+    env,
+    instanceId,
+    elementId,
+    0,
+    `Engine step budget exceeded (${steps} > ${budget}) at '${elementId}' — settled as a graceful incident below the platform step ceiling.`,
+    { elementId, budget, steps },
+    "stepBudget",
+  );
+}
+
 /** Workflow-driver fallback: a terminal/uncaught failure becomes a view-only incident. */
 export async function recordTerminalIncident(env: Env, instanceId: string, reason: string): Promise<void> {
   const inst = await getInstanceRow(env.DB, instanceId);

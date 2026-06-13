@@ -1056,8 +1056,11 @@ components:
             `jobActivationTimeout` (un-leasable-job DLQ) and `waitTimeout`
             (un-guarded service-task / receive-task wait caps). `conditionFailure`
             is a hard FEEL evaluation error on an exclusiveGateway flow. The
-            compensation-wait cap deliberately stays `compensationFailure`.
-          enum: [serviceTaskFailure, compensationFailure, timeout, poison, loopLimit, noPath, jobActivationTimeout, waitTimeout, conditionFailure]
+            compensation-wait cap deliberately stays `compensationFailure`. M4-L6
+            adds `concurrencyLimit` (a split fan-out exceeded MAX_CONCURRENT_TOKENS
+            live tokens) and `stepBudget` (the per-drive step counter crossed
+            STEP_BUDGET_SOFT — a graceful incident below the platform step ceiling).
+          enum: [serviceTaskFailure, compensationFailure, timeout, poison, loopLimit, noPath, jobActivationTimeout, waitTimeout, conditionFailure, concurrencyLimit, stepBudget]
         resolution:
           type: string
           nullable: true

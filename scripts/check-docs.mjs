@@ -163,21 +163,28 @@ if (/\b(parallel|inclusive)\s+gateways?[^.]*\b(deferred|out of scope|M4 \(deferr
   failures.push(`03-gateways.md still marks parallel/inclusive gateways as deferred — they ship in M4.`);
 }
 
-// 6) Every literal "MAX_ELEMENT_OCCURRENCES = <n>" under docs/bpmn/ and
-//    specs/002-saga-orchestrator/ matches the engine constant.
+// 6) Every literal "<CONST> = <n>" under docs/bpmn/ and specs/002-saga-orchestrator/
+//    matches the engine constant, for each engine cap constant. M4-L6 generalised
+//    this from MAX_ELEMENT_OCCURRENCES alone to also cover MAX_CONCURRENT_TOKENS
+//    and STEP_BUDGET_SOFT (each value is repeated across several docs and would rot
+//    silently if the engine retunes it).
 const engineText = readFileSync(engineSrc, "utf8");
-const engineMatch = engineText.match(/MAX_ELEMENT_OCCURRENCES = (\d+)/);
-if (!engineMatch) {
-  failures.push(`src/runtime/engine.ts no longer defines "MAX_ELEMENT_OCCURRENCES = <n>" — update this check.`);
-} else {
+const SYNCED_CONSTANTS = ["MAX_ELEMENT_OCCURRENCES", "MAX_CONCURRENT_TOKENS", "STEP_BUDGET_SOFT"];
+const constDocPaths = [...mdFiles(bpmnDir), ...mdFiles(sagaSpecDir)];
+for (const name of SYNCED_CONSTANTS) {
+  const engineMatch = engineText.match(new RegExp(`${name} = (\\d+)`));
+  if (!engineMatch) {
+    failures.push(`src/runtime/engine.ts no longer defines "${name} = <n>" — update this check.`);
+    continue;
+  }
   const engineValue = engineMatch[1];
-  for (const path of [...mdFiles(bpmnDir), ...mdFiles(sagaSpecDir)]) {
+  for (const path of constDocPaths) {
     const text = readFileSync(path, "utf8");
     const rel = path.slice(repoRoot.length);
     text.split("\n").forEach((line, i) => {
-      for (const m of stripEmphasisKeepUnderscore(line).matchAll(/MAX_ELEMENT_OCCURRENCES = (\d+)/g)) {
+      for (const m of stripEmphasisKeepUnderscore(line).matchAll(new RegExp(`${name} = (\\d+)`, "g"))) {
         if (m[1] !== engineValue) {
-          failures.push(`${rel}:${i + 1} says MAX_ELEMENT_OCCURRENCES = ${m[1]} but src/runtime/engine.ts says ${engineValue}.`);
+          failures.push(`${rel}:${i + 1} says ${name} = ${m[1]} but src/runtime/engine.ts says ${engineValue}.`);
         }
       }
     });

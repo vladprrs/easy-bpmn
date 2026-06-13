@@ -59,6 +59,24 @@ describe("parallelGateway AND (M4-L3, direct mode)", () => {
     expect(inst.body.variables).toMatchObject({ base: 1, fromA: 1, fromB: 1, shared: "B" });
   });
 
+  it("never completes while any token is live (last-token-out, §5.6)", async () => {
+    const token = await mintWorkerToken();
+    const { instance } = await publishAndStart(PARALLEL_BPMN, { correlationKey: "p3", variables: {} });
+    const id = instance.body.instanceId;
+    // Complete ONLY branch f1; f2 + the join + the post-join confirm are all pending,
+    // so a none-end on the produced token is unreachable and completion must NOT fire.
+    const a = await leaseOne(token, "reserve-stock");
+    await complete(token, a, {});
+    const mid = await get(`/instances/${id}`);
+    expect(mid.body.status).not.toBe("completed");
+    // Drain the rest so this instance leaves no open jobs to pollute sibling tests.
+    const b = await leaseOne(token, "authorize-payment");
+    await complete(token, b, {});
+    const c = await leaseOne(token, "confirm-order");
+    await complete(token, c, {});
+    expect((await get(`/instances/${id}`)).body.status).toBe("completed");
+  });
+
   it("does not leak a sibling branch's write into the other branch before the join", async () => {
     const token = await mintWorkerToken();
     const { instance } = await publishAndStart(PARALLEL_BPMN, { correlationKey: "p4", variables: { base: 1 } });

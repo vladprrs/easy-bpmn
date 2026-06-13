@@ -13,6 +13,8 @@ export interface Env {
   JOB_SCHEDULER: DurableObjectNamespace<JobScheduler>;
   /** One Workflow instance per process instance (production execution driver). */
   PROCESS_WORKFLOW: Workflow<ProcessWorkflowParams>;
+  /** Overflow store for branch variable overlays exceeding OVERLAY_INLINE_MAX_BYTES (M4-L6, design §9.1). */
+  OVERLAYS: R2Bucket;
   /** "workflow" (default/prod) or "direct" (deterministic test driver). */
   EXECUTION_MODE: string;
   /**

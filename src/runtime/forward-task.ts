@@ -54,7 +54,7 @@ import { insertSagaStepStmt } from "../persistence/saga";
 import { loadInst, isTransactionScope, SVC_WAIT_TIMEOUT, type RunStep, type WaitForEvent } from "./engine-shared";
 import { createIncident, parkWaiting } from "./incidents";
 import { resolveScope } from "./frontier";
-import { getToken, parseOverlay, rootTokenId, setTokenOverlayStmt } from "../persistence/tokens";
+import { getToken, parseOverlay, readOverlay, rootTokenId, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
 
 /**
  * The token-path node an error boundary on `elementId` routes the failed token
@@ -440,7 +440,8 @@ async function applyForwardCompletion(
   // null/root token keeps the M0–M3 path (merge into process_instances.variables).
   const isBranch = !!activeTokenId && activeTokenId !== rootTokenId(instanceId);
   const branchTokenRow = isBranch ? await getToken(env.DB, activeTokenId!) : null;
-  const baseVars = isBranch ? (branchTokenRow ? parseOverlay(branchTokenRow) : {}) : parseJson<JsonObject>(inst.variables, {});
+  // R2-aware read (M4-L6, design §9.1): a branch overlay may be an {"__r2":…} ref.
+  const baseVars = isBranch ? (branchTokenRow ? await readOverlay(env, parseOverlay(branchTokenRow)) : {}) : parseJson<JsonObject>(inst.variables, {});
   const merged = mergeVariables(baseVars, output);
   const now = nowIso();
 
@@ -500,6 +501,12 @@ async function applyForwardCompletion(
     return { kind: "waiting" };
   }
 
+  // R2-aware write (M4-L6, design §9.1): offload a large branch overlay to R2 BEFORE
+  // the D1 commit (deterministic key ⇒ a crash-retry is byte-identical). Reached
+  // only when merged is within the event-payload limit (the poison gate above);
+  // root vars stay inline.
+  const storedBranchOverlay = isBranch ? await writeOverlay(env, instanceId, activeTokenId!, merged) : merged;
+
   const statements: D1PreparedStatement[] = [
     variableSnapshotStmt(env.DB, { instanceId, source: "serviceTask", sourceId: job.job_id, variables: output, now }),
     historyStmt(env.DB, {
@@ -515,7 +522,7 @@ async function applyForwardCompletion(
     // token keeps the exact M0–M3 write (merged → process_instances.variables).
     ...(isBranch
       ? [
-          setTokenOverlayStmt(env.DB, activeTokenId!, merged, now),
+          setTokenOverlayStmt(env.DB, activeTokenId!, storedBranchOverlay, now),
           applyTransitionStmt(env.DB, { instanceId, currentElementId: null, status: "running", now }),
         ]
       : [applyTransitionStmt(env.DB, { instanceId, variables: merged, currentElementId: next, status: "running", now })]),

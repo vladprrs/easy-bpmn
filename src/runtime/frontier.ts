@@ -11,7 +11,7 @@ import type { MessageEventPayload } from "../contracts/workflow-events";
 import type { WaitForEvent } from "./engine-shared";
 import { isTerminalInstanceStatus, nowIso, type JsonObject } from "../util";
 import { dbBatch } from "../persistence/db";
-import { rootTokenId, upsertTokenStmt, setTokenStatusStmt, listLiveTokens, getToken, parseOverlay, branchTokenId, parseTokenId, getJoinCompletion } from "../persistence/tokens";
+import { rootTokenId, upsertTokenStmt, setTokenStatusStmt, listLiveTokens, getToken, parseOverlay, readOverlay, branchTokenId, parseTokenId, getJoinCompletion } from "../persistence/tokens";
 import { loadInst } from "./engine-shared";
 import { claimJoinCompletion, fanOutSplit, joinBarrierSatisfied, recordJoinArrival, requiredFlowsFor, resolveActivatedFlows, splitAlreadyFannedOut } from "./regions-runtime";
 
@@ -51,7 +51,8 @@ export async function resolveScope(env: Env, instanceId: string, rootVars: JsonO
     guard.add(cur);
     const row = await getToken(env.DB, cur);
     if (!row) break;
-    chain.push(parseOverlay(row));
+    // R2-aware read (M4-L6, design §9.1): an ancestor overlay may be offloaded.
+    chain.push(await readOverlay(env, parseOverlay(row)));
     cur = row.parent_token_id;
   }
   let scope: JsonObject = { ...rootVars };
@@ -252,9 +253,15 @@ export async function driveFrontier(
         // has arrived, then keep walking the post-join path on the parent token.
         const required = await requiredFlowsFor(env, graph, instanceId, region, occ);
         if (await joinBarrierSatisfied(env, instanceId, region.joinId, occ, required)) {
-          const outTarget = await claimJoinCompletion(env, instanceId, graph, region, region.joinId, occ, required, tokenId);
+          const joinOutcome = await claimJoinCompletion(env, instanceId, graph, region, region.joinId, occ, required, tokenId);
+          if (joinOutcome.kind === "incident") {
+            // Join-time payload bound (M4-L6, §9.1): the merged overlay exceeded the
+            // event limit → a terminal poison incident was claimed; stop the walk.
+            incident = true;
+            return;
+          }
           advanced = true;
-          cur = outTarget; // continue on the PRODUCED (= parent) token from the join out-flow
+          cur = joinOutcome.outTarget; // continue on the PRODUCED (= parent) token from the join out-flow
           continue;
         }
         return; // join not yet satisfiable this pass → a sibling is parked

@@ -21,9 +21,11 @@ import {
   insertJoinArrivalStmt,
   insertJoinCompletionStmt,
   parseOverlay,
+  readOverlay,
   rootTokenId,
   setTokenStatusStmt,
   upsertTokenStmt,
+  writeOverlay,
 } from "../persistence/tokens";
 import { loadInst } from "./engine-shared";
 import { evaluateCondition, normalizeFeelValue, ExpressionEvaluationError } from "./expressions";
@@ -248,12 +250,16 @@ export async function joinBarrierSatisfied(env: Env, instanceId: string, joinId:
   return requiredFlowIds.every((f) => arrived.has(f));
 }
 
+/** The outcome of a join-completion claim: advance the produced token, or a terminal incident (M4-L6 join-time payload bound). */
+export type JoinCompletionOutcome = { kind: "advance"; outTarget: string } | { kind: "incident" };
+
 /**
  * Claim the join (design §5.4): a plain-INSERT of `join_completions` in the SAME
  * batch as the merged-overlay write, the contributing branch tokens → 'merged',
  * and the advance to the join's out-flow. A losing concurrent batch aborts on the
  * PK and re-reads the recorded produced token (fast-forward). Returns the produced
- * token's next element id (the join's single out-flow target, SESE).
+ * token's next element id (the join's single out-flow target, SESE), or a terminal
+ * incident when the merged overlay exceeds the event payload limit (M4-L6, §9.1).
  *
  * SESE (design §5.5): the region consumes the parent token at the split and
  * returns ONE token to the enclosing scope at the join — so the produced token
@@ -264,31 +270,56 @@ export async function joinBarrierSatisfied(env: Env, instanceId: string, joinId:
  *  - NESTED region → the base is the enclosing-branch (parent) token's overlay and
  *    the merge is folded onto THAT token's overlay (no root write).
  */
-export async function claimJoinCompletion(env: Env, instanceId: string, graph: ExecutionGraph, region: RegionInfo, joinId: string, activation: number, requiredFlowIds: string[], parentTokenId: string): Promise<string> {
+export async function claimJoinCompletion(env: Env, instanceId: string, graph: ExecutionGraph, region: RegionInfo, joinId: string, activation: number, requiredFlowIds: string[], parentTokenId: string): Promise<JoinCompletionOutcome> {
   const joinNode = graph.nodes[joinId]!;
   const outTarget = joinNode.outgoing[0]!.targetId; // a join has exactly one out-flow (SESE)
   const existing = await getJoinCompletion(env.DB, instanceId, joinId, activation);
-  if (existing) return outTarget; // already produced → fast-forward
+  if (existing) return { kind: "advance", outTarget }; // already produced → fast-forward
 
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
   const isRoot = parentTokenId === rootTokenId(instanceId);
   const parent = await getToken(env.DB, parentTokenId);
   // Merge base: root region folds onto process_instances.variables; a nested
-  // region folds onto its enclosing-branch token overlay (design §5.7/§6).
+  // region folds onto its enclosing-branch token overlay (design §5.7/§6). R2-aware
+  // read (M4-L6, design §9.1): an offloaded overlay rehydrates transparently.
   const baseOverlay: JsonObject = isRoot
     ? parseJson<JsonObject>(inst.variables, {})
     : parent
-      ? parseOverlay(parent)
+      ? await readOverlay(env, parseOverlay(parent))
       : {};
-  // Gather the required branch tokens' overlays.
+  // Gather the required branch tokens' overlays (R2-aware).
   const branchTokens: { branchFlowId: string; overlay: JsonObject; tokenId: string }[] = [];
   for (const flowId of requiredFlowIds) {
     const tid = branchTokenId(instanceId, region.splitId, activation, flowId);
     const row = await getToken(env.DB, tid);
-    branchTokens.push({ branchFlowId: flowId, overlay: row ? parseOverlay(row) : {}, tokenId: tid });
+    branchTokens.push({ branchFlowId: flowId, overlay: row ? await readOverlay(env, parseOverlay(row)) : {}, tokenId: tid });
   }
   const mergedOverlay = mergeBranchOverlays(baseOverlay, region.branchFlowIds, branchTokens);
+
+  // Join-time payload bound (M4-L6, design §9.1): the merged overlay either becomes
+  // root process_instances.variables (which feeds service-task inputs across the
+  // ~1 MiB event channel) or folds onto an enclosing token — so a merge exceeding
+  // MAX_EVENT_PAYLOAD_BYTES is a terminal `poison` incident, NEVER a silent
+  // truncation. (Branch overlays in the 512 KiB–1 MiB band offload to R2; only an
+  // over-1-MiB MERGE is rejected here.)
+  const mergedSize = payloadByteSize(mergedOverlay);
+  if (mergedSize > MAX_EVENT_PAYLOAD_BYTES) {
+    await createIncident(
+      env,
+      instanceId,
+      joinId,
+      0,
+      `Join '${joinId}' merged branch overlays to ${mergedSize} bytes, exceeding the ${MAX_EVENT_PAYLOAD_BYTES}-byte event payload limit.`,
+      { joinId, activation, mergedSize, contributingTokenIds: branchTokens.map((b) => b.tokenId) },
+      "poison",
+    );
+    return { kind: "incident" };
+  }
+
+  // R2-aware write (M4-L6): a nested fold onto an enclosing token overlay may
+  // offload (≤ 1 MiB after the bound above); root vars go inline.
+  const storedFold = isRoot ? mergedOverlay : await writeOverlay(env, instanceId, parentTokenId, mergedOverlay);
 
   const stmts: D1PreparedStatement[] = [
     insertJoinCompletionStmt(env.DB, { instanceId, joinId, activation, producedTokenId: parentTokenId, now }), // THE CLAIM
@@ -306,7 +337,7 @@ export async function claimJoinCompletion(env: Env, instanceId: string, graph: E
     // Produced token = the enclosing-branch (parent) token: fold the merge onto
     // ITS overlay; no root variable write (design §6 nested placement).
     stmts.push(
-      foldTokenOverlayStmt(env.DB, { tokenId: parentTokenId, positionElementId: outTarget, variablesOverlay: mergedOverlay, now }),
+      foldTokenOverlayStmt(env.DB, { tokenId: parentTokenId, positionElementId: outTarget, variablesOverlay: storedFold, now }),
       applyTransitionStmt(env.DB, { instanceId, currentElementId: null, status: "running", now }),
     );
   }
@@ -319,11 +350,11 @@ export async function claimJoinCompletion(env: Env, instanceId: string, graph: E
     await dbBatch(env.DB, stmts);
   } catch (err) {
     if (isUniqueConstraintViolation(err) && (await getJoinCompletion(env.DB, instanceId, joinId, activation))) {
-      return outTarget;
+      return { kind: "advance", outTarget };
     }
     throw err;
   }
-  return outTarget;
+  return { kind: "advance", outTarget };
 }
 
 /** A D1 UNIQUE-constraint violation (the plain-INSERT race loser); mirrors engine.ts. */

@@ -109,7 +109,7 @@ import {
   type LeafOutcome,
 } from "./frontier";
 import { completeInstanceGuarded } from "../persistence/instances";
-import { listLiveTokens, setTokenStatusStmt, rootTokenId, getToken, parseOverlay, setTokenOverlayStmt } from "../persistence/tokens";
+import { listLiveTokens, setTokenStatusStmt, rootTokenId, getToken, parseOverlay, readOverlay, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
 import { withDriveLock } from "../persistence/drive-lock";
 import { driveForwardServiceTask, terminateUnleasableJob } from "./forward-task";
 import { beginCompensating, settleAfterCompensation } from "./compensation";
@@ -1068,8 +1068,11 @@ async function applyMessage(env: Env, instanceId: string, graph: ExecutionGraph,
   // vars mutate only at the join fold-up. A null/root token keeps the M0–M3 path.
   const isBranch = !!activeTokenId && activeTokenId !== rootTokenId(instanceId);
   const branchTokenRow = isBranch ? await getToken(env.DB, activeTokenId!) : null;
-  const baseVars = isBranch ? (branchTokenRow ? parseOverlay(branchTokenRow) : {}) : parseJson<JsonObject>(inst.variables, {});
+  // R2-aware read (M4-L6, design §9.1): a branch overlay may be an {"__r2":…} ref.
+  const baseVars = isBranch ? (branchTokenRow ? await readOverlay(env, parseOverlay(branchTokenRow)) : {}) : parseJson<JsonObject>(inst.variables, {});
   const merged = mergeVariables(baseVars, event.payload ?? {});
+  // R2-aware write (M4-L6): offload a large branch overlay before the D1 commit.
+  const storedBranchOverlay = isBranch ? await writeOverlay(env, instanceId, activeTokenId!, merged) : merged;
 
   let subscriptionId = active?.subscription_id;
   if (!subscriptionId) {
@@ -1098,7 +1101,7 @@ async function applyMessage(env: Env, instanceId: string, graph: ExecutionGraph,
     // current_element_id (NULL = multi-token frontier). A root/single-token token
     // keeps the exact M0–M3 write (merged → process_instances.variables).
     ...(isBranch
-      ? [setTokenOverlayStmt(env.DB, activeTokenId!, merged, now), applyTransitionStmt(env.DB, { instanceId, currentElementId: null, status: "running", now })]
+      ? [setTokenOverlayStmt(env.DB, activeTokenId!, storedBranchOverlay, now), applyTransitionStmt(env.DB, { instanceId, currentElementId: null, status: "running", now })]
       : [applyTransitionStmt(env.DB, { instanceId, variables: merged, currentElementId: next, status: "running", now })]),
     ...(active ? [subscriptionConsumedStmt(env.DB, subscriptionId, event.externalMessageId, now)] : []),
     messageCorrelatedStmt(env.DB, { externalMessageId: event.externalMessageId, instanceId, subscriptionId, now }),

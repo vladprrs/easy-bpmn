@@ -69,7 +69,25 @@
       // the per-element cap itself is an engine constant, not config.
       "name": "easy-bpmn-process",
       "binding": "PROCESS_WORKFLOW",
-      "class_name": "ProcessWorkflow"
+      "class_name": "ProcessWorkflow",
+      // M4-L6 (design §9/§9.1): raise the platform step budget to its configurable
+      // MAX so the engine's STEP_BUDGET_SOFT=20000 (src/runtime/engine.ts) sits
+      // BELOW it — a hot parallel×loop shape settles a graceful `stepBudget`
+      // incident instead of an opaque platform-errored Workflow. Worst-case step
+      // multiplication (MAX_CONCURRENT_TOKENS × per-branch fan-out × in-region
+      // loops + the reverse-compensation pass) is bounded by the three engine caps.
+      "limits": { "steps": 25000 }
+    }
+  ],
+  // M4-L6 (design §9.1): branch `variables_overlay` exceeding OVERLAY_INLINE_MAX_BYTES
+  // is offloaded to R2 under the deterministic key overlays/${instanceId}/${tokenId}.json
+  // (written before the D1 commit so a crash-retry is byte-identical); the D1 column
+  // then holds {"__r2":"<key>"}. Keeps cumulative Workflow state bounded by step
+  // count, not payload size. @cloudflare/vitest-pool-workers provisions a local R2.
+  "r2_buckets": [
+    {
+      "binding": "OVERLAYS",
+      "bucket_name": "easy-bpmn-overlays"
     }
   ],
   "migrations": [

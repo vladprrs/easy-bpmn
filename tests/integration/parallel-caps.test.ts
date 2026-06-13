@@ -1,6 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { get } from "../helpers";
+import { PARALLEL_BPMN, authedPost, get, leaseOne, mintWorkerToken, publishAndStart } from "../helpers";
 import { ensureWorkspace } from "../../src/persistence/db";
 import { createVersion } from "../../src/persistence/definitions";
 import { createInstance } from "../../src/persistence/instances";
@@ -131,5 +131,30 @@ describe("concurrency caps (M4-L6, direct mode)", () => {
     expect(inst.body.incident.status).toBe("open");
     // The trip is well below the platform step ceiling (wrangler limits.steps).
     expect(inst.body.incident.payloadContext.budget).toBe(8);
+  });
+});
+
+describe("join-time payload bound (M4-L6, design §9.1)", () => {
+  const complete = (token: string, job: { jobId: string; lockToken: string }, outputVariables: Record<string, unknown>) =>
+    authedPost(`/jobs/${job.jobId}/complete`, token, { lockToken: job.lockToken, outputVariables });
+
+  it("a merged overlay exceeding MAX_EVENT_PAYLOAD_BYTES raises a poison incident (never a silent truncation)", async () => {
+    const token = await mintWorkerToken();
+    const { instance } = await publishAndStart(PARALLEL_BPMN, { correlationKey: "bigjoin", variables: {} });
+    const id = instance.body.instanceId;
+    // Each branch writes a DISTINCT ~600 KiB key (each individually under the 1 MiB
+    // per-call limit and offloaded to R2 as a branch overlay); their union at the
+    // join is ~1.2 MiB — over the event-payload limit, so the join must NOT merge
+    // it into root/deliver it but raise a terminal poison incident.
+    const big = "x".repeat(600 * 1024);
+    const a = await leaseOne(token, "reserve-stock");
+    await complete(token, a, { bigA: big });
+    const b = await leaseOne(token, "authorize-payment");
+    await complete(token, b, { bigB: big });
+
+    const inst = await get(`/instances/${id}`);
+    expect(inst.body.status).toBe("incident");
+    expect(inst.body.incident.kind).toBe("poison");
+    expect(inst.body.incident.elementId).toBe("join");
   });
 });

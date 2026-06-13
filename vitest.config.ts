@@ -17,6 +17,10 @@ export default defineConfig(async () => {
             TEST_MIGRATIONS: migrations,
             EXECUTION_MODE: "direct",
           },
+          // M4-L6: a local R2 for the branch-overlay offload (design §9.1). Declared
+          // here so unit/integration tests get env.OVERLAYS even though the worker
+          // also declares it in wrangler.jsonc.
+          r2Buckets: ["OVERLAYS"],
         },
       }),
     ],

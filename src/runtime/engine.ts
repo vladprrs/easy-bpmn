@@ -61,6 +61,7 @@ import { brokerKeyOf, type RegisterSubscriptionResult } from "./broker-types";
 import { MAX_EVENT_PAYLOAD_BYTES, payloadByteSize } from "./payload";
 import {
   ONE_HOUR_MS,
+  isoIsBefore,
   isoPlusMs,
   isTerminalInstanceStatus,
   mergeVariables,
@@ -123,9 +124,10 @@ import {
   timerGuardedTimeout,
   timerHasFired,
 } from "./boundary-timer";
-import { getTimer, timerIdFor } from "../persistence/timers";
-import { driveIntermediateCatch } from "./intermediate-timer";
-import { driveEventBasedGateway } from "./event-gateway";
+import { getTimer, listTimersForInstance, timerIdFor } from "../persistence/timers";
+import { driveIntermediateCatch, settleOverdueIntermediateCatchOnWake } from "./intermediate-timer";
+import { driveEventBasedGateway, settleOverdueEventGatewayTimerOnWake } from "./event-gateway";
+import { WAKE_TYPE, wakeBackstop } from "./wake";
 
 // Public surface (M3-L0): the node-kind blocks moved to sibling modules, but the
 // engine.ts import path stays the stable façade for every dependent — re-export
@@ -259,6 +261,33 @@ async function runInstanceInner(env: Env, instanceId: string, opts: RunOptions):
   return result;
 }
 
+/**
+ * Lost-alarm backstop sweep (TASK-54 / design §4.2) — the single-wake analogue of
+ * the per-leaf settleOverdue*OnWake. On a `bpmn_wake` TIMEOUT (a modeled deadline
+ * elapsed with no tickle ⇒ the DO alarm may have been lost) the wake loop calls this
+ * BEFORE re-walking: it settles every OVERDUE armed timer of the instance INLINE —
+ * the IDENTICAL fire batch the DO-alarm path commits — so the following re-walk
+ * routes the timer path from the now-committed D1 decider instead of busy-re-walking
+ * every wakeBackstop. Each per-kind settler is idempotent (decider-guarded); a
+ * not-yet-due timer is skipped (its DO arm is the primary path, re-armed write-free
+ * by the re-walk's self-heal). Reuses the existing settleOverdue*OnWake builders, so
+ * the batch and conflict semantics are identical to the alarm path. Exported for the
+ * wake-backstop seam test (the only CI-reachable check of this Workflow-mode path).
+ */
+export async function settleOverdueTimersForInstance(env: Env, graph: ExecutionGraph, instanceId: string): Promise<void> {
+  const now = nowIso();
+  for (const t of await listTimersForInstance(env.DB, instanceId)) {
+    if (t.status !== "armed" || isoIsBefore(now, t.fireAt)) continue; // settled, or not yet due
+    if (t.kind === "boundary" && t.attachedToRef) {
+      await settleOverdueBoundaryTimerOnWake(env, graph, instanceId, t.attachedToRef, t.occurrence);
+    } else if (t.kind === "intermediateCatch") {
+      await settleOverdueIntermediateCatchOnWake(env, graph, instanceId, t.elementId, t.occurrence);
+    } else if (t.kind === "eventGateway" && t.gatewayId) {
+      await settleOverdueEventGatewayTimerOnWake(env, graph, instanceId, t.gatewayId, t.occurrence);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main scope-aware loop (single-token in M1; occurrence-aware rewalk in M2)
 // ---------------------------------------------------------------------------
@@ -301,11 +330,10 @@ async function loop(
     async driveLeaf(cur: string, occ: number, activeTokenId: string, collector: WaitCollector): Promise<LeafOutcome> {
       const node = graph.nodes[cur]!;
       const tag = `${cur}#${occ}`;
-      // In a region graph in WORKFLOW mode a park REGISTERS in the collector (one
-      // post-DFS `Promise.race`, design §5.2) instead of suspending; direct mode
-      // (waitFor === null) and single-token graphs use the real waitFor unchanged.
-      const leafWaitFor: WaitForEvent | null =
-        waitFor && graph.regions ? collectingWaitFor(collector, activeTokenId) : waitFor;
+      // TASK-54: leaf drivers NEVER suspend — they park (record the wait in D1) and
+      // return `waiting`, identical to direct mode. The single bpmn_wake is issued by
+      // `loop` after the drive (one waitForEvent at a time = the replay-stable shape).
+      const leafWaitFor: WaitForEvent | null = null;
 
       if (node.type === "startEvent") {
         return { kind: "next", next: await runStep(`start:${tag}`, () => enterStart(env, instanceId, graph, cur, occ, node)) };
@@ -448,52 +476,84 @@ async function loop(
     },
   };
 
-  // ---- Single-token graphs (M0–M3): the exact scalar walk, byte-identical ----
-  // No `regions` ⇒ no split/join nodes ⇒ the frontier is one chain from the root
-  // token, driven leaf-by-leaf via `driveLeaf`. This preserves the original loop()
-  // control flow (occurrence counting, loop cap, terminal completion) verbatim.
+  // The single replay-stable wake (TASK-54, design §3.1): issue exactly ONE
+  // `step.waitForEvent` on the constant WAKE_TYPE per parked pass, sized to the
+  // instance's nearest deadline (`wakeBackstop`). A timeout THROWS (Cloudflare
+  // semantics) → caught here; on a timeout we settle overdue timers INLINE (the
+  // lost-alarm backstop, §4.2) so a modeled deadline fires within the bound instead
+  // of busy-re-walking, then fall through to re-walk. Distinct sequential names
+  // `wake#k` give distinct suspension points (a reused name returns the cached event,
+  // not a fresh suspend). Returns false in DIRECT mode (waitFor === null) so the
+  // executor re-drives. Workflow-mode-only — not CI; validated by the real-CF matrix
+  // (Task 10) + the seam tests (the wake never fires under EXECUTION_MODE=direct).
+  let wakeSeq = 0;
+  const issueWake = async (): Promise<boolean> => {
+    if (!waitFor) return false;
+    caps.budget.steps += 1;
+    const timeout = await wakeBackstop(env, instanceId);
+    let timedOut = false;
+    try {
+      await waitFor({ name: `wake#${wakeSeq}`, workflowEventType: WAKE_TYPE, timeout });
+    } catch {
+      timedOut = true; // a wait timeout (or any wait error) → self-heal via re-walk
+    }
+    wakeSeq += 1;
+    if (timedOut) await settleOverdueTimersForInstance(env, graph, instanceId);
+    return true;
+  };
+
+  // ---- Single-token graphs (M0–M3): the scalar walk, now wrapped in the single ----
+  // wake. No `regions` ⇒ one chain from the root token, driven leaf-by-leaf via
+  // `driveLeaf` (which always parks, never suspends — Task 6). On a park: direct mode
+  // returns `waiting` (executor re-drives); workflow mode issues ONE bpmn_wake and
+  // re-walks. Occurrence counting / loop cap / terminal completion are unchanged.
   if (!graph.regions) {
-    const visits = new Map<string, number>();
-    const scratch = new WaitCollector(); // unused: scalar leaves use the real waitFor / direct-mode park
-    let cur: string = graph.startElementId;
+    const scratch = new WaitCollector(); // unused: leaves park (Task 6); kept until Task 9 drops the param
     while (true) {
-      if (!graph.nodes[cur]) return { status: "completed" };
-      const occ = nextOccurrence(visits, cur);
-      if (occ >= MAX_ELEMENT_OCCURRENCES) {
-        await drivers.raiseLoopLimit(cur, occ);
-        return { status: "incident" };
+      const visits = new Map<string, number>();
+      let cur: string = graph.startElementId;
+      let parked = false;
+      while (true) {
+        if (!graph.nodes[cur]) return { status: "completed" };
+        const occ = nextOccurrence(visits, cur);
+        if (occ >= MAX_ELEMENT_OCCURRENCES) {
+          await drivers.raiseLoopLimit(cur, occ);
+          return { status: "incident" };
+        }
+        const r = await drivers.driveLeaf(cur, occ, rootTokenId(instanceId), scratch);
+        if (r.kind === "next") {
+          cur = r.next;
+          continue;
+        }
+        if (r.kind === "parked") {
+          parked = true;
+          break;
+        }
+        if (r.kind === "incident") return { status: "incident" };
+        if (r.kind === "compensate") return settleAfterCompensation(env, instanceId, graph, r.scopeId, runStep, waitFor);
+        return { status: "completed" }; // completed | consumed (consumed is unreachable without regions)
       }
-      const r = await drivers.driveLeaf(cur, occ, rootTokenId(instanceId), scratch);
-      if (r.kind === "next") {
-        cur = r.next;
-        continue;
+      if (parked) {
+        if (!(await issueWake())) return { status: "waiting" }; // direct mode parks; executor re-drives
+        continue; // workflow mode: re-walk after the single wake
       }
-      if (r.kind === "parked") return { status: "waiting" };
-      if (r.kind === "incident") return { status: "incident" };
-      if (r.kind === "compensate") return settleAfterCompensation(env, instanceId, graph, r.scopeId, runStep, waitFor);
-      return { status: "completed" }; // completed | consumed (consumed is unreachable without regions)
     }
   }
 
   // ---- Concurrent regions (M4): the deterministic token-frontier DFS owns the ----
   // walk. One pass per drive in direct mode (the drive lock serialises siblings);
-  // workflow mode loops, racing the collected waits and re-walking on each event.
+  // workflow mode issues ONE bpmn_wake per parked pass and re-walks (TASK-54: the
+  // single wake replaces the shrinking-membership multi-wait Promise.race that hung
+  // on real Cloudflare Workflows). `driveFrontier` still returns the (now-unused)
+  // collector until Task 9 drops it; `pending` stays for direct-mode first-pass apply.
   while (true) {
-    const { result, collector } = await driveFrontier(env, graph, instanceId, drivers, MAX_ELEMENT_OCCURRENCES, caps);
+    const { result } = await driveFrontier(env, graph, instanceId, drivers, MAX_ELEMENT_OCCURRENCES, caps);
     if (result.incident) return { status: "incident" };
     if (result.compensate) return settleAfterCompensation(env, instanceId, graph, result.compensate.scopeId, runStep, waitFor);
     if (result.completed) return { status: "completed" };
     if (result.parked) {
-      if (!waitFor) return { status: "waiting" }; // direct mode parks; the next callback re-drives
-      // Workflow-mode multi-wait (design §5.2/§14) — manual-matrix-validated, not CI.
-      // Count each collected waitForEvent against the step budget (design §9): a
-      // multi-wait that keeps timing out and re-looping (carried blocker #3) burns
-      // steps each pass, so stepBudget is the natural circuit breaker on the top of
-      // the next walk rather than an unbounded re-race.
-      caps.budget.steps += collector.size;
-      const outcome = await raceParkedWaits(collector, waitFor);
-      pending = matchKeyedEvent(outcome);
-      continue;
+      if (!(await issueWake())) return { status: "waiting" }; // direct mode parks; the next callback re-drives
+      continue; // workflow mode: re-walk after the single wake (apply-from-D1 reconciles every branch)
     }
     // Nothing parked and nothing completed → the token frontier drained → last-
     // token-out completion (the guarded terminal fires iff no token is live, §5.6).

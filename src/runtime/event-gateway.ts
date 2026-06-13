@@ -74,12 +74,11 @@ import {
   armTimerDO,
   isUniqueConstraintViolation,
   supersedeBrokerSubscription,
-  timerSizedTimeout,
   type TimerWake,
   type WakeSettleOutcome,
 } from "./boundary-timer";
 import { createIncident } from "./incidents";
-import { loadInst, SVC_WAIT_TIMEOUT, type RunStep, type WaitForEvent } from "./engine-shared";
+import { loadInst, type RunStep, type WaitForEvent } from "./engine-shared";
 
 // ---------------------------------------------------------------------------
 // Branch model
@@ -219,57 +218,8 @@ export async function driveEventBasedGateway(
     return { kind: "next", next: applied.next };
   }
 
-  // (4) Direct mode: park; the broker delivery / timer alarm resumes inline.
-  if (!waitFor) return { kind: "waiting" };
-
-  // (5) Workflow mode: ONE waitForEvent on the gateway type, sized to the timer
-  //     (or the un-guarded cap when there is no timer branch).
-  const timeout = branches.timer
-    ? await timerSizedTimeout(env, timerIdFor(instanceId, branches.timer.catchId, occ))
-    : SVC_WAIT_TIMEOUT;
-  const outcome = await waitFor({ name: `ebg-wait:${tag}`, workflowEventType: workflowEventGatewayTypeFor(elementId, occ), timeout });
-  // M4-L3 multi-wait: a region branch in workflow mode REGISTERED this wait and did
-  // not suspend — return parked (raceParkedWaits awaits it). Direct mode never hits this.
-  if (outcome.kind === "parked") return { kind: "waiting" };
-
-  // The timer may have fired (its sendEvent wake, or a concurrent alarm) — its
-  // fireTimer batch commits the decision before waking, so re-read it.
-  const afterWait = await getGatewayDecision(env.DB, instanceId, elementId, occ);
-  if (afterWait) return { kind: "next", next: winnerNextOf(graph, node, afterWait.chosenFlowId) };
-
-  if (outcome.kind === "timeout") {
-    // Lost-alarm backstop (design §4.2, risk R5): a timer-guarded EBG wait NEVER
-    // raises waitTimeout. Settle an overdue timer branch INLINE (the identical
-    // fireTimer batch), returning the timer path to this loop. Workflow-mode-only.
-    if (branches.timer) {
-      const settled = await settleOverdueEventGatewayTimerOnWake(env, graph, instanceId, elementId, occ);
-      if (settled.kind === "fired") return { kind: "next", next: settled.next };
-      if (settled.kind === "reparked") return { kind: "waiting" };
-      const reread = await getGatewayDecision(env.DB, instanceId, elementId, occ);
-      if (reread) return { kind: "next", next: winnerNextOf(graph, node, reread.chosenFlowId) };
-      return { kind: "waiting" };
-    }
-    // An un-guarded EBG wait (no timer branch) hits the safety-net cap.
-    await runStep(`ebg-timeout:${tag}`, () =>
-      createIncident(env, instanceId, elementId, 0, "Event-based gateway wait timed out (no message branch correlated).", { occurrence: occ }, "waitTimeout"),
-    );
-    return { kind: "incident" };
-  }
-
-  // Woke on a message delivery (the payload is a MessageEventPayload, not the
-  // timerFired discriminator) → apply it (message wins). A concurrent fireTimer
-  // that already won is handled inside applyEbgMessage (convert on conflict).
-  if (isTimerFiredWake(outcome.payload)) return { kind: "waiting" }; // decider not visible yet → re-park defensively
-  const event = outcome.payload as MessageEventPayload;
-  const branch = branches.message.find((b) => b.messageName === event.messageName);
-  if (!branch) return { kind: "waiting" }; // stray event → re-park
-  const applied = await runStep(`ebg-msg:${tag}`, () => applyEbgMessage(env, instanceId, graph, elementId, node, occ, branch, branches, event, activeTokenId));
-  if (applied.kind === "incident") return { kind: "incident" };
-  return { kind: "next", next: applied.next };
-}
-
-function isTimerFiredWake(payload: unknown): boolean {
-  return typeof payload === "object" && payload !== null && (payload as { outcome?: unknown }).outcome === "timerFired";
+  // (4) Park: the broker delivery / timer alarm resumes inline on the next drive.
+  return { kind: "waiting" };
 }
 
 // ---------------------------------------------------------------------------

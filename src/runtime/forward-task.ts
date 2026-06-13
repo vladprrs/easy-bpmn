@@ -8,7 +8,6 @@
 
 import type { Env } from "../env";
 import type { ExecutionGraph, GraphNode } from "../bpmn/graph";
-import { workflowJobEventTypeFor } from "../bpmn/profile";
 import { MAX_EVENT_PAYLOAD_BYTES, payloadByteSize } from "./payload";
 import {
   isoIsBefore,
@@ -30,9 +29,7 @@ import {
   convertOnFire,
   isUniqueConstraintViolation,
   settleBoundaryTimerCancel,
-  settleOverdueBoundaryTimerOnWake,
   timerBoundaryFor,
-  timerGuardedTimeout,
   timerHasFired,
 } from "./boundary-timer";
 import { getTimer, timerIdFor } from "../persistence/timers";
@@ -51,7 +48,7 @@ import {
   variableSnapshotStmt,
 } from "../persistence/instances";
 import { insertSagaStepStmt } from "../persistence/saga";
-import { loadInst, isTransactionScope, SVC_WAIT_TIMEOUT, type RunStep, type WaitForEvent } from "./engine-shared";
+import { loadInst, isTransactionScope, type RunStep, type WaitForEvent } from "./engine-shared";
 import { createIncident, parkWaiting } from "./incidents";
 import { resolveScope } from "./frontier";
 import { branchHistoryTags, getToken, parseOverlay, readOverlay, rootTokenId, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
@@ -163,82 +160,10 @@ export async function driveForwardServiceTask(
     if (trow?.status === "armed") await armTimerDO(env, trow.timerId, trow.fireAt);
   }
 
-  // Park (direct mode) — the instance resumes by re-running once the worker's
-  // complete/fail mutates the job in D1 (or the timer alarm fires).
-  if (!waitFor) {
-    await runStep(`svc-park:${tag}`, () => parkWaiting(env, instanceId, elementId, occ, "serviceTask"));
-    return { kind: "waiting" };
-  }
-
-  // Suspend (workflow mode) — re-lease drives retries within this single wait. A
-  // timer-guarded wait is SIZED to the timer (so a long timer costs O(1) steps).
-  const timeout = tb ? await timerGuardedTimeout(env, instanceId, tb, occ) : SVC_WAIT_TIMEOUT;
-  const outcome = await waitFor({
-    name: `wait-job:${tag}`,
-    workflowEventType: workflowJobEventTypeFor(job.job_id),
-    timeout,
-  });
-  // M4-L3 multi-wait: a region branch in workflow mode REGISTERED this wait in the
-  // collector and did not suspend — return parked; raceParkedWaits awaits it. (CI is
-  // direct mode: waitFor is null, so we never reach here.)
-  if (outcome.kind === "parked") return { kind: "waiting" };
-  // The timer may have fired (its sendEvent wake, or a concurrent alarm) while we
-  // waited — re-read the decider FIRST so an abandoned job is not misread as a fail.
-  if (tb && (await timerHasFired(env, instanceId, tb, occ))) {
-    return { kind: "next", next: tb.node.next! };
-  }
-  // D1 is canonical: re-read the job whether we woke on the event OR on a timeout.
-  // A lost wake-up event (swallowed sendEvent, isolate eviction) for an already
-  // terminal job must be applied here, not masked as a spurious timeout incident.
-  const fresh = (await getForwardJob(env.DB, instanceId, elementId, occ)) ?? job;
-  // A concurrent inline drive may have applied the outcome while we waited.
-  const appliedMeanwhile = appliedForwardOutcome(graph, elementId, node, fresh);
-  if (appliedMeanwhile) return appliedMeanwhile;
-  if (fresh.status === "completed") {
-    return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, fresh, activeTokenId));
-  }
-  if (fresh.status === "failed") {
-    return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, fresh, activeTokenId));
-  }
-  if (outcome.kind === "timeout") {
-    if (tb) {
-      // Lost-alarm backstop (design §4.2, risk R5). A wait guarded by a modeled
-      // timer NEVER raises waitTimeout. The DO alarm is the PRIMARY firing
-      // mechanism; this timer-SIZED timeout doubles as the backstop for a lost/
-      // failed alarm: on this wake re-read D1 and settle an OVERDUE timer INLINE
-      // exactly as the alarm path would, RETURNING the boundary path to THIS drive
-      // loop. We are already inside a drive, so there is no executor wake here —
-      // that is what avoids the runtime/timers → executor → engine import cycle.
-      // (Workflow-mode-only; the DO-alarm fire path is the CI-tested mechanism.)
-      const settled = await settleOverdueBoundaryTimerOnWake(env, graph, instanceId, elementId, occ);
-      if (settled.kind === "fired") return { kind: "next", next: settled.next };
-      if (settled.kind === "reparked") return { kind: "waiting" }; // armed-but-early → re-armed; re-park
-      // fallThrough: a concurrent normal resolution settled the timer 'cancelled'
-      // (its transition rode the same batch) — re-read and run the normal completed/
-      // failed/applied handling so a swallowed wake is not stranded.
-      const settledJob = (await getForwardJob(env.DB, instanceId, elementId, occ)) ?? fresh;
-      const appliedAfterSettle = appliedForwardOutcome(graph, elementId, node, settledJob);
-      if (appliedAfterSettle) return appliedAfterSettle;
-      if (settledJob.status === "completed") {
-        return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, settledJob, activeTokenId));
-      }
-      if (settledJob.status === "failed") {
-        return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, settledJob, activeTokenId));
-      }
-      return { kind: "waiting" }; // still parked (e.g. a concurrent /cancel terminal) — re-park
-    }
-    // A genuine UN-GUARDED wait-cap: nobody completed the job (still created/locked).
-    // M3-L1 (TASK-39): the un-guarded service-task wait cap is 'waitTimeout', split
-    // out of the legacy overloaded 'timeout'. NOTE: `outcome.kind === "timeout"` is
-    // the wait-OUTCOME discriminator (a different axis) — only the incident changes.
-    return runStep(`svc-timeout:${tag}`, () =>
-      createIncident(env, instanceId, elementId, node.retries ?? 1, "Service Task timed out waiting for a worker.", { jobId: fresh.job_id }, "waitTimeout"),
-    );
-  }
-  // Defensive: event arrived but job is not terminal — treat as a technical incident.
-  return runStep(`svc-stuck:${tag}`, () =>
-    createIncident(env, instanceId, elementId, fresh.attempt_count, "Service Task resumed with a non-terminal job.", { jobId: fresh.job_id }, "serviceTaskFailure"),
-  );
+  // Park: the instance resumes on the next drive (a /jobs/complete tickle in workflow
+  // mode, or an inline re-drive in direct mode) once the job mutates in D1.
+  await runStep(`svc-park:${tag}`, () => parkWaiting(env, instanceId, elementId, occ, "serviceTask"));
+  return { kind: "waiting" };
 }
 
 async function createForwardJob(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, node: GraphNode, activeTokenId?: string): Promise<JobRow | null> {

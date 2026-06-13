@@ -46,7 +46,6 @@ import { computeFireAt } from "./iso8601";
 import {
   armTimerDO,
   isUniqueConstraintViolation,
-  timerSizedTimeout,
   type TimerWake,
   type WakeSettleOutcome,
 } from "./boundary-timer";
@@ -98,40 +97,8 @@ export async function driveIntermediateCatch(
     await armTimerDO(env, existing.timerId, existing.fireAt);
   }
 
-  // (3a) Direct mode: park; the instance resumes when the timer alarm fires.
-  if (!waitFor) return { kind: "waiting" };
-
-  // (3b) Workflow mode: wait on the per-visit event type, sized to the timer.
-  const timeout = await timerSizedTimeout(env, timerId);
-  const outcome = await waitFor({
-    name: `timer-wait:${tag}`,
-    workflowEventType: workflowTimerEventTypeFor(elementId, occ),
-    timeout,
-  });
-  // M4-L3 multi-wait: a region branch in workflow mode REGISTERED this wait and did
-  // not suspend — return parked (raceParkedWaits awaits it). Direct mode never hits this.
-  if (outcome.kind === "parked") return { kind: "waiting" };
-  // The timer may have fired (its sendEvent wake, or a concurrent alarm) while we waited.
-  if (await catchTimerFired(env, instanceId, elementId, occ)) return { kind: "next", next };
-  if (outcome.kind === "timeout") {
-    // Lost-alarm backstop (design §4.2, risk R5): a timer-guarded wait NEVER
-    // raises waitTimeout. The DO alarm is the PRIMARY firing mechanism; this
-    // timer-SIZED timeout doubles as the backstop for a lost/failed alarm —
-    // settle an OVERDUE catch INLINE (the IDENTICAL fire batch the alarm path
-    // commits), RETURNING the outgoing flow to THIS drive loop (no executor wake
-    // → no import cycle). Workflow-mode-only (CI forces direct, where waitFor is
-    // null and a wait never times out — verified by reading + the direct-mode
-    // backstop seam test).
-    const settled = await settleOverdueIntermediateCatchOnWake(env, graph, instanceId, elementId, occ);
-    if (settled.kind === "fired") return { kind: "next", next: settled.next };
-    if (settled.kind === "reparked") return { kind: "waiting" }; // armed-but-early → re-armed; re-park
-    // fallThrough: already decided `cancelled` (a concurrent operator /cancel) or
-    // the row vanished — re-read; advance only if it actually fired meanwhile.
-    if (await catchTimerFired(env, instanceId, elementId, occ)) return { kind: "next", next };
-    return { kind: "waiting" }; // still parked (e.g. a concurrent /cancel terminal) — re-park
-  }
-  // Woke on the timerFired event but the decider is not visible yet (should not
-  // happen — fireTimer commits the decider before waking) — re-park defensively.
+  // (3) Park: the instance resumes when the timer alarm fires (an inline fireTimer
+  // in direct mode, or a tickle re-walk in workflow mode). Leaf drivers never suspend.
   return { kind: "waiting" };
 }
 

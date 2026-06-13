@@ -8,7 +8,6 @@
 
 import type { Env } from "../env";
 import type { ExecutionGraph } from "../bpmn/graph";
-import { workflowJobEventTypeFor } from "../bpmn/profile";
 import { isTerminalInstanceStatus, newId, nowIso, parseJson, traceIdFor, type JsonObject } from "../util";
 import { dbBatch } from "../persistence/db";
 import { historyStmt } from "../persistence/history";
@@ -32,7 +31,7 @@ import {
 } from "../persistence/saga";
 import { listLiveTokens, setTokenStatusStmt } from "../persistence/tokens";
 import { armCohortLeaseExpiryTerminators } from "./forward-task";
-import { loadInst, SVC_WAIT_TIMEOUT, type RunStep, type WaitForEvent, type DriveResult } from "./engine-shared";
+import { loadInst, type RunStep, type WaitForEvent, type DriveResult } from "./engine-shared";
 
 /** The failure-path target of the cancel boundary attached to transaction `scopeId`. */
 function cancelBoundaryTarget(graph: ExecutionGraph, scopeId: string): string | null {
@@ -136,12 +135,6 @@ async function runCompensation(
       return "failed";
     }
     if (!waitFor) return "waiting"; // direct mode parks at 'compensating'; resume re-runs this pass
-
-    const outcome = await waitFor({ name: `wait-comp:${ctag}`, workflowEventType: workflowJobEventTypeFor(comp.job_id), timeout: SVC_WAIT_TIMEOUT });
-    if (outcome.kind === "timeout") {
-      await runStep(`comp-timeout:${ctag}`, () => markStepCompensationFailed(env, instanceId, step));
-      return "failed";
-    }
     // loop re-reads the (now terminal) comp job
   }
 }

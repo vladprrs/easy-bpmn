@@ -55,4 +55,21 @@ describe("parallel-branch compensation (M4-L5)", () => {
     expect(branchAStep).toBeDefined(); // ledgered, not leaked
     expect(branchAStep!.compensationStatus).toBe("compensated"); // and reverse-compensated
   });
+
+  it("a technical incident on one branch leaves the instance 'incident' with the sibling frozen (not wedged), then /cancel runs the reverse pass", async () => {
+    const { instance } = await publishAndStart(PARALLEL_SAGA_BPMN, { correlationKey: "pc3", variables: { hazardBranchB: true } });
+    const id = instance.body.instanceId;
+    // Branch A completes (→ arrivedAtJoin); branch B exhausts its retries → a technical
+    // Hazard transitions the WHOLE instance to 'incident' with branch A frozen (no wedge).
+    await drainSampleWorkers({ taskTypes: ["branch-a", "branch-b"] });
+    expect((await get(`/instances/${id}`)).body.status).toBe("incident");
+
+    // Operator /cancel from 'incident' runs the same straggler-catching reverse pass over
+    // the cohort (no new code beyond L5.1–L5.4): A compensates, B (failed forward) discards.
+    const cancelled = await post(`/instances/${id}/cancel`, {});
+    expect(cancelled.status).toBe(200);
+    await drainSampleWorkers({ taskTypes: ["comp-a", "comp-b"] });
+    expect(["compensated", "compensationFailed", "cancelled"]).toContain((await get(`/instances/${id}`)).body.status);
+    expect(await liveTokens(id)).toHaveLength(0);
+  });
 });

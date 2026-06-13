@@ -782,6 +782,77 @@ export const PARALLEL_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 </bpmn:definitions>`;
 
 /**
+ * Parallel SAGA (M4-L5): a <transaction> wrapping a strongly-SESE AND fork/join
+ * where EACH branch is one compensatable service task (compensation boundary →
+ * handler). The region (fork↔join) stays balanced — the SESE validator (design
+ * §4.1 rules 4/5) rejects any branch boundary that escapes the region to a cancel
+ * end — so the cancel is triggered by a POST-JOIN `settle` task whose interrupting
+ * error boundary routes to the cancel end (the SAGA_XOR_BPMN compensation+error+
+ * cancel pattern, with the two compensatable tasks now concurrent). Steerable:
+ *   - `failSettle`   → settle raises a BUSINESS error → Tx_cancel → reverse-
+ *                      compensate the completed branch steps across the cohort.
+ *   - `hazardBranchB`→ branch B exhausts its retries → a TECHNICAL Hazard (whole-
+ *                      instance incident, design §5.6) with branch A frozen (L5.5).
+ *   - (no flag)      → both branches + settle complete → the transaction commits.
+ * At the post-join cancel the merged branch tokens are `merged` while the produced
+ * root token is live at `settle` — the reverse pass's straggler scan discards it
+ * (a failed forward job owes no compensation) and the barrier holds until then.
+ */
+export const PARALLEL_SAGA_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+                  id="D_parsaga" targetNamespace="http://easy-bpmn/example/parallel-saga">
+  <bpmn:error id="Err_settle" name="Settle rejected" errorCode="SETTLE_REJECTED"/>
+  <bpmn:process id="ParallelSaga" isExecutable="true">
+    <bpmn:startEvent id="Start"><bpmn:outgoing>g1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:transaction id="Tx_par" name="Parallel work">
+      <bpmn:startEvent id="Tx_start"><bpmn:outgoing>tx0</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:parallelGateway id="fork"><bpmn:incoming>tx0</bpmn:incoming><bpmn:outgoing>f_a</bpmn:outgoing><bpmn:outgoing>f_b</bpmn:outgoing></bpmn:parallelGateway>
+      <bpmn:serviceTask id="branchA" name="Branch A">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="branch-a" retries="2"/></bpmn:extensionElements>
+        <bpmn:incoming>f_a</bpmn:incoming><bpmn:outgoing>j_a</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="branchA_comp" attachedToRef="branchA"><bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="compA" name="Compensate A" isForCompensation="true">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="comp-a" retries="3"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:association id="aA" associationDirection="One" sourceRef="branchA_comp" targetRef="compA"/>
+      <bpmn:serviceTask id="branchB" name="Branch B">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="branch-b" retries="1"/></bpmn:extensionElements>
+        <bpmn:incoming>f_b</bpmn:incoming><bpmn:outgoing>j_b</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="branchB_comp" attachedToRef="branchB"><bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="compB" name="Compensate B" isForCompensation="true">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="comp-b" retries="3"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:association id="aB" associationDirection="One" sourceRef="branchB_comp" targetRef="compB"/>
+      <bpmn:parallelGateway id="join"><bpmn:incoming>j_a</bpmn:incoming><bpmn:incoming>j_b</bpmn:incoming><bpmn:outgoing>t_join</bpmn:outgoing></bpmn:parallelGateway>
+      <bpmn:serviceTask id="settle" name="Settle">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="branch-settle" retries="1"/></bpmn:extensionElements>
+        <bpmn:incoming>t_join</bpmn:incoming><bpmn:outgoing>t_ok</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="settle_err" attachedToRef="settle"><bpmn:errorEventDefinition errorRef="Err_settle"/></bpmn:boundaryEvent>
+      <bpmn:endEvent id="Tx_ok"><bpmn:incoming>t_ok</bpmn:incoming></bpmn:endEvent>
+      <bpmn:endEvent id="Tx_cancel"><bpmn:cancelEventDefinition/></bpmn:endEvent>
+      <bpmn:sequenceFlow id="tx0"   sourceRef="Tx_start"   targetRef="fork"/>
+      <bpmn:sequenceFlow id="f_a"   sourceRef="fork"       targetRef="branchA"/>
+      <bpmn:sequenceFlow id="f_b"   sourceRef="fork"       targetRef="branchB"/>
+      <bpmn:sequenceFlow id="j_a"   sourceRef="branchA"    targetRef="join"/>
+      <bpmn:sequenceFlow id="j_b"   sourceRef="branchB"    targetRef="join"/>
+      <bpmn:sequenceFlow id="t_join" sourceRef="join"      targetRef="settle"/>
+      <bpmn:sequenceFlow id="t_ok"  sourceRef="settle"     targetRef="Tx_ok"/>
+      <bpmn:sequenceFlow id="fe"    sourceRef="settle_err" targetRef="Tx_cancel"/>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="Tx_cancelled" attachedToRef="Tx_par"><bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:endEvent id="Done"><bpmn:incoming>g2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="Failed"><bpmn:incoming>g3</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="g1" sourceRef="Start"        targetRef="Tx_par"/>
+    <bpmn:sequenceFlow id="g2" sourceRef="Tx_par"       targetRef="Done"/>
+    <bpmn:sequenceFlow id="g3" sourceRef="Tx_cancelled" targetRef="Failed"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
  * Nested AND regions (M4-L3.5): outer fork/join with an inner fork/join wholly
  * inside outer branch f1. fork → { f1: if → {A1, A2} → ij, f2: B } → join → C → E.
  * The inner join (ij) folds its merged overlay onto the f1 (enclosing-branch) token,

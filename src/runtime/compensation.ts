@@ -17,15 +17,20 @@ import {
   applyTransitionStmt,
   createJobStmt,
   getCompensationJob,
+  getForwardJobByElement,
   incidentStmt,
   type JobRow,
 } from "../persistence/instances";
 import {
   attachCompensationJobStmt,
+  filterLineageQuiesced,
+  getSagaStep,
+  insertSagaStepStmt,
   selectScopeStepsForCompensation,
   updateCompensationStatusStmt,
   type SagaStepView,
 } from "../persistence/saga";
+import { listLiveTokens, setTokenStatusStmt } from "../persistence/tokens";
 import { loadInst, SVC_WAIT_TIMEOUT, type RunStep, type WaitForEvent, type DriveResult } from "./engine-shared";
 
 /** The failure-path target of the cancel boundary attached to transaction `scopeId`. */
@@ -79,11 +84,38 @@ async function runCompensation(
   // With loops each iteration is its own ledger row (occurrence-keyed), so the
   // reverse pass compensates every iteration separately with zero algorithm
   // change; compensation jobs + step names inherit the forward occurrence.
+  //
+  // M4-L5: under in-instance concurrency a scope can have several live branch
+  // tokens at cancel. `isRegion` gates the cohort logic so M1–M3 single-token
+  // instances behave EXACTLY as before (no token rows of interest, the filter is a
+  // no-op, the barrier reduces to "ledger empty ⇒ compensated").
+  const isRegion = !!graph.regions;
   // eslint-disable-next-line no-constant-condition
   while (true) {
+    // M4-L5 (design §8.3): before the reverse pass, catch stragglers + drain
+    // terminal cohort tokens — a token whose forward job COMPLETED (possibly after
+    // cancel) is ledgered (INSERT OR IGNORE) + consumed; a FAILED one is discarded.
+    if (isRegion) await ledgerStragglers(env, instanceId, graph, scopeId);
+
     const steps = await selectScopeStepsForCompensation(env.DB, instanceId, scopeId);
-    if (steps.length === 0) return "compensated";
-    const step = steps[0]!; // highest seq still needing compensation
+    // Live cohort tokens (region only). filterLineageQuiesced is a no-op for the
+    // single-token path (token_id NULL steps are never blocked), so `live` is only
+    // needed for region instances.
+    const live = isRegion ? await listLiveTokens(env.DB, instanceId) : [];
+
+    // Quiescence barrier (design §8.3): settle the terminal ONLY when no scope step
+    // still needs compensation AND no cohort token is live. If the ledger is drained
+    // but a token is still in flight, park (`waiting`) on the terminators so a late
+    // straggler is always ledgered + compensated before the terminal transition.
+    if (steps.length === 0) return live.length === 0 ? "compensated" : "waiting";
+
+    // Lineage-quiescence-ordered reverse (design §8.4 / Principle VI): a step is
+    // eligible only once its branch lineage has no live descendant — so a causally-
+    // downstream straggler is compensated before its predecessor. Cross-branch order
+    // is unconstrained (concurrent branches have no happens-before relation).
+    const eligible = filterLineageQuiesced(steps, live);
+    if (eligible.length === 0) return "waiting"; // every remaining step blocked by a live descendant → park
+    const step = eligible[0]!; // highest seq among the eligible (selectScope orders seq DESC)
     const ctag = `${step.elementId}#${step.occurrence}`;
 
     let comp = await getCompensationJob(env.DB, instanceId, step.elementId, step.occurrence);
@@ -106,6 +138,68 @@ async function runCompensation(
       return "failed";
     }
     // loop re-reads the (now terminal) comp job
+  }
+}
+
+/**
+ * Cohort straggler scan (design §8.1/§8.3) — region instances only. For each LIVE
+ * token positioned inside the compensating scope, settle it against its forward
+ * job so the quiescence barrier can drain and no executed side-effect leaks:
+ *   - forward job COMPLETED → ledger it (INSERT OR IGNORE, carrying the producing
+ *     token + the job's occurrence/captured I/O — a no-op when the forward path
+ *     already wrote the row) and CONSUME the token. This catches a straggler that
+ *     completed AFTER cancel began, and an `arrivedAtJoin` token whose step was
+ *     ledgered upstream (the half-satisfied join never fires).
+ *   - forward job FAILED → DISCARD the token (a failed forward job executed no
+ *     compensatable side-effect; the per-token terminator may have just failed it).
+ *   - no forward job at the position (a gateway/event/pure-wait) → DISCARD (owes no
+ *     compensation), so the barrier is never wedged by a non-compensatable token.
+ *   - forward job still `created`/`locked` (in-flight) → LEAVE the token live; the
+ *     per-token terminator (DLQ / lease-expiry, L5.3) drives it terminal and the
+ *     next pass re-scans.
+ *
+ * Single-transaction scope assumption: branch tokens are confined to one region per
+ * the SESE validator, so "positioned inside `scopeId`" (the position node's scopeId)
+ * is the cohort; a token's region branch is a single-entry/single-exit sub-region.
+ */
+async function ledgerStragglers(env: Env, instanceId: string, graph: ExecutionGraph, scopeId: string): Promise<void> {
+  const live = await listLiveTokens(env.DB, instanceId);
+  for (const t of live) {
+    if (graph.nodes[t.position_element_id]?.scopeId !== scopeId) continue; // not in this cohort
+    const now = nowIso();
+    const job = await getForwardJobByElement(env.DB, instanceId, t.position_element_id);
+    if (job && job.status === "completed") {
+      const stmts: D1PreparedStatement[] = [];
+      if (!(await getSagaStep(env.DB, instanceId, t.position_element_id, job.occurrence))) {
+        const wiring = graph.transactions?.[scopeId]?.compensations?.[t.position_element_id];
+        const handlerNode = wiring ? graph.nodes[wiring.handlerId] : undefined;
+        stmts.push(
+          insertSagaStepStmt(env.DB, {
+            stepId: newId("step"),
+            instanceId,
+            scopeId,
+            elementId: t.position_element_id,
+            forwardJobId: job.job_id,
+            capturedInput: parseJson<JsonObject>(job.input_variables, {}),
+            capturedOutput: job.output_variables ? parseJson<JsonObject>(job.output_variables, {}) : null,
+            compensationElementId: wiring?.handlerId ?? null,
+            compensationTaskType: handlerNode?.taskType ?? null,
+            compensationStatus: wiring ? "pending" : "notRequired",
+            traceId: traceIdFor(instanceId),
+            occurrence: job.occurrence,
+            tokenId: t.token_id,
+            now,
+          }),
+        );
+      }
+      stmts.push(setTokenStatusStmt(env.DB, t.token_id, "consumed", now));
+      await dbBatch(env.DB, stmts);
+    } else if (job && job.status === "failed") {
+      await dbBatch(env.DB, [setTokenStatusStmt(env.DB, t.token_id, "discarded", now)]);
+    } else if (!job) {
+      await dbBatch(env.DB, [setTokenStatusStmt(env.DB, t.token_id, "discarded", now)]);
+    }
+    // else: job created/locked (in-flight) → leave live for the terminator.
   }
 }
 

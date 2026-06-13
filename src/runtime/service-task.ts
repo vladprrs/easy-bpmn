@@ -79,6 +79,25 @@ const SAMPLE_WORKERS: Record<string, SampleWorker> = {
       ? { status: "failed", reason: "carrier rejected the shipment", errorCode: "SHIPPING_REJECTED" }
       : { status: "completed", outputVariables: { shipmentId: `shp-${req.instanceId.slice(-6)}` } },
 
+  // --- M4-L5 parallel-saga workers (PARALLEL_SAGA_BPMN). branch-a/branch-b are the
+  // two concurrent compensatable branch tasks (comp-a/comp-b are their handlers).
+  // branch-b is steerable: `hazardBranchB` → a TECHNICAL failure (no errorCode) that
+  // exhausts retries → a whole-instance Hazard with the sibling frozen (L5.5). The
+  // post-join `branch-settle` triggers scope cancel: `failSettle` → a BUSINESS error
+  // (errorCode matching the model's bpmn:error) routed to the cancel end →
+  // reverse-compensate the completed branch steps across the cohort (L5.2).
+  "branch-a": (req) => ({ status: "completed", outputVariables: { aDone: true, aId: `a-${req.instanceId.slice(-6)}` } }),
+  "branch-b": (req) =>
+    req.variables.hazardBranchB === true
+      ? { status: "failed", reason: "branch B technical failure", diagnostics: { attempt: req.attempt } }
+      : { status: "completed", outputVariables: { bDone: true } },
+  "comp-a": () => ({ status: "completed", outputVariables: { compensatedA: true } }),
+  "comp-b": () => ({ status: "completed", outputVariables: { compensatedB: true } }),
+  "branch-settle": (req) =>
+    req.variables.failSettle === true
+      ? { status: "failed", reason: "settle rejected the parallel work", errorCode: "SETTLE_REJECTED" }
+      : { status: "completed", outputVariables: { settled: true } },
+
   // --- M4 inclusiveGateway (OR) branch workers — trivial completers used by the
   // INCLUSIVE_BPMN notification fan-out fixture (send the subset whose conditions hold).
   "send-email": () => ({ status: "completed", outputVariables: { emailed: true } }),

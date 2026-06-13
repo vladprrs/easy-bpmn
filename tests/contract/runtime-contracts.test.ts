@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { jobResultEventSchema, messageEventPayloadSchema } from "../../src/contracts/workflow-events";
 import { activateJobsResponseSchema } from "../../src/contracts/api";
 import { workflowEventTypeFor } from "../../src/bpmn/profile";
-import { DEMO_BPMN, createDraft, drainSampleWorkers, get, post, publishDraft, startInstance } from "../helpers";
+import { DEMO_BPMN, PARALLEL_BPMN, createDraft, drainSampleWorkers, get, post, publishAndStart, publishDraft, startInstance } from "../helpers";
 
 // Cloudflare Workflows reject event types that don't match this pattern
 // (sendEvent throws `workflow.invalid_event_type`). Must hold for every name.
@@ -70,6 +70,58 @@ describe("Runtime contracts", () => {
     expect(activated).toBeTruthy();
     expect(activated.elementId).toBe("Task_check");
     expect(activated.diagnostics.attempt).toBe(1);
+  });
+
+  it("GET /instances/{id} returns tokens array + null currentElementId when >1 token is live (M4-L6.3)", async () => {
+    const { instance } = await publishAndStart(PARALLEL_BPMN, { correlationKey: "rc-tok-1", variables: {} });
+    const id = instance.body.instanceId;
+
+    // Right after start the fork has fanned out: two branch service-task jobs are
+    // leasable concurrently, so there must be ≥2 live tokens in the read-model.
+    const inst = await get(`/instances/${id}`);
+    expect(inst.status).toBe(200);
+
+    // tokens array must be present and contain at least the two branch tokens.
+    const tokens: any[] = inst.body.tokens;
+    expect(Array.isArray(tokens)).toBe(true);
+    expect(tokens.length).toBeGreaterThanOrEqual(2);
+
+    // Every token object must carry all 7 required fields.
+    for (const tok of tokens) {
+      expect(typeof tok.tokenId).toBe("string");
+      expect(typeof tok.positionElementId).toBe("string");
+      expect(typeof tok.status).toBe("string");
+      // regionId / branchFlowId / parentTokenId are nullable strings
+      expect(tok).toHaveProperty("regionId");
+      expect(tok).toHaveProperty("regionActivation");
+      expect(tok).toHaveProperty("branchFlowId");
+      expect(tok).toHaveProperty("parentTokenId");
+    }
+
+    // The two expected branch tokens must be present with the correct metadata.
+    const f1 = tokens.find((t) => t.branchFlowId === "f1");
+    const f2 = tokens.find((t) => t.branchFlowId === "f2");
+    expect(f1).toBeTruthy();
+    expect(f2).toBeTruthy();
+    expect(f1).toMatchObject({
+      tokenId: `${id}:fork#0:f1`,
+      positionElementId: "A",
+      regionId: "fork",
+      regionActivation: 0,
+      parentTokenId: `${id}:#root`,
+      status: expect.stringMatching(/^(active|waiting)$/),
+    });
+    expect(f2).toMatchObject({
+      tokenId: `${id}:fork#0:f2`,
+      positionElementId: "B",
+      regionId: "fork",
+      regionActivation: 0,
+      parentTokenId: `${id}:#root`,
+      status: expect.stringMatching(/^(active|waiting)$/),
+    });
+
+    // currentElementId must be null while >1 token is live (design §L6.3).
+    expect(inst.body.currentElementId).toBeNull();
   });
 
   it("records the correlated message payload snapshot atomically with the transition", async () => {

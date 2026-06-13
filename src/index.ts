@@ -89,7 +89,7 @@ import { cancelArmedTimersForInstance, supersedeBrokerSubscription } from "./run
 import { armCohortLeaseExpiryTerminators } from "./runtime/forward-task";
 import { listTimersForInstance } from "./persistence/timers";
 import { abandonActiveForwardJobs, resetJobForRetry } from "./persistence/jobs";
-import { listLiveTokens } from "./persistence/tokens";
+import { LIVE_TOKEN_STATUSES, listLiveTokens, listTokens, parseOverlay } from "./persistence/tokens";
 import {
   countPendingSteps,
   getFailedStep,
@@ -101,6 +101,7 @@ import {
   retryInstanceRequestSchema,
   type InstanceListResponse,
   type SagaInspection,
+  type TokenInspection,
 } from "./contracts/api";
 
 export { ProcessWorkflow } from "./workflows/process-workflow";
@@ -311,8 +312,27 @@ async function handleGetInstance(env: Env, instanceId: string): Promise<Response
     firedAt: t.firedAt,
   }));
 
+  // M4-L6.3 (TASK-53): live token frontier — read from D1 (execution_tokens).
+  // variablesOverlay is returned verbatim (inline or {"__r2":"<key>"} reference)
+  // so callers may rehydrate from R2 if needed; this endpoint does not fetch R2.
+  const tokenRows = await listTokens(env.DB, instanceId);
+  const tokens: TokenInspection[] = tokenRows.map((row) => ({
+    tokenId: row.token_id,
+    positionElementId: row.position_element_id,
+    status: row.status as TokenInspection["status"],
+    regionId: row.region_id,
+    regionActivation: row.region_activation,
+    branchFlowId: row.branch_flow_id,
+    parentTokenId: row.parent_token_id,
+    variablesOverlay: parseOverlay(row),
+  }));
+  // If >1 live tokens the instance is in a concurrent state: currentElementId
+  // loses meaning (multiple positions) and MUST be null per the L6.3 contract.
+  const liveTokenCount = tokens.filter((t) => LIVE_TOKEN_STATUSES.includes(t.status)).length;
+
   const inspection: ProcessInstanceInspection = {
     ...instance,
+    ...(liveTokenCount > 1 ? { currentElementId: null } : {}),
     historySummary: history,
     diagnostics: {
       workflowInstanceId: instance.workflowInstanceId,
@@ -324,6 +344,7 @@ async function handleGetInstance(env: Env, instanceId: string): Promise<Response
     openIncidents,
     saga,
     ...(timers.length > 0 ? { timers } : {}),
+    ...(tokens.length > 0 ? { tokens } : {}),
   };
   return json(inspection, 200);
 }

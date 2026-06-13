@@ -263,6 +263,31 @@ export const timerInspectionSchema = z.object({
 });
 export type TimerInspection = z.infer<typeof timerInspectionSchema>;
 
+/**
+ * One token row in the instance-inspection `tokens` block (M4-L6.3) — read
+ * straight from D1 (execution_tokens), so the live token frontier is directly
+ * observable without touching Workflow internals.
+ * `variablesOverlay` is verbatim: an inline JSON object for small overlays, or
+ * `{"__r2":"<key>"}` for an offloaded large overlay (not rehydrated here).
+ */
+export const tokenInspectionSchema = z.object({
+  tokenId: z.string(),
+  positionElementId: z.string(),
+  /** Live or terminal status from the execution_tokens read-model. */
+  status: z.enum(["active", "waiting", "arrivedAtJoin", "consumed", "merged", "discarded"]),
+  /** The parallel/inclusive split gateway element id that owns this token's region; null for the root token. */
+  regionId: z.string().nullable(),
+  /** How many times the owning split gateway has activated (0-based occurrence). */
+  regionActivation: z.number().int(),
+  /** Sequence-flow id that left the split gateway for this branch; null for the root token. */
+  branchFlowId: z.string().nullable(),
+  /** Parent token id (`${instanceId}:#root` for branch tokens, null for root). */
+  parentTokenId: z.string().nullable(),
+  /** Verbatim overlay column: inline object or {"__r2":"<key>"} reference. Not rehydrated. */
+  variablesOverlay: z.record(z.unknown()).optional(),
+});
+export type TokenInspection = z.infer<typeof tokenInspectionSchema>;
+
 export interface ProcessInstanceInspection extends ProcessInstance {
   historySummary: HistoryEvent[];
   diagnostics: Record<string, unknown>;
@@ -281,6 +306,12 @@ export interface ProcessInstanceInspection extends ProcessInstance {
    * timer; Workflow internals stay hidden.
    */
   timers?: TimerInspection[];
+  /**
+   * Live token frontier (M4-L6.3): present when the instance has materialised
+   * execution_tokens rows; `currentElementId` is null while >1 token is live.
+   * Single-token (M1/M2/M3) instances with no token rows omit this field.
+   */
+  tokens?: TokenInspection[];
 }
 
 // ---- Operator remediation verbs ----

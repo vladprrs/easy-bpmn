@@ -771,6 +771,47 @@ components:
                 read from D1. Present when the instance has any timer.
               items:
                 $ref: "#/components/schemas/TimerView"
+            tokens:
+              type: array
+              description: >
+                Live token frontier (M4-L6.3): present when the instance has materialised
+                execution_tokens rows. currentElementId is null while >1 token is live.
+                Single-token (M1/M2/M3) instances with no token rows omit this field.
+              items:
+                $ref: "#/components/schemas/TokenView"
+    TokenView:
+      type: object
+      required: [tokenId, positionElementId, status, regionId, regionActivation, branchFlowId, parentTokenId]
+      properties:
+        tokenId:
+          type: string
+          description: "Deterministic id: instanceId:#root (root token) or instanceId:splitId#activation:branchFlowId (branch token)."
+        positionElementId:
+          type: string
+          description: The element id at which this token currently sits (or last sat).
+        status:
+          type: string
+          enum: [active, waiting, arrivedAtJoin, consumed, merged, discarded]
+          description: Read-model status from execution_tokens; live statuses are active|waiting|arrivedAtJoin.
+        regionId:
+          type: string
+          nullable: true
+          description: "The parallel/inclusive split gateway element id that owns this token's region; null for the root token."
+        regionActivation:
+          type: integer
+          description: How many times the owning split gateway has activated (0-based occurrence).
+        branchFlowId:
+          type: string
+          nullable: true
+          description: "Sequence-flow id that left the split gateway for this branch; null for the root token."
+        parentTokenId:
+          type: string
+          nullable: true
+          description: "Parent token id (instanceId:#root for branch tokens, null for root)."
+        variablesOverlay:
+          type: object
+          additionalProperties: true
+          description: "Verbatim overlay column: inline JSON object or {\"__r2\":\"<key>\"} for an offloaded large overlay. Not rehydrated."
     TimerView:
       type: object
       required: [timerId, elementId, occurrence, kind, status, attachedToRef, gatewayId, fireAt, firedAt]

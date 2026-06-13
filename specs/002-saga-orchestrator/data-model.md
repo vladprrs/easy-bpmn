@@ -1,4 +1,4 @@
-# Data Model: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas; M3 — Time & failure taxonomy)
+# Data Model: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas; M3 — Time & failure taxonomy; M4 — Concurrency)
 
 All M1 changes are **additive migrations** (`migrations/0002_saga.sql`); published definition
 versions are never mutated. The MVP entities (Workspace, Process Definition Draft, Validation
@@ -8,7 +8,9 @@ Message, Variable Snapshot, History Event, Idempotency Record) carry forward fro
 described here. The **M2 deltas** (occurrence discriminator, conditional topology,
 `gateway_decisions` — migrations `0004_conditional.sql` + `0005_output_applied_backfill.sql`) are
 described in their own section, followed by the **M3 deltas** (model-level timers + the
-technical-vs-business incident-kind split — migration `0006_timers.sql`).
+technical-vs-business incident-kind split — migration `0006_timers.sql`), and finally the **M4 deltas**
+(the token-frontier read-model + the append-only join facts that make in-instance concurrency replayable —
+migration `0007_tokens.sql`).
 
 ## Entity: Transaction Scope (graph IR)
 
@@ -483,10 +485,165 @@ New event types: `timerArmed`, `timerFired`, `timerCancelled`, `eventBasedGatewa
 Gains a `timers` block (armed/fired/cancelled with `fire_at`/`fired_at`) read from D1 and the
 **list** of open incidents; Cloudflare Workflow internals stay hidden. No new operator verbs.
 
+## M4 deltas (Concurrency — token frontier + join facts — migration `0007_tokens.sql`)
+
+Additive over the M3 schema (latest shipped was `0006_timers.sql`); published versions are never mutated.
+Source design: `docs/superpowers/specs/2026-06-13-m4-concurrency-design.md` (§5 engine, §7 persistence).
+Constitution v2.3.0. Existing M1–M3 instances need **no backfill**: each has a single implicit root token,
+materialised lazily on its next drive.
+
+> **The `/jobs/*` worker API surface is UNCHANGED by M4** (still pinned by
+> `tests/contract/jobs-schema-pin.test.ts`). Branch tokens, variable overlays, and join facts are
+> persistence-internal; a deployed M1–M3 pull worker keeps working against an M4 orchestrator unchanged.
+
+### Entity: Execution Token (the frontier read-model — new table `execution_tokens`)
+
+The set of live token positions inside **one** instance. `execution_tokens` is a **denormalised
+read-model**: `position_element_id` and `status` are recomputed by the deterministic rewalk each drive (for
+operator inspection + compensation cohort capture) and are **NEVER read as a replay-decision input** —
+occurrence assignment, join-fire, and split fan-out all derive from the static graph + the append-only join
+facts below. `variables_overlay` is authoritative mutable branch state, made idempotent by the existing
+`output_applied` marker exactly like `process_instances.variables`.
+
+```sql
+CREATE TABLE execution_tokens (
+  token_id            TEXT PRIMARY KEY,                 -- root: '<inst>:#root'; branch: '<inst>:<split>#<activation>:<branchFlow>'
+  instance_id         TEXT NOT NULL,
+  region_id           TEXT,                             -- enclosing split id; NULL for root
+  region_activation   INTEGER NOT NULL DEFAULT 0,       -- split's walk-local occurrence; 0 for root
+  parent_token_id     TEXT,                             -- token consumed at the split; NULL for root
+  branch_flow_id      TEXT,                             -- split out-flow taken; NULL for root/produced
+  position_element_id TEXT NOT NULL,                    -- DERIVED read-model; not a replay input
+  status              TEXT NOT NULL DEFAULT 'active',   -- active|waiting|arrivedAtJoin|consumed|merged|discarded
+  variables_overlay   TEXT NOT NULL DEFAULT '{}',       -- JSON delta over parent; or {"__r2":"<key>"}
+  created_at          TEXT NOT NULL,
+  updated_at          TEXT NOT NULL
+);
+CREATE INDEX idx_tokens_instance_status ON execution_tokens (instance_id, status);
+CREATE INDEX idx_tokens_region          ON execution_tokens (instance_id, region_id, region_activation, status);
+```
+
+**Fields** (semantics):
+- `token_id`: replay-stable PK in one of **three forms** — **root** `${instanceId}:#root`; **branch**
+  `${instanceId}:${splitId}#${activation}:${branchFlowId}`; a **produced (post-join)** token re-uses its
+  `parent_token_id` (a SESE region consumes the parent at the split and returns the frontier to exactly one
+  token at the join).
+- `region_activation`: the split gateway's **walk-local occurrence** at the moment the walk entered the
+  region (the same in-memory counter as `MAX_ELEMENT_OCCURRENCES`, never a `COUNT` over this table); it
+  increments on each loop re-entry of the region. It is a **separate axis** from a branch element's own
+  occurrence — a cycle inside a branch makes the element's occurrence exceed `region_activation`; the two
+  are never conflated in any key.
+- `parent_token_id` / `region_id` / `branch_flow_id`: the lineage, enclosing split, and split out-flow this
+  token descended from. Branch identity is a **stack of `(region_id, region_activation, branch_flow_id)`
+  frames** — entering a split pushes a frame, the matching join pops that activation's frames — so a nested
+  region's join output satisfies its enclosing branch at the outer join.
+- `position_element_id`: a **DERIVED** read-model cursor; never a replay input.
+- `status`: `active | waiting | arrivedAtJoin | consumed | merged | discarded`. The `MAX_CONCURRENT_TOKENS
+  = 256` cap counts only the **live** subset (`active|waiting|arrivedAtJoin`), and from the **in-memory
+  reconstructed frontier**, never a live `COUNT` over this table (else the cap fires nondeterministically on
+  replay).
+- `variables_overlay`: a JSON **delta over the parent scope**; reads resolve the overlay chain (token →
+  ancestors → root `process_instances.variables`, nearest wins) and writes go to the token's own overlay.
+  An overlay exceeding `OVERLAY_INLINE_MAX_BYTES` is offloaded to R2 (deterministic key
+  `overlays/${instanceId}/${tokenId}.json`) and the column holds `{"__r2":"<key>"}` (§9.1; see
+  `contracts/runtime-contracts.md`).
+
+**Validation Rules**:
+- The read-model is **never** a replay predicate; all fast-forward / barrier / fan-out decisions consult the
+  static graph + the append-only join facts. A duplicate concurrent fan-out aborts wholesale on the
+  `token_id` PK and re-reads.
+- **Element-disjointness invariant.** SESE guarantees every element id belongs to at most one branch of at
+  most one enclosing region, so two concurrent tokens can never visit the same element. M4 therefore adds
+  **no token discriminator** to `uq_jobs_instance_element_kind`, `uq_saga_steps_forward`, or
+  `uq_timers_visit` — each element's own walk-local occurrence remains sufficient.
+
+### Entity: Join Arrival / Join Completion (the append-only join facts — the real replay predicates)
+
+The AND/OR join barrier decides on these append-only tables, **never** on the `execution_tokens`
+read-model. Mirrors the `gateway_decisions` plain-INSERT race discipline
+(`src/persistence/gateway-decisions.ts`).
+
+```sql
+CREATE TABLE join_arrivals (
+  instance_id    TEXT NOT NULL,
+  join_id        TEXT NOT NULL,
+  activation     INTEGER NOT NULL,
+  branch_flow_id TEXT NOT NULL,
+  arrived_at     TEXT NOT NULL,
+  PRIMARY KEY (instance_id, join_id, activation, branch_flow_id)             -- INSERT OR IGNORE
+);
+CREATE TABLE join_completions (
+  instance_id       TEXT NOT NULL,
+  join_id           TEXT NOT NULL,
+  activation        INTEGER NOT NULL,
+  produced_token_id TEXT NOT NULL,
+  decided_at        TEXT NOT NULL,
+  PRIMARY KEY (instance_id, join_id, activation)                            -- PLAIN INSERT in the advance batch
+);
+```
+
+**Fields / Rules**:
+- **`join_arrivals`** records a branch reaching its join via **`INSERT OR IGNORE`** (duplicate arrival =
+  no-op). The traversal **halts** on that branch — the join node is NOT entered and nothing downstream is
+  walked from it — so the join and the post-region path are visited exactly **once per activation**
+  (`join.occurrence == region_activation`).
+- **`join_completions`** claims the join fire with a single **plain `INSERT`** composed into the **same
+  `dbBatch`** as the merged-overlay write, the source tokens' transition to `status='merged'`, the produced
+  token row, and the advance onto the join's out-flow. A losing concurrent arrival's batch **aborts on the
+  PK** and re-reads the recorded `produced_token_id`.
+- The **required arrival count** is read from persisted state — **AND** = `count(split.outgoing)`; **OR** =
+  the recorded `gateway_decisions.activated_flow_ids` subset — **never** a live `COUNT`.
+
+### Entity: Gateway Decision (delta — inclusive-split activation set)
+
+`gateway_decisions` gains an `activated_flow_ids` column so an OR split's multi-branch activation is
+replayable (a single `chosen_flow_id` cannot represent a subset):
+
+```sql
+ALTER TABLE gateway_decisions ADD COLUMN activated_flow_ids TEXT;   -- JSON array, document order; NULL for XOR/EBG/parallel
+```
+
+- For an **inclusive split** it holds the activated out-flows in **document order**; `chosen_flow_id` holds
+  the document-order-first activated flow as a sentinel. **NULL** for XOR / `eventBasedGateway` / parallel
+  (which always activates all). On rewalk the OR-join's wait set is the recorded `activated_flow_ids`, reused
+  verbatim and never re-evaluated (same contract as `exclusiveGateway`).
+
+### Entity: Saga Step (delta — producing branch token for lineage-ordered reverse)
+
+```sql
+ALTER TABLE saga_steps ADD COLUMN token_id TEXT;   -- producing branch token; NULL on the single-token (M1–M3 / root) path
+```
+
+- `token_id` is the **branch token that produced the ledger row**. The lineage-quiescence-ordered reverse
+  pass (Principle VI **per causal chain**) compensates a step only once its token lineage (via
+  `parent_token_id`) has **no live (`active|waiting|arrivedAtJoin`) descendant token** — so a causally-downstream straggler
+  is always compensated before its predecessor; cross-branch order is unconstrained. `seq` stays an
+  **ordering field only** (assigned once at `INSERT OR IGNORE`) and MUST NOT appear in any step name or key.
+
+### Entity: Process Instance (delta — `current_element_id` becomes derived)
+
+`process_instances.current_element_id` becomes a **nullable, denormalised representative position**: the
+sole live token's position when the frontier has exactly one token, **NULL** otherwise. It is **not
+authoritative for any wake decision** — every former `current_element_id` staleness guard
+(`planIntermediateCatchFire`, `planEventGatewayTimerFire`, `parkWaiting`) is re-expressed as a **per-token
+predicate** (M4-L2, before any split is enabled). No new instance status is added (`running|waiting|
+compensating|compensated|compensationFailed|cancelled|completed|incident` suffice); only the **completion
+rule** changes — an instance completes when its **frontier is empty** (§5.6). Inspection surfaces the
+frontier from `execution_tokens` as the `GET /instances/{id}` `tokens` array (see
+`contracts/runtime-contracts.md`).
+
+### Region map (publish-time topology, on the immutable version)
+
+The publish-time SESE pass persists the region map `{ splitId → { joinId, type: 'and'|'or', branchFlowIds[]
+(document order), enclosingScopeId } }` alongside the element topology in the immutable version's graph IR
+(`parsed_profile`), so the deterministic merge order and the OR-join wait set are **never recomputed from
+the live graph** at runtime.
+
 ## Roadmap stub tables (named here; created in later milestones)
 
-Named now for the roadmap; **not** created yet:
-
-- `execution_tokens` (M4) — the single `current_element_id` becomes one token among many; the
-  concurrent token set for parallelism (target semantics:
-  `docs/bpmn/07-execution-semantics.md`).
+- `execution_tokens` (M4) — **SHIPPED** in migration `0007_tokens.sql` (see the **M4 deltas** above): the
+  single `current_element_id` is now one token among many in the frontier read-model, with the
+  `join_arrivals`/`join_completions` append-only join facts as the replay predicates. Parallelism target
+  semantics: `docs/bpmn/07-execution-semantics.md`.
+- No further roadmap stub tables are named yet — M5 (composition: `callActivity`, non-transaction
+  `subProcess`, `multiInstance`, `signal`/`escalation`) will name its own when the constitution is amended.

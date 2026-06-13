@@ -1,12 +1,16 @@
-# Quickstart: SAGA Orchestrator Validation (M1 + M2 + M3)
+# Quickstart: SAGA Orchestrator Validation (M1 + M2 + M3 + M4)
 
 This guide describes the end-to-end validation scenarios for the transaction-saga implementation:
 scenarios 1–9 are the named M1 constitution-critical gates; scenarios 10–14 are the M2
 conditional-saga gates (exclusiveGateway + FEEL + cycles); scenarios 15–26 are the M3
 time-&-failure-taxonomy gates (boundary/intermediate timers, `eventBasedGateway`, free error
-routing, the incident-kind split + `retryable`) — each mapping to a green integration test named
-next to it. The M3 design source is
-`docs/superpowers/specs/2026-06-11-m3-time-failure-taxonomy-design.md` (§7 gates).
+routing, the incident-kind split + `retryable`); scenarios 27–30 are the M4 concurrency gates
+(block-structured parallel AND / inclusive OR, the token frontier, branch-local variable merge, and
+parallel-branch compensation) — each mapping to a green integration test named next to it — followed by
+the **M4 manual Workflow-mode matrix** placeholder (the Workflow-mode-only concurrency behaviours, filled
+in by task L6.6). The M3 design source is
+`docs/superpowers/specs/2026-06-11-m3-time-failure-taxonomy-design.md` (§7 gates); the M4 source is
+`docs/superpowers/specs/2026-06-13-m4-concurrency-design.md` (§14 testing & exit criteria).
 
 ## Prerequisites
 
@@ -22,7 +26,7 @@ next to it. The M3 design source is
 
 ```bash
 npm install
-npx wrangler d1 migrations apply easy_bpmn --local   # applies 0001 … 0006 (MVP, saga, topology, conditional, backfill, timers)
+npx wrangler d1 migrations apply easy_bpmn --local   # applies 0001 … 0007 (MVP, saga, topology, conditional, backfill, timers, tokens)
 npm run test
 npm run dev
 ```
@@ -33,8 +37,10 @@ Expected setup outcome:
 - Local Worker API is available at `http://localhost:8787`.
 - Local D1 database has the MVP schema plus the saga ledger, jobs lease/DLQ columns, worker
   credentials, incident `kind`/`resolution`, the `(workspace_id, status)` list index, the M2
-  `occurrence`/`output_applied` columns, conditional topology columns, `gateway_decisions`, and the
-  M3 `timers` + `timer_outcomes` tables (migration `0006_timers.sql`).
+  `occurrence`/`output_applied` columns, conditional topology columns, `gateway_decisions`, the
+  M3 `timers` + `timer_outcomes` tables (migration `0006_timers.sql`), and the M4 `execution_tokens`
+  read-model + `join_arrivals`/`join_completions` join facts + `gateway_decisions.activated_flow_ids` +
+  `saga_steps.token_id` (migration `0007_tokens.sql`).
 - Workflow and Durable Object bindings are available in local development.
 
 ## Scenario 1: Happy Saga Commits (gate: happy-saga-commit)
@@ -435,6 +441,86 @@ service-task / receive-task wait cap → `waitTimeout`; a hard FEEL error → `c
 incidents); inspection lists **all** open incidents; an empty-ledger `/cancel` closes them all as
 `operatorResolved`. A fired model timer never creates an incident.
 
+---
+
+The M4 scenarios below exercise block-structured parallel (`parallelGateway`) and inclusive
+(`inclusiveGateway`) gateways, the token frontier, branch-local variable scopes, and
+parallel-branch compensation. The design source is
+`docs/superpowers/specs/2026-06-13-m4-concurrency-design.md` (§14 testing & exit criteria).
+
+## Scenario 27: AND Split / Join (gate: parallel-and-split-join — `tests/integration/parallel-gateway.test.ts`)
+
+A `parallelGateway` split fans out into two or more concurrent service-task branches; the
+matching AND join waits for a token from every activated branch before producing the post-join
+token; the instance completes once the token frontier is empty.
+
+Expected outcome: both branch jobs become leasable simultaneously (real worker-side parallelism);
+each completed branch records a `join_arrivals` row via `INSERT OR IGNORE`; the last arrival
+fires the `join_completions` plain-INSERT claim in the same `dbBatch` as the merged-overlay
+write and the produced-token row; the instance reaches `completed` via the atomic last-token-out
+conditional UPDATE when the frontier empties.
+
+## Scenario 28: OR Split / Join (gate: inclusive-or-split-join — `tests/integration/inclusive-gateway.test.ts`)
+
+An `inclusiveGateway` split evaluates FEEL conditions on its outgoing flows in document order;
+only the true-condition flows are activated (the activated set is recorded in
+`gateway_decisions.activated_flow_ids`). The matching OR join waits for exactly the recorded
+activated subset (keyed by origin branch, not incoming flow). A `default` flow is taken when no
+condition is true; zero activation with no default raises a `noPath` incident.
+
+Expected outcome: an instance with exactly one true-condition branch activates one job and one
+branch token; the OR join fires when that branch's token arrives; with no `default` and no true
+condition the engine settles a terminal `noPath` incident (Hazard inside a transaction; no
+auto-compensation); with a `default` flow it is taken as the activated singleton; the recorded
+`activated_flow_ids` set is reused verbatim on rewalk and never re-evaluated.
+
+## Scenario 29: Branch-Local Variable Merge at the Join (gate: branch-local-variable-merge — `tests/integration/parallel-gateway.test.ts`)
+
+Each branch token carries its own `variables_overlay` delta; service-task output writes inside
+a branch go to that token's own overlay and are invisible to sibling branches before the join
+merge. At the join the deltas are merged into the post-join token in **split out-flow document
+order** (later-in-order wins on key conflict); the merge is shallow (top-level key union).
+
+Expected outcome: branch A writes key `aResult` and branch B writes key `bResult`; both are
+present in the post-join scope; when both branches write the same key `shared`, the value from
+the branch whose out-flow appears later in the split's `outgoing[]` (document order) wins; a
+branch-A write is not visible when branch B reads the same key before the join — branch B reads
+the pre-split scope value.
+
+## Scenario 30: Parallel Transaction Compensation (gate: parallel-branch-compensation — `tests/integration/parallel-compensation.test.ts`)
+
+A business error in one branch (or an operator `/cancel`) begins scope cancel while a sibling
+branch is still in-flight (a straggler). The compensation reverse pass (a) records the live-token
+cohort, (b) arms per-token terminators so the quiescence barrier never depends on a future poll,
+(c) ledgers straggler completes that arrive after cancel begins, (d) compensates each causal
+chain in lineage-ordered reverse, and (e) settles `compensated` exactly once — only after the
+ledger is drained **and** all cohort tokens are terminal.
+
+Expected outcome: a straggler's late `complete` writes a `saga_steps` ledger row (`INSERT OR
+IGNORE`) but does not advance the instance; the compensating drive ledgers the straggler before
+running the reverse pass; within each branch lineage the compensation steps run in strict
+descending-seq order; cross-branch order is unconstrained (no happens-before relation across
+independent branches); the quiescence barrier prevents the `compensated` terminal transition
+while any cohort token is still live; the instance settles `compensated` exactly once.
+
+## M4 manual Workflow-mode matrix
+
+The direct-mode integration tests (Scenarios 27–30) cover all concurrent-join logic via the D1
+replay predicates and the deterministic DFS traversal — the same predicates as Workflow mode.
+The following scenarios exercise `Promise.race` fan-in, Workflow step memoization across
+suspend/resume, and budget incident behaviour that only manifests when a real Cloudflare
+Workflow drives the instance. They are validated manually via `wrangler dev`; results with
+PASS/FAIL evidence are recorded by task **L6.6** — **no PASS is claimed here**.
+
+| # | Scenario | Status |
+|---|----------|--------|
+| WM-1 | Two parallel message catches, deliver A then B → each applies exactly once, join proceeds, no duplicate-step-name error | TBD (pending L6.6) |
+| WM-2 | Crash/restart mid-race after delivering A → re-walk fast-forwards A write-free, re-races B, no re-apply | TBD (pending L6.6) |
+| WM-3 | Deliver A and B near-simultaneously then force replay → identical final state regardless of race winner | TBD (pending L6.6) |
+| WM-4 | One branch times out while a sibling is live → no `unhandledRejection`, the sibling completes | TBD (pending L6.6) |
+| WM-5 | In-region loops approaching the budget → graceful `stepBudget`/`concurrencyLimit` incident, not an opaque errored Workflow | TBD (pending L6.6) |
+| WM-6 | Cancel a region with parked + in-flight straggler branches → quiescence barrier + per-causal-chain reverse-seq ordering across suspend/resume | TBD (pending L6.6) |
+
 ## Workflow-mode-only paths (manual validation)
 
 Direct mode (the CI mode) covers the alarm → `fireTimer` → claim/abort → D1 path — the **primary**
@@ -478,5 +564,10 @@ Expected validation outcome:
   (message/timer/buffered/tie-break); receive-task boundary timer; multi-error-boundary + catch-all
   routing; error-path-then-compensate ledger integrity; standalone message catch; abnormal-exit timer
   settlement; `retryable=false` + lease-expiry exhaustion; the incident-kind split + hygiene. The
-  Workflow-mode-only paths above are validated manually.
+  M3 Workflow-mode-only paths above are validated manually.
+- The four M4 direct-mode gates pass (Scenarios 27–30): AND split/join with frontier-empty
+  completion; OR split/join with recorded activation subset; branch-local variable merge in split
+  out-flow document order; parallel-branch compensation with straggler ledger, per-token terminators,
+  lineage-ordered reverse, and quiescence barrier. The M4 manual Workflow-mode matrix (WM-1 through
+  WM-6) is pending (task L6.6 records PASS/FAIL + evidence).
 - No external workflow infrastructure (Camunda/Zeebe/broker/cluster) is deployed.

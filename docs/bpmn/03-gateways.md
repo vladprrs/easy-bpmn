@@ -109,9 +109,11 @@ one matching join of the **same type**, validated at publish via dominators/post
 join, a branch escaping the region, an uncontrolled merge, a mismatched join type, non-laminar nesting,
 or two concurrent branches awaiting the same message name are rejected with element ids). Each token
 carries the split out-flow it descended from (its **origin branch**), so a join is satisfied once a token
-from every activated branch has arrived — on whatever physical in-flow. (M4-L1 opens **publish-time
-validation only**; the concurrency runtime — token frontier, fan-out, the AND/OR join barrier — ships in
-later M4 layers.)
+from every activated branch has arrived — on whatever physical in-flow. The multi-token **runtime has
+shipped**: the token frontier fans a branch token out per activated out-flow, the AND/OR join barrier
+synchronises them, branch-local variable overlays merge in split out-flow document order at the join, and
+the instance completes when the frontier is empty (AND through M4-L3, OR through M4-L4, parallel-branch
+compensation through M4-L5).
 
 Of the other gateway types, `eventBasedGateway` is **supported since M3-L4** (the timer/message race,
 below). Only `complexGateway` stays out of scope, rejected before publish with a user-visible reason and
@@ -119,8 +121,8 @@ its roadmap pointer (kept in lockstep with `DEFERRED_GATEWAY_REASONS` in `src/bp
 
 | Gateway | Status |
 |---------|--------|
-| `parallelGateway` | **Supported since M4-L1** (TASK-48) — block-structured (SESE) AND split/join; validated at publish (matching same-type join, strong single-exit, branch confinement). |
-| `inclusiveGateway` | **Supported since M4-L1** (TASK-48) — block-structured (SESE) OR split/join; non-default out-flows carry FEEL conditions + an optional gateway-owned default; join waits for the recorded activation subset. |
+| `parallelGateway` | **Supported (M4)** — block-structured (SESE) AND split/join; SESE-validated at publish (TASK-48: matching same-type join, strong single-exit, branch confinement); multi-token runtime (fan-out + AND-join barrier + frontier-empty completion) shipped at **M4-L3**. |
+| `inclusiveGateway` | **Supported (M4)** — block-structured (SESE) OR split/join; non-default out-flows carry FEEL conditions + an optional gateway-owned default; the split's activated subset is recorded and the join waits for exactly it; runtime shipped at **M4-L4**. |
 | `eventBasedGateway` | **Supported since M3-L4** (TASK-46) — races timer/message branch catches and routes on the first event to occur (≥2 branches, every target a single-incoming intermediate catch, ≤1 timer branch, distinct messages). |
 | `complexGateway` | Not on the roadmap; deferred to a later milestone. |
 

@@ -288,3 +288,69 @@ Re-checked against constitution **v2.0.0** after the data model, contracts, and 
 `terminal-instance-noop-ack`, `cross-tenant-activate-reject`,
 `version-binding-during-compensation`. Each ships with the corresponding runtime/persistence/API
 change; none may be deferred past M1 without a constitution violation entry.
+
+---
+
+## M4: Concurrency — Parallel + Inclusive Gateways, Token Frontier, AND/OR Joins
+
+**Design source**: `docs/superpowers/specs/2026-06-13-m4-concurrency-design.md`
+**Constitution**: v2.2.0 → v2.3.0 (MINOR), amended in L1 before any runtime ships.
+
+### Summary
+
+M4 introduces genuine concurrency within one instance: a `parallelGateway` (AND) or
+`inclusiveGateway` (OR) splits control into concurrent tokens that run their branches in
+parallel (worker-side) and re-synchronise at a matching join. The scalar cursor in the
+engine becomes a **token frontier**; instance completion becomes frontier-empty; compensation
+grows straggler-catching, per-token terminators, and a lineage-quiescence-ordered reverse pass.
+
+One Cloudflare Workflow per instance is retained. Real parallelism is **worker-side** (both
+branch jobs leasable at once); the engine serializes drives. The `Promise.race` multi-wait
+within the single Workflow is the concurrency strategy.
+
+### Constitution Check (Initial — against v2.2.0)
+
+- **BPMN profile** (Principle I): **PASS**. `parallelGateway` (AND) and `inclusiveGateway`
+  (OR) move into `SUPPORTED_NODE_TYPES`, block-structured (SESE) only; `complexGateway` stays
+  rejected. The no-custom-notation / XSD-valid / round-trippable clause is unchanged.
+- **SAGA / Compensation integrity** (Principle VI): **PASS** with amendment. Compensation is
+  redefined per causal chain (lineage): within-lineage reverse-seq is strict; cross-branch
+  order unconstrained. Straggler-catching (`INSERT OR IGNORE` + cohort terminators) and the
+  quiescence barrier satisfy the at-least-once / idempotent compensation clauses.
+- **Multi-token completion**: **PASS** (frontier-empty completion subsumes and preserves the
+  single-token rule).
+- **Immutable version binding** (Principle II): **PASS**. Region topology and compensation
+  graph derive from the bound version; migrations are additive (`0007_tokens.sql`).
+- **Durable idempotency** (Principle III): **PASS**. Fan-out / join-arrival / join-completion
+  all use the same `INSERT OR IGNORE` / plain-INSERT batch race discipline as prior milestones.
+- **Receive Task correlation** (Principle IV): **PASS** (preserved). Publish-time rule 10
+  rejects concurrent same-message-name catch points; the single-active-subscription-per-key
+  invariant holds.
+- **Audit and operator clarity** (Principle V): **PASS**. `tokens` array in
+  `GET /instances/{id}`; per-token history tags; frontier-wide `/cancel` and `/retry`.
+
+**Mandated M4 constitution-critical test gates**: `parallel-and-split-join`,
+`inclusive-or-split-join`, `branch-local-variable-merge`, `parallel-branch-compensation`.
+The manual Workflow-mode matrix (WM-1 through WM-6) is a blocking DoD gate for L3 and L5,
+executed via `wrangler dev` and recorded by task L6.6.
+
+### Layer Roadmap (L1–L6)
+
+| Layer | Scope | Blockers resolved |
+|-------|-------|-------------------|
+| **M4-L1** | Governance 2.3.0 (Principle I + VI + multi-token completion) + Sync Impact Report; profile flip (`parallelGateway`/`inclusiveGateway` → supported, `complexGateway`/`terminate` stay rejected); **SESE region validator** (post-dominators, strong single-exit, branch confinement, bijection, laminar nesting, no-uncontrolled-merge, cycle/transaction/boundary rules, same-message rejection, inclusive condition/default rules, element-disjointness test). **No runtime change.** | 6, 13, 14 |
+| **M4-L2** | Graph IR (`parallelGateway`/`inclusiveGateway` nodes + region map); `0007_tokens.sql` (`execution_tokens` read-model + `join_arrivals` + `join_completions` + `gateway_decisions.activated_flow_ids`); **token-frontier engine refactor** (single-token = 1-element frontier, no behaviour change); **migrate all `current_element_id` staleness guards to per-token lookups**; `current_element_id` → derived nullable; per-instance **drive serialization** (direct-mode lock); in-memory step-name Map + write-free fast-forward extended to token statuses. | 1, 2, 5, 11 |
+| **M4-L3** | `parallelGateway` AND: atomic fan-out claim; multi-wait `Promise.race` (individually wrapped, dedup by step name, advisory winner, match-keyed payload); join barrier (`join_arrivals`/`join_completions`); frontier-empty completion (last-token-out conditional UPDATE); branch-local scopes + deterministic merge-at-join in document order; `region_activation` = split occurrence; token-id forms + nested-region frame stack. | 2, 3, 4, 7, 12 |
+| **M4-L4** | `inclusiveGateway` OR: split activation recorded in `gateway_decisions.activated_flow_ids`; OR-join waits for recorded subset (origin-branch keyed); zero-activation default/`noPath`; empty-activated-set immediate produce. | 7 |
+| **M4-L5** | Compensation of parallel branches: cohort capture + scope-wide teardown; per-token terminators (DLQ-while-compensating, lease-expiry alarm, message/timer sweep, unapplied-ledger sync); straggler-ledger-insert in compensating drive; lineage-quiescence-ordered reverse (EXISTS-anti-join on `parent_token_id` chain); quiescence barrier (ledger-empty AND tokens-terminal); operator `/cancel` non-eager-abandon for region cohort tokens; half-satisfied-join teardown; generalised forward-incident cohort capture (`serviceTaskFailure`, `poison`, `loopLimit`, `concurrencyLimit`, `compensationFailure`, `stepBudget`). | 8, 9, 10 |
+| **M4-L6** | `MAX_CONCURRENT_TOKENS = 256` + `concurrencyLimit` incident; `STEP_BUDGET_SOFT = 20000` + `stepBudget` incident + `limits.steps = 25000` Workflow ceiling; R2 binding + overlay offload (`{"__r2":"<key>"}` sentinel) + join-time 1 MiB bound; small event envelopes; per-token spans + history token tags; inspection `tokens` array + openapi/contract updates; `docs/bpmn` (03/07/09) + `check:docs` guards (constant-sync + gateway-shipped flip); manual Workflow-mode validation matrix placeholder; quickstart Scenarios 27–30; epic closure. | — |
+
+### Complexity Tracking
+
+No constitution violations. All Initial-gate items are PASS; the SAGA/Compensation integrity
+gate carries a narrowing amendment (per-lineage ordering) that tightens, not loosens, the
+principle.
+
+| Violation | Why Needed | Simpler Alternative Rejected Because |
+|-----------|------------|-------------------------------------|
+| _(none)_  | _(none)_   | _(none)_                            |

@@ -140,14 +140,42 @@ receiveTask → WAIT STATE: persist & park. External system POSTs message.
 none end    → consume token; no tokens left ⇒ instance completed
 ```
 
-The engine stays **single-token at runtime through M3**, but the line is no longer straight: **since M1**
+The engine stayed **single-token at runtime through M3**, but the line is no longer straight: **since M1**
 the token may pass through a `bpmn:transaction` whose steps carry **boundary events**
 (error/cancel/compensation — an interrupting boundary *redirects* the token, it never forks it),
 **since M2** it may **branch and loop through an XOR `exclusiveGateway`** (FEEL conditions, default
 flow, occurrence-counted cycles — the token takes exactly one outgoing flow), and **since M3** it may
 **wait on timers and message intermediate catches and race them through an `eventBasedGateway`**.
-**Since M4-L1** a block-structured `parallelGateway` (AND) / `inclusiveGateway` (OR) region is
-**accepted and SESE-validated at publish**; genuine **multi-token concurrency** — the token frontier
-that fans branches out and synchronises at the join — ships in the later M4 runtime layers. Every arrow
-is an audited, replay-safe, idempotent transition. That constrained model is precisely what makes the
-engine *provably* durable. See [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
+**Since M4** a block-structured `parallelGateway` (AND) / `inclusiveGateway` (OR) region runs as
+**genuine multi-token concurrency** (constitution v2.3.0): the engine maintains a **token frontier** —
+the set of live token positions inside one instance — reconstructed each drive by the same
+re-walk-from-start as M2, now descending every split's out-flows in document order. The runtime
+mechanics (shipped across M4-L2…L6):
+
+- **Split (fan-out).** The parent token is consumed and one **branch token** is produced per activated
+  out-flow — an AND split takes **all** out-flows; an OR (`inclusiveGateway`) split takes the subset
+  whose FEEL conditions are true (≥1, else the gateway-owned `default`, else terminal `noPath`). The
+  branches' jobs all become leasable at once, so external workers run them **concurrently** (real
+  parallelism is worker-side; the engine itself never drives one instance concurrently).
+- **Multi-wait.** Each drive re-walks the frontier, fast-forwards already-applied visits write-free, and
+  awaits every parked token together in one `Promise.race` over per-token `step.waitForEvent`s; any
+  resolution re-walks from start and reconciles against canonical D1.
+- **Join (synchronise).** An **AND-join** waits for a token from **every activated branch**; an
+  **OR-join** for exactly the recorded activated subset — keyed by the token's **origin branch**
+  (the split out-flow it descended from), not by physical in-flow. The join merges the joined branches'
+  **branch-local variable overlays** in split out-flow **document order** (shallow; later-in-order wins
+  on a key conflict), then produces one token onto the join's outgoing flow.
+- **Completion.** The instance completes when the **frontier is empty** (every token consumed at an end
+  event) — not when a single cursor reaches an end. A Hazard/incident on any one token freezes its live
+  siblings in place and transitions the whole instance.
+- **Compensation.** Cancelling a parallel scope catches stragglers and compensates **per token lineage**
+  (causal chain) in reverse — ordering **between** concurrent branches is unconstrained (they have no
+  happens-before relation). A late `complete` after cancel still ledgers its step and is compensated.
+- **Caps.** A split fan-out exceeding `MAX_CONCURRENT_TOKENS = 256` live tokens settles a terminal
+  `concurrencyLimit` incident; a per-drive step counter crossing `STEP_BUDGET_SOFT = 20000` (below the
+  platform `limits.steps = 25000` ceiling) settles a graceful `stepBudget` incident. See the profile and
+  constants in [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
+
+Every arrow is an audited, replay-safe, idempotent transition. That constrained model — multi-token but
+**block-structured (SESE)** — is precisely what makes the engine *provably* durable. See
+[`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).

@@ -641,3 +641,172 @@ constitution-critical saga behavior; see `quickstart.md` and `plan.md`):
 - The expression language (M2), per-step/boundary timeout behavior (M3), CF-Workflows
   concurrency strategy (M4), and the worker SDK shape (M1/fast-follow) are open questions
   recorded in research.md, not resolved here.
+
+---
+
+## M4: Concurrency — Parallel and Inclusive Gateways, Token Frontier, AND/OR Joins
+
+**Constitution**: v2.3.0 (MINOR — amended before any M4 runtime ships)
+**Design source**: `docs/superpowers/specs/2026-06-13-m4-concurrency-design.md`
+**Shipped layers**: L1 (governance + SESE validator), L2 (token-frontier engine refactor +
+0007_tokens.sql), L3 (parallelGateway AND), L4 (inclusiveGateway OR), L5 (parallel-branch
+compensation), L6 (caps + R2 offload + observability + docs + closure).
+
+### Constitution Alignment
+
+**BPMN Profile Impact** (Principle I, widened to v2.3.0): M4 widens the executable profile
+to accept `bpmn:parallelGateway` (AND split/join) and `bpmn:inclusiveGateway` (OR split/join),
+**block-structured (SESE) only** — every split paired with exactly one matching join of the same
+type, validated at publish time by the SESE region validator. `complexGateway` and `terminate`
+end events remain rejected. The no-custom-notation clause, XSD-validity, and modeler
+round-trippability are unchanged: `parallelGateway`/`inclusiveGateway` are standard BPMN 2.0
+elements carrying no new MODEL-namespace attributes; every still-unsupported construct is
+rejected before publish with element id + reason; ignorable extension content is tolerated.
+
+**SAGA / Compensation Impact** (Principle VI, amended for multi-token): The existing
+reverse-order compensation guarantee is refined to **per causal chain (token lineage)**: within
+each lineage steps compensate in strict reverse-seq order; order between concurrent branches is
+unconstrained (no happens-before relation). A straggler completing after a parallel scope began
+compensating is still ledgered (`INSERT OR IGNORE`) and compensated within its lineage before
+any causally-earlier step. The quiescence barrier (ledger drained **and** all cohort tokens
+terminal) prevents the instance from settling `compensated` while any cohort token remains live.
+
+**Multi-token Completion Rule** (Principle VI amendment): An instance completes only when the
+**token frontier is empty** (all tokens in `consumed|merged|discarded` status). A single-token
+instance's frontier empties at its end event, preserving M0–M3 behaviour exactly.
+
+**Immutable Version Binding** (Principle II): Unchanged. The compensation graph (region topology,
+branch wiring, compensation associations) derives from the instance's bound definition version.
+
+**Durable Idempotency** (Principle III): Fan-out, join arrival, and join completion use
+`INSERT OR IGNORE` / plain `INSERT` race discipline (same as `gateway_decisions` and
+`saga_steps`). Branch-local `variables_overlay` is made idempotent by the existing
+`output_applied` marker. A losing concurrent fan-out or join batch aborts on the PK and re-reads
+the already-recorded result.
+
+**Receive Task Correlation** (Principle IV): Unchanged for single-token paths. The
+publish-time SESE validator (§4 rule 10 of the design) rejects any model placing two concurrent
+catch points with the same message name in the same region, preserving the single-active-
+subscription-per-broker-key invariant.
+
+**Audit and Operator Visibility** (Principle V): `GET /instances/{id}` gains a `tokens` array
+from `execution_tokens` (D1, never Workflow state). New history event types (`regionActivated`,
+`branchForked`, `branchArrivedAtJoin`, `joinCompleted`) carry `tokenId`, `regionId`,
+`regionActivation` in `diagnostics`. Operator `/cancel` is frontier-wide; `/retry` reconstructs
+the frontier from `execution_tokens`.
+
+### User Scenarios & Testing
+
+#### User Story 7 — Run Two Concurrent Branches and Join (Priority: P1)
+
+A BPMN model fans out at a `parallelGateway` into two or more service-task branches that run
+concurrently (both jobs leasable at once by independent workers) and synchronises at the
+matching AND join; the instance completes when the token frontier is empty.
+
+**Acceptance Scenarios**:
+
+1. **Given** a `parallelGateway` split with two outgoing branches, **When** the instance fans
+   out, **Then** one `execution_tokens` row per branch is written atomically and both branch
+   jobs are leasable simultaneously.
+2. **Given** both branch jobs completed (in any order), **When** the second `join_arrivals`
+   row is inserted, **Then** the `join_completions` plain-INSERT claim fires in the same
+   `dbBatch` as the merged overlay and the advance; the instance reaches `completed` on empty
+   frontier via the atomic last-token-out conditional UPDATE.
+
+#### User Story 8 — Activate Only True-Condition Branches (OR Gateway) (Priority: P1)
+
+An `inclusiveGateway` split activates only flows whose FEEL conditions are true (or the
+`default`); the recorded activation set is replayed verbatim on rewalk. The OR join waits for
+exactly the recorded subset. Zero activation with no default raises `noPath`.
+
+**Acceptance Scenarios**:
+
+1. **Given** two conditional flows with one true condition, **When** the split fires, **Then**
+   `gateway_decisions.activated_flow_ids` records the singleton; only one branch job becomes
+   leasable; the OR join fires when that branch arrives.
+2. **Given** no true condition and no `default` flow, **When** the split fires, **Then** a
+   terminal `noPath` incident is raised (Hazard inside a transaction; no auto-compensation).
+
+#### User Story 9 — Branch-Local Variables Merge Deterministically (Priority: P1)
+
+Each branch token's `variables_overlay` is isolated from siblings before the join. At the join
+the overlays merge in **split out-flow document order**; later-in-order wins on key conflict.
+
+**Acceptance Scenarios**:
+
+1. **Given** two branches each writing to a distinct key, **When** the join fires, **Then**
+   both keys are present in the post-join scope.
+2. **Given** two branches each writing the same key, **When** the join fires, **Then** the
+   value from the later-in-document-order branch out-flow wins.
+3. **Given** branch A writes key `x` in-flight, **When** branch B reads `x` before the join,
+   **Then** branch B reads the pre-split scope value — branch A's overlay is not visible to
+   siblings before merge.
+
+#### User Story 10 — Compensate Parallel Branches with Straggler Handling (Priority: P1)
+
+A scope cancel (business error → cancel end, or operator `/cancel`) captures the live-token
+cohort, arms per-token terminators, and holds the quiescence barrier until the ledger is
+drained and all cohort tokens are terminal; straggler completes are ledgered and compensated
+within their lineage.
+
+**Acceptance Scenarios**:
+
+1. **Given** an in-flight straggler branch at cancel time, **When** the straggler later
+   completes, **Then** a `saga_steps` row is written (`INSERT OR IGNORE`) but the instance
+   does not advance; the compensating drive ledgers the straggler before the reverse pass.
+2. **Given** completed steps on two concurrent branches, **When** compensation runs, **Then**
+   within each branch lineage steps compensate in strict descending-seq order; cross-branch
+   order is unconstrained.
+3. **Given** the last cohort terminator fires and the ledger is drained, **When** the
+   quiescence barrier passes, **Then** the instance settles `compensated` exactly once.
+
+### Key Entities (M4)
+
+- **Token (`execution_tokens`)**: A live position in the frontier. `token_id` is deterministic:
+  `${instanceId}:#root` for the root token; `${instanceId}:${splitId}#${activation}:${branchFlowId}`
+  for a branch token. `position_element_id` and `status` are derived read-models; all fast-forward
+  and barrier decisions read the append-only join facts, never mutable token state.
+- **Join Arrival (`join_arrivals`)**: Append-only. `(instance_id, join_id, activation,
+  branch_flow_id)` recorded via `INSERT OR IGNORE` when a branch token reaches the join.
+- **Join Completion (`join_completions`)**: Append-only. `(instance_id, join_id, activation,
+  produced_token_id)` claimed by a plain `INSERT` in the same batch as the merge-overlay write
+  and the advance. The replay predicate for "this join activation has fired."
+- **`MAX_CONCURRENT_TOKENS = 256`**: Walk-local frontier cap (live tokens in
+  `active|waiting|arrivedAtJoin`). Exceeding it at a split fan-out settles a terminal
+  `concurrencyLimit` incident (never a live SQL COUNT; counted in-memory during the deterministic
+  rewalk, like `MAX_ELEMENT_OCCURRENCES = 1000`).
+- **`STEP_BUDGET_SOFT = 20000`**: Per-drive cumulative `runStep`/`waitForEvent` cap (the counter
+  resets each drive). Exceeding
+  it settles a terminal `stepBudget` incident below the platform ceiling (`limits.steps = 25000`
+  in `wrangler.jsonc`). The three caps enforce jointly: `MAX_CONCURRENT_TOKENS`,
+  `MAX_ELEMENT_OCCURRENCES`, and `STEP_BUDGET_SOFT`.
+- **Token Cohort** (compensation): The set of `execution_tokens` live at cancel time. Every cohort
+  token gets a per-token terminator; the quiescence barrier holds until all are terminal.
+
+### Success Criteria (M4)
+
+- **SC-008**: A `parallelGateway` AND split fans out concurrently; the AND join waits for all
+  activated branches; the instance completes on empty frontier (`completed`).
+- **SC-009**: An `inclusiveGateway` OR split activates only true-condition branches (recorded in
+  `activated_flow_ids`); the OR join fires for exactly the recorded subset; zero activation with
+  no default raises `noPath`.
+- **SC-010**: Branch-local variable writes are isolated before the join; the join merge applies
+  branches in document order; later-in-order wins on key conflict.
+- **SC-011**: A parallel-scope cancel ledgers stragglers, holds the quiescence barrier, compensates
+  within each lineage in reverse-seq order, and settles `compensated` exactly once.
+- **SC-012**: Exceeding `MAX_CONCURRENT_TOKENS = 256` at fan-out settles a `concurrencyLimit`
+  incident; exceeding `STEP_BUDGET_SOFT = 20000` steps in a single drive settles a `stepBudget`
+  incident; neither is an opaque errored Workflow.
+- **SC-013**: `GET /instances/{id}` surfaces the `tokens` array (live and terminal) from `execution_tokens` (D1);
+  history events inside a region carry `tokenId`/`regionId`/`regionActivation` in `diagnostics`.
+
+### M4 constitution-critical test gates
+
+1. **parallel-and-split-join** — AND fan-out, multi-wait race, join, frontier-empty completion
+   (`tests/integration/parallel-gateway.test.ts`).
+2. **inclusive-or-split-join** — OR activation subset, OR join, zero-activation `noPath`
+   (`tests/integration/inclusive-gateway.test.ts`).
+3. **branch-local-variable-merge** — token-scoped writes, document-order merge, no sibling leak
+   (`tests/integration/parallel-gateway.test.ts`).
+4. **parallel-branch-compensation** — straggler ledger, quiescence barrier, lineage-ordered
+   reverse, quiesced settle (`tests/integration/parallel-compensation.test.ts`).

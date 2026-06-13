@@ -96,6 +96,7 @@ import {
   type DriveResult,
 } from "./engine-shared";
 import { createIncident, completeInstance, recordTerminalIncident } from "./incidents";
+import { reconstructFrontier, syncFrontierReadModel } from "./frontier";
 import { driveForwardServiceTask, terminateUnleasableJob } from "./forward-task";
 import { beginCompensating, settleAfterCompensation } from "./compensation";
 import {
@@ -179,7 +180,15 @@ export async function runInstance(env: Env, instanceId: string, opts: RunOptions
   // "The walk is the replay" (TASK-32): ALWAYS re-walk from the start element,
   // in both modes — opts.startAt is ignored. Applied steps fast-forward
   // write-free from canonical D1 state; the walk lands on the live frontier.
-  return loop(env, instanceId, graph, opts.runStep, opts.waitFor, opts.incomingEvent);
+  const result = await loop(env, instanceId, graph, opts.runStep, opts.waitFor, opts.incomingEvent);
+  // M4-L2: refresh the token read-model from the settled cursor (single-token in
+  // L2; L3 grows the frontier). Best-effort + non-fatal — it never blocks the drive.
+  try {
+    await syncFrontierReadModel(env, instanceId, await reconstructFrontier(env, graph, instanceId));
+  } catch (err) {
+    console.error(JSON.stringify({ level: "warn", message: "frontier read-model sync failed", instanceId, error: err instanceof Error ? err.message : String(err) }));
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------

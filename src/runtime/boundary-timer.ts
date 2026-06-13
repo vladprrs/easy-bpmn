@@ -249,8 +249,9 @@ export async function settleBoundaryTimerCancel(
  * (design §4.5), so the sweep settles it with the bookkeeping flip + history ONLY —
  * writing a `timer_outcomes` row would falsify the "EBG timer has no decider row"
  * invariant. A stray post-cancel alarm still no-ops: fireTimer guards on
- * status!='armed' (this flip) and the terminal instance, and planEventGatewayTimerFire
- * guards on the cursor having moved off the gateway.
+ * status!='armed' (this flip) and on the terminal instance — both stop the alarm
+ * before planEventGatewayTimerFire is reached (whose decider, post M4-L2, is the
+ * `gateway_decisions` row alone; the old current_element_id cursor guard was dropped).
  */
 export async function cancelArmedTimersForInstance(env: Env, instanceId: string): Promise<void> {
   const inst = await getInstanceRow(env.DB, instanceId);

@@ -58,6 +58,7 @@ import {
   type SubscriptionRow,
 } from "../persistence/instances";
 import { messageCorrelatedStmt } from "../persistence/messages";
+import { branchHistoryTags, getToken, parseOverlay, readOverlay, rootTokenId, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
 import { insertGatewayDecisionStmt, getGatewayDecision } from "../persistence/gateway-decisions";
 import {
   flipTimerCancelledStmt,
@@ -162,6 +163,7 @@ export async function driveEventBasedGateway(
   runStep: RunStep,
   waitFor: WaitForEvent | null,
   pending?: MessageEventPayload,
+  activeTokenId?: string,
 ): Promise<EbgOutcome> {
   const tag = `${elementId}#${occ}`;
   const branches = ebgBranches(graph, node);
@@ -182,7 +184,7 @@ export async function driveEventBasedGateway(
   if (pending) {
     const branch = branches.message.find((b) => b.messageName === pending.messageName);
     if (branch) {
-      const r = await runStep(`ebg-msg:${tag}`, () => applyEbgMessage(env, instanceId, graph, elementId, node, occ, branch, branches, pending));
+      const r = await runStep(`ebg-msg:${tag}`, () => applyEbgMessage(env, instanceId, graph, elementId, node, occ, branch, branches, pending, activeTokenId));
       if (r.kind === "incident") return { kind: "incident" };
       return { kind: "next", next: r.next, consumedPending: true };
     }
@@ -190,7 +192,7 @@ export async function driveEventBasedGateway(
   }
 
   // (3) Park (first visit) or self-heal re-register (rewalk past an armed park).
-  const r = await runStep(`ebg:${tag}`, () => parkEventBasedGateway(env, instanceId, elementId, occ, branches));
+  const r = await runStep(`ebg:${tag}`, () => parkEventBasedGateway(env, instanceId, elementId, occ, branches, activeTokenId));
   if (r.kind === "incident") return { kind: "incident" };
   if (r.kind === "correlated") {
     // Early-buffered message claimed at registration → apply in its OWN memoized
@@ -198,7 +200,7 @@ export async function driveEventBasedGateway(
     // the broker consume (committed in `ebg:`) and the decision commit re-applies the
     // CAPTURED event on retry instead of re-hitting the now-empty broker — mirroring
     // driveReceiveTask's recv→msg split. applyEbgMessage is idempotent on re-run.
-    const applied = await runStep(`ebg-msg:${tag}`, () => applyEbgMessage(env, instanceId, graph, elementId, node, occ, r.branch, branches, r.event));
+    const applied = await runStep(`ebg-msg:${tag}`, () => applyEbgMessage(env, instanceId, graph, elementId, node, occ, r.branch, branches, r.event, activeTokenId));
     if (applied.kind === "incident") return { kind: "incident" };
     return { kind: "next", next: applied.next };
   }
@@ -247,7 +249,7 @@ export async function driveEventBasedGateway(
   const event = outcome.payload as MessageEventPayload;
   const branch = branches.message.find((b) => b.messageName === event.messageName);
   if (!branch) return { kind: "waiting" }; // stray event → re-park
-  const applied = await runStep(`ebg-msg:${tag}`, () => applyEbgMessage(env, instanceId, graph, elementId, node, occ, branch, branches, event));
+  const applied = await runStep(`ebg-msg:${tag}`, () => applyEbgMessage(env, instanceId, graph, elementId, node, occ, branch, branches, event, activeTokenId));
   if (applied.kind === "incident") return { kind: "incident" };
   return { kind: "next", next: applied.next };
 }
@@ -284,6 +286,7 @@ async function parkEventBasedGateway(
   gwId: string,
   occ: number,
   branches: EbgBranches,
+  activeTokenId?: string,
 ): Promise<ParkOutcome> {
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
@@ -348,7 +351,7 @@ async function parkEventBasedGateway(
           instanceId,
           elementId: branches.timer.catchId,
           type: "timerArmed",
-          diagnostics: { kind: "eventGateway", gateway: gwId, fireAt, occurrence: occ, trigger: branches.timer.trigger },
+          diagnostics: { kind: "eventGateway", gateway: gwId, fireAt, occurrence: occ, trigger: branches.timer.trigger, ...branchHistoryTags(activeTokenId) },
         }),
       );
     }
@@ -362,6 +365,7 @@ async function parkEventBasedGateway(
           occurrence: occ,
           messageBranches: subMeta.map((m) => ({ catchId: m.branch.catchId, messageName: m.branch.messageName })),
           timerBranch: branches.timer ? { catchId: branches.timer.catchId } : null,
+          ...branchHistoryTags(activeTokenId),
         },
       }),
       applyTransitionStmt(env.DB, { instanceId, currentElementId: gwId, status: "waiting", now }),
@@ -461,6 +465,7 @@ async function applyEbgMessage(
   winner: EbgMessageBranch,
   branches: EbgBranches,
   event: MessageEventPayload,
+  activeTokenId?: string,
 ): Promise<ApplyOutcome> {
   // Idempotent re-run guard: a recorded decision means the race already resolved.
   const decided = await getGatewayDecision(env.DB, instanceId, gwId, occ);
@@ -469,12 +474,18 @@ async function applyEbgMessage(
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
   const next = winnerNextOf(graph, node, winner.flowId);
-  // M4-L3 review DEFERRED (workflow-mode/L6, design §5.7): an eventBasedGateway
-  // INSIDE a parallel branch whose MESSAGE branch wins should merge the payload onto
-  // the branch token's overlay (as applyMessage now does), not root. EBG-in-region is
-  // exotic and untested; this still writes to root. Mirror applyForwardCompletion's
-  // isBranch/setTokenOverlayStmt pattern + thread activeTokenId when L6 enables it.
-  const merged = mergeVariables(parseJson<JsonObject>(inst.variables, {}), event.payload ?? {});
+  // Branch-scoped payload (M4-L6.4, design §5.7): an eventBasedGateway whose MESSAGE
+  // branch wins INSIDE a parallel branch merges its payload onto the active branch
+  // token's OWN overlay (not root); root vars mutate only at the join fold-up. A
+  // null/root token keeps the exact M0–M3 path (merge into process_instances.variables).
+  // Mirrors applyMessage / applyForwardCompletion. (Was the M4-L3 review DEFERRED here.)
+  const isBranch = !!activeTokenId && activeTokenId !== rootTokenId(instanceId);
+  const branchTokenRow = isBranch ? await getToken(env.DB, activeTokenId!) : null;
+  // R2-aware read (M4-L6, design §9.1): a branch overlay may be an {"__r2":…} ref.
+  const baseVars = isBranch ? (branchTokenRow ? await readOverlay(env, parseOverlay(branchTokenRow)) : {}) : parseJson<JsonObject>(inst.variables, {});
+  const merged = mergeVariables(baseVars, event.payload ?? {});
+  // R2-aware write (M4-L6): offload a large branch overlay before the D1 commit.
+  const storedBranchOverlay = isBranch ? await writeOverlay(env, instanceId, activeTokenId!, merged) : merged;
   const winnerSub = await getSubscriptionForVisit(env.DB, instanceId, winner.catchId, occ);
   const winnerSubId = winnerSub?.subscription_id ?? subscriptionIdFor(instanceId, winner.catchId, occ);
 
@@ -490,7 +501,13 @@ async function applyEbgMessage(
       variablesSnapshot: null,
       now,
     }), // THE CLAIM
-    applyTransitionStmt(env.DB, { instanceId, variables: merged, currentElementId: next, status: "running", now }),
+    // A branch token's payload goes to its OWN overlay (design §5.7); the instance
+    // status moves to 'running' WITHOUT touching root vars or pinning a single
+    // current_element_id (NULL = multi-token frontier). A root/single-token token
+    // keeps the exact M0–M3 write (merged → process_instances.variables).
+    ...(isBranch
+      ? [setTokenOverlayStmt(env.DB, activeTokenId!, storedBranchOverlay, now), applyTransitionStmt(env.DB, { instanceId, currentElementId: null, status: "running", now })]
+      : [applyTransitionStmt(env.DB, { instanceId, variables: merged, currentElementId: next, status: "running", now })]),
     messageCorrelatedStmt(env.DB, { externalMessageId: event.externalMessageId, instanceId, subscriptionId: winnerSubId, now }),
     variableSnapshotStmt(env.DB, { instanceId, source: "message", sourceId: event.externalMessageId, variables: event.payload ?? {}, now }),
     historyStmt(env.DB, {
@@ -499,7 +516,7 @@ async function applyEbgMessage(
       elementId: winner.catchId,
       externalMessageId: event.externalMessageId,
       type: "messageCorrelated",
-      diagnostics: { subscriptionId: winnerSubId, messageName: event.messageName, messageId: event.messageId, occurrence: occ, viaEventGateway: gwId },
+      diagnostics: { subscriptionId: winnerSubId, messageName: event.messageName, messageId: event.messageId, occurrence: occ, viaEventGateway: gwId, ...branchHistoryTags(activeTokenId) },
       payloadSnapshot: event.payload ?? {},
     }),
     historyStmt(env.DB, {
@@ -507,7 +524,7 @@ async function applyEbgMessage(
       instanceId,
       elementId: gwId,
       type: "ebgDecision",
-      diagnostics: { winner: winner.catchId, branch: "message", flowId: winner.flowId, messageName: event.messageName, occurrence: occ },
+      diagnostics: { winner: winner.catchId, branch: "message", flowId: winner.flowId, messageName: event.messageName, occurrence: occ, ...branchHistoryTags(activeTokenId) },
     }),
   ];
   if (winnerSub?.status === "active") {

@@ -115,6 +115,46 @@ describe("parallelGateway AND (M4-L3, direct mode)", () => {
     expect(inst.body.variables).toMatchObject({ a1: true, a2: true, b: true, c: true });
   });
 
+  it("tags in-region history events with tokenId/regionId/regionActivation/spanId; emits the four region events (L6.4 AC#6)", async () => {
+    const token = await mintWorkerToken();
+    const { instance } = await publishAndStart(PARALLEL_BPMN, { correlationKey: "obs1", variables: {} });
+    const id = instance.body.instanceId;
+
+    const a = await leaseOne(token, "reserve-stock");
+    await complete(token, a, { reserved: true });
+    const b = await leaseOne(token, "authorize-payment");
+    await complete(token, b, { paid: true });
+    const c = await leaseOne(token, "confirm-order");
+    await complete(token, c, {});
+    expect((await get(`/instances/${id}`)).body.status).toBe("completed");
+
+    const history = await get(`/instances/${id}/history`);
+    const events = history.body.events as Array<{ type: string; elementId: string | null; diagnostics: Record<string, any> }>;
+
+    // (1) The four region-lifecycle events are all present in a parallel run.
+    for (const t of ["regionActivated", "branchForked", "branchArrivedAtJoin", "joinCompleted"]) {
+      expect(events.some((e) => e.type === t)).toBe(true);
+    }
+
+    // (2) The in-region serviceTaskCompleted for branch A carries the branch tags
+    // (token `${id}:fork#0:f1`, region "fork", activation 0, a deterministic spanId).
+    const branchAToken = `${id}:fork#0:f1`;
+    const aCompleted = events.find((e) => e.type === "serviceTaskCompleted" && e.elementId === "A");
+    expect(aCompleted).toBeDefined();
+    expect(aCompleted!.diagnostics.tokenId).toBe(branchAToken);
+    expect(aCompleted!.diagnostics.regionId).toBe("fork");
+    expect(aCompleted!.diagnostics.regionActivation).toBe(0);
+    expect(aCompleted!.diagnostics.spanId).toBe("fork#0:f1");
+
+    // (3) Backward-compat: the POST-JOIN confirm-order task runs on the root token,
+    // so its serviceTaskCompleted is UNTAGGED — root-path history stays byte-identical.
+    const cCompleted = events.find((e) => e.type === "serviceTaskCompleted" && e.elementId === "C");
+    expect(cCompleted).toBeDefined();
+    expect(cCompleted!.diagnostics.tokenId).toBeUndefined();
+    expect(cCompleted!.diagnostics.regionId).toBeUndefined();
+    expect(cCompleted!.diagnostics.spanId).toBeUndefined();
+  });
+
   it("re-drive reconstructs the same frontier — branch token ids embed splitId#activation:flow (L3.5)", async () => {
     const token = await mintWorkerToken();
     const { instance } = await publishAndStart(PARALLEL_BPMN, { correlationKey: "r1", variables: {} });

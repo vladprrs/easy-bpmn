@@ -54,7 +54,7 @@ import { insertSagaStepStmt } from "../persistence/saga";
 import { loadInst, isTransactionScope, SVC_WAIT_TIMEOUT, type RunStep, type WaitForEvent } from "./engine-shared";
 import { createIncident, parkWaiting } from "./incidents";
 import { resolveScope } from "./frontier";
-import { getToken, parseOverlay, readOverlay, rootTokenId, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
+import { branchHistoryTags, getToken, parseOverlay, readOverlay, rootTokenId, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
 
 /**
  * The token-path node an error boundary on `elementId` routes the failed token
@@ -150,7 +150,7 @@ export async function driveForwardServiceTask(
     return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, job!, activeTokenId));
   }
   if (job?.status === "failed") {
-    return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, job!));
+    return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, job!, activeTokenId));
   }
 
   if (!job) {
@@ -198,7 +198,7 @@ export async function driveForwardServiceTask(
     return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, fresh, activeTokenId));
   }
   if (fresh.status === "failed") {
-    return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, fresh));
+    return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, fresh, activeTokenId));
   }
   if (outcome.kind === "timeout") {
     if (tb) {
@@ -223,7 +223,7 @@ export async function driveForwardServiceTask(
         return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, settledJob, activeTokenId));
       }
       if (settledJob.status === "failed") {
-        return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, settledJob));
+        return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, settledJob, activeTokenId));
       }
       return { kind: "waiting" }; // still parked (e.g. a concurrent /cancel terminal) — re-park
     }
@@ -276,7 +276,7 @@ async function createForwardJob(env: Env, instanceId: string, graph: ExecutionGr
       instanceId,
       elementId,
       type: "elementEntered",
-      diagnostics: { elementType: "serviceTask", taskType, occurrence: occ },
+      diagnostics: { elementType: "serviceTask", taskType, occurrence: occ, ...branchHistoryTags(activeTokenId) },
     }),
     createJobStmt(env.DB, {
       jobId,
@@ -297,7 +297,7 @@ async function createForwardJob(env: Env, instanceId: string, graph: ExecutionGr
       instanceId,
       elementId,
       type: "serviceTaskJobCreated",
-      diagnostics: { jobId, taskType, retryLimit: Math.max(1, node.retries ?? 1), activationExpiresAt, occurrence: occ },
+      diagnostics: { jobId, taskType, retryLimit: Math.max(1, node.retries ?? 1), activationExpiresAt, occurrence: occ, ...branchHistoryTags(activeTokenId) },
     }),
     ...(arm ? arm.stmts : []),
   ]);
@@ -469,7 +469,7 @@ async function applyForwardCompletion(
         instanceId,
         elementId,
         type: "poisonJob",
-        diagnostics: { jobId: job.job_id, strikes: strike, mergedSize: payloadByteSize(merged) },
+        diagnostics: { jobId: job.job_id, strikes: strike, mergedSize: payloadByteSize(merged), ...branchHistoryTags(activeTokenId) },
       }).run();
       // Like the DLQ jobActivationTimeout race, this poison terminal does NOT settle
       // the host's boundary timer (no decider claim) — it is left `armed` on a now-
@@ -494,7 +494,7 @@ async function applyForwardCompletion(
         instanceId,
         elementId,
         type: "serviceTaskOutputRejected",
-        diagnostics: { jobId: job.job_id, strike, mergedSize: payloadByteSize(merged), reason: "merged variables exceed the event payload limit" },
+        diagnostics: { jobId: job.job_id, strike, mergedSize: payloadByteSize(merged), reason: "merged variables exceed the event payload limit", ...branchHistoryTags(activeTokenId) },
       }),
       applyTransitionStmt(env.DB, { instanceId, currentElementId: elementId, status: "waiting", now }),
     ]);
@@ -514,7 +514,7 @@ async function applyForwardCompletion(
       instanceId,
       elementId,
       type: "serviceTaskCompleted",
-      diagnostics: { jobId: job.job_id, attempts: job.attempt_count, traceId: traceIdFor(instanceId), occurrence: occ },
+      diagnostics: { jobId: job.job_id, attempts: job.attempt_count, traceId: traceIdFor(instanceId), occurrence: occ, ...branchHistoryTags(activeTokenId) },
     }),
     // A branch token's output goes to its OWN overlay (design §5.7); the instance
     // status moves to 'running' WITHOUT touching root vars or pinning a single
@@ -583,6 +583,7 @@ async function handleForwardFailure(
   occ: number,
   node: GraphNode,
   job: JobRow,
+  activeTokenId?: string,
 ): Promise<ForwardOutcome> {
   // Route-once guard (idempotent step body): a re-run after the business-error
   // batch committed fast-forwards to the recorded boundary target instead of
@@ -606,7 +607,7 @@ async function handleForwardFailure(
           instanceId,
           elementId,
           type: "businessErrorCaught",
-          diagnostics: { jobId: job.job_id, errorCode: job.error_code, boundaryTarget: target, occurrence: occ },
+          diagnostics: { jobId: job.job_id, errorCode: job.error_code, boundaryTarget: target, occurrence: occ, ...branchHistoryTags(activeTokenId) },
         }),
         applyTransitionStmt(env.DB, { instanceId, currentElementId: target, status: "running", now }),
         // Atomic with the route: the rewalk fast-forwards this visit by

@@ -109,7 +109,7 @@ import {
   type LeafOutcome,
 } from "./frontier";
 import { completeInstanceGuarded } from "../persistence/instances";
-import { listLiveTokens, setTokenStatusStmt, rootTokenId, getToken, parseOverlay, readOverlay, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
+import { branchHistoryTags, listLiveTokens, setTokenStatusStmt, rootTokenId, getToken, parseOverlay, readOverlay, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
 import { withDriveLock } from "../persistence/drive-lock";
 import { driveForwardServiceTask, terminateUnleasableJob } from "./forward-task";
 import { beginCompensating, settleAfterCompensation } from "./compensation";
@@ -352,7 +352,7 @@ async function loop(
         // M3-L4 (TASK-45): a timer delay on the token path. Arms + parks; the DO
         // alarm (fireTimer) claims the `timer_outcomes` decider in the same batch
         // as the advance, then re-walks here to fast-forward.
-        const r = await driveIntermediateCatch(env, instanceId, graph, cur, occ, node, runStep, leafWaitFor);
+        const r = await driveIntermediateCatch(env, instanceId, graph, cur, occ, node, runStep, leafWaitFor, activeTokenId);
         if (r.kind === "waiting") return { kind: "parked" };
         return { kind: "next", next: r.next };
       }
@@ -372,7 +372,7 @@ async function loop(
         // M3-L4 (TASK-46): the timer/message race; the decision is claimed by a
         // CONCURRENT writer (broker apply vs fireTimer). Reuses the receiveTask
         // `pending` consume rule.
-        const r = await driveEventBasedGateway(env, instanceId, graph, cur, occ, node, runStep, leafWaitFor, pending);
+        const r = await driveEventBasedGateway(env, instanceId, graph, cur, occ, node, runStep, leafWaitFor, pending, activeTokenId);
         if (r.kind === "waiting") return { kind: "parked" };
         if (r.kind === "incident") return { kind: "incident" };
         if (r.consumedPending) pending = undefined;
@@ -817,6 +817,7 @@ export async function decideGateway(
     evaluations: evaluationsAsJson(evaluations),
     ...(passThrough ? { passThrough: true } : {}),
     ...(!passThrough && !snapshotFits ? { variablesSnapshotOmitted: true, variablesByteSize } : {}),
+    ...branchHistoryTags(activeTokenId),
   };
 
   try {
@@ -921,7 +922,7 @@ async function driveReceiveTask(
     return { kind: "next", next: r.next, consumedPending: true };
   }
 
-  const reg = await runStep(`recv:${tag}`, () => registerReceive(env, instanceId, graph, elementId, occ, messageName, node.type));
+  const reg = await runStep(`recv:${tag}`, () => registerReceive(env, instanceId, graph, elementId, occ, messageName, node.type, activeTokenId));
   if (reg.kind === "incident") return { kind: "incident" };
   if (reg.kind === "applied") return { kind: "next", next };
   if (reg.kind === "correlated") {
@@ -992,7 +993,7 @@ type RegisterOutcome =
   | { kind: "applied" }
   | { kind: "incident" };
 
-async function registerReceive(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, messageName: string, elementType: NodeType): Promise<RegisterOutcome> {
+async function registerReceive(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, messageName: string, elementType: NodeType, activeTokenId?: string): Promise<RegisterOutcome> {
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
   // Honest operator-visible labels: a standalone message intermediate catch
@@ -1046,7 +1047,7 @@ async function registerReceive(env: Env, instanceId: string, graph: ExecutionGra
     // first-registration batch (persist-before-advance); arm the DO after commit.
     const arm = buildBoundaryArm(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: elementId, occ, now });
     await dbBatch(env.DB, [
-      historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: isCatch ? "messageCatchWaiting" : "receiveTaskWaiting", diagnostics: { subscriptionId, messageName, correlationKey: inst.correlation_key, expiresAt, occurrence: occ } }),
+      historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: isCatch ? "messageCatchWaiting" : "receiveTaskWaiting", diagnostics: { subscriptionId, messageName, correlationKey: inst.correlation_key, expiresAt, occurrence: occ, ...branchHistoryTags(activeTokenId) } }),
       applyTransitionStmt(env.DB, { instanceId, currentElementId: elementId, status: "waiting", now }),
       ...(arm ? arm.stmts : []),
     ]);
@@ -1106,7 +1107,7 @@ async function applyMessage(env: Env, instanceId: string, graph: ExecutionGraph,
     ...(active ? [subscriptionConsumedStmt(env.DB, subscriptionId, event.externalMessageId, now)] : []),
     messageCorrelatedStmt(env.DB, { externalMessageId: event.externalMessageId, instanceId, subscriptionId, now }),
     variableSnapshotStmt(env.DB, { instanceId, source: "message", sourceId: event.externalMessageId, variables: event.payload ?? {}, now }),
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, externalMessageId: event.externalMessageId, type: "messageCorrelated", diagnostics: { subscriptionId, messageName: event.messageName, messageId: event.messageId, occurrence: occ }, payloadSnapshot: event.payload ?? {} }),
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, externalMessageId: event.externalMessageId, type: "messageCorrelated", diagnostics: { subscriptionId, messageName: event.messageName, messageId: event.messageId, occurrence: occ, ...branchHistoryTags(activeTokenId) }, payloadSnapshot: event.payload ?? {} }),
   ];
   // M3-L3: settle the guarding timer 'cancelled' ATOMICALLY with consuming the
   // message; on a decider conflict the timer FIRED first → convert to its path.

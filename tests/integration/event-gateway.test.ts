@@ -2,6 +2,7 @@ import { env, runDurableObjectAlarm } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { get, leaseAndComplete, mintWorkerToken, post, publishAndStart, publishMessage } from "../helpers";
 import { resumeInline } from "../../src/runtime/engine";
+import { listTokens } from "../../src/persistence/tokens";
 
 // eventBasedGateway runtime end-to-end (M3-L4, TASK-46; design §4.5, §7 gate 5).
 // The EBG races a message branch against a timer branch (or two message
@@ -55,6 +56,43 @@ const TWO_MSG_EBG = `<?xml version="1.0" encoding="UTF-8"?>
     <bpmn:sequenceFlow id="m2" sourceRef="onB" targetRef="afterB"/>
     <bpmn:sequenceFlow id="z1" sourceRef="afterA" targetRef="E"/>
     <bpmn:sequenceFlow id="z2" sourceRef="afterB" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+// M4-L6.4 (carried blocker #1): an eventBasedGateway INSIDE a parallel branch (f1).
+// SESE-valid — the EBG's message + timer branches reconverge through an
+// exclusiveGateway pass-through (xj) before the AND join, so every member stays
+// branch-confined and only the merge-safe XOR has >1 incoming flow; the EBG message
+// "EbgBranchMsg" is unique (no same-message-in-region collision). f2 is a plain
+// service task (ebg-branch-c). When the EBG message wins it must merge its payload
+// onto the f1 branch token's OWN overlay (design §5.7), not root.
+//   S → fork ─ f1 → EBG ─{ onMsg(msg) , onTimer(PT5M) }→ xj → join → After → E
+//             └ f2 → C ─────────────────────────────────────→ join
+const EBG_IN_BRANCH = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_ebgbr" targetNamespace="x">
+  <bpmn:message id="MEB" name="EbgBranchMsg"/>
+  <bpmn:process id="P_ebgbr" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:parallelGateway id="fork"/>
+    <bpmn:eventBasedGateway id="EBG"/>
+    <bpmn:intermediateCatchEvent id="onMsg"><bpmn:messageEventDefinition messageRef="MEB"/></bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="onTimer"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent>
+    <bpmn:exclusiveGateway id="xj"/>
+    ${svc("C", "ebg-branch-c")}
+    <bpmn:parallelGateway id="join"/>
+    ${svc("After", "ebg-after-join")}
+    <bpmn:endEvent id="E"/>
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="fork"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="fork" targetRef="EBG"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="C"/>
+    <bpmn:sequenceFlow id="e1" sourceRef="EBG" targetRef="onMsg"/>
+    <bpmn:sequenceFlow id="e2" sourceRef="EBG" targetRef="onTimer"/>
+    <bpmn:sequenceFlow id="m1" sourceRef="onMsg" targetRef="xj"/>
+    <bpmn:sequenceFlow id="m2" sourceRef="onTimer" targetRef="xj"/>
+    <bpmn:sequenceFlow id="x1" sourceRef="xj" targetRef="join"/>
+    <bpmn:sequenceFlow id="j2" sourceRef="C" targetRef="join"/>
+    <bpmn:sequenceFlow id="s1" sourceRef="join" targetRef="After"/>
+    <bpmn:sequenceFlow id="s2" sourceRef="After" targetRef="E"/>
   </bpmn:process>
 </bpmn:definitions>`;
 
@@ -286,5 +324,57 @@ describe("eventBasedGateway — rewalk fast-forward (M3-L4 AC#1: replay-stable)"
 
     await leaseAndComplete(token, "ebg-approved", {});
     expect((await get(`/instances/${id}`)).body.status).toBe("completed");
+  });
+});
+
+describe("eventBasedGateway INSIDE a parallel branch — branch-scoped payload (M4-L6.4, carried blocker #1)", () => {
+  it("the winning message payload lands on the BRANCH overlay (not root), then merges up at the join", async () => {
+    const token = await mintWorkerToken();
+    const { instance } = await publishAndStart(EBG_IN_BRANCH, { correlationKey: "ebgbr1", variables: {} });
+    const id = instance.body.instanceId;
+    // Fan-out: f1 parks at the EBG (message sub + armed timer), f2 parks at C's job.
+    expect(["running", "waiting"]).toContain(instance.body.status);
+
+    // Deliver the EBG message BEFORE f2 (C) completes: the EBG message branch wins and
+    // its payload merges onto the f1 branch overlay. f1 then arrives at the join, but
+    // the AND barrier is unsatisfied (f2 still at C) so the fold-up has NOT fired yet.
+    const pub = await publishMessage({ messageName: "EbgBranchMsg", correlationKey: "ebgbr1", messageId: "ebgbr1-m", payload: { ebgKey: "v" } });
+    expect(pub.body.outcome).toBe("correlated");
+
+    const mid = await get(`/instances/${id}`);
+    expect(["running", "waiting"]).toContain(mid.body.status);
+    // Branch-scoping proof: root vars must NOT yet carry the EBG payload…
+    expect(mid.body.variables.ebgKey).toBeUndefined();
+    // …it lives on the f1 branch token's OWN overlay.
+    const tokens = await listTokens(env.DB, id);
+    const f1 = tokens.find((t) => t.token_id === `${id}:fork#0:f1`);
+    expect(f1).toBeDefined();
+    expect(JSON.parse(f1!.variables_overlay)).toMatchObject({ ebgKey: "v" });
+    // The EBG decided the message branch (e1) and bookkeeping-cancelled its timer.
+    expect((await gwDecision(id))?.chosen_flow_id).toBe("e1");
+    expect(await historyTypes(id)).not.toContain("incidentCreated");
+    // Assert the EBG's own history events carry per-token tags (M4-L6.4 AC #6, follow-up #2).
+    // In EBG_IN_BRANCH: splitId="fork", branchFlowId="f1", activation=0.
+    const branchTokenId = `${id}:fork#0:f1`;
+    const allEvents = (await get(`/instances/${id}/history`)).body.events as any[];
+    const msgCorr = allEvents.find((e: any) => e.type === "messageCorrelated" && e.diagnostics?.tokenId === branchTokenId);
+    expect(msgCorr, "messageCorrelated must carry branch token tags").toBeDefined();
+    expect(msgCorr.diagnostics.regionId).toBe("fork");
+    expect(msgCorr.diagnostics.regionActivation).toBe(0);
+    expect(msgCorr.diagnostics.spanId).toBeTruthy();
+    const ebgDec = allEvents.find((e: any) => e.type === "ebgDecision" && e.diagnostics?.tokenId === branchTokenId);
+    expect(ebgDec, "ebgDecision must carry branch token tags").toBeDefined();
+    expect(ebgDec.diagnostics.regionId).toBe("fork");
+    expect(ebgDec.diagnostics.regionActivation).toBe(0);
+    expect(ebgDec.diagnostics.spanId).toBeTruthy();
+
+    // Complete f2 (C) → the AND join fires and folds the f1 overlay up into root vars.
+    await leaseAndComplete(token, "ebg-branch-c", {});
+    // Drive the post-join task to completion.
+    await leaseAndComplete(token, "ebg-after-join", {});
+
+    const done = await get(`/instances/${id}`);
+    expect(done.body.status).toBe("completed");
+    expect(done.body.variables).toMatchObject({ ebgKey: "v" });
   });
 });

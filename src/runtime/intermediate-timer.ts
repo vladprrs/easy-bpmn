@@ -32,6 +32,7 @@ import { workflowTimerEventTypeFor } from "../bpmn/profile";
 import { dbBatch } from "../persistence/db";
 import { historyStmt } from "../persistence/history";
 import { applyTransitionStmt, getInstanceRow, type InstanceRow } from "../persistence/instances";
+import { branchHistoryTags } from "../persistence/tokens";
 import {
   flipTimerFiredStmt,
   getTimer,
@@ -80,6 +81,7 @@ export async function driveIntermediateCatch(
   node: GraphNode,
   runStep: RunStep,
   waitFor: WaitForEvent | null,
+  activeTokenId?: string,
 ): Promise<CatchOutcome> {
   const tag = `${elementId}#${occ}`;
   const next = node.next!;
@@ -91,7 +93,7 @@ export async function driveIntermediateCatch(
   // (2) Arm + park (first visit) or self-heal re-arm (rewalk past an armed catch).
   const existing = await getTimer(env.DB, timerId);
   if (!existing) {
-    await runStep(`timer:${tag}`, () => parkIntermediateCatch(env, instanceId, elementId, occ, node));
+    await runStep(`timer:${tag}`, () => parkIntermediateCatch(env, instanceId, elementId, occ, node, activeTokenId));
   } else if (existing.status === "armed") {
     await armTimerDO(env, existing.timerId, existing.fireAt);
   }
@@ -146,6 +148,7 @@ async function parkIntermediateCatch(
   elementId: string,
   occ: number,
   node: GraphNode,
+  activeTokenId?: string,
 ): Promise<void> {
   const timerId = timerIdFor(instanceId, elementId, occ);
   const existing = await getTimer(env.DB, timerId);
@@ -172,7 +175,7 @@ async function parkIntermediateCatch(
       instanceId,
       elementId,
       type: "timerArmed",
-      diagnostics: { kind: "intermediateCatch", fireAt, occurrence: occ, trigger: node.timerTrigger },
+      diagnostics: { kind: "intermediateCatch", fireAt, occurrence: occ, trigger: node.timerTrigger, ...branchHistoryTags(activeTokenId) },
     }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: elementId, status: "waiting", now }),
   ]);

@@ -34,6 +34,29 @@ export function parseTokenId(tokenId: string): { kind: "root" } | { kind: "branc
   return { kind: "unknown" };
 }
 
+/**
+ * Per-token history tags (M4-L6.4, design §9 observability): when a history event
+ * is emitted while a BRANCH token is active, stamp its `diagnostics` with the
+ * token's identity (`tokenId` / `regionId` / `regionActivation` / `spanId`) so the
+ * audit timeline is per-region attributable. A root/single-token (or unknown)
+ * token returns NO tags — spread into a root event's diagnostics it is a no-op, so
+ * the M0–M3 history shape stays BYTE-IDENTICAL (the key to not regressing existing
+ * history-assertion tests). The `spanId` is DETERMINISTIC — derived purely from the
+ * token id, with no clock / counter / random / DB read — so it is replay-stable
+ * across a Workflow suspend/resume. PURE function (mirrors `parseTokenId`).
+ */
+export function branchHistoryTags(tokenId: string | undefined): Record<string, unknown> {
+  if (!tokenId) return {};
+  const p = parseTokenId(tokenId);
+  if (p.kind !== "branch") return {};
+  return {
+    tokenId,
+    regionId: p.splitId,
+    regionActivation: p.activation,
+    spanId: `${p.splitId}#${p.activation}:${p.branchFlowId}`,
+  };
+}
+
 /** Upsert a token row (read-model). Position/status are derived; safe to overwrite. */
 export function upsertTokenStmt(db: D1Database, input: {
   tokenId: string; instanceId: string; regionId?: string | null; regionActivation?: number;

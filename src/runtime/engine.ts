@@ -108,7 +108,7 @@ import {
   type LeafOutcome,
 } from "./frontier";
 import { completeInstanceGuarded } from "../persistence/instances";
-import { listLiveTokens, setTokenStatusStmt, rootTokenId } from "../persistence/tokens";
+import { listLiveTokens, setTokenStatusStmt, rootTokenId, getToken, parseOverlay, setTokenOverlayStmt } from "../persistence/tokens";
 import { withDriveLock } from "../persistence/drive-lock";
 import { driveForwardServiceTask, terminateUnleasableJob } from "./forward-task";
 import { beginCompensating, settleAfterCompensation } from "./compensation";
@@ -269,7 +269,7 @@ async function loop(
       }
 
       if (node.type === "receiveTask") {
-        const r = await driveReceiveTask(env, instanceId, graph, cur, occ, node, runStep, leafWaitFor, pending);
+        const r = await driveReceiveTask(env, instanceId, graph, cur, occ, node, runStep, leafWaitFor, pending, activeTokenId);
         if (r.kind === "waiting") return { kind: "parked" };
         if (r.kind === "incident") return { kind: "incident" };
         // The delivered event is consumed at the LIVE visit only — a consumed
@@ -287,7 +287,7 @@ async function loop(
           // the SAME driveReceiveTask path (the subscription/correlation/broker
           // machinery, NOT a parallel copy). The validator guarantees no boundary
           // timer attaches, so driveReceiveTask's timer branches are inert.
-          const r = await driveReceiveTask(env, instanceId, graph, cur, occ, node, runStep, leafWaitFor, pending);
+          const r = await driveReceiveTask(env, instanceId, graph, cur, occ, node, runStep, leafWaitFor, pending, activeTokenId);
           if (r.kind === "waiting") return { kind: "parked" };
           if (r.kind === "incident") return { kind: "incident" };
           if (r.consumedPending) pending = undefined;
@@ -816,6 +816,7 @@ async function driveReceiveTask(
   runStep: RunStep,
   waitFor: WaitForEvent | null,
   pending?: MessageEventPayload,
+  activeTokenId?: string,
 ): Promise<ReceiveOutcome> {
   const tag = `${elementId}#${occ}`;
   const next = node.next!;
@@ -837,8 +838,12 @@ async function driveReceiveTask(
     return { kind: "next", next, consumedPending: !!pending && sub.external_message_id === pending.externalMessageId };
   }
 
-  if (pending) {
-    const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, graph, elementId, occ, next, pending));
+  // Match-keyed apply (design §5.2): a delivered message is consumed HERE only when
+  // its messageName matches THIS receive's — never positionally. In a region a
+  // sibling branch's message (a different name) must fall through so the matching
+  // branch consumes it (single-token M3 always matches, so this is a no-op there).
+  if (pending && pending.messageName === messageName) {
+    const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, graph, elementId, occ, next, pending, activeTokenId));
     return { kind: "next", next: r.next, consumedPending: true };
   }
 
@@ -846,7 +851,7 @@ async function driveReceiveTask(
   if (reg.kind === "incident") return { kind: "incident" };
   if (reg.kind === "applied") return { kind: "next", next };
   if (reg.kind === "correlated") {
-    const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, graph, elementId, occ, next, reg.event));
+    const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, graph, elementId, occ, next, reg.event, activeTokenId));
     return { kind: "next", next: r.next };
   }
   if (!waitFor) return { kind: "waiting" };
@@ -897,7 +902,7 @@ async function driveReceiveTask(
     return { kind: "incident" };
   }
   const event = parseMessageEvent(outcome.payload);
-  const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, graph, elementId, occ, next, event));
+  const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, graph, elementId, occ, next, event, activeTokenId));
   return { kind: "next", next: r.next };
 }
 
@@ -976,7 +981,7 @@ async function registerReceive(env: Env, instanceId: string, graph: ExecutionGra
   return { kind: "waiting", workflowEventType, subscriptionId };
 }
 
-async function applyMessage(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, next: string, event: MessageEventPayload): Promise<{ next: string }> {
+async function applyMessage(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, next: string, event: MessageEventPayload, activeTokenId?: string): Promise<{ next: string }> {
   const inst = await loadInst(env, instanceId);
   const sub = await getSubscriptionForVisit(env.DB, instanceId, elementId, occ);
   // Apply-once guard (idempotent step body): the payload merge + the transition
@@ -984,7 +989,13 @@ async function applyMessage(env: Env, instanceId: string, graph: ExecutionGraph,
   if (sub?.status === "consumed") return { next };
   const active = sub?.status === "active" ? sub : null;
   const now = nowIso();
-  const merged = mergeVariables(parseJson<JsonObject>(inst.variables, {}), event.payload ?? {});
+  // Branch-scoped payload (design §5.7 — applyMessage is a named scope-aware site):
+  // a branch token's message payload merges onto its OWN overlay (not root); root
+  // vars mutate only at the join fold-up. A null/root token keeps the M0–M3 path.
+  const isBranch = !!activeTokenId && activeTokenId !== rootTokenId(instanceId);
+  const branchTokenRow = isBranch ? await getToken(env.DB, activeTokenId!) : null;
+  const baseVars = isBranch ? (branchTokenRow ? parseOverlay(branchTokenRow) : {}) : parseJson<JsonObject>(inst.variables, {});
+  const merged = mergeVariables(baseVars, event.payload ?? {});
 
   let subscriptionId = active?.subscription_id;
   if (!subscriptionId) {
@@ -1008,7 +1019,13 @@ async function applyMessage(env: Env, instanceId: string, graph: ExecutionGraph,
   }
 
   const statements: D1PreparedStatement[] = [
-    applyTransitionStmt(env.DB, { instanceId, variables: merged, currentElementId: next, status: "running", now }),
+    // A branch token's payload goes to its OWN overlay (design §5.7); the instance
+    // status moves to 'running' WITHOUT touching root vars or pinning a single
+    // current_element_id (NULL = multi-token frontier). A root/single-token token
+    // keeps the exact M0–M3 write (merged → process_instances.variables).
+    ...(isBranch
+      ? [setTokenOverlayStmt(env.DB, activeTokenId!, merged, now), applyTransitionStmt(env.DB, { instanceId, currentElementId: null, status: "running", now })]
+      : [applyTransitionStmt(env.DB, { instanceId, variables: merged, currentElementId: next, status: "running", now })]),
     ...(active ? [subscriptionConsumedStmt(env.DB, subscriptionId, event.externalMessageId, now)] : []),
     messageCorrelatedStmt(env.DB, { externalMessageId: event.externalMessageId, instanceId, subscriptionId, now }),
     variableSnapshotStmt(env.DB, { instanceId, source: "message", sourceId: event.externalMessageId, variables: event.payload ?? {}, now }),

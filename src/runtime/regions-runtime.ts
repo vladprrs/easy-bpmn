@@ -185,8 +185,25 @@ export async function claimJoinCompletion(env: Env, instanceId: string, graph: E
       applyTransitionStmt(env.DB, { instanceId, currentElementId: null, status: "running", now }),
     );
   }
-  await dbBatch(env.DB, stmts);
+  // Plain-INSERT race contract (design §5.4, the gateway_decisions discipline): the
+  // join_completions PK is the claim. The per-instance drive lock serialises drives,
+  // but under extreme contention it proceeds unlocked (drive-lock.ts) — so a losing
+  // concurrent batch's UNIQUE violation aborts this ENTIRE batch (the produced-token
+  // write + advance included); re-read the winner and fast-forward, never double-produce.
+  try {
+    await dbBatch(env.DB, stmts);
+  } catch (err) {
+    if (isUniqueConstraintViolation(err) && (await getJoinCompletion(env.DB, instanceId, joinId, activation))) {
+      return outTarget;
+    }
+    throw err;
+  }
   return outTarget;
+}
+
+/** A D1 UNIQUE-constraint violation (the plain-INSERT race loser); mirrors engine.ts. */
+function isUniqueConstraintViolation(err: unknown): boolean {
+  return err instanceof Error && /UNIQUE/i.test(err.message);
 }
 
 export { getToken, parseOverlay };

@@ -867,6 +867,32 @@ export const PARALLEL_SAME_MESSAGE_BPMN = `<?xml version="1.0" encoding="UTF-8"?
   </bpmn:process>
 </bpmn:definitions>`;
 
+/**
+ * AND region with a message catch in EACH branch on DISTINCT message names
+ * (no broker-key collision — accepted, unlike PARALLEL_SAME_MESSAGE_BPMN). Each
+ * branch's applied payload must land on its OWN token overlay (design §5.7), so the
+ * join merges them in document order (f2 "Paid" wins a shared key over f1 "Ready").
+ */
+export const PARALLEL_MESSAGE_DISTINCT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D_pmd" targetNamespace="x">
+  <bpmn:message id="MA" name="Ready"/>
+  <bpmn:message id="MB" name="Paid"/>
+  <bpmn:process id="P_pmd" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>s0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="fork"/>
+    <bpmn:parallelGateway id="fork"><bpmn:incoming>s0</bpmn:incoming><bpmn:outgoing>f1</bpmn:outgoing><bpmn:outgoing>f2</bpmn:outgoing></bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="f1" sourceRef="fork" targetRef="R1"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="R2"/>
+    <bpmn:receiveTask id="R1" name="AwaitReady" messageRef="MA"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>j1</bpmn:outgoing></bpmn:receiveTask>
+    <bpmn:receiveTask id="R2" name="AwaitPaid" messageRef="MB"><bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>j2</bpmn:outgoing></bpmn:receiveTask>
+    <bpmn:parallelGateway id="join"><bpmn:incoming>j1</bpmn:incoming><bpmn:incoming>j2</bpmn:incoming><bpmn:outgoing>s1</bpmn:outgoing></bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="j1" sourceRef="R1" targetRef="join"/>
+    <bpmn:sequenceFlow id="j2" sourceRef="R2" targetRef="join"/>
+    <bpmn:sequenceFlow id="s1" sourceRef="join" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>s1</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
 /** A Receive Task referencing a <message> with no name — not correlatable. */
 export const EMPTY_MESSAGE_NAME_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D" targetNamespace="x">

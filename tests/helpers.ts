@@ -781,6 +781,40 @@ export const PARALLEL_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
   </bpmn:process>
 </bpmn:definitions>`;
 
+/**
+ * Nested AND regions (M4-L3.5): outer fork/join with an inner fork/join wholly
+ * inside outer branch f1. fork → { f1: if → {A1, A2} → ij, f2: B } → join → C → E.
+ * The inner join (ij) folds its merged overlay onto the f1 (enclosing-branch) token,
+ * which then satisfies the outer join. Mirrors the validateRegions nested-accept
+ * structure (regions keyed by ["fork","if"]); ACCEPTED from M4-L1.
+ */
+export const NESTED_PARALLEL_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_nest" targetNamespace="x">
+  <bpmn:process id="P_nest" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>s0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="fork"/>
+    <bpmn:parallelGateway id="fork"><bpmn:incoming>s0</bpmn:incoming><bpmn:outgoing>f1</bpmn:outgoing><bpmn:outgoing>f2</bpmn:outgoing></bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="f1" sourceRef="fork" targetRef="if"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="B"/>
+    <bpmn:parallelGateway id="if"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>i1</bpmn:outgoing><bpmn:outgoing>i2</bpmn:outgoing></bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="i1" sourceRef="if" targetRef="A1"/>
+    <bpmn:sequenceFlow id="i2" sourceRef="if" targetRef="A2"/>
+    <bpmn:serviceTask id="A1" name="InnerA1"><bpmn:extensionElements><easy-bpmn:taskDefinition type="inner-a1"/></bpmn:extensionElements><bpmn:incoming>i1</bpmn:incoming><bpmn:outgoing>k1</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:serviceTask id="A2" name="InnerA2"><bpmn:extensionElements><easy-bpmn:taskDefinition type="inner-a2"/></bpmn:extensionElements><bpmn:incoming>i2</bpmn:incoming><bpmn:outgoing>k2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="k1" sourceRef="A1" targetRef="ij"/>
+    <bpmn:sequenceFlow id="k2" sourceRef="A2" targetRef="ij"/>
+    <bpmn:parallelGateway id="ij"><bpmn:incoming>k1</bpmn:incoming><bpmn:incoming>k2</bpmn:incoming><bpmn:outgoing>m1</bpmn:outgoing></bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="m1" sourceRef="ij" targetRef="join"/>
+    <bpmn:serviceTask id="B" name="OuterB"><bpmn:extensionElements><easy-bpmn:taskDefinition type="outer-b"/></bpmn:extensionElements><bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>m2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="m2" sourceRef="B" targetRef="join"/>
+    <bpmn:parallelGateway id="join"><bpmn:incoming>m1</bpmn:incoming><bpmn:incoming>m2</bpmn:incoming><bpmn:outgoing>s1</bpmn:outgoing></bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="s1" sourceRef="join" targetRef="C"/>
+    <bpmn:serviceTask id="C" name="AfterJoin"><bpmn:extensionElements><easy-bpmn:taskDefinition type="after-join"/></bpmn:extensionElements><bpmn:incoming>s1</bpmn:incoming><bpmn:outgoing>s2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="s2" sourceRef="C" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>s2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
 /** Inclusive (OR) split with two FEEL-conditional branches + default, matching OR join. ACCEPTED from M4-L1. */
 export const INCLUSIVE_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_inc" targetNamespace="x">

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:test";
-import { publishAndStart, get, mintWorkerToken, leaseOne, authedPost, PARALLEL_BPMN } from "../helpers";
+import { publishAndStart, get, mintWorkerToken, leaseOne, authedPost, PARALLEL_BPMN, NESTED_PARALLEL_BPMN } from "../helpers";
 import { listTokens } from "../../src/persistence/tokens";
 
 const complete = (token: string, job: { jobId: string; lockToken: string }, outputVariables: Record<string, unknown> = {}) =>
@@ -87,5 +87,47 @@ describe("parallelGateway AND (M4-L3, direct mode)", () => {
     const b = await leaseOne(token, "authorize-payment");
     expect(b.variables).toMatchObject({ base: 1 });
     expect(b.variables.fromA).toBeUndefined();
+    // Drain so this instance leaves no open jobs to pollute sibling tests.
+    await complete(token, b, {});
+    const c = await leaseOne(token, "confirm-order");
+    await complete(token, c, {});
+  });
+
+  it("nested regions: the inner join output satisfies the enclosing branch at the outer join (L3.5)", async () => {
+    const token = await mintWorkerToken();
+    const { instance } = await publishAndStart(NESTED_PARALLEL_BPMN, { correlationKey: "n1", variables: {} });
+    const id = instance.body.instanceId;
+    // Fan-out cascades: the outer fork forks f1 into the inner region, so the inner
+    // branch jobs (A1, A2) and the outer-b job are ALL leasable at once.
+    const a1 = await leaseOne(token, "inner-a1");
+    await complete(token, a1, { a1: true });
+    const a2 = await leaseOne(token, "inner-a2");
+    await complete(token, a2, { a2: true });
+    const b = await leaseOne(token, "outer-b");
+    await complete(token, b, { b: true });
+    // The inner join folds {a1,a2} onto the f1 token, which then arrives at the
+    // outer join; merged root vars feed the post-join after-join task.
+    const c = await leaseOne(token, "after-join");
+    expect(c.variables).toMatchObject({ a1: true, a2: true, b: true });
+    await complete(token, c, { c: true });
+    const inst = await get(`/instances/${id}`);
+    expect(inst.body.status).toBe("completed");
+    expect(inst.body.variables).toMatchObject({ a1: true, a2: true, b: true, c: true });
+  });
+
+  it("re-drive reconstructs the same frontier — branch token ids embed splitId#activation:flow (L3.5)", async () => {
+    const token = await mintWorkerToken();
+    const { instance } = await publishAndStart(PARALLEL_BPMN, { correlationKey: "r1", variables: {} });
+    const id = instance.body.instanceId;
+    // Each lease+complete re-drives (re-walks from start); the branch token ids must
+    // stay deterministic — the split occurrence is 0 on every re-walk.
+    const a = await leaseOne(token, "reserve-stock");
+    await complete(token, a, {});
+    const b = await leaseOne(token, "authorize-payment");
+    await complete(token, b, {});
+    const c = await leaseOne(token, "confirm-order");
+    await complete(token, c, {});
+    const rows = await listTokens(env.DB, id);
+    expect(rows.filter((r) => r.branch_flow_id).map((r) => r.token_id).sort()).toEqual([`${id}:fork#0:f1`, `${id}:fork#0:f2`]);
   });
 });

@@ -55,12 +55,17 @@ entry in Complexity Tracking before implementation planning may continue.
   routing, static ISO-8601 `timeDate`/`timeDuration` triggers only — accepted in
   constitution v2.2.0, the validator opening each construct as its runtime layer
   ships and rejecting it with "M3 — not yet implemented" until then, per
-  `docs/bpmn/09-easy-bpmn-profile.md`), introduces no custom notation, stays
+  `docs/bpmn/09-easy-bpmn-profile.md` — plus the M4 in-instance concurrency set:
+  block-structured (SESE) `bpmn:parallelGateway` (AND) and `bpmn:inclusiveGateway`
+  (OR), each split paired with one matching same-type join, validated at publish,
+  the inclusive split obeying the exclusiveGateway condition/default rules,
+  accepted in constitution v2.3.0), introduces no custom notation, stays
   XSD-valid and modeler-round-trippable when easy-bpmn extensions + DI are
   ignored, and rejects unsupported standard-namespace flow nodes before publish
   with the element id + a user-visible reason.
 - **SAGA / Compensation integrity**: If the feature touches sagas, compensation
-  runs in reverse completion order, scoped to its transaction, idempotent +
+  runs in reverse order of completion within each causal chain (a token lineage) —
+  concurrent-branch order unconstrained — scoped to its transaction, idempotent +
   at-least-once; compensation is triggered only by transaction Cancel (never by an
   uncaught Error/Hazard); a compensator that exhausts retries settles to
   `compensationFailed` with operator remediation, never blocking forever. N/A only

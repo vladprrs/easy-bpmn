@@ -28,6 +28,11 @@ export const SUPPORTED_NODE_TYPES: Record<string, NodeType> = {
   // single-incoming intermediate catch, ≤1 timer branch, distinct messages,
   // instantiate/Parallel rejected); this entry is the type mapping.
   "bpmn:EventBasedGateway": "eventBasedGateway",
+  // M4 concurrency (TASK-48): block-structured AND/OR splits. The validator opens
+  // them in its own classification + region-validation passes (SESE-gated); these
+  // entries are the type mapping, not the accept gate.
+  "bpmn:ParallelGateway": "parallelGateway",
+  "bpmn:InclusiveGateway": "inclusiveGateway",
 };
 
 export const SEQUENCE_FLOW_TYPE = "bpmn:SequenceFlow";
@@ -36,18 +41,13 @@ export const ERROR_TYPE = "bpmn:Error";
 
 /**
  * Gateway types OUTSIDE the profile, each with its roadmap pointer (saga design
- * §8): parallel/inclusive need multiple concurrent tokens (M4 concurrency),
- * complex is not on the roadmap. The validator rejects these with element id +
- * this reason. (eventBasedGateway is IN since M3-L4 — it has its own
- * branch-target-aware accept block in the validator, no longer deferred here.)
+ * §8): complex is not on the roadmap. The validator rejects these with element id
+ * + this reason. (parallelGateway / inclusiveGateway are IN since M4-L1 (TASK-48)
+ * — block-structured (SESE) AND/OR splits, opened in the validator's own
+ * classification + region-validation passes; eventBasedGateway is IN since M3-L4
+ * — both have their own accept blocks in the validator, no longer deferred here.)
  */
 export const DEFERRED_GATEWAY_REASONS: Record<string, string> = {
-  "bpmn:ParallelGateway":
-    "Parallel (AND) gateways need concurrent tokens, which are deferred to concurrency (M4). " +
-    "Only exclusiveGateway branching is supported.",
-  "bpmn:InclusiveGateway":
-    "Inclusive (OR) gateways activate multiple branches at once and are deferred to concurrency (M4). " +
-    "Only exclusiveGateway branching is supported.",
   "bpmn:ComplexGateway":
     "Complex gateways are not on the roadmap and are deferred to a later milestone. " +
     "Only exclusiveGateway branching is supported.",

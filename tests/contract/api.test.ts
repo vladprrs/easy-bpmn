@@ -24,15 +24,16 @@ describe("Public API contract (openapi.yaml)", () => {
     expect(typeof r.body.createdAt).toBe("string");
   });
 
-  // TASK-33: exclusiveGateway models now publish, so the unsupported-draft 409
-  // case pins a STILL-rejected gateway type (parallelGateway, deferred to M4)
-  // instead of the old exclusiveGateway fixture.
+  // TASK-33: exclusiveGateway models publish; TASK-48 (M4-L1): parallel/inclusive
+  // also publish (block-structured SESE), so the unsupported-draft 409 case pins a
+  // STILL-rejected gateway type (complexGateway, not on the roadmap) instead of the
+  // old parallelGateway fixture.
   it("records validation issues for an unsupported draft and blocks publish with 409", async () => {
-    const draft = await createDraft(deferredGatewayBpmn("parallelGateway"), "bad");
+    const draft = await createDraft(deferredGatewayBpmn("complexGateway"), "bad");
     expect(draft.status).toBe(201);
     expect(draft.body.status).toBe("invalid");
     expect(draft.body.validationIssues.length).toBeGreaterThan(0);
-    expect(draft.body.validationIssues.some((i: any) => i.elementId === "G" && /M4/.test(i.reason))).toBe(true);
+    expect(draft.body.validationIssues.some((i: any) => i.elementId === "G" && /complex|later milestone/i.test(i.reason))).toBe(true);
 
     const pub = await publishDraft(draft.body.draftId);
     expect(pub.status).toBe(409);

@@ -365,8 +365,16 @@ const CANCELLABLE_FROM = ["running", "waiting", "incident"] as const;
  */
 async function releaseActiveSubscriptionsForInstance(env: Env, instanceId: string, now: string): Promise<void> {
   for (const sub of await listActiveSubscriptionsForInstance(env.DB, instanceId)) {
-    await supersedeBrokerSubscription(env, sub);
-    await subscriptionSupersededStmt(env.DB, sub.subscription_id, now).run();
+    // Per-subscription best-effort: one release failure (broker hiccup or D1 error)
+    // must NOT abort the cancel before the status transition + resumeInline, which
+    // would strand the instance. A leaked broker key is recoverable via its TTL;
+    // a stuck cancel is not.
+    try {
+      await supersedeBrokerSubscription(env, sub);
+      await subscriptionSupersededStmt(env.DB, sub.subscription_id, now).run();
+    } catch (err) {
+      console.error(JSON.stringify({ level: "warn", message: "releaseActiveSubscription failed", subscriptionId: sub.subscription_id, error: err instanceof Error ? err.message : String(err) }));
+    }
   }
 }
 
@@ -386,8 +394,13 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
   // armed (so a genuinely abandoned job still goes terminal) and let a late complete
   // land as a straggler. Still release every active broker subscription so no broker
   // key leaks. The single-token (non-region) path keeps the M1–M3 eager abandon.
-  const graph = await loadGraphForInstance(env, instanceId).catch(() => null);
-  const isRegion = !!graph?.regions && Object.keys(graph.regions).length > 0;
+  // Load the graph to classify region vs single-token. Do NOT swallow a load
+  // failure: silently defaulting to non-region would take the EAGER-abandon path on
+  // a region instance and leak a late complete (design §8.1). A started instance
+  // always has a parsed published graph; if it genuinely cannot load, the downstream
+  // resumeInline would fail anyway, so surface it rather than degrade to unsafe.
+  const graph = await loadGraphForInstance(env, instanceId);
+  const isRegion = !!graph.regions && Object.keys(graph.regions).length > 0;
   if (isRegion) {
     await releaseActiveSubscriptionsForInstance(env, instanceId, now);
   } else {

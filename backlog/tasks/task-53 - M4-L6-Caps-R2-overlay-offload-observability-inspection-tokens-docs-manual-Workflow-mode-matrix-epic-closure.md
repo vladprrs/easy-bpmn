@@ -3,10 +3,11 @@ id: TASK-53
 title: >-
   M4-L6: Caps, R2 overlay offload, observability, inspection tokens, docs,
   manual Workflow-mode matrix, epic closure
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - claude
 created_date: '2026-06-13 08:56'
-updated_date: '2026-06-13 12:46'
+updated_date: '2026-06-13 20:01'
 labels:
   - saga
   - engine
@@ -88,17 +89,65 @@ _Part of **EPIC TASK-27** (M4 — Concurrency), milestone `m-4`. Layer task M4-L
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 L6.1: tests/integration/parallel-caps.test.ts passes — a fan-out exceeding MAX_CONCURRENT_TOKENS (CONCURRENCY_BOMB_BPMN against a documented test-only cap override) settles a terminal concurrencyLimit incident; crossing STEP_BUDGET_SOFT settles a graceful stepBudget incident below the platform ceiling.
-- [ ] #2 L6.1: MAX_CONCURRENT_TOKENS=256 and STEP_BUDGET_SOFT=20000 defined in engine.ts, counted from the in-memory reconstructed frontier (never a SQL COUNT); IncidentKind gains exactly concurrencyLimit+stepBudget and equals the openapi Incident.kind enum (check:docs guard #7); api.ts doc mentions both; check-docs guard #6 constant-syncs all three constants between engine.ts and docs/bpmn + specs/002.
-- [ ] #3 L6.2: wrangler.jsonc declares workflows[0].limits.steps=25000 + an OVERLAYS R2 binding; Env has OVERLAYS: R2Bucket; npx wrangler deploy --dry-run passes; overlays > OVERLAY_INLINE_MAX_BYTES are stored in R2 under deterministic key overlays/${id}/${tokenId}.json (written before the D1 commit) with the column holding {"__r2":"<key>"}, small overlays inline, reads transparently rehydrate.
-- [ ] #4 L6.2: claimJoinCompletion checks payloadByteSize(mergedOverlay) ≤ MAX_EVENT_PAYLOAD_BYTES before writing/delivering and on exceed raises the existing serviceTaskOutputRejected/poison incident (never a silent truncation); parallel-gateway.test.ts still passes.
-- [ ] #5 L6.3: GET /instances/{id} returns a tokens array of {tokenId, positionElementId, status, regionId, regionActivation, branchFlowId, parentTokenId} (large overlays by R2 reference) and currentElementId is null while >1 token is live; a contract test asserts this; the openapi inspection schema is updated; npm run test:contract passes.
-- [ ] #6 L6.4: a parallel run's history contains regionActivated, branchForked, branchArrivedAtJoin and joinCompleted events (asserted in parallel-gateway.test.ts), and every in-region history event carries tokenId/regionId/regionActivation/spanId in its diagnostics JSON with no new column.
-- [ ] #7 L6.5: specs/002-saga-orchestrator/{spec,plan,data-model,contracts/runtime-contracts,quickstart}.md carry the M4 deltas (token tables, tokens array, two new incident kinds, AND/OR/compensation quickstart scenarios); docs/bpmn/{03,07,09} flip parallel/inclusive to shipped; npm run check:docs passes with cited constant literals matching engine.ts.
+- [x] #1 L6.1: tests/integration/parallel-caps.test.ts passes — a fan-out exceeding MAX_CONCURRENT_TOKENS (CONCURRENCY_BOMB_BPMN against a documented test-only cap override) settles a terminal concurrencyLimit incident; crossing STEP_BUDGET_SOFT settles a graceful stepBudget incident below the platform ceiling.
+- [x] #2 L6.1: MAX_CONCURRENT_TOKENS=256 and STEP_BUDGET_SOFT=20000 defined in engine.ts, counted from the in-memory reconstructed frontier (never a SQL COUNT); IncidentKind gains exactly concurrencyLimit+stepBudget and equals the openapi Incident.kind enum (check:docs guard #7); api.ts doc mentions both; check-docs guard #6 constant-syncs all three constants between engine.ts and docs/bpmn + specs/002.
+- [x] #3 L6.2: wrangler.jsonc declares workflows[0].limits.steps=25000 + an OVERLAYS R2 binding; Env has OVERLAYS: R2Bucket; npx wrangler deploy --dry-run passes; overlays > OVERLAY_INLINE_MAX_BYTES are stored in R2 under deterministic key overlays/${id}/${tokenId}.json (written before the D1 commit) with the column holding {"__r2":"<key>"}, small overlays inline, reads transparently rehydrate.
+- [x] #4 L6.2: claimJoinCompletion checks payloadByteSize(mergedOverlay) ≤ MAX_EVENT_PAYLOAD_BYTES before writing/delivering and on exceed raises the existing serviceTaskOutputRejected/poison incident (never a silent truncation); parallel-gateway.test.ts still passes.
+- [x] #5 L6.3: GET /instances/{id} returns a tokens array of {tokenId, positionElementId, status, regionId, regionActivation, branchFlowId, parentTokenId} (large overlays by R2 reference) and currentElementId is null while >1 token is live; a contract test asserts this; the openapi inspection schema is updated; npm run test:contract passes.
+- [x] #6 L6.4: a parallel run's history contains regionActivated, branchForked, branchArrivedAtJoin and joinCompleted events (asserted in parallel-gateway.test.ts), and every in-region history event carries tokenId/regionId/regionActivation/spanId in its diagnostics JSON with no new column.
+- [x] #7 L6.5: specs/002-saga-orchestrator/{spec,plan,data-model,contracts/runtime-contracts,quickstart}.md carry the M4 deltas (token tables, tokens array, two new incident kinds, AND/OR/compensation quickstart scenarios); docs/bpmn/{03,07,09} flip parallel/inclusive to shipped; npm run check:docs passes with cited constant literals matching engine.ts.
 - [ ] #8 L6.6 (blocking DoD gate, NOT CI): the six §14 manual Workflow-mode scenarios (parallel message catches; crash-restart mid-race; near-simultaneous deliver+replay; one branch times out while sibling live; in-region loops near budget ⇒ graceful incident not an opaque errored Workflow; cancel a region with parked + in-flight stragglers) are run against wrangler dev (workflow mode, local D1 applied) and recorded PASS with evidence under an 'M4 manual Workflow-mode matrix' heading in quickstart.md.
 - [ ] #9 L6.7: the After-Phase-1 constitution gate in m4-constitution-check.md is satisfied vs v2.3.0 with each constitution-critical behaviour ticked (SESE validation, immutable version binding, Service Task contract, Receive Task correlation, idempotency/retry, audit history, operator-visible errors); the Backlog M4 milestone + L1–L6 tasks are closed with the manual-matrix as DoD evidence; the m4-concurrency branch is finished (PR) via finishing-a-development-branch.
-- [ ] #10 L6 gate: npm run typecheck && npm run test && npm run check:docs && npx wrangler deploy --dry-run all pass.
+- [x] #10 L6 gate: npm run typecheck && npm run test && npm run check:docs && npx wrangler deploy --dry-run all pass.
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+## Approved approach (executing-plans + TDD per layer)
+
+Baseline confirmed GREEN (typecheck, check:docs). Branch `m4-concurrency` is 60 ahead / 0 behind `main` (clean FF). Migration `0007_tokens.sql` already exists (L2) — **L6 adds NO new schema** (R2 offload reuses the JSON overlay column `{"__r2":key}`; observability is "no new column"; inspection reads existing tables). "Сделай миграцию" = APPLY `0007` (local for L6.6; remote/prod before push — `wrangler deploy` does not auto-apply migrations and CD is Workers-Builds-on-push-to-main, so prod D1 needs it for the deployed M4 code).
+
+**L6.1 caps** — `MAX_CONCURRENT_TOKENS=256`/`STEP_BUDGET_SOFT=20000` in engine.ts; counting `runStep` wrapper (per-drive step counter); fan-out cap in `driveFrontier` (`liveTokens + activated.length > cap`, in-memory frontier — never SQL COUNT) via new `drivers.raiseConcurrencyLimit`; step-budget check at top of the `walk` while-loop (reachable in direct mode) via new `drivers.raiseStepBudget`; two incident kinds single-sourced into `IncidentKind` + openapi enum + api.ts doc (guard #7); generalise check-docs guard #6 to loop-sync all three constants; test-only `MAX_CONCURRENT_TOKENS_OVERRIDE`/`STEP_BUDGET_SOFT_OVERRIDE`. Test via the loop-limit harness-injection pattern (`createVersion`+`createInstance`+`resumeInline(env,…)`) so the bomb trips on a lowered cap without 256 real branches.
+
+**L6.2 R2 offload** — `OVERLAYS` R2 binding + `workflows.limits.steps=25000` in wrangler.jsonc; `Env.OVERLAYS`; `OVERLAY_INLINE_MAX_BYTES=512*1024` + async `writeOverlay`/`readOverlay` in tokens.ts (deterministic key `overlays/${instanceId}/${tokenId}.json`, R2 put before D1 commit); thread writeOverlay through `setTokenOverlayStmt`/`foldTokenOverlayStmt` write sites and readOverlay through `resolveScope`/`claimJoinCompletion`/`applyMessage`/`applyForwardCompletion` reads; join-time `payloadByteSize(merged) ≤ MAX_EVENT_PAYLOAD_BYTES` in `claimJoinCompletion` → existing poison incident (never silent truncation). Unit tests for write/read round-trip; parallel-gateway stays green; `wrangler deploy --dry-run` passes.
+
+**L6.3 inspection tokens** — `tokenInspectionSchema` + `ProcessInstanceInspection.tokens` (mirror timers); `handleGetInstance` reads `listTokens`, maps the seven fields (large overlays by R2 ref), `currentElementId=null` when >1 live token; openapi delta; contract test.
+
+**L6.4 observability** — assert history has regionActivated/branchForked/branchArrivedAtJoin/joinCompleted (already emitted by regions-runtime); tag in-region events (serviceTaskCompleted/gatewayDecisionEvaluated/messageCorrelated) with `{tokenId,regionId,regionActivation,spanId}` derived from `parseTokenId` (deterministic spanId, no row read, no new column). **Carried blocker #1**: branch-scope `applyEbgMessage` (thread activeTokenId through driveEventBasedGateway) + EBG-in-branch fixture.
+
+**L6.5 spec/docs** — fold M4 deltas into specs/002 {spec,plan,data-model,contracts/runtime-contracts,quickstart}.md + docs/bpmn {03,07,09}; constants match engine.ts (guard #6).
+
+**L6.6 manual matrix (DoD gate)** — apply local D1, `wrangler dev` workflow mode, run the six §14 scenarios, record PASS/FAIL + real evidence in quickstart.md. Honesty rule: only genuinely-verified PASS; anything not executable in this env is flagged, never fabricated.
+
+**L6.7 closure** — gate (typecheck && test && check:docs && wrangler deploy --dry-run); constitution After-Phase-1 vs v2.3.0 in m4-constitution-check.md; Backlog close M4 milestone + L1–L6 with manual-matrix DoD evidence; apply `0007` local+remote; **merge m4-concurrency → main and push** (user override of the PR step in L6.7/finishing-a-development-branch).
+
+Carried blockers #2 (matchKeyedEvent positional) and #3 (multi-wait timeout re-loop) are workflow-mode-only → addressed by the L6.6 matrix scenarios 1/3/4; #3 also gets a graceful escape if reachable.
+<!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+**L6.1 + L6.2 shipped (paused here per user request — stop after L6.2, do not start L6.3).**
+
+- **L6.1** (commit `ef3deb9`): `MAX_CONCURRENT_TOKENS=256` + `STEP_BUDGET_SOFT=20000` in engine.ts; counting `runStep` wrapper (per-drive step counter, replay-stable); fan-out cap in `driveFrontier` (`liveTokens + activated.length > cap`, in-memory frontier — never a SQL COUNT) → `concurrencyLimit`; step-budget check at the top of the `walk` loop (reachable in direct mode) → graceful `stepBudget`; both kinds single-sourced into `IncidentKind` + openapi enum + api.ts doc (guard #7 passes); check-docs guard #6 generalised to constant-sync all three constants; test-only `MAX_CONCURRENT_TOKENS_OVERRIDE`/`STEP_BUDGET_SOFT_OVERRIDE` (Env optional fields); `tests/integration/parallel-caps.test.ts` (harness-injection: concurrencyLimit at fan-out, stepBudget on an in-region self-loop). AC #1, #2 ✓.
+- **L6.2** (commit `02ec323`): `OVERLAYS` R2 binding + `workflows.limits.steps=25000` in wrangler.jsonc; `Env.OVERLAYS`; vitest `r2Buckets:[OVERLAYS]`; `OVERLAY_INLINE_MAX_BYTES=512KiB` + async `writeOverlay`/`readOverlay` (deterministic key `overlays/${id}/${tokenId}.json`, R2 put before D1 commit) threaded through branch-overlay writes (applyForwardCompletion, applyMessage, nested join fold) + reads (resolveScope, claimJoinCompletion); `claimJoinCompletion` now returns a discriminated `{advance|incident}` and raises a terminal `poison` incident when `payloadByteSize(mergedOverlay) > MAX_EVENT_PAYLOAD_BYTES` (never a silent truncation); unit round-trip test + join payload-bound integration test. AC #3, #4 ✓.
+
+**Gate at pause:** `npm run typecheck` ✓, `npm test` ✓ (58 files / 410 tests), `npm run check:docs` ✓, `npx wrangler deploy --dry-run` ✓ (OVERLAYS bound).
+
+**Remaining (not started):** L6.3 inspection tokens array, L6.4 observability + EBG-branch-scope carry-over, L6.5 spec/docs, L6.6 manual Workflow-mode matrix (DoD gate), L6.7 closure. **Migration + push to main NOT performed** (they were L6.7) — awaiting user go-ahead. Branch `m4-concurrency` is now 62 ahead / 0 behind main.
+
+## L6.3–L6.6 outcome + L6.6 BLOCKER (2026-06-13)
+
+**L6.3** (commit `c898f03`): inspection `tokens` array + openapi/contract; spec-review ✓ + code-review APPROVED, 2 minor fixes folded. **AC #5 ✓**. (tokens array also validated live on real CF.)
+**L6.4** (commit `eb59dd3`): per-token history tags (`tokenId/regionId/regionActivation/spanId`, root path byte-identical) + branch-scoped `applyEbgMessage` (carried blocker #1) + EBG-in-branch fixture; spec-review ✓ + code-review APPROVED, 2 follow-ups folded. **AC #6 ✓**.
+**L6.5** (commit `7ead4d9`): specs/002 {spec,plan,data-model,runtime-contracts,quickstart} M4 deltas + docs/bpmn 03/07/09 flipped to shipped; spec-review ✓ + code-review found+fixed 4 accuracy errors vs the engine (per-instance→per-drive stepBudget; arrivedAtJoin in quiescence set; etc.). **AC #7 ✓**.
+**L6 gate (AC #10 ✓):** `typecheck` + `npm test` (413/413) + `check:docs` + `wrangler deploy --dry-run` all pass.
+
+**L6.6 (AC #8) — FAILED / BLOCKING.** Ran real workflow mode locally (`wrangler dev`) AND deployed M4 to real CF (`bpmn.rntme.com` Version `1993c802`, remote D1 `0007` applied, R2 enabled). The M4 multi-wait AND/OR-join **HANGS after the 2nd branch on BOTH real CF and local**; sequential resume PASSES, isolating it to the multi-wait. Root cause: the token-frontier rewalk issues a different set of `step.waitForEvent` calls per CF `run()` re-invocation (a completed branch shifts from `waitForEvent` to `step.do`), so the `Promise.race` over concurrent `step.waitForEvent` does not compose with CF's deterministic replay → the surviving branch's `sendEvent` never resumes the Workflow. This is the design's **R-cf-multiwait** risk, confirmed real. Full record: `quickstart.md` → 'M4 manual Workflow-mode matrix'. Fix tracked in **TASK-54** (re-opens the L3 engine; brainstorm → impl → real-CF re-validation).
+
+**L6.7 (AC #9) — BLOCKED** on TASK-54. **Epic NOT closed; `m4-concurrency` NOT merged to main.** Prod LEFT on the broken-concurrency M4 per operator decision (pre-revenue, no users, single-token M0–M3 flows unaffected; `wrangler rollback` available).
+<!-- SECTION:NOTES:END -->
 
 ## Comments
 

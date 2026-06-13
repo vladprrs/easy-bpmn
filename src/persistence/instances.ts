@@ -751,6 +751,19 @@ export function subscriptionSupersededStmt(
   );
 }
 
+/** Every ACTIVE subscription of an instance — the cohort broker keys an operator
+ * `/cancel` of a region must release so no broker key leaks (M4-L5, design §8.1). */
+export async function listActiveSubscriptionsForInstance(
+  db: D1Database,
+  instanceId: string,
+): Promise<SubscriptionRow[]> {
+  return dbAll<SubscriptionRow>(
+    db,
+    `SELECT * FROM message_subscriptions WHERE instance_id = ? AND status = 'active'`,
+    [instanceId],
+  );
+}
+
 export async function markSubscriptionExpired(
   db: D1Database,
   subscriptionId: string,

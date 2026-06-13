@@ -73,19 +73,23 @@ import {
   getInstance,
   getInstanceRow,
   getOpenIncidentsForInstance,
+  listActiveSubscriptionsForInstance,
   listInstances,
   mergeInstanceVariables,
   resolveAllOpenIncidents,
   resolveIncident,
+  subscriptionSupersededStmt,
   transitionStatusGuarded,
 } from "./persistence/instances";
 import { getExternalMessage, insertExternalMessage } from "./persistence/messages";
 import { listInstanceHistory, recordHistory } from "./persistence/history";
 import { getIdempotentResult, putIdempotentResult } from "./persistence/idempotency";
-import { resumeInline } from "./runtime/engine";
-import { cancelArmedTimersForInstance } from "./runtime/boundary-timer";
+import { loadGraphForInstance, resumeInline } from "./runtime/engine";
+import { cancelArmedTimersForInstance, supersedeBrokerSubscription } from "./runtime/boundary-timer";
+import { armCohortLeaseExpiryTerminators } from "./runtime/forward-task";
 import { listTimersForInstance } from "./persistence/timers";
 import { abandonActiveForwardJobs, resetJobForRetry } from "./persistence/jobs";
+import { listLiveTokens } from "./persistence/tokens";
 import {
   countPendingSteps,
   getFailedStep,
@@ -352,6 +356,20 @@ async function handleListInstances(env: Env, url: URL): Promise<Response> {
 // reverse compensation of already-completed steps).
 const CANCELLABLE_FROM = ["running", "waiting", "incident"] as const;
 
+/**
+ * Frontier-wide broker release (M4-L5, design §8.1): supersede every ACTIVE message
+ * subscription of an instance on cancel — a best-effort broker supersede per key (so a
+ * late publish gets the stable buffered/no-match outcome) + the `active → superseded`
+ * D1 flip. Prevents a leaked broker key when a region cohort token parked at a message
+ * catch is abandoned without eagerly failing its forward work.
+ */
+async function releaseActiveSubscriptionsForInstance(env: Env, instanceId: string, now: string): Promise<void> {
+  for (const sub of await listActiveSubscriptionsForInstance(env.DB, instanceId)) {
+    await supersedeBrokerSubscription(env, sub);
+    await subscriptionSupersededStmt(env.DB, sub.subscription_id, now).run();
+  }
+}
+
 async function handleCancelInstance(env: Env, instanceId: string, request: Request): Promise<Response> {
   await parseBody(cancelInstanceRequestSchema, request).catch(() => ({}));
   const inst = await getInstance(env.DB, instanceId);
@@ -360,17 +378,35 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
     throw new ConflictError(`Instance ${instanceId} cannot be cancelled from status '${inst.status}'.`);
   }
   const now = nowIso();
-  // Abandon in-flight forward work so a late worker callback no-ops, and end the
-  // suspended Workflow (if any) so subsequent job callbacks drive compensation
-  // inline rather than sendEvent-ing a Workflow that is waiting on the wrong job.
-  await abandonActiveForwardJobs(env.DB, instanceId, now);
+  // M4-L5 (design §8.1): a region (parallel/inclusive) instance may have several
+  // live cohort tokens at cancel. It must NOT eagerly fail their forward jobs —
+  // `abandonActiveForwardJobs` flips `locked → failed`, so a late `complete` gets a
+  // 0-row no-op and LEAKS the executed side-effect (no ledger row → never
+  // compensated). Instead leave the cohort jobs in place with per-token terminators
+  // armed (so a genuinely abandoned job still goes terminal) and let a late complete
+  // land as a straggler. Still release every active broker subscription so no broker
+  // key leaks. The single-token (non-region) path keeps the M1–M3 eager abandon.
+  const graph = await loadGraphForInstance(env, instanceId).catch(() => null);
+  const isRegion = !!graph?.regions && Object.keys(graph.regions).length > 0;
+  if (isRegion) {
+    await releaseActiveSubscriptionsForInstance(env, instanceId, now);
+  } else {
+    // Abandon in-flight forward work so a late worker callback no-ops, and end the
+    // suspended Workflow (if any) so subsequent job callbacks drive compensation
+    // inline rather than sendEvent-ing a Workflow that is waiting on the wrong job.
+    await abandonActiveForwardJobs(env.DB, instanceId, now);
+  }
   // M3-L3 (TASK-44, design §4.3.2 exit d): settle every armed boundary timer so a
   // stray alarm afterwards is a decided no-op — no mid-compensation firing (gate 10).
   await cancelArmedTimersForInstance(env, instanceId);
   await getExecutor(env).terminate(instanceId);
 
   const pending = await countPendingSteps(env.DB, instanceId);
-  if (pending === 0) {
+  // M4-L5: a region instance with live cohort tokens must NOT take the empty-ledger
+  // terminal shortcut — a late straggler still owes a ledger row + compensation, so
+  // it enters `compensating` and the quiescence barrier holds until the cohort drains.
+  const liveCohort = isRegion ? (await listLiveTokens(env.DB, instanceId)).length : 0;
+  if (pending === 0 && liveCohort === 0) {
     const changed = await transitionStatusGuarded(env.DB, instanceId, [...CANCELLABLE_FROM], "cancelled", now);
     if (changed > 0) {
       // M3-L1 (TASK-39): a terminal empty-ledger cancel closes ALL open incidents
@@ -385,6 +421,9 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
   // Status-conditional → only the first cancel initiates one reverse pass.
   const changed = await transitionStatusGuarded(env.DB, instanceId, [...CANCELLABLE_FROM], "compensating", now);
   if (changed > 0) {
+    // M4-L5 (design §8.2): arm a per-token lease-expiry terminator for every in-flight
+    // cohort forward job so the quiescence barrier drains without a future worker poll.
+    if (isRegion) await armCohortLeaseExpiryTerminators(env, instanceId);
     if (inst.status === "incident") {
       // Target ONLY the current Hazard incident (M3-L1, TASK-39) so a sibling
       // incident is never collaterally moved into the compensation lifecycle. An

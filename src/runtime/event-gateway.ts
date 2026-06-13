@@ -469,6 +469,11 @@ async function applyEbgMessage(
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
   const next = winnerNextOf(graph, node, winner.flowId);
+  // M4-L3 review DEFERRED (workflow-mode/L6, design §5.7): an eventBasedGateway
+  // INSIDE a parallel branch whose MESSAGE branch wins should merge the payload onto
+  // the branch token's overlay (as applyMessage now does), not root. EBG-in-region is
+  // exotic and untested; this still writes to root. Mirror applyForwardCompletion's
+  // isBranch/setTokenOverlayStmt pattern + thread activeTokenId when L6 enables it.
   const merged = mergeVariables(parseJson<JsonObject>(inst.variables, {}), event.payload ?? {});
   const winnerSub = await getSubscriptionForVisit(env.DB, instanceId, winner.catchId, occ);
   const winnerSubId = winnerSub?.subscription_id ?? subscriptionIdFor(instanceId, winner.catchId, occ);

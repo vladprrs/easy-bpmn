@@ -500,6 +500,10 @@ async function applyForwardCompletion(
         compensationStatus: wiring ? "pending" : "notRequired",
         traceId: traceIdFor(instanceId),
         occurrence: occ,
+        // M4-L5 (design §8.4): carry the producing branch token so the reverse
+        // pass compensates this step only once its lineage quiesces. NULL on the
+        // root/single-token (M1–M3) path → filterLineageQuiesced is a no-op there.
+        tokenId: activeTokenId ?? null,
         now,
       }),
     );

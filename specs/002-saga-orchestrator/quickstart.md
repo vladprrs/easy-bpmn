@@ -505,21 +505,78 @@ while any cohort token is still live; the instance settles `compensated` exactly
 
 ## M4 manual Workflow-mode matrix
 
-The direct-mode integration tests (Scenarios 27–30) cover all concurrent-join logic via the D1
-replay predicates and the deterministic DFS traversal — the same predicates as Workflow mode.
-The following scenarios exercise `Promise.race` fan-in, Workflow step memoization across
-suspend/resume, and budget incident behaviour that only manifests when a real Cloudflare
-Workflow drives the instance. They are validated manually via `wrangler dev`; results with
-PASS/FAIL evidence are recorded by task **L6.6** — **no PASS is claimed here**.
+> **L6.6 executed 2026-06-13 against REAL Cloudflare Workflows** (`bpmn.rntme.com`, Worker
+> Version `1993c802-bf27-4b16-bd29-82d0159b4982` = the M4 branch; remote D1 migration
+> `0007_tokens.sql` applied; R2 `easy-bpmn-overlays` enabled). **Result: a BLOCKING defect was
+> found — the M4 workflow-mode multi-wait does NOT work on real Cloudflare Workflows.** This gate
+> is therefore **FAILED** and the M4 epic is **NOT closed**. See "Root cause" + "Fix direction"
+> below; the fix is tracked separately (re-opens the L3 engine).
+
+The direct-mode integration tests (Scenarios 27–30) cover all concurrent-join *logic* via the D1
+replay predicates + the deterministic DFS traversal and pass (413/413 in CI). The behaviours
+below only manifest when a real Cloudflare Workflow drives the instance (`Promise.race` fan-in,
+step memoization across suspend/resume), which is exactly what direct-mode CI cannot reach — the
+reason this matrix is a blocking gate.
+
+### Substrate probes (real CF + local `wrangler dev`)
+
+| Probe | Real CF | Local miniflare | Notes |
+|-------|---------|-----------------|-------|
+| Sequential `Start→A→B→End` (two job-result events in sequence) | **PASS** | **PASS** | workflow-mode multi-event resume works for a linear chain — isolates the defect to the multi-wait |
+| AND-join `PARALLEL_BPMN` (fan-out + two concurrent `step.waitForEvent`) | **FAIL** | **FAIL** | fan-out OK; join correctly holds before the 2nd branch; but completing the 2nd branch never resumes the Workflow → join never fires → instance stuck `running` (no self-heal over minutes; the 1-hour `SVC_WAIT_TIMEOUT` is the only backstop) |
+
+**Evidence (real CF):** instance `pi_abd7ca7f-…` history ends
+`… serviceTaskCompleted(B) → branchArrivedAtJoin(B) → jobCompleted(A)` with **no**
+`serviceTaskCompleted(A)`; token `…:fork#0:f1` left `active` at `A`, `…:fork#0:f2`
+`arrivedAtJoin`. The pattern is **identical** under local `wrangler dev`, ruling out a
+miniflare-only artifact.
+
+### The six matrix scenarios
+
+All six depend on a working multi-branch fan-in, so all are **BLOCKED** by the substrate defect
+above — none can pass until the multi-wait is fixed and the substrate AND-join goes green:
 
 | # | Scenario | Status |
 |---|----------|--------|
-| WM-1 | Two parallel message catches, deliver A then B → each applies exactly once, join proceeds, no duplicate-step-name error | TBD (pending L6.6) |
-| WM-2 | Crash/restart mid-race after delivering A → re-walk fast-forwards A write-free, re-races B, no re-apply | TBD (pending L6.6) |
-| WM-3 | Deliver A and B near-simultaneously then force replay → identical final state regardless of race winner | TBD (pending L6.6) |
-| WM-4 | One branch times out while a sibling is live → no `unhandledRejection`, the sibling completes | TBD (pending L6.6) |
-| WM-5 | In-region loops approaching the budget → graceful `stepBudget`/`concurrencyLimit` incident, not an opaque errored Workflow | TBD (pending L6.6) |
-| WM-6 | Cancel a region with parked + in-flight straggler branches → quiescence barrier + per-causal-chain reverse-seq ordering across suspend/resume | TBD (pending L6.6) |
+| WM-1 | Two parallel message catches, deliver A then B → each applies exactly once, join proceeds, no duplicate-step-name error | **BLOCKED** — multi-wait join hangs |
+| WM-2 | Crash/restart mid-race after delivering A → re-walk fast-forwards A write-free, re-races B, no re-apply | **BLOCKED** — multi-wait join hangs |
+| WM-3 | Deliver A and B near-simultaneously then force replay → identical final state regardless of race winner | **BLOCKED** — multi-wait join hangs |
+| WM-4 | One branch times out while a sibling is live → no `unhandledRejection`, the sibling completes | **BLOCKED** — multi-wait join hangs |
+| WM-5 | In-region loops approaching the budget → graceful `stepBudget`/`concurrencyLimit` incident, not an opaque errored Workflow | **BLOCKED** — multi-wait join hangs |
+| WM-6 | Cancel a region with parked + in-flight straggler branches → quiescence barrier + per-causal-chain reverse-seq ordering across suspend/resume | **BLOCKED** — multi-wait join hangs |
+
+### Root cause (high confidence)
+
+Cloudflare Workflows re-invokes `run()` from the top on every event (deterministic replay,
+memoizing `step.do`/`step.waitForEvent` by name). The token-frontier rewalk
+(`runInstance` → `driveFrontier` → `raceParkedWaits`) issues **a different set of
+`step.waitForEvent` calls on each re-invocation**: when one branch's job completes, that branch
+shifts from a `step.waitForEvent` to a `step.do` apply, so the per-replay step sequence diverges
+(invocation #1 issues `waitForEvent(A)` + `waitForEvent(B)`; invocation #2 issues
+`step.do(svc-apply:B)` + `waitForEvent(A)`). A `Promise.race` over multiple concurrent
+`step.waitForEvent` does not compose with Cloudflare's one-suspension-point-at-a-time replay
+model, so the surviving branch's later `sendEvent` never resumes the Workflow. This is the
+**R-cf-multiwait** risk flagged in the design (§5.2, decision 3, the risk register) — now
+confirmed real, not merely "partially testable".
+
+### Fix direction (separate effort — re-opens the L3 engine)
+
+The workflow-mode multi-wait needs a **replay-stable** wake mechanism — e.g. a **single
+per-instance `step.waitForEvent`** on one stable event type (every job-result / message / timer
+`sendEvent`s that type), with the engine re-walking and reconciling against canonical D1 on each
+wake (the "advisory winner, D1 is the truth" philosophy already in §5.2). That keeps the
+`step.*` sequence identical across replays regardless of which branches have completed. The
+direct-mode join logic (Scenarios 27–30, 413 CI tests) is unaffected and is the regression net.
+Needs: brainstorm → implementation → **real-CF re-validation via this matrix** before M4 closes.
+
+### Current production state (2026-06-13)
+
+`bpmn.rntme.com` serves the **M4 branch** (Version `1993c802…`), deployed for this validation.
+Single-token M0–M3 flows are **unaffected** (M4 is gated on `graph.regions`) — existing
+functionality works; **any parallel/inclusive instance hangs at its join**. The prior M3
+version is one `wrangler rollback` away. Per operator decision (2026-06-13) the M4 version was
+**left deployed** (pre-revenue, no users) pending the multi-wait fix; the validation instances
+above remain in prod D1 as identifiable `workspaceId="default"` test data.
 
 ## Workflow-mode-only paths (manual validation)
 
@@ -568,6 +625,9 @@ Expected validation outcome:
 - The four M4 direct-mode gates pass (Scenarios 27–30): AND split/join with frontier-empty
   completion; OR split/join with recorded activation subset; branch-local variable merge in split
   out-flow document order; parallel-branch compensation with straggler ledger, per-token terminators,
-  lineage-ordered reverse, and quiescence barrier. The M4 manual Workflow-mode matrix (WM-1 through
-  WM-6) is pending (task L6.6 records PASS/FAIL + evidence).
+  lineage-ordered reverse, and quiescence barrier. **The M4 manual Workflow-mode matrix (WM-1
+  through WM-6) FAILED on real Cloudflare Workflows (L6.6, 2026-06-13): the multi-wait AND/OR-join
+  hangs after the second branch — a blocking defect that re-opens the L3 engine. M4 is NOT
+  closed.** See the "M4 manual Workflow-mode matrix" section above for the root cause + fix
+  direction.
 - No external workflow infrastructure (Camunda/Zeebe/broker/cluster) is deployed.

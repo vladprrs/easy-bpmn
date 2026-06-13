@@ -66,6 +66,25 @@ export function setTokenStatusStmt(db: D1Database, tokenId: string, status: Toke
   return stmt(db, `UPDATE execution_tokens SET status = ?, updated_at = ? WHERE token_id = ?`, [status, now, tokenId]);
 }
 
+/**
+ * Fold a merged overlay onto an EXISTING token row (M4-L3, design §5.7/§6): the
+ * join-time produce of a NESTED region re-uses its enclosing-branch token and
+ * must overwrite that token's `variables_overlay` with the merged result —
+ * which `upsertTokenStmt`'s ON CONFLICT deliberately does NOT touch (so the
+ * post-drive read-model sync can never clobber a branch's accumulated writes).
+ * A plain UPDATE keyed by token_id; sets overlay + position + status='active'.
+ */
+export function foldTokenOverlayStmt(db: D1Database, input: { tokenId: string; positionElementId: string; variablesOverlay: JsonObject; now: string }): D1PreparedStatement {
+  return stmt(db,
+    `UPDATE execution_tokens SET variables_overlay = ?, position_element_id = ?, status = 'active', updated_at = ? WHERE token_id = ?`,
+    [toJson(input.variablesOverlay), input.positionElementId, input.now, input.tokenId]);
+}
+
+/** Set a token's overlay only (M4-L3): a forward service task in a branch writes its output to the token's own scope. */
+export function setTokenOverlayStmt(db: D1Database, tokenId: string, variablesOverlay: JsonObject, now: string): D1PreparedStatement {
+  return stmt(db, `UPDATE execution_tokens SET variables_overlay = ?, updated_at = ? WHERE token_id = ?`, [toJson(variablesOverlay), now, tokenId]);
+}
+
 export async function getToken(db: D1Database, tokenId: string): Promise<TokenRow | null> {
   return dbFirst<TokenRow>(db, `SELECT * FROM execution_tokens WHERE token_id = ?`, [tokenId]);
 }

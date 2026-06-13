@@ -212,6 +212,9 @@ export async function driveEventBasedGateway(
     ? await timerSizedTimeout(env, timerIdFor(instanceId, branches.timer.catchId, occ))
     : SVC_WAIT_TIMEOUT;
   const outcome = await waitFor({ name: `ebg-wait:${tag}`, workflowEventType: workflowEventGatewayTypeFor(elementId, occ), timeout });
+  // M4-L3 multi-wait: a region branch in workflow mode REGISTERED this wait and did
+  // not suspend — return parked (raceParkedWaits awaits it). Direct mode never hits this.
+  if (outcome.kind === "parked") return { kind: "waiting" };
 
   // The timer may have fired (its sendEvent wake, or a concurrent alarm) — its
   // fireTimer batch commits the decision before waking, so re-read it.

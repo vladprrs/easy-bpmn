@@ -175,6 +175,23 @@ export async function transitionStatusGuarded(
   return res.meta?.changes ?? 0;
 }
 
+/**
+ * Guarded terminal completion (M4-L3 last-token-out, design §5.6): flips
+ * running/waiting → completed AND stamps completed_at, only while the instance is
+ * still live. Returns rows changed — the single non-zero return is the one drive
+ * that emits the terminal (belt-and-braces under concurrent region drives even
+ * with the per-instance drive lock). Idempotent: a replay/late drive changes 0 rows.
+ */
+export async function completeInstanceGuarded(db: D1Database, instanceId: string, now: string): Promise<number> {
+  const res = await stmt(
+    db,
+    `UPDATE process_instances SET status = 'completed', completed_at = ?, updated_at = ?
+       WHERE instance_id = ? AND status IN ('running', 'waiting')`,
+    [now, now, instanceId],
+  ).run();
+  return res.meta?.changes ?? 0;
+}
+
 /** Merge a variables patch into the instance (operator remediation). */
 export async function mergeInstanceVariables(
   db: D1Database,

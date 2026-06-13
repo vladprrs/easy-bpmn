@@ -11,7 +11,12 @@ import type { ExecutionGraph } from "../bpmn/graph";
 import { getInstanceRow, type InstanceRow } from "../persistence/instances";
 
 export type RunStep = <T>(name: string, fn: () => Promise<T>) => Promise<T>;
-export type WaitOutcome = { kind: "event"; payload: unknown } | { kind: "timeout" };
+// `parked` is the M4-L3 multi-wait sentinel: in a region graph in WORKFLOW mode the
+// frontier driver hands each leaf a COLLECTING waitFor that registers the wait in
+// the drive's WaitCollector and returns `parked` instead of suspending — the driver
+// returns 'waiting' and the post-DFS `raceParkedWaits` issues one Promise.race over
+// every collected wait (design §5.2). Direct mode (waitFor=null) never sees it.
+export type WaitOutcome = { kind: "event"; payload: unknown } | { kind: "timeout" } | { kind: "parked" };
 export type WaitForEvent = (sub: {
   name: string;
   workflowEventType: string;

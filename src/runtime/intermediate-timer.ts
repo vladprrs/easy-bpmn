@@ -106,6 +106,9 @@ export async function driveIntermediateCatch(
     workflowEventType: workflowTimerEventTypeFor(elementId, occ),
     timeout,
   });
+  // M4-L3 multi-wait: a region branch in workflow mode REGISTERED this wait and did
+  // not suspend — return parked (raceParkedWaits awaits it). Direct mode never hits this.
+  if (outcome.kind === "parked") return { kind: "waiting" };
   // The timer may have fired (its sendEvent wake, or a concurrent alarm) while we waited.
   if (await catchTimerFired(env, instanceId, elementId, occ)) return { kind: "next", next };
   if (outcome.kind === "timeout") {

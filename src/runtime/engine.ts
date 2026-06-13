@@ -96,7 +96,19 @@ import {
   type DriveResult,
 } from "./engine-shared";
 import { createIncident, completeInstance, recordTerminalIncident } from "./incidents";
-import { reconstructFrontier, syncFrontierReadModel, resolveScope } from "./frontier";
+import {
+  reconstructFrontier,
+  syncFrontierReadModel,
+  resolveScope,
+  driveFrontier,
+  raceParkedWaits,
+  matchKeyedEvent,
+  WaitCollector,
+  type LeafDrivers,
+  type LeafOutcome,
+} from "./frontier";
+import { completeInstanceGuarded } from "../persistence/instances";
+import { listLiveTokens, setTokenStatusStmt, rootTokenId } from "../persistence/tokens";
 import { withDriveLock } from "../persistence/drive-lock";
 import { driveForwardServiceTask, terminateUnleasableJob } from "./forward-task";
 import { beginCompensating, settleAfterCompensation } from "./compensation";
@@ -194,12 +206,17 @@ async function runInstanceInner(env: Env, instanceId: string, opts: RunOptions):
   // in both modes — opts.startAt is ignored. Applied steps fast-forward
   // write-free from canonical D1 state; the walk lands on the live frontier.
   const result = await loop(env, instanceId, graph, opts.runStep, opts.waitFor, opts.incomingEvent);
-  // M4-L2: refresh the token read-model from the settled cursor (single-token in
-  // L2; L3 grows the frontier). Best-effort + non-fatal — it never blocks the drive.
-  try {
-    await syncFrontierReadModel(env, instanceId, await reconstructFrontier(env, graph, instanceId));
-  } catch (err) {
-    console.error(JSON.stringify({ level: "warn", message: "frontier read-model sync failed", instanceId, error: err instanceof Error ? err.message : String(err) }));
+  // M4-L2: refresh the single-token read-model from the settled cursor. GATED on
+  // !graph.regions (design refinement): a region graph's frontier is owned by the
+  // DFS (fanOutSplit / claimJoinCompletion write the token rows directly), and the
+  // single-token reconstruct would wrongly mark live branch tokens 'consumed'.
+  // Best-effort + non-fatal — it never blocks the drive.
+  if (!graph.regions) {
+    try {
+      await syncFrontierReadModel(env, instanceId, await reconstructFrontier(env, graph, instanceId));
+    } catch (err) {
+      console.error(JSON.stringify({ level: "warn", message: "frontier read-model sync failed", instanceId, error: err instanceof Error ? err.message : String(err) }));
+    }
   }
   return result;
 }
@@ -216,161 +233,253 @@ async function loop(
   waitFor: WaitForEvent | null,
   incomingEvent?: MessageEventPayload,
 ): Promise<DriveResult> {
-  const visits = new Map<string, number>();
-  let cur: string = graph.startElementId;
+  // The delivered event flows to the receive leaf that matches it (consumed at the
+  // LIVE visit only); a region re-walk re-points it via matchKeyedEvent.
   let pending = incomingEvent;
 
-  while (true) {
-    const node = graph.nodes[cur];
-    if (!node) return { status: "completed" };
+  // The per-node leaf dispatch (design §5.1: `driveLeaf`) — the SINGLE source of
+  // node handling for BOTH the single-token scalar walk and the region DFS. It
+  // returns a `LeafOutcome`; the existing per-kind drivers are reused verbatim,
+  // threaded with `activeTokenId` (Task L3.2 branch-scoped reads/writes).
+  const drivers: LeafDrivers = {
+    async driveLeaf(cur: string, occ: number, activeTokenId: string, collector: WaitCollector): Promise<LeafOutcome> {
+      const node = graph.nodes[cur]!;
+      const tag = `${cur}#${occ}`;
+      // In a region graph in WORKFLOW mode a park REGISTERS in the collector (one
+      // post-DFS `Promise.race`, design §5.2) instead of suspending; direct mode
+      // (waitFor === null) and single-token graphs use the real waitFor unchanged.
+      const leafWaitFor: WaitForEvent | null =
+        waitFor && graph.regions ? collectingWaitFor(collector, activeTokenId) : waitFor;
 
-    // Walk-local occurrence: in-memory, identical in both modes and across
-    // replays (the path is deterministic — graph topology + recorded outcomes).
-    const occ = nextOccurrence(visits, cur);
-    const tag = `${cur}#${occ}`;
+      if (node.type === "startEvent") {
+        return { kind: "next", next: await runStep(`start:${tag}`, () => enterStart(env, instanceId, graph, cur, occ, node)) };
+      }
 
-    // Loop guard (design M2 §5, TASK-35): only COMPLETED-VISIT re-entries
-    // reach this check — a technical retry of one iteration (re-lease, fail
-    // retryable) re-walks to the SAME frontier occurrence and never consumes
-    // the cap. Inside a transaction the trip is a HAZARD (saga §4.5): a
-    // terminal incident with NO auto-compensation; operator /cancel stays
-    // available to run the reverse pass over the completed iterations.
-    if (occ >= MAX_ELEMENT_OCCURRENCES) {
-      await runStep(`loop-limit:${tag}`, () =>
+      if (node.type === "transaction") {
+        const innerStart = graph.transactions?.[cur]?.startId;
+        if (!innerStart) return { kind: "completed" }; // malformed (validator guards this)
+        return { kind: "next", next: await runStep(`tx:${tag}`, () => enterTransaction(env, instanceId, cur, occ, innerStart)) };
+      }
+
+      if (node.type === "serviceTask" && !node.isForCompensation) {
+        const r = await driveForwardServiceTask(env, instanceId, graph, cur, occ, node, runStep, leafWaitFor, activeTokenId);
+        if (r.kind === "waiting") return { kind: "parked" };
+        if (r.kind === "incident") return { kind: "incident" };
+        return { kind: "next", next: r.next };
+      }
+
+      if (node.type === "receiveTask") {
+        const r = await driveReceiveTask(env, instanceId, graph, cur, occ, node, runStep, leafWaitFor, pending);
+        if (r.kind === "waiting") return { kind: "parked" };
+        if (r.kind === "incident") return { kind: "incident" };
+        // The delivered event is consumed at the LIVE visit only — a consumed
+        // (fast-forwarded) earlier iteration must NOT clear it, or the live
+        // frontier would never see it; conversely once applied it must never
+        // leak into a later visit of the same (or another) receive task.
+        if (r.consumedPending) pending = undefined;
+        return { kind: "next", next: r.next };
+      }
+
+      if (node.type === "intermediateCatchEvent") {
+        if (node.messageName) {
+          // M3-L4 (TASK-46): a STANDALONE message intermediate catch — IDENTICAL
+          // wait/correlation/resume semantics to a receiveTask, so it is driven by
+          // the SAME driveReceiveTask path (the subscription/correlation/broker
+          // machinery, NOT a parallel copy). The validator guarantees no boundary
+          // timer attaches, so driveReceiveTask's timer branches are inert.
+          const r = await driveReceiveTask(env, instanceId, graph, cur, occ, node, runStep, leafWaitFor, pending);
+          if (r.kind === "waiting") return { kind: "parked" };
+          if (r.kind === "incident") return { kind: "incident" };
+          if (r.consumedPending) pending = undefined;
+          return { kind: "next", next: r.next };
+        }
+        // M3-L4 (TASK-45): a timer delay on the token path. Arms + parks; the DO
+        // alarm (fireTimer) claims the `timer_outcomes` decider in the same batch
+        // as the advance, then re-walks here to fast-forward.
+        const r = await driveIntermediateCatch(env, instanceId, graph, cur, occ, node, runStep, leafWaitFor);
+        if (r.kind === "waiting") return { kind: "parked" };
+        return { kind: "next", next: r.next };
+      }
+
+      if (node.type === "exclusiveGateway") {
+        // Branch selection OWNS the successor: the engine NEVER reads `.next` on a
+        // gateway (null by IR contract) — the chosen flow's targetId drives the
+        // cursor. The recorded gateway_decisions row is the fast-forward predicate.
+        // A branch token reads its RESOLVED scope (Task L3.2); root/single-token
+        // keeps the M0–M3 path (activeTokenId === root ⇒ inst.variables verbatim).
+        const r = await runStep(`gw:${tag}`, () => decideGateway(env, instanceId, cur, occ, node, activeTokenId));
+        if (r.kind === "incident") return { kind: "incident" };
+        return { kind: "next", next: r.next };
+      }
+
+      if (node.type === "eventBasedGateway") {
+        // M3-L4 (TASK-46): the timer/message race; the decision is claimed by a
+        // CONCURRENT writer (broker apply vs fireTimer). Reuses the receiveTask
+        // `pending` consume rule.
+        const r = await driveEventBasedGateway(env, instanceId, graph, cur, occ, node, runStep, leafWaitFor, pending);
+        if (r.kind === "waiting") return { kind: "parked" };
+        if (r.kind === "incident") return { kind: "incident" };
+        if (r.consumedPending) pending = undefined;
+        return { kind: "next", next: r.next };
+      }
+
+      if (node.type === "endEvent") {
+        if (node.endKind === "cancel" && isTransactionScope(graph, node.scopeId)) {
+          await runStep(`cancel:${tag}`, () => beginCompensating(env, instanceId, node.scopeId!, cur));
+          return { kind: "compensate", scopeId: node.scopeId!, elementId: cur };
+        }
+        if (isTransactionScope(graph, node.scopeId)) {
+          // Inner none end → COMMIT the transaction → continue on its outer flow.
+          return { kind: "next", next: await runStep(`commit:${tag}`, () => commitTransaction(env, instanceId, graph, node.scopeId!, cur, occ)) };
+        }
+        // Process-level none end. A single-token (M0–M3) instance completes
+        // DIRECTLY — byte-identical to the old loop. In a region graph, last-token-
+        // out (§5.6): consume THIS token; the loop's settleFrontierCompletion fires
+        // the guarded terminal once no other token is live.
+        if (!graph.regions) {
+          await runStep(`end:${tag}`, () => completeInstance(env, instanceId, cur));
+          return { kind: "completed" };
+        }
+        await runStep(`end:${tag}`, () => consumeTokenAtEnd(env, instanceId, cur, occ, activeTokenId));
+        return { kind: "consumed" };
+      }
+
+      // Boundary events / compensation handlers are never on the token path — the
+      // validator rejects sequence flows into them. A walk can only land here on an
+      // injected/legacy graph that bypassed the publish gate: fail LOUD.
+      await runStep(`non-token:${tag}`, () =>
         createIncident(
           env,
           instanceId,
           cur,
           0,
-          `Element '${cur}' exceeded the loop-iteration cap (${MAX_ELEMENT_OCCURRENCES} visits).`,
-          { elementId: cur, occurrence: occ, cap: MAX_ELEMENT_OCCURRENCES },
+          `Element '${cur}' (${node.type}) is not a token-path node — the validator should have rejected this model.`,
+          { elementId: cur, nodeType: node.type },
+          "serviceTaskFailure",
+        ),
+      );
+      return { kind: "incident" };
+    },
+
+    async raiseLoopLimit(elementId: string, occ: number): Promise<void> {
+      // Loop guard (design M2 §5, TASK-35): only COMPLETED-VISIT re-entries reach
+      // this — a technical retry re-walks to the SAME occurrence and never consumes
+      // the cap. Inside a transaction the trip is a HAZARD (saga §4.5).
+      await runStep(`loop-limit:${elementId}#${occ}`, () =>
+        createIncident(
+          env,
+          instanceId,
+          elementId,
+          0,
+          `Element '${elementId}' exceeded the loop-iteration cap (${MAX_ELEMENT_OCCURRENCES} visits).`,
+          { elementId, occurrence: occ, cap: MAX_ELEMENT_OCCURRENCES },
           "loopLimit",
         ),
       );
-      return { status: "incident" };
-    }
+    },
+  };
 
-    if (node.type === "startEvent") {
-      cur = await runStep(`start:${tag}`, () => enterStart(env, instanceId, graph, cur, occ, node));
-      continue;
-    }
-
-    if (node.type === "transaction") {
-      const innerStart = graph.transactions?.[cur]?.startId;
-      if (!innerStart) return { status: "completed" }; // malformed (validator guards this)
-      cur = await runStep(`tx:${tag}`, () => enterTransaction(env, instanceId, cur, occ, innerStart));
-      continue;
-    }
-
-    if (node.type === "serviceTask" && !node.isForCompensation) {
-      const r = await driveForwardServiceTask(env, instanceId, graph, cur, occ, node, runStep, waitFor);
-      if (r.kind === "waiting") return { status: "waiting" };
-      if (r.kind === "incident") return { status: "incident" };
-      cur = r.next;
-      continue;
-    }
-
-    if (node.type === "receiveTask") {
-      const r = await driveReceiveTask(env, instanceId, graph, cur, occ, node, runStep, waitFor, pending);
-      if (r.kind === "waiting") return { status: "waiting" };
-      if (r.kind === "incident") return { status: "incident" };
-      // The delivered event is consumed at the LIVE visit only — a consumed
-      // (fast-forwarded) earlier iteration must NOT clear it, or the live
-      // frontier would never see it; conversely once applied it must never
-      // leak into a later visit of the same (or another) receive task.
-      if (r.consumedPending) pending = undefined;
-      cur = r.next;
-      continue;
-    }
-
-    if (node.type === "intermediateCatchEvent") {
-      if (node.messageName) {
-        // M3-L4 (TASK-46): a STANDALONE message intermediate catch — IDENTICAL
-        // wait/correlation/resume semantics to a receiveTask, so it is driven by
-        // the SAME driveReceiveTask path (registerReceive/applyMessage — the
-        // subscription/correlation/broker machinery, NOT a parallel copy). It is
-        // an EVENT: the validator guarantees no boundary timer attaches, so
-        // driveReceiveTask's timer-boundary branches are inert (timerBoundaryFor
-        // → null). Occurrence keying + the atomic apply + duplicate-publish dedup
-        // are all inherited unchanged.
-        const r = await driveReceiveTask(env, instanceId, graph, cur, occ, node, runStep, waitFor, pending);
-        if (r.kind === "waiting") return { status: "waiting" };
-        if (r.kind === "incident") return { status: "incident" };
-        // Consumed at the LIVE visit only (same as the receiveTask branch).
-        if (r.consumedPending) pending = undefined;
+  // ---- Single-token graphs (M0–M3): the exact scalar walk, byte-identical ----
+  // No `regions` ⇒ no split/join nodes ⇒ the frontier is one chain from the root
+  // token, driven leaf-by-leaf via `driveLeaf`. This preserves the original loop()
+  // control flow (occurrence counting, loop cap, terminal completion) verbatim.
+  if (!graph.regions) {
+    const visits = new Map<string, number>();
+    const scratch = new WaitCollector(); // unused: scalar leaves use the real waitFor / direct-mode park
+    let cur: string = graph.startElementId;
+    while (true) {
+      if (!graph.nodes[cur]) return { status: "completed" };
+      const occ = nextOccurrence(visits, cur);
+      if (occ >= MAX_ELEMENT_OCCURRENCES) {
+        await drivers.raiseLoopLimit(cur, occ);
+        return { status: "incident" };
+      }
+      const r = await drivers.driveLeaf(cur, occ, rootTokenId(instanceId), scratch);
+      if (r.kind === "next") {
         cur = r.next;
         continue;
       }
-      // M3-L4 (TASK-45): a timer delay on the token path — its OWN visit
-      // occurrence (`timer:el#occ`). Arms + parks; the DO alarm (fireTimer)
-      // claims the `timer_outcomes` decider in the same batch as the advance
-      // down the single outgoing flow, then re-walks here to fast-forward.
-      const r = await driveIntermediateCatch(env, instanceId, graph, cur, occ, node, runStep, waitFor);
-      if (r.kind === "waiting") return { status: "waiting" };
-      cur = r.next;
-      continue;
-    }
-
-    if (node.type === "exclusiveGateway") {
-      // Branch selection OWNS the successor: the engine NEVER reads `.next` on
-      // a gateway (it is null by IR contract) — the chosen flow's targetId
-      // drives the cursor. One persisted step per visit; the recorded
-      // gateway_decisions row is the applied/fast-forward predicate (checked
-      // inside the idempotent body; Workflow replays additionally
-      // short-circuit on the memoized step name).
-      const r = await runStep(`gw:${tag}`, () => decideGateway(env, instanceId, cur, occ, node));
+      if (r.kind === "parked") return { status: "waiting" };
       if (r.kind === "incident") return { status: "incident" };
-      cur = r.next;
-      continue;
+      if (r.kind === "compensate") return settleAfterCompensation(env, instanceId, graph, r.scopeId, runStep, waitFor);
+      return { status: "completed" }; // completed | consumed (consumed is unreachable without regions)
     }
-
-    if (node.type === "eventBasedGateway") {
-      // M3-L4 (TASK-46): the timer/message race. Like the XOR gateway, branch
-      // selection owns the successor and the recorded gateway_decisions row is the
-      // fast-forward predicate — but the decision is claimed by a CONCURRENT writer
-      // (broker message apply vs fireTimer), not check-first. The winning branch's
-      // catch is never re-dispatched: the EBG advances straight to the catch's
-      // single outgoing flow. Reuses the SAME `pending` consume rule as receiveTask.
-      const r = await driveEventBasedGateway(env, instanceId, graph, cur, occ, node, runStep, waitFor, pending);
-      if (r.kind === "waiting") return { status: "waiting" };
-      if (r.kind === "incident") return { status: "incident" };
-      if (r.consumedPending) pending = undefined;
-      cur = r.next;
-      continue;
-    }
-
-    if (node.type === "endEvent") {
-      if (node.endKind === "cancel" && isTransactionScope(graph, node.scopeId)) {
-        await runStep(`cancel:${tag}`, () => beginCompensating(env, instanceId, node.scopeId!, cur));
-        return settleAfterCompensation(env, instanceId, graph, node.scopeId!, runStep, waitFor);
-      }
-      if (isTransactionScope(graph, node.scopeId)) {
-        // Inner none end → COMMIT the transaction → continue on its outer flow.
-        cur = await runStep(`commit:${tag}`, () => commitTransaction(env, instanceId, graph, node.scopeId!, cur, occ));
-        continue;
-      }
-      await runStep(`end:${tag}`, () => completeInstance(env, instanceId, cur));
-      return { status: "completed" };
-    }
-
-    // Boundary events / compensation handlers are never on the token path —
-    // the validator rejects sequence flows into them (M2 final review). A walk
-    // can only land here on an injected/legacy graph that bypassed the publish
-    // gate: fail LOUD with a deterministic incident instead of silently
-    // returning "completed" with no terminal write (a wedged instance).
-    await runStep(`non-token:${tag}`, () =>
-      createIncident(
-        env,
-        instanceId,
-        cur,
-        0,
-        `Element '${cur}' (${node.type}) is not a token-path node — the validator should have rejected this model.`,
-        { elementId: cur, nodeType: node.type },
-        "serviceTaskFailure",
-      ),
-    );
-    return { status: "incident" };
   }
+
+  // ---- Concurrent regions (M4): the deterministic token-frontier DFS owns the ----
+  // walk. One pass per drive in direct mode (the drive lock serialises siblings);
+  // workflow mode loops, racing the collected waits and re-walking on each event.
+  while (true) {
+    const { result, collector } = await driveFrontier(env, graph, instanceId, drivers, MAX_ELEMENT_OCCURRENCES);
+    if (result.incident) return { status: "incident" };
+    if (result.compensate) return settleAfterCompensation(env, instanceId, graph, result.compensate.scopeId, runStep, waitFor);
+    if (result.completed) return { status: "completed" };
+    if (result.parked) {
+      if (!waitFor) return { status: "waiting" }; // direct mode parks; the next callback re-drives
+      // Workflow-mode multi-wait (design §5.2/§14) — manual-matrix-validated, not CI.
+      const outcome = await raceParkedWaits(collector, waitFor);
+      pending = matchKeyedEvent(outcome);
+      continue;
+    }
+    // Nothing parked and nothing completed → the token frontier drained → last-
+    // token-out completion (the guarded terminal fires iff no token is live, §5.6).
+    return await settleFrontierCompletion(env, instanceId, graph);
+  }
+}
+
+/**
+ * A region branch (or the post-join root) token reaching a process-level none end
+ * (design §5.6 last-token-out): mark THIS token `consumed` + an audit marker. The
+ * instance terminal is NOT written here — `settleFrontierCompletion` fires it once
+ * the whole frontier is drained, so a none-end on one branch can never complete the
+ * instance while a sibling is still live.
+ */
+async function consumeTokenAtEnd(env: Env, instanceId: string, elementId: string, occ: number, tokenId: string): Promise<void> {
+  const inst = await loadInst(env, instanceId);
+  const now = nowIso();
+  await dbBatch(env.DB, [
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "elementEntered", diagnostics: { elementType: "endEvent", endKind: "none", occurrence: occ, tokenId } }),
+    setTokenStatusStmt(env.DB, tokenId, "consumed", now),
+  ]);
+}
+
+/**
+ * Last-token-out completion (design §5.6): if ANY token is still live the instance
+ * is not done (a sibling is in flight) → `waiting`. Otherwise a GUARDED terminal
+ * transition (running/waiting → completed, completed_at stamped) fires; the single
+ * rows-changed return is the one drive that emits `instanceCompleted`.
+ */
+async function settleFrontierCompletion(env: Env, instanceId: string, graph: ExecutionGraph): Promise<DriveResult> {
+  const live = await listLiveTokens(env.DB, instanceId);
+  if (live.length > 0) return { status: "waiting" };
+  const now = nowIso();
+  const changed = await completeInstanceGuarded(env.DB, instanceId, now);
+  if (changed > 0) {
+    const inst = await loadInst(env, instanceId);
+    await historyStmt(env.DB, {
+      workspaceId: inst.workspace_id,
+      instanceId,
+      elementId: inst.current_element_id ?? graph.endElementIds[0] ?? "",
+      type: "instanceCompleted",
+      diagnostics: {},
+    }).run();
+  }
+  return { status: "completed" };
+}
+
+/**
+ * The COLLECTING waitFor (workflow-mode multi-wait, design §5.2): instead of
+ * suspending the Workflow at the first branch's wait, it REGISTERS the wait in the
+ * drive's `WaitCollector` (keyed by step name, deduped) and returns `parked`, so
+ * the DFS keeps fanning out across siblings. After the DFS, `raceParkedWaits`
+ * issues ONE `Promise.race` over every collected wait. Direct mode never builds
+ * this (waitFor === null); it is recorded for the L6.7 manual matrix.
+ */
+function collectingWaitFor(collector: WaitCollector, tokenId: string): WaitForEvent {
+  return async (sub) => {
+    collector.add({ name: sub.name, workflowEventType: sub.workflowEventType, timeout: sub.timeout, tokenId });
+    return { kind: "parked" };
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -750,6 +859,9 @@ async function driveReceiveTask(
   // A timer-guarded wait is SIZED to the timer (so a long timer costs O(1) steps).
   const timeout = tb ? await timerGuardedTimeout(env, instanceId, tb, occ) : SVC_WAIT_TIMEOUT;
   const outcome = await waitFor({ name: `wait:${tag}`, workflowEventType: reg.workflowEventType, timeout });
+  // M4-L3 multi-wait: a region branch in workflow mode REGISTERED this wait and did
+  // not suspend — return parked (raceParkedWaits awaits it). Direct mode never hits this.
+  if (outcome.kind === "parked") return { kind: "waiting" };
   // The timer may have fired (its wake, or a concurrent alarm) while we waited.
   if (tb && (await timerHasFired(env, instanceId, tb, occ))) {
     return { kind: "next", next: tb.node.next! };

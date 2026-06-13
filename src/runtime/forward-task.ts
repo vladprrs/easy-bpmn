@@ -178,6 +178,10 @@ export async function driveForwardServiceTask(
     workflowEventType: workflowJobEventTypeFor(job.job_id),
     timeout,
   });
+  // M4-L3 multi-wait: a region branch in workflow mode REGISTERED this wait in the
+  // collector and did not suspend — return parked; raceParkedWaits awaits it. (CI is
+  // direct mode: waitFor is null, so we never reach here.)
+  if (outcome.kind === "parked") return { kind: "waiting" };
   // The timer may have fired (its sendEvent wake, or a concurrent alarm) while we
   // waited — re-read the decider FIRST so an abandoned job is not misread as a fail.
   if (tb && (await timerHasFired(env, instanceId, tb, occ))) {

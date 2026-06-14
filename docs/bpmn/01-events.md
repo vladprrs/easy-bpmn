@@ -147,9 +147,10 @@ only. The whole set has now **shipped (M3-L2/L3/L4)** and the validator accepts-
 [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
 
 **Still out of scope** (each needs a future amendment): timer **start** events (instances start via API);
-**non-interrupting** boundary timers and `timeCycle` (M4); `signal`/`escalation`/`conditional` events and
-boundary timers on a `transaction` (M5); `intermediateThrowEvent`; **link** events; **non-catch** message
-events; and the **terminate** end event.
+**non-interrupting** boundary timers and `timeCycle`; `signal`/`escalation`/`conditional` events and
+boundary timers on a `transaction`; `intermediateThrowEvent`; **link** events; **non-catch** message
+events; and the **terminate** end event. (M4 = concurrency, shipped; M5 = composition, next — neither
+delivers these items.)
 
 The original message-shaped behavior remains the **Receive Task** wait + message correlation — modeled as
 a *task*. M3 adds the equivalent **message `intermediateCatchEvent`** (the same wait/correlation/resume

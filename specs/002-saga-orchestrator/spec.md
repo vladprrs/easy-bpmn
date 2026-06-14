@@ -15,8 +15,9 @@ state — modeled in canonical BPMN, with pull workers and operator visibility."
 
 This specification covers **Milestone M1 — Canonical transaction-saga
 (multi-microservice)**, which alone satisfies the literal "SAGA orchestrator for
-multiple microservices" ask. M2–M5 (conditional sagas, time/failure taxonomy,
-concurrency, composition) are out of scope here and tracked in the roadmap.
+multiple microservices" ask. M2 (conditional sagas), M3 (time/failure taxonomy),
+and M4 (concurrency) have since shipped — the M4 concurrency section is appended
+below; **M5 (composition)** is the next milestone, tracked in the roadmap.
 
 ## Constitution Alignment *(mandatory)*
 

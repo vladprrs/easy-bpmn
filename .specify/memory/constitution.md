@@ -118,11 +118,11 @@ profile. The currently accepted construct set is:
   distinct-`errorCode` interrupting error boundaries plus at most one catch-all
   per activity, each routing to any token-path node in the same scope). Timer
   triggers are static ISO-8601 `timeDate`/`timeDuration` literals only. This set
-  is declared **accepted** by this amendment; the validator opens each construct
-  only when its runtime layer ships (boundary timers, then intermediate catch +
-  eventBasedGateway), and until then rejects it with the reason "M3 — not yet
-  implemented" — the interim state defined in
-  `docs/bpmn/09-easy-bpmn-profile.md`; and
+  was declared **accepted** by the M3 amendment, and its runtime opened per
+  validator layer (boundary timers, then intermediate catch + eventBasedGateway);
+  the whole set has now **fully shipped** and the interim "M3 — not yet
+  implemented" rejection is retired (see
+  `docs/bpmn/09-easy-bpmn-profile.md`); and
 - the in-instance concurrency set (M4) — `bpmn:parallelGateway` (the AND split
   and join) and `bpmn:inclusiveGateway` (the OR split and join),
   **block-structured only**: every split MUST pair with exactly one matching join
@@ -130,9 +130,11 @@ profile. The currently accepted construct set is:
   validated **at publish** (a non-block-structured, branch-escaping,
   mismatched-join, or uncontrolled-merge region — or two concurrent branches
   awaiting the same message name — is rejected with the offending element id).
-  This amendment opens **publish-time validation only**; the concurrency runtime
-  (the token frontier, branch fan-out, and the AND/OR join barrier) ships in later
-  M4 layers. The inclusive split obeys the same FEEL `conditionExpression` /
+  The M4 amendment opened **publish-time validation** first; the concurrency runtime
+  (the token frontier, branch fan-out, the AND/OR join barrier, and parallel-branch
+  compensation) has since **fully shipped** across the M4 runtime layers (the
+  single-wake engine, TASK-54, re-validated GREEN on real Cloudflare Workflows
+  2026-06-14). The inclusive split obeys the same FEEL `conditionExpression` /
   gateway-owned `default` rules as the `exclusiveGateway` split. Every gateway
   type other than `exclusiveGateway`, `eventBasedGateway`, `parallelGateway`, and
   `inclusiveGateway` remains excluded — `complexGateway` is not on the roadmap,
@@ -277,16 +279,17 @@ is likewise in scope (Principle I, the M2 amendment). The accepted M3
 time-&-failure-taxonomy set — an interrupting boundary `timerEventDefinition` on
 a `serviceTask`/`receiveTask`, a timer/message `intermediateCatchEvent`, the
 `bpmn:eventBasedGateway`, and free error-boundary routing (static ISO-8601 timer
-triggers only) — is in scope as of this M3 amendment (Principle I); the validator
-opens each construct as its runtime layer ships and rejects it with
-"M3 — not yet implemented" until then (the interim state in
+triggers only) — is in scope as of the M3 amendment (Principle I); the validator
+opened each construct as its runtime layer shipped, and the whole M3 set has now
+fully shipped — the interim "M3 — not yet implemented" rejection is retired (see
 `docs/bpmn/09-easy-bpmn-profile.md`). The accepted M4 concurrency set —
 block-structured (SESE) `bpmn:parallelGateway` (AND) and `bpmn:inclusiveGateway`
 (OR), each split paired with one matching same-type join — is in scope as of this
-M4 amendment (Principle I); this amendment opens **publish-time validation only**
+M4 amendment (Principle I); the M4 amendment opened **publish-time validation** first
 (a non-SESE / mismatched / branch-escaping / uncontrolled-merge / same-message
-region is rejected with element ids), and the concurrency runtime ships in later
-M4 layers. Only `parallel` and `inclusive` were removed from the exclusion list
+region is rejected with element ids), and the concurrency runtime has since
+**fully shipped** across the M4 runtime layers (re-validated GREEN on real
+Cloudflare Workflows 2026-06-14). Only `parallel` and `inclusive` were removed from the exclusion list
 above (`complex` stays). Nothing else was removed.
 
 The first demo flow MUST run without requiring users to deploy their own workflow

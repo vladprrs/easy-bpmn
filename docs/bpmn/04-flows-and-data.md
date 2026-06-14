@@ -35,7 +35,9 @@ The owning gateway/activity may declare one outgoing flow as the default:
 <bpmn:exclusiveGateway id="Gateway_1" default="Flow_default" />
 ```
 > Conditional/default flows are how you do data routing. Combined with an exclusive gateway they form
-> the most common BPMN decision pattern. (Both are out of `easy-bpmn`'s MVP scope.)
+> the most common BPMN decision pattern. (Both are in scope since M2 when the flow leaves an
+> `exclusiveGateway` — and since M4 an `inclusiveGateway`; anywhere else they are rejected — see the
+> easy-bpmn scope section below.)
 
 ### Message flow vs sequence flow — the cardinal rule
 - **Sequence flow** never crosses a pool boundary.
@@ -94,8 +96,9 @@ These are *referenced* by events/tasks but *declared* as top-level elements unde
 
 **In scope:**
 - **Sequence Flow** (`sequenceFlow`) — plain by default; **since M2** a flow leaving an
-  `exclusiveGateway` may carry a FEEL `conditionExpression`, or be that gateway's `default` flow.
-  Conditions anywhere else are still rejected — see [`03-gateways.md`](./03-gateways.md).
+  `exclusiveGateway`, and **since M4** a flow leaving an `inclusiveGateway`, may carry a FEEL
+  `conditionExpression`, or be that gateway's `default` flow. Conditions anywhere else are still rejected
+  — see [`03-gateways.md`](./03-gateways.md).
 - **Association** (`association`) — **since M1**, exclusively as compensation wiring: from a
   compensation boundary event to its `isForCompensation` handler. Free-floating associations to
   artifacts remain ignorable annotation, not flow.
@@ -107,8 +110,8 @@ These are *referenced* by events/tasks but *declared* as top-level elements unde
   workers; payload applied on message correlation.
 
 **Out of scope (reject before publish):** conditional or default flow **not leaving an
-`exclusiveGateway`** (including the "conditional sequence flow from a task" pattern and any implicit
-split), **message flow** (no multi-pool collaboration), and **all** data shapes (`dataObject`,
+`exclusiveGateway` or `inclusiveGateway`** (including the "conditional sequence flow from a task" pattern
+and any implicit split), **message flow** (no multi-pool collaboration), and **all** data shapes (`dataObject`,
 `dataStore`, `dataInput`/`dataOutput`, data associations). Signals and escalations are out of scope
 too. (Errors are **in since M1** — `bpmn:error` + error boundary events drive the saga failure
 path; see [`01-events.md`](./01-events.md) and [`09`](./09-easy-bpmn-profile.md).)

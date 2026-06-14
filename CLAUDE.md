@@ -12,7 +12,7 @@ makes a standard subset of BPMN 2.0 executable without Camunda/Zeebe. Implemente
 - **M2** — conditional sagas (`exclusiveGateway`, FEEL conditions via `feelin`, default flows, token-path cycles with per-occurrence ledger rows)
 
 - **M3** — time & failure taxonomy (interrupting boundary/intermediate timers, message intermediate catch, `eventBasedGateway`, free error routing, the `timeout` incident-kind split + honored `retryable`) — **shipped** (constitution v2.2.0; the runtime opened per validator layer, now complete).
-- **M4** — concurrency (block-structured `parallelGateway` AND / `inclusiveGateway` OR (SESE), the token frontier, AND/OR-join barrier, branch-local variable merge, parallel-branch compensation) — **shipped** (constitution v2.3.0; the single-wake engine, TASK-54, **re-validated GREEN on real Cloudflare Workflows 2026-06-14**, Worker Version `f194b722` — the L6.6 multi-wait defect is resolved).
+- **M4** — concurrency (block-structured `parallelGateway` AND / `inclusiveGateway` OR (SESE), the token frontier, AND/OR-join barrier, branch-local variable merge, parallel-branch compensation) — **shipped** (constitution v2.3.0 added the construct set, with the single-wake un-guarded-wait semantics recorded in the v2.3.1 PATCH; the single-wake engine, TASK-54, **re-validated GREEN on real Cloudflare Workflows 2026-06-14**, Worker Version `f194b722` — the L6.6 multi-wait defect is resolved).
 
 **M5 (composition) is the next milestone.** The Worker is live at `https://bpmn.rntme.com`
 (Cloudflare Workers + D1 + Durable Object broker + Workflow), with GitHub Actions CI/CD at the repo root.
@@ -29,10 +29,11 @@ Several overlapping document sets exist. When they conflict, this order wins:
 3. **`docs/superpowers/specs/`** — implementation bridge documents (module seams, M2 design, risk maps).
    Distill the specs; do not replace them.
 4. **`docs/bpmn/`** — a general BPMN 2.0 reference + the `easy-bpmn` profile (`09-easy-bpmn-profile.md`,
-   the **canonical transaction-saga + M2 conditional-saga + M3 time-&-failure-taxonomy** profile (the M3
+   the **canonical transaction-saga + M2 conditional-saga + M3 time-&-failure-taxonomy + M4 concurrency** profile (the M3
    set — boundary/intermediate timers, message intermediate catch, `eventBasedGateway`, free error
    routing — was **accepted in constitution v2.2.0 and has now fully shipped**; no construct remains in
-   the interim per-layer state in `09`; in lockstep with constitution v2.2.0).
+   the interim per-layer state in `09`; the M4 concurrency set was accepted in v2.3.0 and
+   likewise fully shipped, in lockstep with constitution v2.3.1)).
 
 ### Architecture is Workflow-per-instance + DO-broker (not DO-per-instance)
 
@@ -90,7 +91,9 @@ counts — during a Workflow replay those reads see post-crash state and would d
   `(instance, gateway, occurrence)` is the rewalk fast-forward predicate; the recorded branch is reused
   even if variables changed since.
 - `MAX_ELEMENT_OCCURRENCES = 1000` (in `src/runtime/engine.ts`) caps visits per element; exceeding it
-  triggers a `loopLimit` incident. `npm run check:docs` enforces that every copy of this constant in
+  triggers a `loopLimit` incident. M4 adds two further caps in the same file: `MAX_CONCURRENT_TOKENS = 256`
+  (a `concurrencyLimit` incident on the token frontier) and `STEP_BUDGET_SOFT = 20000` (a `stepBudget`
+  incident). `npm run check:docs` enforces that every copy of this constant in
   `docs/bpmn/` and `specs/002-saga-orchestrator/` matches the engine source.
 
 ## Non-obvious invariants (enforce these in code and tests)
@@ -103,13 +106,14 @@ counts — during a Workflow replay those reads see post-crash state and would d
   element's runtime meaning, no non-standard attribute *required to parse*. Every accepted file must stay
   XSD-valid and round-trip through a standard modeler (bpmn-js / Camunda Modeler) when `easy-bpmn`
   extensions and Diagram Interchange are ignored.
-- **Reject unsupported *flow nodes* before publish, with element id + reason** (parallel/inclusive/complex
+- **Reject unsupported *flow nodes* before publish, with element id + reason** (complex gateways, non-block-structured (non-SESE) parallel/inclusive
   gateways, user tasks, non-transaction subprocesses, conditional/default flows not leaving an
   `exclusiveGateway`, `instantiate="true"`, etc. — `exclusiveGateway` + FEEL conditions + default flows +
   token-path cycles are IN since M2 / constitution v2.1.0; the **M3 set** — interrupting boundary/
   intermediate timers, message intermediate catch, `eventBasedGateway`, free error routing — is **IN since
   M3 / constitution v2.2.0** (accepted-and-validated; the runtime opened per validator layer and is now
-  complete — see `docs/bpmn/09-easy-bpmn-profile.md`)). But
+  complete — see `docs/bpmn/09-easy-bpmn-profile.md`); block-structured (SESE) `parallelGateway` (AND) +
+  `inclusiveGateway` (OR) are **IN since M4 / constitution v2.3.0**). But
   **tolerate and ignore**
   *ignorable extension content* — foreign-namespace `<extensionElements>` (`camunda:`/`zeebe:`/…), Diagram
   Interchange, and `documentation`. Rejecting a file merely for carrying those is itself non-canonical.
@@ -160,8 +164,12 @@ npm run test:integration                               # D1 + DO + Workflow + Wo
 npx vitest run tests/integration/demo-flow.test.ts     # single test file
 npm run typecheck                                      # tsc --noEmit
 npm run check:docs                                     # docs consistency guard (CI enforced)
+npm run check:matrix                                   # e2e combination-matrix registry guard
+npm run test:matrix                                    # e2e combination matrix (direct + Workflow mode)
 npx wrangler deploy --dry-run                          # validate bindings/config
 ```
+
+The **e2e combination matrix** ([design](docs/superpowers/specs/2026-06-13-e2e-combination-matrix-design.md)) is a risk-curated suite of 60 end-to-end scenarios (49 valid + 11 publish-reject) covering every supported construct, weighted toward M4 concurrency, run in **both** execution modes: Layer A direct-mode (`vitest-pool-workers`, CI-gated semantics; the 11 rejects live here) and Layer B Workflow-mode (`wrangler dev` + real-CF smoke gate, asserted only over the public HTTP API). `tests/matrix/registry.ts` is the single source of truth; `npm run check:matrix` (sibling of `check:docs`, CI-gated) is the drift-guard — it fails when a registered scenario at/below the active `MATRIX_PHASE` lacks a `[<id>]` marker in its declared test file, when a must-cover construct tag is unreferenced, or when fewer than 11 reject scenarios are registered. `npm run test:matrix` runs the suites (`tests/matrix` + `tests/integration/matrix`). Phase 1 (scaffold + registry seed + drift-guard + npm scripts) is in place; the Layer A direct-mode tests and Workflow-mode Phases 2-3 are not yet authored.
 
 Tests use **Vitest with `@cloudflare/vitest-pool-workers`** — D1, Durable Objects, Workflows, and the
 Worker run in the workerd runtime (miniflare). The vitest config (`vitest.config.ts`) always overrides
@@ -184,8 +192,8 @@ aligned.
 This project is driven by two systems whose state lives in the repo:
 
 - **Spec Kit** (`.specify/`, plus `.agents/skills/speckit-*`): the spec→plan→tasks→implement workflow.
-  `AGENTS.md` points at `specs/001-bpmn-lite-orchestrator-mvp/plan.md` (original MVP); the active plan
-  for M1–M5 saga work is `specs/002-saga-orchestrator/plan.md`.
+  `AGENTS.md` and `.specify/feature.json` point at the active plan `specs/002-saga-orchestrator/plan.md`
+  for the M1–M5 saga work; `specs/001-bpmn-lite-orchestrator-mvp/plan.md` is the superseded original MVP.
 - **Backlog.md MCP** (`backlog/`): all task and project management. Use it before creating tasks — the
   workflow is described below and is not summarized here.
 

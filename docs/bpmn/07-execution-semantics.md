@@ -157,9 +157,11 @@ mechanics (shipped across M4-L2…L6):
   whose FEEL conditions are true (≥1, else the gateway-owned `default`, else terminal `noPath`). The
   branches' jobs all become leasable at once, so external workers run them **concurrently** (real
   parallelism is worker-side; the engine itself never drives one instance concurrently).
-- **Multi-wait.** Each drive re-walks the frontier, fast-forwards already-applied visits write-free, and
-  awaits every parked token together in one `Promise.race` over per-token `step.waitForEvent`s; any
-  resolution re-walks from start and reconciles against canonical D1.
+- **Single wake.** Each drive re-walks the frontier and fast-forwards already-applied visits write-free;
+  all parked tokens share **one** replay-stable `bpmn_wake` tickle (TASK-54) instead of a `Promise.race`
+  over per-token `step.waitForEvent`s. Any token's external event (worker callback, message correlation,
+  timer fire) fires that single wake, and the drive re-walks from start and reconciles against canonical
+  D1. (The shrinking-membership multi-`waitForEvent` race was the L6.6 hang TASK-54 replaced.)
 - **Join (synchronise).** An **AND-join** waits for a token from **every activated branch**; an
   **OR-join** for exactly the recorded activated subset — keyed by the token's **origin branch**
   (the split out-flow it descended from), not by physical in-flow. The join merges the joined branches'

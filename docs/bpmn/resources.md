@@ -77,8 +77,9 @@ can stand on `bpmn-moddle` for parsing and on existing engines for semantic grou
 - **Parse** with `bpmn-moddle` (don't reinvent XML/namespace handling).
 - **Validate** with a custom whitelist (inspired by `bpmnlint`) — reject anything outside the
   [profile](./09-easy-bpmn-profile.md).
-- **Execute** a tiny subset durably on Cloudflare Durable Objects — cross-check semantics against
-  `bpmn-engine` / `SpiffWorkflow`.
+- **Execute** a tiny subset durably on **one Cloudflare Workflow per process instance** (coordinated by a
+  single Durable Object correlation broker; Workflow state is runtime-only, never the inspection source) —
+  cross-check semantics against `bpmn-engine` / `SpiffWorkflow`.
 - **Service-task contract** modeled on the **external-task / job-worker** pattern (Operaton / Zeebe).
 - **Durability/idempotency** philosophy informed by **Temporal**.
 

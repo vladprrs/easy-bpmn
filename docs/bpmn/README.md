@@ -35,24 +35,24 @@ execution semantics, the surrounding engine ecosystem, and — most importantly 
 
 ## Scope-at-a-glance
 
-`easy-bpmn`'s MVP is deliberately tiny (see [the constitution](../../.specify/memory/constitution.md),
-Principle I). The supported happy path is:
+The original M0 happy path was `Start Event → Service Task → Receive Task → End Event`. The
+supported subset has since grown through **M1–M4** (transaction-saga + compensation, `exclusiveGateway`
+conditionals, timers / message intermediate catch / `eventBasedGateway` / free error routing,
+block-structured `parallelGateway` / `inclusiveGateway` concurrency) — see
+[`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md) for the **authoritative current scope** (constitution
+now v2.3.1).
 
-```text
-Start Event → Service Task → Receive Task → End Event
-```
-
-| Category | In MVP scope | Out of scope (rejected before publish) |
-|----------|--------------|----------------------------------------|
-| Events | None Start, None End | Message/Timer/Signal/Error/Escalation/Conditional start & end, all intermediate & boundary events, terminate |
+| Category | In scope (M1–M4) | Out of scope (rejected before publish) |
+|----------|------------------|----------------------------------------|
+| Events | None Start/End; interrupting boundary/intermediate timers, message intermediate catch, error/cancel/compensation boundary events (M1/M3) | Timer **start** events, non-interrupting boundary timers, `timeCycle`, signal/escalation/conditional events, `intermediateThrowEvent`, link events, terminate end |
 | Tasks | **Service Task**, **Receive Task** | User, Send, Script, Manual, Business Rule, abstract Task |
-| Gateways | — | Exclusive, Parallel, Inclusive, Event-based, Complex |
-| Flow | Sequence Flow | Conditional flow, default flow, message flow |
-| Sub-processes | — | Embedded, event, transaction, ad-hoc, call activity |
-| Other | Message + correlation key (for Receive Task) | Timers, multi-instance, compensation, data objects, pools/lanes, process migration |
+| Gateways | Exclusive (M2), Event-based (M3), block-structured (SESE) Parallel + Inclusive (M4) | Complex |
+| Flow | Sequence Flow; conditional + default flow off an `exclusiveGateway`/`inclusiveGateway` (M2/M4) | Conditional/default flow elsewhere, message flow |
+| Sub-processes | `transaction` (M1) | Embedded, event, ad-hoc, call activity |
+| Other | Message + correlation key, compensation (M1) | Multi-instance, data objects, pools/lanes, process migration |
 
 > The rest of this reference documents **all of BPMN 2.0** so we understand the standard we're a
-> subset of — but only the left column above is executable in the MVP. Anything else MUST be
+> subset of — but only the left column above is executable in `easy-bpmn`. Anything else MUST be
 > rejected at publish time with a user-visible reason
 > ([`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md)).
 

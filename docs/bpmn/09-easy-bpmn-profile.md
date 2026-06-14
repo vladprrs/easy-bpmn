@@ -1,7 +1,7 @@
 # 09 — The `easy-bpmn` BPMN Profile
 
 This is the **contract** between the BPMN standard and what `easy-bpmn` actually executes. It is the
-operational reading of the [constitution](../../.specify/memory/constitution.md) (now **v2.3.0**, with
+operational reading of the [constitution](../../.specify/memory/constitution.md) (now **v2.3.1**, with
 the widened **Principle I — "Standard BPMN Profile Only"** covering the M2 conditional set, **the M3
 time-&-failure-taxonomy set** — interrupting boundary timers, timer/message intermediate catch events,
 the `eventBasedGateway`, and free error-boundary routing — **and the M4 in-instance concurrency set**
@@ -33,7 +33,7 @@ The profile grows one milestone at a time, each guarded by a constitution amendm
   `conditionExpression` (via `feelin`) on flows leaving an exclusiveGateway, the gateway-owned `default`
   flow, and **cycles on the token path** (occurrence-discriminated iterations). Documented here;
   execution semantics in [`03-gateways.md`](./03-gateways.md).
-- **M3 (current) → time & failure taxonomy** (timers, the job-activation DLQ, error catalog):
+- **M3 → time & failure taxonomy** (timers, the job-activation DLQ, error catalog):
   [`01-events.md`](./01-events.md). The M3 construct set — interrupting boundary `timerEventDefinition` on
   a `serviceTask`/`receiveTask`, timer/message `intermediateCatchEvent`, the `bpmn:eventBasedGateway`, and
   free error-boundary routing — is **accepted in constitution v2.2.0** and was **opened per validator

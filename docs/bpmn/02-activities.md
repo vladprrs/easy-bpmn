@@ -103,10 +103,15 @@ Any activity (task or sub-process) can have **boundary events** attached to its 
 `<extensionElements>` under the `easy-bpmn` namespace (additive, ignorable — not custom notation; see
 [`09`](./09-easy-bpmn-profile.md)).
 
-**Out of scope (reject before publish):** the abstract `task`, `userTask`, `sendTask`, `manualTask`,
-`scriptTask`, `businessRuleTask`, **all** sub-process types (`subProcess`, `transaction`,
-`adHocSubProcess`), `callActivity`, **all** markers (loop, multi-instance, compensation), and any task
-with `instantiate="true"` (instances start via the API) — per the constitution's MVP scope.
+**In scope since M1 (canonical transaction-saga):** the `transaction` sub-process and the **compensation**
+marker (a compensation boundary event wired to an `isForCompensation` handler), plus error/cancel boundary
+events.
 
-The MVP's entire activity vocabulary is: *call a worker* (service task) and *wait for a message*
-(receive task). See [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
+**Out of scope (reject before publish):** the abstract `task`, `userTask`, `sendTask`, `manualTask`,
+`scriptTask`, `businessRuleTask`, the non-transaction sub-process types (`subProcess`, `adHocSubProcess`),
+`callActivity`, the loop and multi-instance markers, and any task with `instantiate="true"` (instances start
+via the API).
+
+The baseline activity vocabulary is *call a worker* (service task) and *wait for a message* (receive task);
+since M1 it also includes the `transaction` sub-process with compensation / error / cancel boundary events
+— the canonical saga scope. See [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).

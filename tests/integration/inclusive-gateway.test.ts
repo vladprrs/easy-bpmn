@@ -25,7 +25,7 @@ const INCLUSIVE_NODEFAULT_BPMN = INCLUSIVE_BPMN.replace(' default="f_def"', "").
 // `default`, and the join produces its single output token exactly once. All in
 // EXECUTION_MODE=direct (the CI harness).
 describe("inclusiveGateway OR (M4-L4, direct mode)", () => {
-  it("activates only the true-condition branches; the join waits for exactly them", async () => {
+  it("[C-OR-SUBSET-01] activates only the true-condition branches; the join waits for exactly them", async () => {
     const { instance } = await publishAndStart(INCLUSIVE_BPMN, {
       correlationKey: "i1",
       variables: { wantsEmail: true, wantsSms: false },
@@ -114,7 +114,7 @@ describe("inclusiveGateway OR (M4-L4, direct mode)", () => {
 
   // AC #4 / #8: no true condition AND no default → terminal noPath (the token is
   // not silently dropped). Reached via a published no-default OR model.
-  it("raises terminal noPath when no condition is true and there is no default", async () => {
+  it("[C-OR-NOPATH-01] raises terminal noPath when no condition is true and there is no default", async () => {
     const { instance } = await publishAndStart(INCLUSIVE_NODEFAULT_BPMN, {
       correlationKey: "i5",
       variables: { wantsEmail: false, wantsSms: false }, // wantsLog absent ⇒ all false

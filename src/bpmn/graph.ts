@@ -23,7 +23,11 @@ export type ElementType =
   | "exclusiveGateway"
   // M3 time & failure taxonomy:
   | "intermediateCatchEvent"
-  | "eventBasedGateway";
+  | "eventBasedGateway"
+  // M4 concurrency — a split fans out concurrent tokens; `next` is null, the
+  // engine reads `outgoing[]` (split) or the recorded join facts (join).
+  | "parallelGateway"
+  | "inclusiveGateway";
 
 /** A node in the executable graph (excludes sequence flows, messages, associations, errors). */
 export type NodeType =
@@ -41,7 +45,11 @@ export type NodeType =
   // M3-L4 (TASK-46): a deterministic timer/message race over its branch catches.
   // Like a gateway, `next` is null — the chosen branch (recorded in
   // gateway_decisions) owns the successor; the engine reads `outgoing[]`.
-  | "eventBasedGateway";
+  | "eventBasedGateway"
+  // M4 concurrency — a split fans out concurrent tokens; `next` is null, the
+  // engine reads `outgoing[]` (split) or the recorded join facts (join).
+  | "parallelGateway"
+  | "inclusiveGateway";
 
 /** Discriminator for end events: a plain (commit) end vs a transaction Cancel end. */
 export type EndKind = "none" | "cancel";
@@ -174,6 +182,22 @@ export interface ErrorDeclaration {
 }
 
 /**
+ * One block-structured concurrent region (M4 design §4.1/§7), keyed by its split
+ * id. Persisted in the graph IR (parsed_profile) at publish, so the engine never
+ * recomputes split↔join matching or branch order from the live graph: `type`
+ * picks the AND/OR join semantics, `branchFlowIds` is the split's outgoing flow
+ * ids in DOCUMENT ORDER (the deterministic merge + OR-wait order), and
+ * `enclosingScopeId` is the process id or transaction id the region lives in.
+ */
+export interface RegionInfo {
+  splitId: string;
+  joinId: string;
+  type: "and" | "or";
+  branchFlowIds: string[];
+  enclosingScopeId: string;
+}
+
+/**
  * Immutable execution graph stored in `definition_versions.parsed_profile`.
  * The linear MVP profile is a deterministic path; `nodes`/`next` encode it. SAGA
  * definitions additionally carry `transactions`, `associations`, and `errors`.
@@ -190,6 +214,8 @@ export interface ExecutionGraph {
   transactions?: Record<string, TransactionScope>;
   associations?: AssociationLink[];
   errors?: ErrorDeclaration[];
+  /** Concurrent regions keyed by split id (M4); absent on non-concurrent graphs. */
+  regions?: Record<string, RegionInfo>;
 }
 
 export interface ValidationIssueData {

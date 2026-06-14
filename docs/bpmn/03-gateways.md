@@ -12,8 +12,8 @@ has multiple incoming flows. The same element type is used for both — meaning 
 | Gateway | Symbol | XML element | Split behavior | Join behavior |
 |---------|--------|-------------|----------------|---------------|
 | **Exclusive (XOR)** | `X` (or empty diamond) | `exclusiveGateway` | Take **exactly one** outgoing flow — the first whose condition is true (else the `default`). | Pass through each arriving token immediately (no waiting). |
-| **Parallel (AND)** | `+` | `parallelGateway` | Take **all** outgoing flows (fork). | **Wait** for a token on *every* incoming flow, then emit one (synchronize). |
-| **Inclusive (OR)** | `O` (circle) | `inclusiveGateway` | Take **all** outgoing flows whose condition is true (≥1; else `default`). | Wait for all tokens that *could still arrive* on incoming flows, then merge. |
+| **Parallel (AND)** | `+` | `parallelGateway` | Take **all** outgoing flows (fork). | **Wait** for a token from **every activated branch of the matching split**, then emit one (synchronize). |
+| **Inclusive (OR)** | `O` (circle) | `inclusiveGateway` | Take **all** outgoing flows whose condition is true (≥1; else `default`). | Wait for a token from every **activated branch** of the matching split (the recorded activation subset), then merge. |
 | **Event-based** | pentagon in double circle | `eventBasedGateway` | **Supported (M3-L4)**: wait, then take the path of whichever **event** (message catch / timer) happens *first*. | (Used as a split only; ≤1 timer branch.) |
 | **Complex** | `*` | `complexGateway` | Custom split/merge via an `activationCondition` expression. | Custom synchronization. Rarely used; poorly supported. |
 
@@ -98,18 +98,31 @@ M2 executes, anywhere a token node can appear (process level and inside a `trans
 - **Audit/replay** — every gateway visit persists a `gateway_decisions` row atomically with the
   transition; crash/replay reuses the recorded branch, never re-evaluates.
 
-Conditions live **only** on flows leaving an `exclusiveGateway`: a `conditionExpression` on any other
-flow (the "conditional sequence flow from a task" pattern above) and any implicit split (>1 outgoing
-flow on a non-gateway node) are still **rejected** before publish with element id + reason.
+Conditions live **only** on flows leaving an `exclusiveGateway` or `inclusiveGateway`: a
+`conditionExpression` on any other flow (the "conditional sequence flow from a task" pattern above) and
+any implicit split (>1 outgoing flow on a non-gateway node) are still **rejected** before publish with
+element id + reason.
+
+**Concurrency (`parallelGateway` AND / `inclusiveGateway` OR) is IN scope since M4-L1** (constitution
+v2.3.0), **block-structured (single-entry/single-exit, SESE) only** — every split is paired with exactly
+one matching join of the **same type**, validated at publish via dominators/post-dominators (no matching
+join, a branch escaping the region, an uncontrolled merge, a mismatched join type, non-laminar nesting,
+or two concurrent branches awaiting the same message name are rejected with element ids). Each token
+carries the split out-flow it descended from (its **origin branch**), so a join is satisfied once a token
+from every activated branch has arrived — on whatever physical in-flow. The multi-token **runtime has
+shipped**: the token frontier fans a branch token out per activated out-flow, the AND/OR join barrier
+synchronises them, branch-local variable overlays merge in split out-flow document order at the join, and
+the instance completes when the frontier is empty (AND through M4-L3, OR through M4-L4, parallel-branch
+compensation through M4-L5).
 
 Of the other gateway types, `eventBasedGateway` is **supported since M3-L4** (the timer/message race,
-below); the remaining three stay out of scope, each rejected before publish with a user-visible reason
-and its roadmap pointer (kept in lockstep with `DEFERRED_GATEWAY_REASONS` in `src/bpmn/profile.ts`):
+below). Only `complexGateway` stays out of scope, rejected before publish with a user-visible reason and
+its roadmap pointer (kept in lockstep with `DEFERRED_GATEWAY_REASONS` in `src/bpmn/profile.ts`):
 
 | Gateway | Status |
 |---------|--------|
-| `parallelGateway` | Deferred to **M4** (concurrency) — AND-splits need multiple concurrent tokens. |
-| `inclusiveGateway` | Deferred to **M4** (concurrency) — OR-splits activate multiple branches at once. |
+| `parallelGateway` | **Supported (M4)** — block-structured (SESE) AND split/join; SESE-validated at publish (TASK-48: matching same-type join, strong single-exit, branch confinement); multi-token runtime (fan-out + AND-join barrier + frontier-empty completion) shipped at **M4-L3**. |
+| `inclusiveGateway` | **Supported (M4)** — block-structured (SESE) OR split/join; non-default out-flows carry FEEL conditions + an optional gateway-owned default; the split's activated subset is recorded and the join waits for exactly it; runtime shipped at **M4-L4**. |
 | `eventBasedGateway` | **Supported since M3-L4** (TASK-46) — races timer/message branch catches and routes on the first event to occur (≥2 branches, every target a single-incoming intermediate catch, ≤1 timer branch, distinct messages). |
 | `complexGateway` | Not on the roadmap; deferred to a later milestone. |
 

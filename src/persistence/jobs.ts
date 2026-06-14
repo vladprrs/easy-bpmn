@@ -222,6 +222,8 @@ export interface JobByIdRow {
   attempt_count: number;
   is_compensation: number;
   activation_expires_at: string | null;
+  // M4-L5: the in-flight lease deadline, for the locked-cohort lease-expiry terminator.
+  lock_expires_at: string | null;
 }
 
 /** Load a job purely by id (the JobScheduler alarm holds only the jobId). */
@@ -229,11 +231,52 @@ export async function getJobRowById(db: D1Database, jobId: string): Promise<JobB
   return (
     (await stmt(
       db,
-      `SELECT job_id, instance_id, element_id, task_type, status, attempt_count, is_compensation, activation_expires_at
+      `SELECT job_id, instance_id, element_id, task_type, status, attempt_count, is_compensation, activation_expires_at, lock_expires_at
          FROM service_task_jobs WHERE job_id = ?`,
       [jobId],
     ).first<JobByIdRow>()) ?? null
   );
+}
+
+/** A still-leased forward job + its lease deadline — the cohort lease-expiry terminator targets (M4-L5). */
+export interface LockedForwardJob {
+  job_id: string;
+  lock_expires_at: string | null;
+}
+
+/**
+ * In-flight (`locked`) FORWARD jobs of an instance — the cohort whose lease-expiry
+ * terminators (design §8.2) must be armed when the scope enters `compensating`, so the
+ * quiescence barrier never depends on a future `/jobs/activate` poll. Empty for a
+ * single-token instance at cancel (its forward jobs are already terminal), so arming
+ * is a no-op there.
+ */
+export async function listLockedForwardJobs(db: D1Database, instanceId: string): Promise<LockedForwardJob[]> {
+  const res = await stmt(
+    db,
+    `SELECT job_id, lock_expires_at FROM service_task_jobs
+      WHERE instance_id = ? AND is_compensation = 0 AND status = 'locked'`,
+    [instanceId],
+  ).all<LockedForwardJob>();
+  return res.results ?? [];
+}
+
+/**
+ * Lease-expiry terminator claim (design §8.2 — the in-flight twin of
+ * failUnleasableJobConditional): flip a still-`locked` job → `failed`, clearing the
+ * lease so a late worker complete/fail (guarded on `status='locked'`) matches 0 rows
+ * and gets the stable no-op ack. Race-safe by the `status='locked'` guard: a concurrent
+ * complete that flips it `completed` first leaves this matching 0 rows (the straggler
+ * is ledgered instead). The caller gates on `lock_expires_at < now`. Returns rows changed.
+ */
+export async function failLeasedJobConditional(db: D1Database, jobId: string, now: string): Promise<number> {
+  const res = await stmt(
+    db,
+    `UPDATE service_task_jobs SET status = 'failed', lock_token = NULL, lock_expires_at = NULL, worker_id = NULL, updated_at = ?
+      WHERE job_id = ? AND status = 'locked'`,
+    [now, jobId],
+  ).run();
+  return res.meta?.changes ?? 0;
 }
 
 /**

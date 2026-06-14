@@ -25,7 +25,10 @@ constructs (interrupting boundary `timerEventDefinition` on a
 `serviceTask`/`receiveTask`, timer/message `intermediateCatchEvent`,
 `eventBasedGateway`, free error-boundary routing; static ISO-8601 timer triggers
 only — accepted in constitution v2.2.0, opened per validator layer with
-"M3 — not yet implemented" rejection until each layer ships) — unsupported
+"M3 — not yet implemented" rejection until each layer ships), or M4 in-instance
+concurrency constructs (block-structured / SESE `parallelGateway` (AND) and
+`inclusiveGateway` (OR), each split paired with one matching same-type join,
+validated at publish — accepted in constitution v2.3.0) — unsupported
 elements that must be rejected before publish with element id + reason, or N/A
 with rationale]
 

@@ -6,6 +6,7 @@
 
 import { dbAll, dbFirst, stmt } from "./db";
 import { parseJson, toJson, type JsonObject } from "../util";
+import type { TokenRow } from "./tokens";
 
 export type CompensationStatus =
   | "pending"
@@ -35,6 +36,10 @@ export interface SagaStepRow {
   updated_at: string;
   // CONDITIONAL (0004) — each completed pass of a looped step is its own row.
   occurrence: number;
+  // M4-L5 (0007) — the branch token that produced this row; NULL on the single-
+  // token (M1–M3 / root) path. The lineage-quiescence-ordered reverse pass uses it
+  // to compensate a step only once its branch lineage has no live token (§8.4).
+  token_id: string | null;
 }
 
 export interface SagaStepView {
@@ -52,6 +57,8 @@ export interface SagaStepView {
   compensationJobId: string | null;
   compensationStatus: CompensationStatus;
   traceId: string | null;
+  /** M4-L5: the branch token that produced this row; NULL on the root/single-token path. */
+  tokenId: string | null;
 }
 
 export function mapSagaStep(row: SagaStepRow): SagaStepView {
@@ -69,16 +76,51 @@ export function mapSagaStep(row: SagaStepRow): SagaStepView {
     compensationJobId: row.compensation_job_id,
     compensationStatus: row.compensation_status as CompensationStatus,
     traceId: row.trace_id,
+    tokenId: row.token_id,
   };
 }
 
 /**
+ * Lineage-quiescence filter (design §8.4 / blocker 10 — Principle VI per causal
+ * chain): a completed ledger step is eligible for compensation only once its token
+ * lineage has NO live (`active|waiting|arrivedAtJoin`) descendant — so a causally-
+ * downstream straggler in the same branch is always compensated before its
+ * predecessor. A step is BLOCKED iff some live token is the step's token or a
+ * descendant of it. Root-lineage steps (`token_id` NULL — the M1–M3 / single-token
+ * path) are NEVER blocked, so this is a pure no-op there (cross-branch order is
+ * unconstrained: concurrent branches have no happens-before relation).
+ */
+export function filterLineageQuiesced(steps: SagaStepView[], liveTokens: TokenRow[]): SagaStepView[] {
+  if (liveTokens.length === 0) return steps;
+  const parentOf = new Map(liveTokens.map((t) => [t.token_id, t.parent_token_id]));
+  const ancestorsOf = (tid: string): Set<string> => {
+    const out = new Set<string>();
+    let cur: string | null = tid;
+    const guard = new Set<string>();
+    while (cur && !guard.has(cur)) {
+      guard.add(cur);
+      out.add(cur);
+      cur = parentOf.get(cur) ?? null;
+    }
+    return out;
+  };
+  const blocked = new Set<string>();
+  for (const t of liveTokens) for (const a of ancestorsOf(t.token_id)) blocked.add(a);
+  return steps.filter((s) => s.tokenId == null || !blocked.has(s.tokenId));
+}
+
+/**
  * INSERT OR IGNORE a completed forward step into the ledger. `seq` is computed
- * atomically as the next monotonic value within (instance_id, scope_id), so the
- * reverse pass walks steps in true completion order. A duplicate (instance_id,
- * element_id, occurrence) is ignored — the replay/double-complete no-op, held
- * PER loop iteration (design M2 §8): each completed pass of a looped step is
- * its own ledger row and is compensated separately by the unchanged reverse pass.
+ * atomically as the next monotonic value within (instance_id, scope_id): a
+ * deterministic serialized walk-order rank that EQUALS completion order within a
+ * causal chain (a token lineage), NOT across concurrent branches (design §10 — the
+ * per-instance drive serialization makes it a strict total order with no
+ * collisions; cross-branch reverse order is unconstrained, §8.4). A duplicate
+ * (instance_id, element_id, occurrence) is ignored — the replay/double-complete
+ * no-op, held PER loop iteration (design M2 §8): each completed pass of a looped
+ * step is its own ledger row and is compensated separately by the reverse pass.
+ * `tokenId` is the branch token that produced the row (NULL on the root/single-
+ * token path); the lineage-quiescence filter (§8.4) reads it.
  */
 export function insertSagaStepStmt(
   db: D1Database,
@@ -97,6 +139,8 @@ export function insertSagaStepStmt(
     traceId?: string | null;
     /** CONDITIONAL (0004) — loop-iteration discriminator; defaults to 0. */
     occurrence?: number;
+    /** M4-L5 (0007) — producing branch token; NULL on the root/single-token path. */
+    tokenId?: string | null;
     now: string;
   },
 ): D1PreparedStatement {
@@ -104,10 +148,10 @@ export function insertSagaStepStmt(
     db,
     `INSERT OR IGNORE INTO saga_steps
        (step_id, instance_id, scope_id, seq, element_id, forward_job_id, captured_input, captured_output,
-        compensation_element_id, compensation_task_type, compensation_job_id, compensation_status, trace_id, created_at, updated_at, occurrence)
+        compensation_element_id, compensation_task_type, compensation_job_id, compensation_status, trace_id, created_at, updated_at, occurrence, token_id)
      SELECT ?, ?, ?,
             COALESCE((SELECT MAX(seq) FROM saga_steps WHERE instance_id = ? AND scope_id = ?), 0) + 1,
-            ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?`,
+            ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?`,
     [
       input.stepId,
       input.instanceId,
@@ -125,6 +169,7 @@ export function insertSagaStepStmt(
       input.now,
       input.now,
       input.occurrence ?? 0,
+      input.tokenId ?? null,
     ],
   );
 }

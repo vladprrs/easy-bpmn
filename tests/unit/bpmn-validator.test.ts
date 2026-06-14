@@ -13,6 +13,11 @@ import {
   MALFORMED_XML,
   MULTI_INSTANCE_BPMN,
   NO_TASKTYPE_BPMN,
+  PARALLEL_BPMN,
+  INCLUSIVE_BPMN,
+  PARALLEL_DEADLOCK_BPMN,
+  PARALLEL_MISMATCH_BPMN,
+  PARALLEL_SAME_MESSAGE_BPMN,
   PASSTHROUGH_GATEWAY_BPMN,
   SAGA_BPMN,
   SAGA_CANCEL_BOUNDARY_ON_TASK_BPMN,
@@ -722,11 +727,11 @@ describe("Exclusive-gateway reject matrix (TASK-33, M2 design §3)", () => {
     expect(r.issues.some((i) => i.elementId === "bad_b" && /gateway/i.test(i.reason))).toBe(true);
   });
 
-  // eventBasedGateway is IN since M3-L4 (TASK-46) — it has its own accept/reject
-  // matrix below, no longer a DEFERRED_GATEWAY_REASONS milestone pointer.
+  // eventBasedGateway is IN since M3-L4 (TASK-46); parallelGateway/inclusiveGateway
+  // are IN since M4-L1 (TASK-48, block-structured SESE — see "M4 concurrency
+  // profile" below). Only complexGateway remains a DEFERRED_GATEWAY_REASONS
+  // milestone pointer; a 1-in/1-out parallel/inclusive pass-through now validates.
   it.each([
-    ["parallelGateway", /concurrency \(M4\)/],
-    ["inclusiveGateway", /concurrency \(M4\)/],
     ["complexGateway", /later milestone/],
   ] as const)("rejects %s with a milestone pointer", async (tag, pointer) => {
     const r = await parseAndValidate(deferredGatewayBpmn(tag));
@@ -1731,5 +1736,38 @@ describe("Event-based gateway (M3-L4, TASK-46)", () => {
     const r = await parseAndValidate(ebgBpmn({ extra: `<bpmn:documentation>race the events</bpmn:documentation>` }));
     expect(r.ok).toBe(true);
     expect(r.issues).toHaveLength(0);
+  });
+});
+
+describe("M4 concurrency profile", () => {
+  it("accepts a balanced AND region and records the region map", async () => {
+    const r = await parseAndValidate(PARALLEL_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.graph?.regions?.["fork"]).toMatchObject({ joinId: "join", type: "and", branchFlowIds: ["f1", "f2"] });
+    expect(r.graph?.nodes["fork"]?.type).toBe("parallelGateway");
+  });
+  it("accepts a balanced OR region with conditional branches + default", async () => {
+    const r = await parseAndValidate(INCLUSIVE_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.graph?.regions?.["fork"]).toMatchObject({ joinId: "join", type: "or" });
+  });
+  it("still rejects complexGateway with a roadmap pointer", async () => {
+    const r = await parseAndValidate(deferredGatewayBpmn("complexGateway"));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "G" && /complex/i.test(i.reason))).toBe(true);
+  });
+  it("rejects a deadlocking AND region (branch loses its token to an end)", async () => {
+    const r = await parseAndValidate(PARALLEL_DEADLOCK_BPMN);
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => /fork|region|single-exit|matching join/i.test(i.reason))).toBe(true);
+  });
+  it("rejects a mismatched join type", async () => {
+    const r = await parseAndValidate(PARALLEL_MISMATCH_BPMN);
+    expect(r.ok).toBe(false);
+  });
+  it("rejects two concurrent branches on the same message name (blocker 14)", async () => {
+    const r = await parseAndValidate(PARALLEL_SAME_MESSAGE_BPMN);
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => /same message|broker key|distinct message/i.test(i.reason))).toBe(true);
   });
 });

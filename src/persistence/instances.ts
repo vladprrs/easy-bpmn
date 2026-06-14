@@ -175,6 +175,23 @@ export async function transitionStatusGuarded(
   return res.meta?.changes ?? 0;
 }
 
+/**
+ * Guarded terminal completion (M4-L3 last-token-out, design §5.6): flips
+ * running/waiting → completed AND stamps completed_at, only while the instance is
+ * still live. Returns rows changed — the single non-zero return is the one drive
+ * that emits the terminal (belt-and-braces under concurrent region drives even
+ * with the per-instance drive lock). Idempotent: a replay/late drive changes 0 rows.
+ */
+export async function completeInstanceGuarded(db: D1Database, instanceId: string, now: string): Promise<number> {
+  const res = await stmt(
+    db,
+    `UPDATE process_instances SET status = 'completed', completed_at = ?, updated_at = ?
+       WHERE instance_id = ? AND status IN ('running', 'waiting')`,
+    [now, now, instanceId],
+  ).run();
+  return res.meta?.changes ?? 0;
+}
+
 /** Merge a variables patch into the instance (operator remediation). */
 export async function mergeInstanceVariables(
   db: D1Database,
@@ -734,6 +751,19 @@ export function subscriptionSupersededStmt(
   );
 }
 
+/** Every ACTIVE subscription of an instance — the cohort broker keys an operator
+ * `/cancel` of a region must release so no broker key leaks (M4-L5, design §8.1). */
+export async function listActiveSubscriptionsForInstance(
+  db: D1Database,
+  instanceId: string,
+): Promise<SubscriptionRow[]> {
+  return dbAll<SubscriptionRow>(
+    db,
+    `SELECT * FROM message_subscriptions WHERE instance_id = ? AND status = 'active'`,
+    [instanceId],
+  );
+}
+
 export async function markSubscriptionExpired(
   db: D1Database,
   subscriptionId: string,
@@ -771,7 +801,14 @@ export type IncidentKind =
   //     (previously masked as serviceTaskFailure).
   | "jobActivationTimeout"
   | "waitTimeout"
-  | "conditionFailure";
+  | "conditionFailure"
+  // CONCURRENCY (M4-L6 §9). concurrencyLimit — a split fan-out would exceed
+  // MAX_CONCURRENT_TOKENS live tokens (counted from the in-memory frontier, never
+  // a live SQL COUNT). stepBudget — the per-drive cumulative runStep/waitForEvent
+  // count crossed STEP_BUDGET_SOFT (a graceful incident BELOW the platform step
+  // ceiling, so a hot parallel×loop shape never becomes an opaque errored Workflow).
+  | "concurrencyLimit"
+  | "stepBudget";
 /**
  * Incident remediation lifecycle (one-way):
  *

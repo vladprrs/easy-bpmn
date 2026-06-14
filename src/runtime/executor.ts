@@ -4,18 +4,18 @@
 import type { Env } from "../env";
 import type { JobResultEvent, MessageEventPayload, ProcessWorkflowParams } from "../contracts/workflow-events";
 import { recordTerminalIncident, runInstance } from "./engine";
-import { workflowJobEventTypeFor } from "../bpmn/profile";
+import { WAKE_TYPE } from "./wake";
 
 export interface DeliverArgs {
   workflowInstanceId: string;
   instanceId: string;
   elementId: string;
   /**
-   * The matched subscription's STORED Workflow wake type (M3-L4, TASK-46, §4.5):
-   * `sendEvent` fires on THIS type rather than re-deriving it from the message
-   * name. For a receiveTask / standalone message catch it equals
-   * workflowEventTypeFor(messageName); for an eventBasedGateway branch it is the
-   * per-visit gateway type, so a single waitForEvent is woken by any branch.
+   * The matched subscription's STORED Workflow wake type. VESTIGE under single-wake
+   * (TASK-54): the engine now waits on the SINGLE constant WAKE_TYPE, so `sendEvent`
+   * tickles on WAKE_TYPE regardless of this field's value (every subscription stores
+   * WAKE_TYPE). The re-walk after the tickle reconciles the matched receive/branch
+   * from D1. Carried only because the underlying column is kept NOT NULL (no migration).
    */
   workflowEventType: string;
   event: MessageEventPayload;
@@ -61,22 +61,15 @@ class WorkflowExecutor implements Executor {
 
   async deliver(args: DeliverArgs): Promise<void> {
     const instance = await this.env.PROCESS_WORKFLOW.get(args.workflowInstanceId);
-    // Honor the subscription's STORED wake type (M3-L4, §4.5) — for an EBG branch
-    // it is the per-visit gateway type; for a receiveTask / standalone catch it is
-    // byte-identical to workflowEventTypeFor(messageName).
-    await instance.sendEvent({
-      type: args.workflowEventType,
-      payload: args.event,
-    });
+    // TASK-54: contentless tickle — the engine re-walks and applies the correlated
+    // message from D1 (apply-from-D1). One constant type = replay-stable.
+    await instance.sendEvent({ type: WAKE_TYPE, payload: { kind: "message" } });
   }
 
   async deliverJobResult(args: DeliverJobArgs): Promise<void> {
     try {
       const instance = await this.env.PROCESS_WORKFLOW.get(args.workflowInstanceId);
-      await instance.sendEvent({
-        type: workflowJobEventTypeFor(args.event.jobId),
-        payload: args.event,
-      });
+      await instance.sendEvent({ type: WAKE_TYPE, payload: { kind: "jobResult" } });
     } catch {
       // The Workflow has terminated (after an incident, or an operator /cancel
       // that ended it) and cannot resume from this event. Drive the engine inline
@@ -110,7 +103,7 @@ class WorkflowExecutor implements Executor {
     // re-reads the decider from D1 and routes down the boundary path either way.
     try {
       const instance = await this.env.PROCESS_WORKFLOW.get(args.instanceId);
-      await instance.sendEvent({ type: args.workflowEventType, payload: { outcome: "timerFired", timerId: args.timerId } });
+      await instance.sendEvent({ type: WAKE_TYPE, payload: { kind: "timerFired", timerId: args.timerId } });
     } catch {
       try {
         await runInstance(this.env, args.instanceId, { runStep: inlineStep, waitFor: null });

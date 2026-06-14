@@ -15,8 +15,9 @@ export type MessageEventPayload = z.infer<typeof messageEventPayloadSchema>;
 
 /**
  * The discriminated job-result a pull worker's complete/fail delivers to the
- * Service-Task-as-wait engine (event type `bpmn_job_<jobId>`, see
- * workflowJobEventTypeFor). `completed` advances; `failed` carries the
+ * Service-Task-as-wait engine. Under single-wake (TASK-54) the delivery is a
+ * contentless tickle on the constant WAKE_TYPE and the engine re-reads the job
+ * from D1 (the per-job event type was removed). `completed` advances; `failed` carries the
  * technical-vs-business distinction (retryable vs an errorCode matching a model
  * bpmn:error/@errorCode → raises that BPMN error → compensation). A non-retryable
  * failure may additionally carry a `kind` classifying a runtime-synthesized

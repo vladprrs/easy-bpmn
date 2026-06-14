@@ -1,68 +1,93 @@
 <!--
+PATCH addendum — 2.3.0 -> 2.3.1 (2026-06-14)
+Rationale (PATCH): clarifies wording only — no principle is redefined, removed,
+or scope-widened (per the versioning policy: "PATCH = clarify wording … or make
+non-semantic refinements"). Records the M4 single-wake (TASK-54) standard-BPMN
+un-guarded-wait semantics in Principle IV: an un-guarded receive task / message
+intermediate catch (no modeled deadline) waits INDEFINITELY; un-guarded Service
+Task liveness is the job-activation DLQ (`jobActivationTimeout`); the M3 leaf
+`waitTimeout` durable-wait cap is RETIRED (its incident kind is now unproduced,
+kept as a vestigial enum value until the dead-code sweep). `compensationFailure`
+remains the compensation retry-exhaustion terminal (Principle VI — unchanged, and
+its "MUST NOT silently block forever" clause already reads as retry-exhaustion).
+Aligned in lockstep: docs/bpmn/09-easy-bpmn-profile.md (the DLQ/liveness note) and
+specs/002-saga-orchestrator/contracts/openapi.yaml (Incident.kind description).
+Templates: no change (no construct-set or quality-gate change). The 2.2.0 -> 2.3.0
+Sync Impact Report below is unchanged.
+
 Sync Impact Report
-Version change: 2.1.0 -> 2.2.0
+Version change: 2.2.0 -> 2.3.0
 Rationale (MINOR): materially expands Principle I's accepted construct set with
-the M3 time-&-failure-taxonomy constructs while preserving every existing
-principle (per the versioning policy: "MINOR = ... materially expand guidance
-while preserving existing principles"). Same MINOR class as the 2.0.0 -> 2.1.0
-M2 bump. Unlike M2 — which amended the constitution AFTER the validator opened
-the constructs and recorded no Constitution Check — M3 amends FIRST, as the
-opening governance item before any M3 construct's runtime ships (the
-Principle-I-compliant ordering). The M3 set is declared accepted here; the
-validator opens each construct only together with its own runtime layer (L3
-boundary timers, L4 intermediate catch + eventBasedGateway), rejecting a
-not-yet-shipped construct with the reason "M3 — not yet implemented" in the
-interim — documented behavior (docs/bpmn/09-easy-bpmn-profile.md), not drift.
-Source: M3 time-&-failure-taxonomy design
-(docs/superpowers/specs/2026-06-11-m3-time-failure-taxonomy-design.md §3, §8).
+the M4 in-instance concurrency gateways (`parallelGateway` / `inclusiveGateway`,
+block-structured / SESE only) while preserving every existing principle (per the
+versioning policy: "MINOR = ... materially expand guidance while preserving
+existing principles"). Same MINOR class as the 2.0.0 -> 2.1.0 (M2) and
+2.1.0 -> 2.2.0 (M3) bumps. Like M3 — and unlike M2, which amended AFTER the
+validator opened the constructs — M4 amends FIRST, as the opening governance item
+before any M4 concurrency construct's runtime ships (the Principle-I-compliant
+ordering). The single behaviour THIS amendment authorises is publish-time
+accept/reject: a block-structured parallel/inclusive region validates, a
+non-SESE one is rejected with the offending element ids; no engine concurrency
+runs yet. The concurrency runtime (token frontier, branch fan-out, the AND/OR
+join barrier, parallel-branch compensation) ships in later M4 layers (L2-L5).
+Source: M4 concurrency design
+(docs/superpowers/specs/2026-06-13-m4-concurrency-design.md §4, §6, §12, §17).
 Modified principles:
-- I. Standard BPMN Profile Only (accepted construct set widened with the M3 set:
-  an interrupting boundary `timerEventDefinition` on a `serviceTask`/`receiveTask`,
-  a timer or message `intermediateCatchEvent`, the `bpmn:eventBasedGateway`, and
-  free error-boundary routing; the no-custom-notation / XSD-valid /
-  round-trippable / reject-unsupported-flow-node-with-element-id-and-reason
-  clause is unchanged)
+- I. Standard BPMN Profile Only (accepted construct set widened with the M4
+  concurrency set: `bpmn:parallelGateway` (AND) and `bpmn:inclusiveGateway` (OR),
+  BLOCK-STRUCTURED only — each split paired with exactly one matching join of the
+  SAME type forming a single-entry/single-exit (SESE) region, validated at
+  publish; `complexGateway` and the `terminate` end event stay excluded; the
+  no-custom-notation / XSD-valid / round-trippable /
+  reject-unsupported-flow-node-with-element-id-and-reason clause is unchanged)
+- VI. SAGA / Compensation Integrity (reverse-order compensation REDEFINED per
+  causal chain (a token lineage); order between concurrent branches is
+  unconstrained; a straggler completing after a parallel scope began compensating
+  is still ledgered + compensated, idempotent under at-least-once, and ordered
+  within its lineage. A multi-token (frontier-empty) completion rule is added: an
+  instance completes only when zero tokens remain. The at-least-once /
+  idempotency / Cancel-only-trigger / Hazard-does-not-compensate /
+  compensationFailed clauses are unchanged — only the ORDERING qualifier becomes
+  per-causal-chain, because concurrency makes a single global completion order
+  ill-defined.)
 Modified sections:
-- MVP Scope and Platform Constraints (exclusion list requalified: `event-based`
-  dropped from the gateway line; the events line now keeps timer START events,
-  non-interrupting boundary timers, `timeCycle`, signal / escalation /
-  conditional events, and non-catch message events excluded, but no longer
-  excludes interrupting boundary timers, timer/message intermediate catch
-  events, or the eventBasedGateway. Milestone parenthetical updated — M3 timers/
-  intermediate-catch/eventBasedGateway/free-error-routing is added by THIS
-  amendment; M4 parallelism and M5 composition remain pending. In-scope recap
-  extended with the M3 accepted set and the per-layer interim note.)
+- MVP Scope and Platform Constraints (exclusion list requalified: `parallel` and
+  `inclusive` dropped from the gateway line — `complex` stays excluded; the
+  milestone parenthetical updated — M4 parallel/inclusive concurrency is added by
+  THIS amendment, M5 composition remains pending; in-scope recap extended with
+  the M4 SESE concurrency set and its publish-time-only interim note.)
 Unchanged principles:
-- II-V verbatim; VI (SAGA / Compensation Integrity) untouched — every M3 timer
-  routes a drawn token down a modeled path; a boundary timer that cancels a
-  transaction does so only via a modeled cancel end event (standard reverse-order
-  compensation), and an interrupting timer boundary is NOT attachable to a
-  `transaction` (no silent rollback loss).
+- II-V verbatim.
 Templates requiring updates:
 - updated: .specify/templates/plan-template.md (Constitution Check BPMN-profile
-  gate names the M3 set)
-- updated: .specify/templates/spec-template.md (BPMN Profile Impact prompt
-  covers the M3 constructs)
+  gate names the M4 SESE parallel/inclusive set; SAGA gate ordering qualified per
+  causal chain)
+- updated: .specify/templates/spec-template.md (BPMN Profile Impact prompt covers
+  the M4 concurrency constructs)
 - checked: .specify/templates/tasks-template.md (no construct list; generic
   saga/compensation test guidance still accurate)
 - checked: AGENTS.md
-- updated: CLAUDE.md (profile-lockstep line -> v2.2.0; reject-list invariant
-  notes the M3 set is accepted-but-staged)
+- deferred: CLAUDE.md (its v2.2.0 references describe M3 as shipped — historically
+  accurate; the CLAUDE.md M4 profile-lockstep + reject-list-invariant updates land
+  with the M4 runtime layers / epic closure (L6), not this publish-time-only
+  governance opener)
 Constitution-impacting file changes (this amendment):
-- .specify/memory/constitution.md (Principle I, MVP Scope, version footer)
+- .specify/memory/constitution.md (Principle I, Principle VI, MVP Scope, version
+  footer)
 - .specify/templates/plan-template.md, .specify/templates/spec-template.md
-- CLAUDE.md (profile-lockstep line + reject-list invariant)
-- docs/bpmn/09-easy-bpmn-profile.md (version pin, deferred table -> interim
-  marking, lockstep sentence)
-- docs/bpmn/01-events.md (scope section corrected for M1/M2/M3)
-- scripts/check-docs.mjs (01-events stale-phrase guards)
-- specs/002-saga-orchestrator/m3-constitution-check.md (recorded Constitution Check)
+- specs/002-saga-orchestrator/m4-constitution-check.md (recorded Constitution
+  Check)
+- docs/bpmn/{03-gateways,07-execution-semantics,09-easy-bpmn-profile}.md +
+  scripts/check-docs.mjs (profile-doc lockstep — landed in the M4-L1 validator/
+  docs commits, not this governance commit)
 Follow-up TODOs:
-- M3 validator layers (L3 boundary timers; L4 intermediate catch +
-  eventBasedGateway; free error routing) open each accepted construct as its
-  runtime ships.
-- M4 (parallelism), M5 (composition) each still require their own amendment
-  before widening the profile further.
+- M4 validator runtime layers (L2 token foundation; L3 parallelGateway AND; L4
+  inclusiveGateway OR; L5 parallel-branch compensation) open the accepted
+  concurrency runtime; this amendment only opens publish-time validation.
+- M5 (composition) still requires its own amendment before widening the profile
+  further.
+- CLAUDE.md M4 profile-lockstep + reject-list-invariant update owed at M4 epic
+  closure (L6).
 -->
 
 # easy-bpmn Constitution
@@ -97,8 +122,21 @@ profile. The currently accepted construct set is:
   only when its runtime layer ships (boundary timers, then intermediate catch +
   eventBasedGateway), and until then rejects it with the reason "M3 — not yet
   implemented" — the interim state defined in
-  `docs/bpmn/09-easy-bpmn-profile.md`. Every gateway type other than
-  `exclusiveGateway` and `eventBasedGateway` remains excluded.
+  `docs/bpmn/09-easy-bpmn-profile.md`; and
+- the in-instance concurrency set (M4) — `bpmn:parallelGateway` (the AND split
+  and join) and `bpmn:inclusiveGateway` (the OR split and join),
+  **block-structured only**: every split MUST pair with exactly one matching join
+  of the **same type**, forming a single-entry/single-exit (SESE) region,
+  validated **at publish** (a non-block-structured, branch-escaping,
+  mismatched-join, or uncontrolled-merge region — or two concurrent branches
+  awaiting the same message name — is rejected with the offending element id).
+  This amendment opens **publish-time validation only**; the concurrency runtime
+  (the token frontier, branch fan-out, and the AND/OR join barrier) ships in later
+  M4 layers. The inclusive split obeys the same FEEL `conditionExpression` /
+  gateway-owned `default` rules as the `exclusiveGateway` split. Every gateway
+  type other than `exclusiveGateway`, `eventBasedGateway`, `parallelGateway`, and
+  `inclusiveGateway` remains excluded — `complexGateway` is not on the roadmap,
+  and the `terminate` end event stays out of scope.
 
 A saga is modeled in **canonical BPMN**: the only additive binding is
 `easy-bpmn:taskDefinition` carried inside the standard `<bpmn:extensionElements>`
@@ -113,9 +151,10 @@ reason; ignorable extension content (foreign-namespace `<extensionElements>`,
 Diagram Interchange, `documentation`, text annotations) MUST be tolerated and
 ignored, never rejected.
 
-Each later milestone (parallelism, composition) widens this profile only by
-amending this constitution first — exactly as this M3 amendment does for timers,
-intermediate catch events, the `eventBasedGateway`, and the failure taxonomy.
+Each later milestone (composition) widens this profile only by amending this
+constitution first — exactly as this M4 amendment does for the block-structured
+parallel/inclusive concurrency set (and as the M3 amendment did for timers,
+intermediate catch events, the `eventBasedGateway`, and the failure taxonomy).
 
 Rationale: the product promise depends on making standard BPMN executable without
 inventing a notation or pretending to support the full BPMN ecosystem at once.
@@ -148,9 +187,14 @@ External messages MUST correlate by message name plus correlation key to exactly
 one eligible waiting process instance. Missing, ambiguous, duplicate, or late
 messages MUST have deterministic outcomes and clear API responses. A Receive
 Task wait state MUST be durable, and applying a received payload MUST be atomic
-with the transition that continues the instance. Human work remains outside the
-platform; the platform receives only the fact of that work as a BPMN-compatible
-message.
+with the transition that continues the instance. An **un-guarded** receive task
+or message `intermediateCatchEvent` — one carrying **no modeled deadline** (no
+boundary timer) — has no timeout and waits **indefinitely** (standard BPMN: no
+deadline ⇒ no expiry); operational liveness for an un-guarded **Service Task**
+instead comes from the job-activation DLQ (`jobActivationTimeout`), not an
+engine-level wait cap (M4 single-wake, TASK-54; the prior M3 leaf `waitTimeout`
+cap is retired). Human work remains outside the platform; the platform receives
+only the fact of that work as a BPMN-compatible message.
 
 Rationale: event correlation is the bridge between external systems and durable
 process execution, so weak matching would make the core flow unreliable.
@@ -170,8 +214,13 @@ execution without deploying a separate observability stack.
 ### VI. SAGA / Compensation Integrity
 
 When a transaction-saga is cancelled, the orchestrator MUST compensate the
-transaction's successfully completed activities **in reverse completion order**,
-scoped to that transaction. Each compensating action MUST be **idempotent** and
+transaction's successfully completed activities **in reverse order of completion
+within each causal chain (a token lineage)**, scoped to that transaction; ordering
+**between concurrent branches is unconstrained**. A straggler activity that
+completes after a parallel scope has begun compensating is still ledgered and
+compensated (at-least-once, idempotent) and, within its lineage, before any
+causally-earlier step. An instance completes only when **zero tokens remain in its
+frontier** (multi-token completion). Each compensating action MUST be **idempotent** and
 safe under **at-least-once** delivery (duplicate compensation callbacks MUST NOT
 compensate twice), and MUST receive both the original step input and the captured
 step output. Compensation MUST be triggered **only** by a transaction Cancel (an
@@ -202,7 +251,7 @@ invocation, external event waiting, event correlation, and basic execution
 history.
 
 The platform MUST NOT include built-in tasklists, BPMN User Task, forms,
-assignment, parallel / inclusive / complex gateways, conditional
+assignment, complex gateways, conditional
 or default sequence flows that do not leave an `exclusiveGateway`, timer
 **start** events, non-interrupting boundary timers, `timeCycle` triggers,
 signal / escalation / conditional events, non-catch message events (message
@@ -214,9 +263,9 @@ characteristics (`multiInstanceLoopCharacteristics` /
 the token path), process migration, full Zeebe/Camunda compatibility, a visual
 BPMN modeler, or advanced Operate-style UI unless this constitution is amended
 first. (Each of these is added only by its own later milestone amendment —
-M4 parallelism, M5 composition; the M3 time-&-failure-taxonomy set — interrupting
-boundary timers, timer/message intermediate catch events, the `eventBasedGateway`,
-and free error routing — is added by THIS amendment.)
+M5 composition; the M4 in-instance concurrency set — block-structured
+`parallelGateway` (AND) and `inclusiveGateway` (OR) — is added by THIS amendment,
+as the M3 time-&-failure-taxonomy set was by the prior one.)
 
 The accepted saga set — the `bpmn:transaction` scope, compensation / error /
 cancel boundary events, the `isForCompensation` handler, `bpmn:association`, the
@@ -231,7 +280,14 @@ a `serviceTask`/`receiveTask`, a timer/message `intermediateCatchEvent`, the
 triggers only) — is in scope as of this M3 amendment (Principle I); the validator
 opens each construct as its runtime layer ships and rejects it with
 "M3 — not yet implemented" until then (the interim state in
-`docs/bpmn/09-easy-bpmn-profile.md`). Nothing else was removed.
+`docs/bpmn/09-easy-bpmn-profile.md`). The accepted M4 concurrency set —
+block-structured (SESE) `bpmn:parallelGateway` (AND) and `bpmn:inclusiveGateway`
+(OR), each split paired with one matching same-type join — is in scope as of this
+M4 amendment (Principle I); this amendment opens **publish-time validation only**
+(a non-SESE / mismatched / branch-escaping / uncontrolled-merge / same-message
+region is rejected with element ids), and the concurrency runtime ships in later
+M4 layers. Only `parallel` and `inclusive` were removed from the exclusion list
+above (`complex` stays). Nothing else was removed.
 
 The first demo flow MUST run without requiring users to deploy their own workflow
 cluster, broker, BPMN engine, or dedicated operations stack.
@@ -276,4 +332,4 @@ Plans with unresolved constitution violations MUST NOT proceed to implementation
 until the violation is either removed or explicitly accepted through the
 Complexity Tracking section.
 
-**Version**: 2.2.0 | **Ratified**: 2026-06-07 | **Last Amended**: 2026-06-11
+**Version**: 2.3.1 | **Ratified**: 2026-06-07 | **Last Amended**: 2026-06-14

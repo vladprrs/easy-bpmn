@@ -11,7 +11,12 @@ import type { ExecutionGraph } from "../bpmn/graph";
 import { getInstanceRow, type InstanceRow } from "../persistence/instances";
 
 export type RunStep = <T>(name: string, fn: () => Promise<T>) => Promise<T>;
-export type WaitOutcome = { kind: "event"; payload: unknown } | { kind: "timeout" };
+// `parked` is a VESTIGIAL WaitOutcome member: it was the M4-L3 multi-wait sentinel
+// returned by the collecting waitFor, but TASK-54 collapsed onto a single bpmn_wake
+// (the leaf drivers PARK and never suspend), so the multi-wait race machinery
+// (WaitCollector / collectingWaitFor / raceParkedWaits) was removed. No code path
+// now produces `parked`; the member is left in the union as a harmless no-op.
+export type WaitOutcome = { kind: "event"; payload: unknown } | { kind: "timeout" } | { kind: "parked" };
 export type WaitForEvent = (sub: {
   name: string;
   workflowEventType: string;
@@ -22,8 +27,6 @@ export type DriveStatus = "completed" | "waiting" | "incident";
 export interface DriveResult {
   status: DriveStatus;
 }
-
-export const SVC_WAIT_TIMEOUT = "1 hour";
 
 export async function loadInst(env: Env, instanceId: string): Promise<InstanceRow> {
   const row = await getInstanceRow(env.DB, instanceId);

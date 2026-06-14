@@ -8,7 +8,6 @@
 
 import type { Env } from "../env";
 import type { ExecutionGraph, GraphNode } from "../bpmn/graph";
-import { workflowJobEventTypeFor } from "../bpmn/profile";
 import { MAX_EVENT_PAYLOAD_BYTES, payloadByteSize } from "./payload";
 import {
   isoIsBefore,
@@ -22,7 +21,7 @@ import {
   type JsonObject,
 } from "../util";
 import { ACTIVATION_TTL_MS, POISON_THRESHOLD } from "./retry-policy";
-import { failUnleasableJobConditional, getJobRowById, reopenJobKeepAttemptStmt } from "../persistence/jobs";
+import { failLeasedJobConditional, failUnleasableJobConditional, getJobRowById, listLockedForwardJobs, reopenJobKeepAttemptStmt } from "../persistence/jobs";
 import {
   armTimerDO,
   buildBoundaryArm,
@@ -30,9 +29,7 @@ import {
   convertOnFire,
   isUniqueConstraintViolation,
   settleBoundaryTimerCancel,
-  settleOverdueBoundaryTimerOnWake,
   timerBoundaryFor,
-  timerGuardedTimeout,
   timerHasFired,
 } from "./boundary-timer";
 import { getTimer, timerIdFor } from "../persistence/timers";
@@ -51,8 +48,10 @@ import {
   variableSnapshotStmt,
 } from "../persistence/instances";
 import { insertSagaStepStmt } from "../persistence/saga";
-import { loadInst, isTransactionScope, SVC_WAIT_TIMEOUT, type RunStep, type WaitForEvent } from "./engine-shared";
+import { loadInst, isTransactionScope, type RunStep, type WaitForEvent } from "./engine-shared";
 import { createIncident, parkWaiting } from "./incidents";
+import { resolveScope } from "./frontier";
+import { branchHistoryTags, getToken, parseOverlay, readOverlay, rootTokenId, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
 
 /**
  * The token-path node an error boundary on `elementId` routes the failed token
@@ -124,6 +123,7 @@ export async function driveForwardServiceTask(
   node: GraphNode,
   runStep: RunStep,
   waitFor: WaitForEvent | null,
+  activeTokenId?: string,
 ): Promise<ForwardOutcome> {
   const tag = `${elementId}#${occ}`;
   const tb = timerBoundaryFor(graph, elementId);
@@ -144,14 +144,14 @@ export async function driveForwardServiceTask(
   if (applied) return applied;
 
   if (job?.status === "completed") {
-    return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, job!));
+    return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, job!, activeTokenId));
   }
   if (job?.status === "failed") {
-    return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, job!));
+    return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, job!, activeTokenId));
   }
 
   if (!job) {
-    job = await runStep(`svc-create:${tag}`, () => createForwardJob(env, instanceId, graph, elementId, occ, node));
+    job = await runStep(`svc-create:${tag}`, () => createForwardJob(env, instanceId, graph, elementId, occ, node, activeTokenId));
     if (!job) return { kind: "incident" }; // oversized input → incident already recorded
   } else if (tb) {
     // Self-healing re-arm (design §4.2): a rewalk landing on a still-armed timer
@@ -160,81 +160,13 @@ export async function driveForwardServiceTask(
     if (trow?.status === "armed") await armTimerDO(env, trow.timerId, trow.fireAt);
   }
 
-  // Park (direct mode) — the instance resumes by re-running once the worker's
-  // complete/fail mutates the job in D1 (or the timer alarm fires).
-  if (!waitFor) {
-    await runStep(`svc-park:${tag}`, () => parkWaiting(env, instanceId, elementId, "serviceTask"));
-    return { kind: "waiting" };
-  }
-
-  // Suspend (workflow mode) — re-lease drives retries within this single wait. A
-  // timer-guarded wait is SIZED to the timer (so a long timer costs O(1) steps).
-  const timeout = tb ? await timerGuardedTimeout(env, instanceId, tb, occ) : SVC_WAIT_TIMEOUT;
-  const outcome = await waitFor({
-    name: `wait-job:${tag}`,
-    workflowEventType: workflowJobEventTypeFor(job.job_id),
-    timeout,
-  });
-  // The timer may have fired (its sendEvent wake, or a concurrent alarm) while we
-  // waited — re-read the decider FIRST so an abandoned job is not misread as a fail.
-  if (tb && (await timerHasFired(env, instanceId, tb, occ))) {
-    return { kind: "next", next: tb.node.next! };
-  }
-  // D1 is canonical: re-read the job whether we woke on the event OR on a timeout.
-  // A lost wake-up event (swallowed sendEvent, isolate eviction) for an already
-  // terminal job must be applied here, not masked as a spurious timeout incident.
-  const fresh = (await getForwardJob(env.DB, instanceId, elementId, occ)) ?? job;
-  // A concurrent inline drive may have applied the outcome while we waited.
-  const appliedMeanwhile = appliedForwardOutcome(graph, elementId, node, fresh);
-  if (appliedMeanwhile) return appliedMeanwhile;
-  if (fresh.status === "completed") {
-    return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, fresh));
-  }
-  if (fresh.status === "failed") {
-    return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, fresh));
-  }
-  if (outcome.kind === "timeout") {
-    if (tb) {
-      // Lost-alarm backstop (design §4.2, risk R5). A wait guarded by a modeled
-      // timer NEVER raises waitTimeout. The DO alarm is the PRIMARY firing
-      // mechanism; this timer-SIZED timeout doubles as the backstop for a lost/
-      // failed alarm: on this wake re-read D1 and settle an OVERDUE timer INLINE
-      // exactly as the alarm path would, RETURNING the boundary path to THIS drive
-      // loop. We are already inside a drive, so there is no executor wake here —
-      // that is what avoids the runtime/timers → executor → engine import cycle.
-      // (Workflow-mode-only; the DO-alarm fire path is the CI-tested mechanism.)
-      const settled = await settleOverdueBoundaryTimerOnWake(env, graph, instanceId, elementId, occ);
-      if (settled.kind === "fired") return { kind: "next", next: settled.next };
-      if (settled.kind === "reparked") return { kind: "waiting" }; // armed-but-early → re-armed; re-park
-      // fallThrough: a concurrent normal resolution settled the timer 'cancelled'
-      // (its transition rode the same batch) — re-read and run the normal completed/
-      // failed/applied handling so a swallowed wake is not stranded.
-      const settledJob = (await getForwardJob(env.DB, instanceId, elementId, occ)) ?? fresh;
-      const appliedAfterSettle = appliedForwardOutcome(graph, elementId, node, settledJob);
-      if (appliedAfterSettle) return appliedAfterSettle;
-      if (settledJob.status === "completed") {
-        return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, settledJob));
-      }
-      if (settledJob.status === "failed") {
-        return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, settledJob));
-      }
-      return { kind: "waiting" }; // still parked (e.g. a concurrent /cancel terminal) — re-park
-    }
-    // A genuine UN-GUARDED wait-cap: nobody completed the job (still created/locked).
-    // M3-L1 (TASK-39): the un-guarded service-task wait cap is 'waitTimeout', split
-    // out of the legacy overloaded 'timeout'. NOTE: `outcome.kind === "timeout"` is
-    // the wait-OUTCOME discriminator (a different axis) — only the incident changes.
-    return runStep(`svc-timeout:${tag}`, () =>
-      createIncident(env, instanceId, elementId, node.retries ?? 1, "Service Task timed out waiting for a worker.", { jobId: fresh.job_id }, "waitTimeout"),
-    );
-  }
-  // Defensive: event arrived but job is not terminal — treat as a technical incident.
-  return runStep(`svc-stuck:${tag}`, () =>
-    createIncident(env, instanceId, elementId, fresh.attempt_count, "Service Task resumed with a non-terminal job.", { jobId: fresh.job_id }, "serviceTaskFailure"),
-  );
+  // Park: the instance resumes on the next drive (a /jobs/complete tickle in workflow
+  // mode, or an inline re-drive in direct mode) once the job mutates in D1.
+  await runStep(`svc-park:${tag}`, () => parkWaiting(env, instanceId, elementId, occ, "serviceTask"));
+  return { kind: "waiting" };
 }
 
-async function createForwardJob(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, node: GraphNode): Promise<JobRow | null> {
+async function createForwardJob(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, node: GraphNode, activeTokenId?: string): Promise<JobRow | null> {
   // Idempotent re-run (Workflow step retry after a committed batch): this
   // iteration's row already exists → return it, never re-insert (the unique
   // index on (instance, element, kind, occurrence) would reject anyway).
@@ -242,7 +174,13 @@ async function createForwardJob(env: Env, instanceId: string, graph: ExecutionGr
   if (existing) return existing;
 
   const inst = await loadInst(env, instanceId);
-  const variables = parseJson<JsonObject>(inst.variables, {});
+  // Branch-scoped input (design §5.7): a branch token's job sees its resolved
+  // overlay chain (root vars + ancestor overlays, nearest wins); a null/root
+  // token reads root variables verbatim (the exact M0–M3 path).
+  const isBranch = !!activeTokenId && activeTokenId !== rootTokenId(instanceId);
+  const variables = isBranch
+    ? await resolveScope(env, instanceId, parseJson<JsonObject>(inst.variables, {}), activeTokenId!)
+    : parseJson<JsonObject>(inst.variables, {});
   if (payloadByteSize(variables) > MAX_EVENT_PAYLOAD_BYTES) {
     await createIncident(env, instanceId, elementId, 0, "Service Task input variables exceed the Workflow event payload limit.", { size: payloadByteSize(variables) }, "serviceTaskFailure");
     return null;
@@ -263,7 +201,7 @@ async function createForwardJob(env: Env, instanceId: string, graph: ExecutionGr
       instanceId,
       elementId,
       type: "elementEntered",
-      diagnostics: { elementType: "serviceTask", taskType, occurrence: occ },
+      diagnostics: { elementType: "serviceTask", taskType, occurrence: occ, ...branchHistoryTags(activeTokenId) },
     }),
     createJobStmt(env.DB, {
       jobId,
@@ -284,7 +222,7 @@ async function createForwardJob(env: Env, instanceId: string, graph: ExecutionGr
       instanceId,
       elementId,
       type: "serviceTaskJobCreated",
-      diagnostics: { jobId, taskType, retryLimit: Math.max(1, node.retries ?? 1), activationExpiresAt, occurrence: occ },
+      diagnostics: { jobId, taskType, retryLimit: Math.max(1, node.retries ?? 1), activationExpiresAt, occurrence: occ, ...branchHistoryTags(activeTokenId) },
     }),
     ...(arm ? arm.stmts : []),
   ]);
@@ -308,6 +246,22 @@ async function armJobScheduler(env: Env, jobId: string, activationExpiresAt: str
 }
 
 /**
+ * Arm a per-job lease-expiry terminator (design §8.2) for EVERY in-flight cohort
+ * forward job when a scope enters `compensating` — so the quiescence barrier never
+ * depends on a future `/jobs/activate` poll (blocker 8). Re-uses the JobScheduler DLQ
+ * alarm: its fire routes to `terminateUnleasableJob`, whose locked-cohort branch
+ * claims the expired lease `failed` and re-drives. Best-effort (a DO hiccup just
+ * leaves that job to the poll-only reclaim), and a no-op for single-token instances
+ * (no locked forward job survives to a cancel).
+ */
+export async function armCohortLeaseExpiryTerminators(env: Env, instanceId: string): Promise<void> {
+  const locked = await listLockedForwardJobs(env.DB, instanceId);
+  for (const job of locked) {
+    if (job.lock_expires_at) await armJobScheduler(env, job.job_id, job.lock_expires_at);
+  }
+}
+
+/**
  * DLQ termination (§4.2), invoked by the JobScheduler alarm at activation_expires_at.
  * D1 is canonical — the DO holds no authoritative state — so this re-reads the job
  * and only acts if it is STILL an un-leased, expired forward job on a non-terminal
@@ -319,12 +273,38 @@ async function armJobScheduler(env: Env, jobId: string, activationExpiresAt: str
 export async function terminateUnleasableJob(env: Env, jobId: string): Promise<void> {
   const job = await getJobRowById(env.DB, jobId);
   if (!job || job.is_compensation === 1) return;
-  if (!(job.status === "created" && job.attempt_count === 0)) return; // leased/completed/failed → no-op
   const now = nowIso();
+
+  // M4-L5 (design §8.2): the in-flight cohort lease-expiry terminator. While the
+  // instance is COMPENSATING, a still-`locked` cohort forward job whose lease has
+  // expired (its worker vanished) MUST be driven terminal so the quiescence barrier
+  // never depends on a future /jobs/activate poll. Claim it `failed` (race-safe vs a
+  // concurrent straggler complete by the `status='locked'` guard), then re-drive so
+  // the straggler scan discards the now-failed token. Only the compensating cohort
+  // takes this path — a normal leased job on a running instance no-ops here.
+  if (job.status === "locked") {
+    const linst = await getInstanceRow(env.DB, job.instance_id);
+    if (!linst || linst.status !== "compensating") return;
+    if (!job.lock_expires_at || isoIsBefore(now, job.lock_expires_at)) return; // lease not yet expired
+    if ((await failLeasedJobConditional(env.DB, jobId, now)) === 0) return; // a complete won the race
+    // Dynamic import: forward-task.ts is imported BY engine.ts (terminateUnleasableJob),
+    // so a static `import { resumeInline } from "./engine"` would form a cycle.
+    const { resumeInline } = await import("./engine");
+    await resumeInline(env, linst.instance_id);
+    return;
+  }
+
+  if (!(job.status === "created" && job.attempt_count === 0)) return; // leased/completed/failed → no-op
   if (!job.activation_expires_at || isoIsBefore(now, job.activation_expires_at)) return; // not yet expired (early/spurious alarm)
 
+  // M4-L5 (design §8.2): the un-leasable DLQ MUST fire even while the instance is
+  // COMPENSATING (the old `inst.status === "compensating"` early-return is dropped),
+  // so a never-leased cohort forward job goes terminal → its token is discarded by
+  // the next compensating drive's straggler scan and the barrier drains. Safe: the
+  // atomic created→failed claim never regresses a compensating status, and the
+  // guarded transition below (running/waiting → incident) is a 0-row no-op for it.
   const inst = await getInstanceRow(env.DB, job.instance_id);
-  if (!inst || isTerminalInstanceStatus(inst.status) || inst.status === "compensating") return;
+  if (!inst || isTerminalInstanceStatus(inst.status)) return;
 
   // Atomic claim: only ONE of {this DLQ pass, a concurrent /jobs/activate, a worker
   // completing} can flip created→failed. If the job was leased/advanced in the
@@ -368,6 +348,7 @@ async function applyForwardCompletion(
   occ: number,
   node: GraphNode,
   job: JobRow,
+  activeTokenId?: string,
 ): Promise<ForwardOutcome> {
   // Apply-once guard (idempotent step body): a Workflow step retry after the
   // batch below committed must not re-merge the output over newer variables.
@@ -379,7 +360,14 @@ async function applyForwardCompletion(
   const next = node.next!;
   const input = parseJson<JsonObject>(job.input_variables, {});
   const output = parseJson<JsonObject>(job.output_variables, {});
-  const merged = mergeVariables(parseJson<JsonObject>(inst.variables, {}), output);
+  // Branch-scoped output (design §5.7): a branch token's output merges onto its
+  // OWN overlay (not root); root vars mutate only at the join fold-up. A
+  // null/root token keeps the M0–M3 path (merge into process_instances.variables).
+  const isBranch = !!activeTokenId && activeTokenId !== rootTokenId(instanceId);
+  const branchTokenRow = isBranch ? await getToken(env.DB, activeTokenId!) : null;
+  // R2-aware read (M4-L6, design §9.1): a branch overlay may be an {"__r2":…} ref.
+  const baseVars = isBranch ? (branchTokenRow ? await readOverlay(env, parseOverlay(branchTokenRow)) : {}) : parseJson<JsonObject>(inst.variables, {});
+  const merged = mergeVariables(baseVars, output);
   const now = nowIso();
 
   // Poison detection (§4.3): the per-call output already passed the payload limit
@@ -406,7 +394,7 @@ async function applyForwardCompletion(
         instanceId,
         elementId,
         type: "poisonJob",
-        diagnostics: { jobId: job.job_id, strikes: strike, mergedSize: payloadByteSize(merged) },
+        diagnostics: { jobId: job.job_id, strikes: strike, mergedSize: payloadByteSize(merged), ...branchHistoryTags(activeTokenId) },
       }).run();
       // Like the DLQ jobActivationTimeout race, this poison terminal does NOT settle
       // the host's boundary timer (no decider claim) — it is left `armed` on a now-
@@ -431,12 +419,18 @@ async function applyForwardCompletion(
         instanceId,
         elementId,
         type: "serviceTaskOutputRejected",
-        diagnostics: { jobId: job.job_id, strike, mergedSize: payloadByteSize(merged), reason: "merged variables exceed the event payload limit" },
+        diagnostics: { jobId: job.job_id, strike, mergedSize: payloadByteSize(merged), reason: "merged variables exceed the event payload limit", ...branchHistoryTags(activeTokenId) },
       }),
       applyTransitionStmt(env.DB, { instanceId, currentElementId: elementId, status: "waiting", now }),
     ]);
     return { kind: "waiting" };
   }
+
+  // R2-aware write (M4-L6, design §9.1): offload a large branch overlay to R2 BEFORE
+  // the D1 commit (deterministic key ⇒ a crash-retry is byte-identical). Reached
+  // only when merged is within the event-payload limit (the poison gate above);
+  // root vars stay inline.
+  const storedBranchOverlay = isBranch ? await writeOverlay(env, instanceId, activeTokenId!, merged) : merged;
 
   const statements: D1PreparedStatement[] = [
     variableSnapshotStmt(env.DB, { instanceId, source: "serviceTask", sourceId: job.job_id, variables: output, now }),
@@ -445,9 +439,18 @@ async function applyForwardCompletion(
       instanceId,
       elementId,
       type: "serviceTaskCompleted",
-      diagnostics: { jobId: job.job_id, attempts: job.attempt_count, traceId: traceIdFor(instanceId), occurrence: occ },
+      diagnostics: { jobId: job.job_id, attempts: job.attempt_count, traceId: traceIdFor(instanceId), occurrence: occ, ...branchHistoryTags(activeTokenId) },
     }),
-    applyTransitionStmt(env.DB, { instanceId, variables: merged, currentElementId: next, status: "running", now }),
+    // A branch token's output goes to its OWN overlay (design §5.7); the instance
+    // status moves to 'running' WITHOUT touching root vars or pinning a single
+    // current_element_id (NULL = multi-token frontier, §5.3). A root/single-token
+    // token keeps the exact M0–M3 write (merged → process_instances.variables).
+    ...(isBranch
+      ? [
+          setTokenOverlayStmt(env.DB, activeTokenId!, storedBranchOverlay, now),
+          applyTransitionStmt(env.DB, { instanceId, currentElementId: null, status: "running", now }),
+        ]
+      : [applyTransitionStmt(env.DB, { instanceId, variables: merged, currentElementId: next, status: "running", now })]),
     // The applied marker commits ATOMICALLY with the advance (design M2 §5):
     // the rewalk treats this visit as write-free fast-forward from here on.
     markJobOutputAppliedStmt(env.DB, job.job_id, now),
@@ -471,6 +474,10 @@ async function applyForwardCompletion(
         compensationStatus: wiring ? "pending" : "notRequired",
         traceId: traceIdFor(instanceId),
         occurrence: occ,
+        // M4-L5 (design §8.4): carry the producing branch token so the reverse
+        // pass compensates this step only once its lineage quiesces. NULL on the
+        // root/single-token (M1–M3) path → filterLineageQuiesced is a no-op there.
+        tokenId: activeTokenId ?? null,
         now,
       }),
     );
@@ -501,6 +508,7 @@ async function handleForwardFailure(
   occ: number,
   node: GraphNode,
   job: JobRow,
+  activeTokenId?: string,
 ): Promise<ForwardOutcome> {
   // Route-once guard (idempotent step body): a re-run after the business-error
   // batch committed fast-forwards to the recorded boundary target instead of
@@ -524,7 +532,7 @@ async function handleForwardFailure(
           instanceId,
           elementId,
           type: "businessErrorCaught",
-          diagnostics: { jobId: job.job_id, errorCode: job.error_code, boundaryTarget: target, occurrence: occ },
+          diagnostics: { jobId: job.job_id, errorCode: job.error_code, boundaryTarget: target, occurrence: occ, ...branchHistoryTags(activeTokenId) },
         }),
         applyTransitionStmt(env.DB, { instanceId, currentElementId: target, status: "running", now }),
         // Atomic with the route: the rewalk fast-forwards this visit by

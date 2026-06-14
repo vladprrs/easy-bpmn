@@ -760,6 +760,210 @@ export const MULTI_INSTANCE_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
   </bpmn:process>
 </bpmn:definitions>`;
 
+/** Balanced AND region: fork → {reserve-stock, authorize-payment} → join. ACCEPTED from M4-L1. */
+export const PARALLEL_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_par" targetNamespace="x">
+  <bpmn:process id="P_par" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>s0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="fork"/>
+    <bpmn:parallelGateway id="fork"><bpmn:incoming>s0</bpmn:incoming><bpmn:outgoing>f1</bpmn:outgoing><bpmn:outgoing>f2</bpmn:outgoing></bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="f1" sourceRef="fork" targetRef="A"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="B"/>
+    <bpmn:serviceTask id="A" name="Reserve"><bpmn:extensionElements><easy-bpmn:taskDefinition type="reserve-stock"/></bpmn:extensionElements><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>j1</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:serviceTask id="B" name="Authorize"><bpmn:extensionElements><easy-bpmn:taskDefinition type="authorize-payment"/></bpmn:extensionElements><bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>j2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:parallelGateway id="join"><bpmn:incoming>j1</bpmn:incoming><bpmn:incoming>j2</bpmn:incoming><bpmn:outgoing>s1</bpmn:outgoing></bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="j1" sourceRef="A" targetRef="join"/>
+    <bpmn:sequenceFlow id="j2" sourceRef="B" targetRef="join"/>
+    <bpmn:sequenceFlow id="s1" sourceRef="join" targetRef="C"/>
+    <bpmn:serviceTask id="C" name="Confirm"><bpmn:extensionElements><easy-bpmn:taskDefinition type="confirm-order"/></bpmn:extensionElements><bpmn:incoming>s1</bpmn:incoming><bpmn:outgoing>s2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="s2" sourceRef="C" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>s2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
+ * Parallel SAGA (M4-L5): a <transaction> wrapping a strongly-SESE AND fork/join
+ * where EACH branch is one compensatable service task (compensation boundary →
+ * handler). The region (fork↔join) stays balanced — the SESE validator (design
+ * §4.1 rules 4/5) rejects any branch boundary that escapes the region to a cancel
+ * end — so the cancel is triggered by a POST-JOIN `settle` task whose interrupting
+ * error boundary routes to the cancel end (the SAGA_XOR_BPMN compensation+error+
+ * cancel pattern, with the two compensatable tasks now concurrent). Steerable:
+ *   - `failSettle`   → settle raises a BUSINESS error → Tx_cancel → reverse-
+ *                      compensate the completed branch steps across the cohort.
+ *   - `hazardBranchB`→ branch B exhausts its retries → a TECHNICAL Hazard (whole-
+ *                      instance incident, design §5.6) with branch A frozen (L5.5).
+ *   - (no flag)      → both branches + settle complete → the transaction commits.
+ * At the post-join cancel the merged branch tokens are `merged` while the produced
+ * root token is live at `settle` — the reverse pass's straggler scan discards it
+ * (a failed forward job owes no compensation) and the barrier holds until then.
+ */
+export const PARALLEL_SAGA_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+                  id="D_parsaga" targetNamespace="http://easy-bpmn/example/parallel-saga">
+  <bpmn:error id="Err_settle" name="Settle rejected" errorCode="SETTLE_REJECTED"/>
+  <bpmn:process id="ParallelSaga" isExecutable="true">
+    <bpmn:startEvent id="Start"><bpmn:outgoing>g1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:transaction id="Tx_par" name="Parallel work">
+      <bpmn:startEvent id="Tx_start"><bpmn:outgoing>tx0</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:parallelGateway id="fork"><bpmn:incoming>tx0</bpmn:incoming><bpmn:outgoing>f_a</bpmn:outgoing><bpmn:outgoing>f_b</bpmn:outgoing></bpmn:parallelGateway>
+      <bpmn:serviceTask id="branchA" name="Branch A">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="branch-a" retries="2"/></bpmn:extensionElements>
+        <bpmn:incoming>f_a</bpmn:incoming><bpmn:outgoing>j_a</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="branchA_comp" attachedToRef="branchA"><bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="compA" name="Compensate A" isForCompensation="true">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="comp-a" retries="3"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:association id="aA" associationDirection="One" sourceRef="branchA_comp" targetRef="compA"/>
+      <bpmn:serviceTask id="branchB" name="Branch B">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="branch-b" retries="1"/></bpmn:extensionElements>
+        <bpmn:incoming>f_b</bpmn:incoming><bpmn:outgoing>j_b</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="branchB_comp" attachedToRef="branchB"><bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="compB" name="Compensate B" isForCompensation="true">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="comp-b" retries="3"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:association id="aB" associationDirection="One" sourceRef="branchB_comp" targetRef="compB"/>
+      <bpmn:parallelGateway id="join"><bpmn:incoming>j_a</bpmn:incoming><bpmn:incoming>j_b</bpmn:incoming><bpmn:outgoing>t_join</bpmn:outgoing></bpmn:parallelGateway>
+      <bpmn:serviceTask id="settle" name="Settle">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="branch-settle" retries="1"/></bpmn:extensionElements>
+        <bpmn:incoming>t_join</bpmn:incoming><bpmn:outgoing>t_ok</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="settle_err" attachedToRef="settle"><bpmn:errorEventDefinition errorRef="Err_settle"/></bpmn:boundaryEvent>
+      <bpmn:endEvent id="Tx_ok"><bpmn:incoming>t_ok</bpmn:incoming></bpmn:endEvent>
+      <bpmn:endEvent id="Tx_cancel"><bpmn:cancelEventDefinition/></bpmn:endEvent>
+      <bpmn:sequenceFlow id="tx0"   sourceRef="Tx_start"   targetRef="fork"/>
+      <bpmn:sequenceFlow id="f_a"   sourceRef="fork"       targetRef="branchA"/>
+      <bpmn:sequenceFlow id="f_b"   sourceRef="fork"       targetRef="branchB"/>
+      <bpmn:sequenceFlow id="j_a"   sourceRef="branchA"    targetRef="join"/>
+      <bpmn:sequenceFlow id="j_b"   sourceRef="branchB"    targetRef="join"/>
+      <bpmn:sequenceFlow id="t_join" sourceRef="join"      targetRef="settle"/>
+      <bpmn:sequenceFlow id="t_ok"  sourceRef="settle"     targetRef="Tx_ok"/>
+      <bpmn:sequenceFlow id="fe"    sourceRef="settle_err" targetRef="Tx_cancel"/>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="Tx_cancelled" attachedToRef="Tx_par"><bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:endEvent id="Done"><bpmn:incoming>g2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="Failed"><bpmn:incoming>g3</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="g1" sourceRef="Start"        targetRef="Tx_par"/>
+    <bpmn:sequenceFlow id="g2" sourceRef="Tx_par"       targetRef="Done"/>
+    <bpmn:sequenceFlow id="g3" sourceRef="Tx_cancelled" targetRef="Failed"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
+ * Nested AND regions (M4-L3.5): outer fork/join with an inner fork/join wholly
+ * inside outer branch f1. fork → { f1: if → {A1, A2} → ij, f2: B } → join → C → E.
+ * The inner join (ij) folds its merged overlay onto the f1 (enclosing-branch) token,
+ * which then satisfies the outer join. Mirrors the validateRegions nested-accept
+ * structure (regions keyed by ["fork","if"]); ACCEPTED from M4-L1.
+ */
+export const NESTED_PARALLEL_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_nest" targetNamespace="x">
+  <bpmn:process id="P_nest" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>s0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="fork"/>
+    <bpmn:parallelGateway id="fork"><bpmn:incoming>s0</bpmn:incoming><bpmn:outgoing>f1</bpmn:outgoing><bpmn:outgoing>f2</bpmn:outgoing></bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="f1" sourceRef="fork" targetRef="if"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="B"/>
+    <bpmn:parallelGateway id="if"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>i1</bpmn:outgoing><bpmn:outgoing>i2</bpmn:outgoing></bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="i1" sourceRef="if" targetRef="A1"/>
+    <bpmn:sequenceFlow id="i2" sourceRef="if" targetRef="A2"/>
+    <bpmn:serviceTask id="A1" name="InnerA1"><bpmn:extensionElements><easy-bpmn:taskDefinition type="inner-a1"/></bpmn:extensionElements><bpmn:incoming>i1</bpmn:incoming><bpmn:outgoing>k1</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:serviceTask id="A2" name="InnerA2"><bpmn:extensionElements><easy-bpmn:taskDefinition type="inner-a2"/></bpmn:extensionElements><bpmn:incoming>i2</bpmn:incoming><bpmn:outgoing>k2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="k1" sourceRef="A1" targetRef="ij"/>
+    <bpmn:sequenceFlow id="k2" sourceRef="A2" targetRef="ij"/>
+    <bpmn:parallelGateway id="ij"><bpmn:incoming>k1</bpmn:incoming><bpmn:incoming>k2</bpmn:incoming><bpmn:outgoing>m1</bpmn:outgoing></bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="m1" sourceRef="ij" targetRef="join"/>
+    <bpmn:serviceTask id="B" name="OuterB"><bpmn:extensionElements><easy-bpmn:taskDefinition type="outer-b"/></bpmn:extensionElements><bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>m2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="m2" sourceRef="B" targetRef="join"/>
+    <bpmn:parallelGateway id="join"><bpmn:incoming>m1</bpmn:incoming><bpmn:incoming>m2</bpmn:incoming><bpmn:outgoing>s1</bpmn:outgoing></bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="s1" sourceRef="join" targetRef="C"/>
+    <bpmn:serviceTask id="C" name="AfterJoin"><bpmn:extensionElements><easy-bpmn:taskDefinition type="after-join"/></bpmn:extensionElements><bpmn:incoming>s1</bpmn:incoming><bpmn:outgoing>s2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="s2" sourceRef="C" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>s2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/** Inclusive (OR) split with two FEEL-conditional branches + default, matching OR join. ACCEPTED from M4-L1. */
+export const INCLUSIVE_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_inc" targetNamespace="x">
+  <bpmn:process id="P_inc" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>s0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="fork"/>
+    <bpmn:inclusiveGateway id="fork" default="f_def"><bpmn:incoming>s0</bpmn:incoming><bpmn:outgoing>f_email</bpmn:outgoing><bpmn:outgoing>f_sms</bpmn:outgoing><bpmn:outgoing>f_def</bpmn:outgoing></bpmn:inclusiveGateway>
+    <bpmn:sequenceFlow id="f_email" sourceRef="fork" targetRef="Email"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">wantsEmail = true</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_sms" sourceRef="fork" targetRef="Sms"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">wantsSms = true</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_def" sourceRef="fork" targetRef="Log"/>
+    <bpmn:serviceTask id="Email"><bpmn:extensionElements><easy-bpmn:taskDefinition type="send-email"/></bpmn:extensionElements><bpmn:incoming>f_email</bpmn:incoming><bpmn:outgoing>j1</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:serviceTask id="Sms"><bpmn:extensionElements><easy-bpmn:taskDefinition type="send-sms"/></bpmn:extensionElements><bpmn:incoming>f_sms</bpmn:incoming><bpmn:outgoing>j2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:serviceTask id="Log"><bpmn:extensionElements><easy-bpmn:taskDefinition type="log-only"/></bpmn:extensionElements><bpmn:incoming>f_def</bpmn:incoming><bpmn:outgoing>j3</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:inclusiveGateway id="join"><bpmn:incoming>j1</bpmn:incoming><bpmn:incoming>j2</bpmn:incoming><bpmn:incoming>j3</bpmn:incoming><bpmn:outgoing>s1</bpmn:outgoing></bpmn:inclusiveGateway>
+    <bpmn:sequenceFlow id="j1" sourceRef="Email" targetRef="join"/>
+    <bpmn:sequenceFlow id="j2" sourceRef="Sms" targetRef="join"/>
+    <bpmn:sequenceFlow id="j3" sourceRef="Log" targetRef="join"/>
+    <bpmn:sequenceFlow id="s1" sourceRef="join" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>s1</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/** AND split whose branch loses its token to a none end → join can never fire. REJECTED (non-SESE). */
+export const PARALLEL_DEADLOCK_BPMN = PARALLEL_BPMN
+  .replace('<bpmn:sequenceFlow id="j2" sourceRef="B" targetRef="join"/>', '<bpmn:sequenceFlow id="j2" sourceRef="B" targetRef="Eb"/>\n    <bpmn:endEvent id="Eb"><bpmn:incoming>j2</bpmn:incoming></bpmn:endEvent>')
+  .replace('<bpmn:incoming>j1</bpmn:incoming><bpmn:incoming>j2</bpmn:incoming>', '<bpmn:incoming>j1</bpmn:incoming>');
+
+/** AND split, INCLUSIVE join — mismatched join type. REJECTED. */
+export const PARALLEL_MISMATCH_BPMN = PARALLEL_BPMN.replace(
+  '<bpmn:parallelGateway id="join">', '<bpmn:inclusiveGateway id="join">',
+).replace('<bpmn:outgoing>s1</bpmn:outgoing></bpmn:parallelGateway>\n    <bpmn:sequenceFlow id="j1"', '<bpmn:outgoing>s1</bpmn:outgoing></bpmn:inclusiveGateway>\n    <bpmn:sequenceFlow id="j1"');
+
+/** Two parallel branches both wait on the SAME message name → broker key collision. REJECTED (blocker 14). */
+export const PARALLEL_SAME_MESSAGE_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D_pm" targetNamespace="x">
+  <bpmn:message id="M" name="Approval"/>
+  <bpmn:process id="P_pm" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>s0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="fork"/>
+    <bpmn:parallelGateway id="fork"><bpmn:incoming>s0</bpmn:incoming><bpmn:outgoing>f1</bpmn:outgoing><bpmn:outgoing>f2</bpmn:outgoing></bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="f1" sourceRef="fork" targetRef="R1"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="R2"/>
+    <bpmn:receiveTask id="R1" messageRef="M"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>j1</bpmn:outgoing></bpmn:receiveTask>
+    <bpmn:receiveTask id="R2" messageRef="M"><bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>j2</bpmn:outgoing></bpmn:receiveTask>
+    <bpmn:parallelGateway id="join"><bpmn:incoming>j1</bpmn:incoming><bpmn:incoming>j2</bpmn:incoming><bpmn:outgoing>s1</bpmn:outgoing></bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="j1" sourceRef="R1" targetRef="join"/>
+    <bpmn:sequenceFlow id="j2" sourceRef="R2" targetRef="join"/>
+    <bpmn:sequenceFlow id="s1" sourceRef="join" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>s1</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
+ * AND region with a message catch in EACH branch on DISTINCT message names
+ * (no broker-key collision — accepted, unlike PARALLEL_SAME_MESSAGE_BPMN). Each
+ * branch's applied payload must land on its OWN token overlay (design §5.7), so the
+ * join merges them in document order (f2 "Paid" wins a shared key over f1 "Ready").
+ */
+export const PARALLEL_MESSAGE_DISTINCT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D_pmd" targetNamespace="x">
+  <bpmn:message id="MA" name="Ready"/>
+  <bpmn:message id="MB" name="Paid"/>
+  <bpmn:process id="P_pmd" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>s0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="s0" sourceRef="S" targetRef="fork"/>
+    <bpmn:parallelGateway id="fork"><bpmn:incoming>s0</bpmn:incoming><bpmn:outgoing>f1</bpmn:outgoing><bpmn:outgoing>f2</bpmn:outgoing></bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="f1" sourceRef="fork" targetRef="R1"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="R2"/>
+    <bpmn:receiveTask id="R1" name="AwaitReady" messageRef="MA"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>j1</bpmn:outgoing></bpmn:receiveTask>
+    <bpmn:receiveTask id="R2" name="AwaitPaid" messageRef="MB"><bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>j2</bpmn:outgoing></bpmn:receiveTask>
+    <bpmn:parallelGateway id="join"><bpmn:incoming>j1</bpmn:incoming><bpmn:incoming>j2</bpmn:incoming><bpmn:outgoing>s1</bpmn:outgoing></bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="j1" sourceRef="R1" targetRef="join"/>
+    <bpmn:sequenceFlow id="j2" sourceRef="R2" targetRef="join"/>
+    <bpmn:sequenceFlow id="s1" sourceRef="join" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>s1</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
 /** A Receive Task referencing a <message> with no name — not correlatable. */
 export const EMPTY_MESSAGE_NAME_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D" targetNamespace="x">

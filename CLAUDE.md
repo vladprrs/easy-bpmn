@@ -12,8 +12,9 @@ makes a standard subset of BPMN 2.0 executable without Camunda/Zeebe. Implemente
 - **M2** — conditional sagas (`exclusiveGateway`, FEEL conditions via `feelin`, default flows, token-path cycles with per-occurrence ledger rows)
 
 - **M3** — time & failure taxonomy (interrupting boundary/intermediate timers, message intermediate catch, `eventBasedGateway`, free error routing, the `timeout` incident-kind split + honored `retryable`) — **shipped** (constitution v2.2.0; the runtime opened per validator layer, now complete).
+- **M4** — concurrency (block-structured `parallelGateway` AND / `inclusiveGateway` OR (SESE), the token frontier, AND/OR-join barrier, branch-local variable merge, parallel-branch compensation) — **shipped** (constitution v2.3.0; the single-wake engine, TASK-54, **re-validated GREEN on real Cloudflare Workflows 2026-06-14**, Worker Version `f194b722` — the L6.6 multi-wait defect is resolved).
 
-**M4 (concurrency: parallel gateway, token set, AND-join) is the next milestone.** The Worker is live at `https://bpmn.rntme.com`
+**M5 (composition) is the next milestone.** The Worker is live at `https://bpmn.rntme.com`
 (Cloudflare Workers + D1 + Durable Object broker + Workflow), with GitHub Actions CI/CD at the repo root.
 
 ## Source-of-truth hierarchy (read this before changing anything)

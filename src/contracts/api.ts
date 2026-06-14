@@ -140,7 +140,10 @@ export interface BpmnElement {
     // M3 time & failure taxonomy — a timer/message delay on the token path and
     // the eventBasedGateway timer/message race over branch catches (M3-L4):
     | "intermediateCatchEvent"
-    | "eventBasedGateway";
+    | "eventBasedGateway"
+    // M4 concurrency — block-structured AND/OR split/join gateways (M4-L1).
+    | "parallelGateway"
+    | "inclusiveGateway";
   name?: string | null;
   taskType?: string | null;
   messageName?: string | null;
@@ -212,8 +215,11 @@ export interface Incident {
   /**
    * Incident taxonomy + remediation linkage. SAGA (M1) base + M2 (loopLimit |
    * noPath) + M3-L1 (TASK-39) split: jobActivationTimeout (DLQ) | waitTimeout
-   * (service/receive wait caps) | conditionFailure (hard FEEL error). `timeout`
-   * is LEGACY — retained for compatibility, never written by current code.
+   * (service/receive wait caps) | conditionFailure (hard FEEL error) + M4-L6
+   * concurrency caps: concurrencyLimit (fan-out exceeded MAX_CONCURRENT_TOKENS) |
+   * stepBudget (per-drive step counter crossed STEP_BUDGET_SOFT, below the
+   * platform step ceiling). `timeout` is LEGACY — retained for compatibility,
+   * never written by current code.
    */
   kind?: IncidentKind;
   resolution?: "open" | "compensating" | "compensated" | "operatorResolved";
@@ -257,6 +263,31 @@ export const timerInspectionSchema = z.object({
 });
 export type TimerInspection = z.infer<typeof timerInspectionSchema>;
 
+/**
+ * One token row in the instance-inspection `tokens` block (M4-L6.3) — read
+ * straight from D1 (execution_tokens), so the live token frontier is directly
+ * observable without touching Workflow internals.
+ * `variablesOverlay` is verbatim: an inline JSON object for small overlays, or
+ * `{"__r2":"<key>"}` for an offloaded large overlay (not rehydrated here).
+ */
+export const tokenInspectionSchema = z.object({
+  tokenId: z.string(),
+  positionElementId: z.string(),
+  /** Live or terminal status from the execution_tokens read-model. */
+  status: z.enum(["active", "waiting", "arrivedAtJoin", "consumed", "merged", "discarded"]),
+  /** The parallel/inclusive split gateway element id that owns this token's region; null for the root token. */
+  regionId: z.string().nullable(),
+  /** How many times the owning split gateway has activated (0-based occurrence). */
+  regionActivation: z.number().int(),
+  /** Sequence-flow id that left the split gateway for this branch; null for the root token. */
+  branchFlowId: z.string().nullable(),
+  /** Parent token id (`${instanceId}:#root` for branch tokens, null for root). */
+  parentTokenId: z.string().nullable(),
+  /** Verbatim overlay column: inline object or {"__r2":"<key>"} reference. Not rehydrated. */
+  variablesOverlay: z.record(z.unknown()).optional(),
+});
+export type TokenInspection = z.infer<typeof tokenInspectionSchema>;
+
 export interface ProcessInstanceInspection extends ProcessInstance {
   historySummary: HistoryEvent[];
   diagnostics: Record<string, unknown>;
@@ -275,6 +306,12 @@ export interface ProcessInstanceInspection extends ProcessInstance {
    * timer; Workflow internals stay hidden.
    */
   timers?: TimerInspection[];
+  /**
+   * Live token frontier (M4-L6.3): present when the instance has materialised
+   * execution_tokens rows; `currentElementId` is null while >1 token is live.
+   * Single-token (M1/M2/M3) instances with no token rows omit this field.
+   */
+  tokens?: TokenInspection[];
 }
 
 // ---- Operator remediation verbs ----

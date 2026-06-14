@@ -217,3 +217,13 @@ export async function listTimersForInstance(db: D1Database, instanceId: string):
   );
   return rows.map(mapTimer);
 }
+
+/** The earliest-firing ARMED timer for an instance (the single-wake backstop, TASK-54), or null. */
+export async function getEarliestArmedTimerForInstance(db: D1Database, instanceId: string): Promise<TimerView | null> {
+  const row = await dbFirst<TimerRow>(
+    db,
+    `SELECT * FROM timers WHERE instance_id = ? AND status = 'armed' ORDER BY fire_at ASC LIMIT 1`,
+    [instanceId],
+  );
+  return row ? mapTimer(row) : null;
+}

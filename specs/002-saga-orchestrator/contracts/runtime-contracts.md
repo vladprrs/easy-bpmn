@@ -1,10 +1,12 @@
-# Runtime Contracts: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas; M3 — Time & failure taxonomy)
+# Runtime Contracts: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas; M3 — Time & failure taxonomy; M4 — Concurrency)
 
 These contracts extend `specs/001-bpmn-lite-orchestrator-mvp/contracts/runtime-contracts.md`. The
 Process Workflow, Receive Task, Correlation Broker, and D1 Persistence contracts from the MVP carry
 forward unchanged; this document specifies the new pull-worker, compensation, idempotency, and
 saga-settlement contracts, plus the M2 conditional-dispatch contract (gateways + occurrence-keyed
-loops) at the end.
+loops), the M3 timer/race-decider/failure-taxonomy contract, and the M4 concurrency contract (the token
+frontier, AND/OR joins, R2 overlay offload, the two new incident kinds, and per-token observability) at
+the end.
 
 ## Process Workflow Contract (delta)
 
@@ -181,10 +183,13 @@ rotate/clear the token:
   node in the scope (M3 free routing; routing to a cancel end event triggers the transaction's
   cancel → compensation, the canonical M1 shape). See the M3 Timer/Race-Decider/Failure-Taxonomy
   contract below.
-- **Un-guarded wait cap / hard condition error** — an un-guarded service-task or receive-task wait
-  hitting the 1-hour safety-net cap raises **`kind=waitTimeout`** (the M3 split of the overloaded
-  `timeout`); a hard FEEL evaluation error raises **`kind=conditionFailure`**. A wait guarded by a
-  modeled timer never raises `waitTimeout`.
+- **Un-guarded wait liveness / hard condition error** — under M4 single-wake (TASK-54) un-guarded
+  waits follow **standard BPMN**: a receive-task / message intermediate catch carrying **no modeled
+  deadline** waits **indefinitely** (no deadline ⇒ no timeout), and un-guarded **service-task**
+  liveness comes from the job-activation DLQ (**`kind=jobActivationTimeout`**), not an engine wait
+  cap. The M3 leaf **`waitTimeout`** cap is therefore **retired and now unproduced** (kept as a
+  vestigial enum value until the dead-code sweep). A hard FEEL evaluation error raises
+  **`kind=conditionFailure`**.
 
 `errorRef`/boundary catching is by the Error's **`@id`** (QName); the worker's `fail.errorCode`
 matches the Error's **`@errorCode`** (wire value). Multi-boundary + catch-all routing and richer
@@ -350,11 +355,111 @@ all standard BPMN — no new extension binding.
   token-path node in the same scope (the M1 "must target a cancel end" rule is lifted). An error
   handled by an alternate path inside a transaction leaves the saga ledger untouched — all completed
   steps stay compensatable until the scope cancels or commits.
-- **Wait cap vs modeled timer.** A wait guarded by an armed modeled timer never raises `waitTimeout`;
+- **Modeled-timer wait.** A wait guarded by an armed modeled timer never raises `waitTimeout`;
   in Workflow mode its `waitForEvent` timeout is sized to `fire_at` (a 7-day timer costs O(1) steps)
   and doubles as the lost-alarm backstop — on any wake the engine settles overdue timers
-  (`fire_at <= now`) exactly as the alarm would. Un-guarded waits keep the fixed 1-hour cap →
-  `waitTimeout`.
+  (`fire_at <= now`) exactly as the alarm would. Un-guarded waits carry **no** engine wait cap: under
+  M4 single-wake a receive-task / message-catch wait is **indefinite** (standard BPMN), and un-guarded
+  service-task liveness is the DLQ `jobActivationTimeout` — the M3 `waitTimeout` cap is
+  retired/unproduced.
+
+## Concurrency Contract (M4 — token frontier + AND/OR joins + branch-local vars)
+
+Design: `docs/superpowers/specs/2026-06-13-m4-concurrency-design.md` (§5/§6/§9/§11). Constitution v2.3.0.
+A block-structured (SESE) `parallelGateway` (AND) / `inclusiveGateway` (OR) region runs as a **token
+frontier** — multiple concurrent tokens within one Cloudflare Workflow instance. **The `/jobs/*` worker
+surface is UNCHANGED** (still pinned by `tests/contract/jobs-schema-pin.test.ts`).
+
+### `GET /instances/{id}` tokens array
+
+`GET /instances/{id}` gains a **`tokens`** array, read from `execution_tokens` (D1, never Workflow state),
+present when the instance has materialised token rows; single-token (M1–M3) instances with no token rows
+**omit** it. `currentElementId` is retained as the sole live token's position when the frontier has exactly
+one token and is **null while >1 token is live** (the `tokens` array is then authoritative). Each item:
+
+```json
+{
+  "tokenId": "pi_123:fork#0:f1",
+  "positionElementId": "reserveStock",
+  "status": "waiting",
+  "regionId": "fork",
+  "regionActivation": 0,
+  "branchFlowId": "f1",
+  "parentTokenId": "pi_123:#root",
+  "variablesOverlay": { "reservationId": "r-9" }
+}
+```
+
+- `tokenId` — deterministic id: `instanceId:#root` (root) or `instanceId:splitId#activation:branchFlowId`
+  (branch).
+- `status` — read-model from `execution_tokens`: `active | waiting | arrivedAtJoin | consumed | merged |
+  discarded` (live = `active|waiting|arrivedAtJoin`).
+- `regionId` / `branchFlowId` / `parentTokenId` — **null** for the root token; `parentTokenId` is
+  `instanceId:#root` for a first-level branch token.
+- `regionActivation` — the owning split's 0-based occurrence.
+- `variablesOverlay` — **always present** (`{}` when the token carries no branch-local delta); the
+  column verbatim — an inline JSON object **or** `{"__r2":"<key>"}` for an R2-offloaded large overlay.
+  It is **not** rehydrated by the API (the caller follows the R2 reference if needed). The contract
+  schema marks it optional, but the inspection endpoint emits it on every token.
+
+`contracts/openapi.yaml` (`TokenView`) and the contract test are kept in lockstep (governance gate).
+
+### New incident kinds (extend the Failure Taxonomy)
+
+Both are **terminal** and added to the `IncidentKind` union (`src/persistence/instances.ts`) **and** the
+openapi `Incident.kind` enum simultaneously (`check:docs` guard #7 enforces equality):
+
+- **`concurrencyLimit`** — a split fan-out would exceed `MAX_CONCURRENT_TOKENS = 256` **live**
+  (`active|waiting|arrivedAtJoin`) tokens. Counted from the **in-memory reconstructed frontier** during the
+  deterministic rewalk (never a live `COUNT` over `execution_tokens`, else it would fire nondeterministically
+  on replay); evaluated at each fan-out and claimed once.
+- **`stepBudget`** — a per-drive cumulative `runStep`/`waitForEvent` counter crossed
+  `STEP_BUDGET_SOFT = 20000`, a **graceful** terminal incident **below** the platform
+  `limits.steps = 25000` ceiling (hitting the platform ceiling would produce an opaque errored Workflow,
+  violating the view-only-incident invariant). Forward steps of all live tokens, in-region loops, and the
+  reverse pass must jointly fit under the three caps (`MAX_CONCURRENT_TOKENS`, `MAX_ELEMENT_OCCURRENCES`,
+  step budget).
+
+Like other forward Hazards, neither auto-compensates: inside a transaction the live-token cohort is captured
+(generalised cohort capture, design §8.5) so a late `complete` ledgers-but-does-not-advance, and an operator
+`POST /instances/{id}/cancel` forces the reverse pass.
+
+### Variable overlays & the R2 offload
+
+- A token's `variables_overlay` (and the resolved scope chain) live in **D1** (`execution_tokens`), out of
+  Workflow `step.do` outputs — payloads crossing the event channel stay **small envelopes** (`messageId`,
+  `correlationKey`, a D1/R2 reference); the engine resolves the body inside a `step.do`.
+- An overlay whose serialized size exceeds **`OVERLAY_INLINE_MAX_BYTES`** (measured via `payloadByteSize`)
+  is written to **R2** under the **deterministic** key `overlays/${instanceId}/${tokenId}.json`, **before**
+  the D1 commit (the deterministic key makes a crash-retry byte-identical), and the column holds
+  `{"__r2":"<key>"}`. (The R2 binding was introduced in L6; none existed before.)
+- **Join-time bound.** At a join the **merged** overlay is checked against **`MAX_EVENT_PAYLOAD_BYTES`**
+  (the ~1 MiB event limit) **before** it is written to `process_instances.variables` or delivered; on
+  exceed it routes to the existing `serviceTaskOutputRejected` / **poison** incident path — **never** a
+  silent truncation.
+
+### Per-token observability & region history events
+
+- History events emitted inside a region carry **`tokenId`**, **`regionId`**, **`regionActivation`**, and a
+  per-token **`spanId`** in their `diagnostics` JSON — **no new column** (`history_events` stays globally
+  ordered by insertion = deterministic single-threaded rewalk order). Clients reconstruct a per-branch
+  timeline by filtering on `diagnostics.tokenId`; the join's merge event records the contributing branch
+  token ids.
+- Four new free-text `history_events.type` values: **`regionActivated`**, **`branchForked`**,
+  **`branchArrivedAtJoin`**, **`joinCompleted`** (no schema change).
+
+### Frontier-wide operator verbs
+
+- **`/cancel` is frontier-wide:** it captures the live-token cohort, arms a per-token terminator for every
+  in-flight job (§8.2 — it does **NOT** eagerly fail region-cohort jobs, so a late `complete` lands as a
+  ledgered straggler rather than leaking an executed side-effect), cancels every armed timer, and
+  **releases every active broker subscription** before entering `compensating` (no live subscription may
+  survive a cancel, else the broker key leaks). The reverse pass then runs **per token lineage** in
+  descending `seq`, draining stragglers, and settles `compensated` only when the scope ledger is drained
+  **and** no scope token remains in a live status.
+- **`/retry`** reconstructs the frontier from `execution_tokens` (fast-forwarding applied
+  splits/joins/branch steps **write-free**) rather than re-forking any split; the
+  `compensationFailed → compensating` edge resumes the reverse pass over the cohort.
 
 ## Observability Contract
 

@@ -28,10 +28,10 @@
 import type { Env } from "../env";
 import type { ExecutionGraph, GraphNode } from "../bpmn/graph";
 import { isTerminalInstanceStatus, isoIsBefore, nowIso } from "../util";
-import { workflowTimerEventTypeFor } from "../bpmn/profile";
 import { dbBatch } from "../persistence/db";
 import { historyStmt } from "../persistence/history";
 import { applyTransitionStmt, getInstanceRow, type InstanceRow } from "../persistence/instances";
+import { branchHistoryTags } from "../persistence/tokens";
 import {
   flipTimerFiredStmt,
   getTimer,
@@ -45,11 +45,11 @@ import { computeFireAt } from "./iso8601";
 import {
   armTimerDO,
   isUniqueConstraintViolation,
-  timerSizedTimeout,
   type TimerWake,
   type WakeSettleOutcome,
 } from "./boundary-timer";
 import { loadInst, type RunStep, type WaitForEvent } from "./engine-shared";
+import { WAKE_TYPE } from "./wake";
 
 export type CatchOutcome = { kind: "next"; next: string } | { kind: "waiting" };
 
@@ -67,9 +67,10 @@ async function catchTimerFired(env: Env, instanceId: string, elementId: string, 
  *   2. First visit → arm + park (persist-before-advance), then arm the DO.
  *      A rewalk landing on a still-`armed` catch re-arms the DO idempotently
  *      (self-heal, design §4.2) and re-parks.
- *   3. Direct mode parks (the DO alarm resumes inline via fireTimer). Workflow
- *      mode waits on the per-visit event type, SIZED to the timer (§4.2), with
- *      the lost-alarm backstop settling overdue on a timeout wake.
+ *   3. Direct mode parks (the DO alarm resumes inline via fireTimer). Under
+ *      single-wake (TASK-54) the driver PARKS; the single `loop` wake
+ *      (`wakeBackstop`-sized to the timer, §4.2) covers it, with the lost-alarm
+ *      backstop settling overdue on a wake.
  */
 export async function driveIntermediateCatch(
   env: Env,
@@ -80,6 +81,7 @@ export async function driveIntermediateCatch(
   node: GraphNode,
   runStep: RunStep,
   waitFor: WaitForEvent | null,
+  activeTokenId?: string,
 ): Promise<CatchOutcome> {
   const tag = `${elementId}#${occ}`;
   const next = node.next!;
@@ -91,42 +93,13 @@ export async function driveIntermediateCatch(
   // (2) Arm + park (first visit) or self-heal re-arm (rewalk past an armed catch).
   const existing = await getTimer(env.DB, timerId);
   if (!existing) {
-    await runStep(`timer:${tag}`, () => parkIntermediateCatch(env, instanceId, elementId, occ, node));
+    await runStep(`timer:${tag}`, () => parkIntermediateCatch(env, instanceId, elementId, occ, node, activeTokenId));
   } else if (existing.status === "armed") {
     await armTimerDO(env, existing.timerId, existing.fireAt);
   }
 
-  // (3a) Direct mode: park; the instance resumes when the timer alarm fires.
-  if (!waitFor) return { kind: "waiting" };
-
-  // (3b) Workflow mode: wait on the per-visit event type, sized to the timer.
-  const timeout = await timerSizedTimeout(env, timerId);
-  const outcome = await waitFor({
-    name: `timer-wait:${tag}`,
-    workflowEventType: workflowTimerEventTypeFor(elementId, occ),
-    timeout,
-  });
-  // The timer may have fired (its sendEvent wake, or a concurrent alarm) while we waited.
-  if (await catchTimerFired(env, instanceId, elementId, occ)) return { kind: "next", next };
-  if (outcome.kind === "timeout") {
-    // Lost-alarm backstop (design §4.2, risk R5): a timer-guarded wait NEVER
-    // raises waitTimeout. The DO alarm is the PRIMARY firing mechanism; this
-    // timer-SIZED timeout doubles as the backstop for a lost/failed alarm —
-    // settle an OVERDUE catch INLINE (the IDENTICAL fire batch the alarm path
-    // commits), RETURNING the outgoing flow to THIS drive loop (no executor wake
-    // → no import cycle). Workflow-mode-only (CI forces direct, where waitFor is
-    // null and a wait never times out — verified by reading + the direct-mode
-    // backstop seam test).
-    const settled = await settleOverdueIntermediateCatchOnWake(env, graph, instanceId, elementId, occ);
-    if (settled.kind === "fired") return { kind: "next", next: settled.next };
-    if (settled.kind === "reparked") return { kind: "waiting" }; // armed-but-early → re-armed; re-park
-    // fallThrough: already decided `cancelled` (a concurrent operator /cancel) or
-    // the row vanished — re-read; advance only if it actually fired meanwhile.
-    if (await catchTimerFired(env, instanceId, elementId, occ)) return { kind: "next", next };
-    return { kind: "waiting" }; // still parked (e.g. a concurrent /cancel terminal) — re-park
-  }
-  // Woke on the timerFired event but the decider is not visible yet (should not
-  // happen — fireTimer commits the decider before waking) — re-park defensively.
+  // (3) Park: the instance resumes when the timer alarm fires (an inline fireTimer
+  // in direct mode, or a tickle re-walk in workflow mode). Leaf drivers never suspend.
   return { kind: "waiting" };
 }
 
@@ -143,6 +116,7 @@ async function parkIntermediateCatch(
   elementId: string,
   occ: number,
   node: GraphNode,
+  activeTokenId?: string,
 ): Promise<void> {
   const timerId = timerIdFor(instanceId, elementId, occ);
   const existing = await getTimer(env.DB, timerId);
@@ -169,7 +143,7 @@ async function parkIntermediateCatch(
       instanceId,
       elementId,
       type: "timerArmed",
-      diagnostics: { kind: "intermediateCatch", fireAt, occurrence: occ, trigger: node.timerTrigger },
+      diagnostics: { kind: "intermediateCatch", fireAt, occurrence: occ, trigger: node.timerTrigger, ...branchHistoryTags(activeTokenId) },
     }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: elementId, status: "waiting", now }),
   ]);
@@ -203,10 +177,12 @@ export async function planIntermediateCatchFire(
   if (!node || node.type !== "intermediateCatchEvent") return { kind: "skip" };
   const next = node.next;
   if (!next) return { kind: "skip" }; // validator guarantees exactly one outgoing; defensive
-  // GUARD: still the current park. A catch can only exit via fire or operator
-  // /cancel (which settles `cancelled`), so a non-matching cursor means the visit
-  // already resolved — never fire onto a progressed instance.
-  if (inst.current_element_id !== timer.elementId) return { kind: "skip" };
+  // Per-token guard (M4, design §5.3): fire iff this catch visit is still the live
+  // wait — i.e. no timer_outcomes decider claimed it yet. NEVER read the scalar
+  // current_element_id (a concurrent sibling token may have moved it). A catch can
+  // only exit via fire ('fired') or operator /cancel ('cancelled'), so a settled
+  // decider ⇔ the visit already resolved.
+  if (await getTimerOutcome(env.DB, timer.timerId)) return { kind: "skip" };
 
   const occ = timer.occurrence;
   const instanceId = timer.instanceId;
@@ -215,7 +191,7 @@ export async function planIntermediateCatchFire(
   return {
     kind: "fire",
     next,
-    wake: { instanceId, workflowEventType: workflowTimerEventTypeFor(timer.elementId, occ), timerId: timer.timerId },
+    wake: { instanceId, workflowEventType: WAKE_TYPE, timerId: timer.timerId },
     stmts: [
       insertTimerOutcomeStmt(env.DB, { timerId: timer.timerId, outcome: "fired", now }), // THE CLAIM
       flipTimerFiredStmt(env.DB, { timerId: timer.timerId, firedAt: now, now }),

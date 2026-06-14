@@ -1,33 +1,40 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { get, leaseOne, mintWorkerToken, publishAndStart } from "../helpers";
-import { runInstance } from "../../src/runtime/engine";
+import { loadGraphForInstance, runInstance, settleOverdueTimersForInstance } from "../../src/runtime/engine";
 import type { RunStep, WaitForEvent } from "../../src/runtime/engine";
 
-// Workflow-mode lost-alarm BACKSTOP in direct mode (TASK-44 review fix; design
-// §4.2, risk R5). `settleOverdueBoundaryTimerOnWake` (commit a6fc248) was the
-// believed-untestable Workflow-mode-only path: when a timer-guarded wait wakes on
-// a TIMEOUT (a lost/failed DO alarm), the engine settles an overdue timer INLINE
-// instead of blindly re-parking. The reviewer found it IS reachable in direct
-// mode — the only CI mode — via the SAME seam wait-cap-incidents.test.ts uses for
-// the un-guarded wait caps: drive `runInstance` with a `waitFor` stub that returns
-// a timeout, forcing the `outcome.kind === "timeout"` branch of forward-task.ts.
+// Lost-alarm backstop under the SINGLE-WAKE drive (TASK-54, design §4.2 / Q2).
 //
-// This is DISTINCT from boundary-timer.test.ts, which exercises the PRIMARY
-// DO-alarm fire path (runDurableObjectAlarm). Here we cover the inline settle the
-// engine runs on the timeout-WAKE, proving the R5 promise: a timer-guarded wait
-// NEVER raises waitTimeout, even on a (lost-alarm) timeout wake.
+// Pre-TASK-54 the inline overdue-timer settle lived in each leaf driver's
+// workflow-mode timeout branch (`settleOverdueBoundaryTimerOnWake`). TASK-54 unifies
+// the engine onto ONE `bpmn_wake` issued by `loop`: leaf drivers always PARK, and on
+// a wake TIMEOUT the loop calls `settleOverdueTimersForInstance` (the per-instance
+// sweep) BEFORE re-walking — so a modeled deadline still fires within the backstop
+// bound (instead of busy-re-walking) even when the DO alarm was lost. The sweep
+// reuses the IDENTICAL `settleOverdueBoundaryTimerOnWake` builder, so the R5 promise
+// holds: a timer-guarded wait NEVER raises waitTimeout.
 //
-// Seam note: direct mode normally PARKS (waitFor=null) and never times out; these
-// tests pass waitFor=timeoutWait so the timeout branch runs and calls
-// settleOverdueBoundaryTimerOnWake. The boundary timer routes to an END event (not
-// another service task) deliberately — under a timeout-returning drive every
-// service-task wait would itself cap with waitTimeout, so a second guarded task
-// would muddy the "no waitTimeout incident" assertion; an end event lets the fired
-// token run to completion cleanly.
+// CI runs EXECUTION_MODE=direct, where the single wake never fires. We cover the
+// backstop two ways:
+//   (1) INTEGRATION — drive `runInstance` with a `waitFor` stub that THROWS (the real
+//       Cloudflare `waitForEvent` throws on timeout), so `issueWake`'s catch runs the
+//       sweep and the re-walk takes the boundary path. An always-throwing stub drives
+//       exactly ONE wake→sweep→re-walk cycle: the sweep fires the overdue timer, so
+//       the re-walk reaches the boundary END and completes before a second wake.
+//   (2) UNIT — call `settleOverdueTimersForInstance` directly to prove its decision
+//       logic in isolation (not-yet-due is skipped; an already-cancelled timer is
+//       never re-fired) — cases that, as integration drives, would re-walk forever
+//       because nothing progresses.
+//
+// This is DISTINCT from boundary-timer.test.ts, which exercises the PRIMARY DO-alarm
+// fire path (runDurableObjectAlarm). The boundary timer routes to an END (not another
+// service task) so the fired token runs to completion cleanly.
 
 const inline: RunStep = (_name, fn) => fn();
-const timeoutWait: WaitForEvent = async () => ({ kind: "timeout" });
+const throwingWait: WaitForEvent = async () => {
+  throw new Error("Execution timed out after 1ms");
+};
 
 // Start → slow (service task `slow`, timer boundary tb PT5M → onTimeout END) → E END.
 function svcBackstopBpmn(): string {
@@ -62,12 +69,12 @@ async function historyEventTypes(instanceId: string): Promise<string[]> {
 }
 
 const PAST = "2000-01-01T00:00:00Z";
-// Clearly in the future, but under workerd's ~year-2189 setAlarm cap so the
-// reparked self-heal re-arm (armTimerDO) does not throw inside the JobScheduler DO.
+// Clearly in the future, but under workerd's ~year-2189 setAlarm cap so a self-heal
+// re-arm (armTimerDO) does not throw inside the JobScheduler DO.
 const FUTURE = "2100-01-01T00:00:00Z";
 
-describe("Workflow-mode lost-alarm backstop in direct mode (TASK-44 review fix; design §4.2, risk R5)", () => {
-  it("an OVERDUE timer fires INLINE on a timeout-wake — boundary path taken, NO waitTimeout incident", async () => {
+describe("Single-wake lost-alarm backstop (TASK-54, design §4.2 / Q2)", () => {
+  it("INTEGRATION: an OVERDUE timer fires on a wake TIMEOUT — boundary path taken, NO waitTimeout incident", async () => {
     const token = await mintWorkerToken();
     const { instance } = await publishAndStart(svcBackstopBpmn(), { correlationKey: `bk-fire-${crypto.randomUUID()}`, variables: {} });
     const id = instance.body.instanceId;
@@ -80,14 +87,14 @@ describe("Workflow-mode lost-alarm backstop in direct mode (TASK-44 review fix; 
     expect(timer.status).toBe("armed");
     await setFireAt(timer.timer_id, PAST);
 
-    // Drive with a timeout-returning waitFor — the Workflow-mode TIMEOUT-wake seam.
-    // (If a6fc248's branch were reverted to a blind re-park, this returns "waiting"
-    // with no fire and every assertion below fails — that is what proves the seam
-    // genuinely exercises settleOverdueBoundaryTimerOnWake.)
-    const result = await runInstance(env, id, { runStep: inline, waitFor: timeoutWait });
+    // Drive with a THROWING waitFor — the single-wake TIMEOUT seam. issueWake catches
+    // the throw, runs settleOverdueTimersForInstance (fires the overdue timer inline),
+    // then re-walks to the boundary path. (If the sweep were not wired into issueWake
+    // this would re-walk forever / never fire and every assertion below would fail.)
+    const result = await runInstance(env, id, { runStep: inline, waitFor: throwingWait });
     expect(result.status).toBe("completed");
 
-    // The token took the boundary path, settled INLINE by the backstop (not an alarm).
+    // The token took the boundary path, settled INLINE by the sweep (not an alarm).
     const inst = await get(`/instances/${id}`);
     expect(inst.body.status).toBe("completed");
     expect(inst.body.currentElementId).toBe("onTimeout");
@@ -101,17 +108,17 @@ describe("Workflow-mode lost-alarm backstop in direct mode (TASK-44 review fix; 
     expect(types).not.toContain("incidentCreated");
   });
 
-  it("an EARLY/spurious timeout-wake REPARKS (re-arms the DO) — no fire, no incident", async () => {
+  it("UNIT: the sweep SKIPS a not-yet-due timer — no fire, no incident, still armed", async () => {
     const token = await mintWorkerToken();
     const { instance } = await publishAndStart(svcBackstopBpmn(), { correlationKey: `bk-early-${crypto.randomUUID()}`, variables: {} });
     const id = instance.body.instanceId;
 
     await leaseOne(token, "slow");
     const timer = await theTimer(id);
-    await setFireAt(timer.timer_id, FUTURE); // NOT yet due → the wake is early/spurious
+    await setFireAt(timer.timer_id, FUTURE); // NOT yet due → the sweep must skip it
 
-    const result = await runInstance(env, id, { runStep: inline, waitFor: timeoutWait });
-    expect(result.status).toBe("waiting"); // reparked, NOT fired
+    const graph = await loadGraphForInstance(env, id);
+    await settleOverdueTimersForInstance(env, graph, id);
 
     const inst = await get(`/instances/${id}`);
     expect(inst.body.status).toBe("waiting");
@@ -124,7 +131,7 @@ describe("Workflow-mode lost-alarm backstop in direct mode (TASK-44 review fix; 
     expect(types).not.toContain("incidentCreated");
   });
 
-  it("a timer already DECIDED 'cancelled' falls THROUGH on a timeout-wake — never re-fires", async () => {
+  it("UNIT: the sweep SKIPS a timer already DECIDED 'cancelled' — never re-fires", async () => {
     const token = await mintWorkerToken();
     const { instance } = await publishAndStart(svcBackstopBpmn(), { correlationKey: `bk-cancel-${crypto.randomUUID()}`, variables: {} });
     const id = instance.body.instanceId;
@@ -132,20 +139,19 @@ describe("Workflow-mode lost-alarm backstop in direct mode (TASK-44 review fix; 
     await leaseOne(token, "slow");
     const timer = await theTimer(id);
     // Simulate a concurrent NORMAL resolution that already settled the decider
-    // 'cancelled' (in real life its transition rode the same batch). The host wait
-    // is still non-terminal here, so even an OVERDUE timeout-wake must fall through
-    // to normal handling — a decided-cancelled timer must NEVER fire.
+    // 'cancelled' (in real life its transition rode the same batch). Even though the
+    // timer is now OVERDUE, the sweep must skip it (status != 'armed') — never re-fire.
     await env.DB.prepare(`INSERT INTO timer_outcomes (timer_id, outcome, decided_at) VALUES (?, 'cancelled', ?)`).bind(timer.timer_id, PAST).run();
     await env.DB.prepare(`UPDATE timers SET status = 'cancelled' WHERE timer_id = ?`).bind(timer.timer_id).run();
     await setFireAt(timer.timer_id, PAST);
 
-    const result = await runInstance(env, id, { runStep: inline, waitFor: timeoutWait });
-    expect(result.status).toBe("waiting"); // fell through → host job still locked → re-park
+    const graph = await loadGraphForInstance(env, id);
+    await settleOverdueTimersForInstance(env, graph, id);
 
+    expect(await timerOutcome(timer.timer_id)).toBe("cancelled"); // unchanged — NOT flipped to fired
     const inst = await get(`/instances/${id}`);
     expect(inst.body.status).toBe("waiting");
     expect(inst.body.currentElementId).toBe("slow");
-    expect(await timerOutcome(timer.timer_id)).toBe("cancelled"); // unchanged — NOT flipped to fired
 
     const types = await historyEventTypes(id);
     expect(types).not.toContain("timerFired");

@@ -145,45 +145,46 @@ if (!/Cloudflare Workflow per process instance/i.test(profileText)) {
   failures.push(`09-easy-bpmn-profile.md must state the "one Cloudflare Workflow per process instance" mapping.`);
 }
 
-// 5) The gateway reference names the M2 constructs/incidents and keeps the
-//    deferred-gateway milestone pointers (emphasis-stripped, same-line).
-//    parallel/inclusive stay M4-deferred; eventBasedGateway is IN since M3-L4
-//    (TASK-46) — its DEFERRED_GATEWAY_REASONS pointer (src/bpmn/profile.ts) and
-//    this guard entry flipped together when the EBG runtime shipped (design §8).
+// 5) The gateway reference names the supported gateway constructs + incident
+//    markers. exclusiveGateway (M2), eventBasedGateway (M3-L4), and now
+//    parallelGateway/inclusiveGateway (M4-L1, block-structured SESE) are all
+//    SHIPPED — their DEFERRED_GATEWAY_REASONS pointers (src/bpmn/profile.ts) and
+//    this guard flipped together when each landed. Only complexGateway stays
+//    deferred. The guard is now a positive supported-set check that also asserts
+//    parallel/inclusive are NOT marked deferred anymore (design §6/§12).
 const gatewaysText = readFileSync(gateways, "utf8");
-for (const needle of ["exclusiveGateway", "noPath", "loopLimit"]) {
+for (const needle of ["exclusiveGateway", "parallelGateway", "inclusiveGateway", "noPath", "loopLimit"]) {
   if (!gatewaysText.includes(needle)) {
-    failures.push(`03-gateways.md is missing the M2 construct/incident marker: ${needle}`);
+    failures.push(`03-gateways.md is missing the gateway construct/incident marker: ${needle}`);
   }
 }
-const gatewayLines = gatewaysText.split("\n").map(stripEmphasis);
-for (const [gateway, milestone] of [
-  ["parallelGateway", "M4"],
-  ["inclusiveGateway", "M4"],
-]) {
-  const pointer = gatewayLines.some(
-    (l) => l.includes(gateway) && new RegExp(`\\b${milestone}\\b`).test(l),
-  );
-  if (!pointer) {
-    failures.push(`03-gateways.md must point ${gateway} at its roadmap milestone (${milestone}) on the same line.`);
-  }
+// parallel/inclusive are SHIPPED in M4 — they must NOT be marked deferred anymore.
+if (/\b(parallel|inclusive)\s+gateways?[^.]*\b(deferred|out of scope|M4 \(deferred\))/i.test(stripEmphasis(gatewaysText))) {
+  failures.push(`03-gateways.md still marks parallel/inclusive gateways as deferred — they ship in M4.`);
 }
 
-// 6) Every literal "MAX_ELEMENT_OCCURRENCES = <n>" under docs/bpmn/ and
-//    specs/002-saga-orchestrator/ matches the engine constant.
+// 6) Every literal "<CONST> = <n>" under docs/bpmn/ and specs/002-saga-orchestrator/
+//    matches the engine constant, for each engine cap constant. M4-L6 generalised
+//    this from MAX_ELEMENT_OCCURRENCES alone to also cover MAX_CONCURRENT_TOKENS
+//    and STEP_BUDGET_SOFT (each value is repeated across several docs and would rot
+//    silently if the engine retunes it).
 const engineText = readFileSync(engineSrc, "utf8");
-const engineMatch = engineText.match(/MAX_ELEMENT_OCCURRENCES = (\d+)/);
-if (!engineMatch) {
-  failures.push(`src/runtime/engine.ts no longer defines "MAX_ELEMENT_OCCURRENCES = <n>" — update this check.`);
-} else {
+const SYNCED_CONSTANTS = ["MAX_ELEMENT_OCCURRENCES", "MAX_CONCURRENT_TOKENS", "STEP_BUDGET_SOFT"];
+const constDocPaths = [...mdFiles(bpmnDir), ...mdFiles(sagaSpecDir)];
+for (const name of SYNCED_CONSTANTS) {
+  const engineMatch = engineText.match(new RegExp(`${name} = (\\d+)`));
+  if (!engineMatch) {
+    failures.push(`src/runtime/engine.ts no longer defines "${name} = <n>" — update this check.`);
+    continue;
+  }
   const engineValue = engineMatch[1];
-  for (const path of [...mdFiles(bpmnDir), ...mdFiles(sagaSpecDir)]) {
+  for (const path of constDocPaths) {
     const text = readFileSync(path, "utf8");
     const rel = path.slice(repoRoot.length);
     text.split("\n").forEach((line, i) => {
-      for (const m of stripEmphasisKeepUnderscore(line).matchAll(/MAX_ELEMENT_OCCURRENCES = (\d+)/g)) {
+      for (const m of stripEmphasisKeepUnderscore(line).matchAll(new RegExp(`${name} = (\\d+)`, "g"))) {
         if (m[1] !== engineValue) {
-          failures.push(`${rel}:${i + 1} says MAX_ELEMENT_OCCURRENCES = ${m[1]} but src/runtime/engine.ts says ${engineValue}.`);
+          failures.push(`${rel}:${i + 1} says ${name} = ${m[1]} but src/runtime/engine.ts says ${engineValue}.`);
         }
       }
     });

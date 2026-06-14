@@ -25,6 +25,7 @@ import { parseBpmnXml } from "./parser";
 import { TASK_DEFINITION_TYPE } from "./moddle-extension";
 import { parseCondition } from "../runtime/expressions";
 import { isValidIso8601DateTime, parseIso8601DurationMs } from "../runtime/iso8601";
+import { validateRegions, type RegionInput, type RegionInfoOut } from "./regions";
 import {
   ASSOCIATION_TYPE,
   CANCEL_EVENT_DEFINITION,
@@ -613,6 +614,21 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         continue;
       }
 
+      // M4: parallelGateway (AND) / inclusiveGateway (OR). The split/join shape,
+      // SESE block-structure, and (for inclusive) the condition/default rules are
+      // validated in dedicated passes after adjacency is built. instantiate is
+      // rejected here (instances start via the API only).
+      if ($type === "bpmn:ParallelGateway" || $type === "bpmn:InclusiveGateway") {
+        const nodeType = SUPPORTED_NODE_TYPES[$type]!;
+        if (el.instantiate === true) {
+          err(`Gateway '${id ?? ""}' has instantiate="true". Instances start via the API only; remove instantiate.`, id, localTypeName($type));
+        }
+        const info: NodeInfo = { id: id ?? "", type: nodeType, name: (el.name as string) ?? undefined, scopeId };
+        if (nodeType === "inclusiveGateway") info.defaultFlowId = refId(el.default);
+        nodes.push(info);
+        continue;
+      }
+
       const nodeType = SUPPORTED_NODE_TYPES[$type];
       if (!nodeType) {
         err(
@@ -758,10 +774,10 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     // §2 decision 3). A conditional flow leaving anything else is an implicit
     // inclusive-split (M4) and stays rejected — on ELEMENT presence, even when
     // the condition body is empty.
-    if (f.hasConditionElement && src.type !== "exclusiveGateway") {
+    if (f.hasConditionElement && src.type !== "exclusiveGateway" && src.type !== "inclusiveGateway") {
       err(
-        `Sequence flow '${f.id}' carries a conditionExpression but does not leave an exclusiveGateway. ` +
-          "Conditions are only supported on outgoing flows of an exclusive gateway.",
+        `Sequence flow '${f.id}' carries a conditionExpression but does not leave an exclusiveGateway or inclusiveGateway. ` +
+          "Conditions are only supported on outgoing flows of an exclusive or inclusive gateway.",
         f.id,
         "sequenceFlow",
       );
@@ -865,10 +881,16 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         if (out.length > 0) err(`End event '${n.id}' must not have outgoing sequence flows.`, n.id, "endEvent");
       } else {
         // Only a gateway may have >1 outgoing token edge — an exclusiveGateway
-        // (M2, FEEL branch) or an eventBasedGateway (M3-L4, the timer/message
-        // race). Cycles are legal, so this is a degree check, not an acyclicity
-        // check.
-        if (out.length > 1 && n.type !== "exclusiveGateway" && n.type !== "eventBasedGateway") {
+        // (M2, FEEL branch), an eventBasedGateway (M3-L4, the timer/message race),
+        // or a parallelGateway / inclusiveGateway (M4, AND/OR split). Cycles are
+        // legal, so this is a degree check, not an acyclicity check.
+        if (
+          out.length > 1 &&
+          n.type !== "exclusiveGateway" &&
+          n.type !== "eventBasedGateway" &&
+          n.type !== "parallelGateway" &&
+          n.type !== "inclusiveGateway"
+        ) {
           err(
             `Element '${n.id}' has ${out.length} outgoing sequence flows. ` +
               "Implicit splits are not supported — route branching through an exclusiveGateway.",
@@ -902,7 +924,13 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     else flowsBySource.set(f.source, [f]);
   }
   for (const n of nodes) {
-    if (n.type !== "exclusiveGateway") continue;
+    // M4: the inclusive split obeys the SAME condition/default rules as the
+    // exclusive split (design §4 — every non-default out-flow carries a non-empty
+    // FEEL condition, the default carries none and is gateway-owned). Only the
+    // gateway label in the messages differs.
+    if (n.type !== "exclusiveGateway" && n.type !== "inclusiveGateway") continue;
+    const gwLabel = n.type === "inclusiveGateway" ? "inclusive gateway" : "exclusive gateway";
+    const GwLabel = n.type === "inclusiveGateway" ? "Inclusive gateway" : "Exclusive gateway";
     const gwFlows = flowsBySource.get(n.id) ?? [];
 
     let defaultFlow: FlowInfo | undefined;
@@ -913,10 +941,10 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         // reported from parser warnings above) but names a flow leaving a
         // different node — default ownership is per gateway.
         err(
-          `Exclusive gateway '${n.id}' declares default flow '${n.defaultFlowId}', ` +
+          `${GwLabel} '${n.id}' declares default flow '${n.defaultFlowId}', ` +
             "which is not one of its own outgoing sequence flows.",
           n.id,
-          "exclusiveGateway",
+          n.type,
         );
       } else if (defaultFlow.hasConditionElement) {
         // Element PRESENCE, not the normalized (trimmed→null) body: an empty
@@ -924,7 +952,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         // a non-empty one — the message says "must not carry", and a flow not
         // leaving a gateway already rejects on the same presence bit.
         err(
-          `Sequence flow '${defaultFlow.id}' is the default flow of exclusive gateway '${n.id}' and must not ` +
+          `Sequence flow '${defaultFlow.id}' is the default flow of ${gwLabel} '${n.id}' and must not ` +
             "carry a conditionExpression — the default is taken only when no condition matches.",
           defaultFlow.id,
           "sequenceFlow",
@@ -939,7 +967,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       // the capture site lands here too — the message covers both shapes.
       if (gwFlows.length > 1 && f.conditionExpression == null) {
         err(
-          `Sequence flow '${f.id}' leaving exclusive gateway '${n.id}' has no (or an empty) conditionExpression ` +
+          `Sequence flow '${f.id}' leaving ${gwLabel} '${n.id}' has no (or an empty) conditionExpression ` +
             "and is not the gateway's default flow. Every non-default flow of a split must carry a FEEL condition.",
           f.id,
           "sequenceFlow",
@@ -959,7 +987,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         const parsed = parseCondition(f.conditionExpression);
         if (!parsed.ok) {
           err(
-            `Sequence flow '${f.id}' leaving exclusive gateway '${n.id}': ${parsed.reason}`,
+            `Sequence flow '${f.id}' leaving ${gwLabel} '${n.id}': ${parsed.reason}`,
             f.id,
             "sequenceFlow",
           );
@@ -1338,6 +1366,68 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // M4 SESE region validation (design §4.1): per scope, match each parallel/
+  // inclusive split to its post-dominating join, validate strong single-exit,
+  // branch confinement, bijection, laminar nesting, uncontrolled-merge. Runs as
+  // its OWN pass after degree/linearity + gateway-condition, emitting region
+  // errors with element ids (the reachability BFS below stays a backstop).
+  // -------------------------------------------------------------------------
+  const regionsByScope: Record<string, RegionInfoOut> = {};
+  for (const sid of scopeIds) {
+    const scopeNodesForRegion = nodes.filter((n) => n.scopeId === sid);
+    const flowsForRegion = flows.filter((f) => f.scopeId === sid);
+    const input: RegionInput = {
+      scopeId: sid,
+      scopeKind: scopeKindOf.get(sid)!,
+      scopeNodes: scopeNodesForRegion as unknown as RegionInput["scopeNodes"],
+      flows: flowsForRegion as unknown as RegionInput["flows"],
+      outgoing,
+      incoming,
+      nodeById: nodeById as unknown as RegionInput["nodeById"],
+    };
+    const result = validateRegions(input);
+    for (const e of result.errors) err(e.reason, e.elementId, "parallelGateway");
+    Object.assign(regionsByScope, result.regions);
+  }
+
+  // Rule 10 — concurrent same-message rejection (blocker 14): two catch points
+  // (receiveTask | message intermediateCatch | EBG message branch) on the SAME
+  // message name that can be SIMULTANEOUSLY active (both inside a region's branch
+  // set, or in two simultaneously-active regions) would collide on the broker key.
+  // SESE guarantees branch element-disjointness, so simultaneity ⇔ "both are
+  // reachable while some region is active". Conservative-but-sound: reject any two
+  // catch points sharing a message name when at least one is inside ANY region.
+  {
+    const memberOfAnyRegion = new Set<string>();
+    for (const r of Object.values(regionsByScope)) {
+      // members are recomputed cheaply: a node is in r's region if its scope is r's
+      // and it lies between split and join — approximate via the branch confinement
+      // set already proven sound. Reuse validateRegions by collecting member ids it
+      // implies through branchFlowIds reachability:
+      const seen = new Set<string>();
+      const queue = r.branchFlowIds.map((fid) => flows.find((f) => f.id === fid)?.target).filter(Boolean) as string[];
+      while (queue.length) {
+        const cur = queue.shift()!;
+        if (cur === r.joinId || seen.has(cur)) continue;
+        seen.add(cur);
+        for (const t of outgoing.get(cur) ?? []) queue.push(t);
+      }
+      for (const m of seen) memberOfAnyRegion.add(m);
+    }
+    const byMessage = new Map<string, string[]>();
+    for (const n of nodes) {
+      if (n.messageName && (n.type === "receiveTask" || n.type === "intermediateCatchEvent")) {
+        (byMessage.get(n.messageName) ?? byMessage.set(n.messageName, []).get(n.messageName)!).push(n.id);
+      }
+    }
+    for (const [msg, ids] of byMessage) {
+      if (ids.length > 1 && ids.some((id) => memberOfAnyRegion.has(id))) {
+        err(`Message '${msg}' is awaited by ${ids.length} catch points (${ids.join(", ")}) that can be concurrently active inside a parallel/inclusive region — the broker permits one active subscription per message+correlationKey, so concurrent same-name waits collide. Use distinct message names.`, ids.find((id) => memberOfAnyRegion.has(id)) ?? ids[0], "receiveTask");
+      }
+    }
+  }
+
   // Compensation handlers must live inside a transaction.
   for (const n of nodes) {
     if (isHandler(n) && scopeKindOf.get(n.scopeId) !== "transaction") {
@@ -1408,7 +1498,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     // decision 3); the activity case is rejected above.
     const defaultFlowByGateway = new Map<string, string>();
     for (const n of nodes) {
-      if (n.type === "exclusiveGateway" && n.defaultFlowId) defaultFlowByGateway.set(n.id, n.defaultFlowId);
+      if ((n.type === "exclusiveGateway" || n.type === "inclusiveGateway") && n.defaultFlowId) defaultFlowByGateway.set(n.id, n.defaultFlowId);
     }
     const isDefaultFlow = (f: FlowInfo): boolean =>
       f.source != null && defaultFlowByGateway.get(f.source) === f.id;
@@ -1444,9 +1534,17 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         outgoing: nodeOutgoing,
         // A gateway never linearly advances: branch selection owns the successor
         // (exclusiveGateway = FEEL conditions; eventBasedGateway = the timer/
-        // message race recorded in gateway_decisions). The IR makes no `.next`
-        // promise for either — the engine reads `outgoing[]`.
-        next: n.type === "exclusiveGateway" || n.type === "eventBasedGateway" ? null : nodeOutgoing[0]?.targetId ?? null,
+        // message race recorded in gateway_decisions; parallelGateway/
+        // inclusiveGateway = the M4 split fan-out / recorded join facts). The IR
+        // makes no `.next` promise for any of them — the engine reads `outgoing[]`
+        // (split) or the recorded join facts (join).
+        next:
+          n.type === "exclusiveGateway" ||
+          n.type === "eventBasedGateway" ||
+          n.type === "parallelGateway" ||
+          n.type === "inclusiveGateway"
+            ? null
+            : nodeOutgoing[0]?.targetId ?? null,
         scopeId: n.scopeId === processId ? null : n.scopeId,
       };
       if (n.type === "serviceTask") node.isForCompensation = n.isForCompensation === true;
@@ -1538,6 +1636,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       ...(transactionNodes.length > 0 ? { transactions } : {}),
       ...(associationLinks.length > 0 ? { associations: associationLinks } : {}),
       ...(errorDecls.length > 0 ? { errors: errorDecls } : {}),
+      ...(Object.keys(regionsByScope).length > 0 ? { regions: regionsByScope } : {}),
     };
   };
 

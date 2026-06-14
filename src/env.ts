@@ -13,6 +13,15 @@ export interface Env {
   JOB_SCHEDULER: DurableObjectNamespace<JobScheduler>;
   /** One Workflow instance per process instance (production execution driver). */
   PROCESS_WORKFLOW: Workflow<ProcessWorkflowParams>;
+  /** Overflow store for branch variable overlays exceeding OVERLAY_INLINE_MAX_BYTES (M4-L6, design §9.1). */
+  OVERLAYS: R2Bucket;
   /** "workflow" (default/prod) or "direct" (deterministic test driver). */
   EXECUTION_MODE: string;
+  /**
+   * TEST-ONLY cap overrides (M4-L6, design §9). Integration tests lower a
+   * concurrency cap via these so a bomb fixture trips it without 256 real branches
+   * / 20000 real steps. Never set in production (wrangler.jsonc declares neither).
+   */
+  MAX_CONCURRENT_TOKENS_OVERRIDE?: string;
+  STEP_BUDGET_SOFT_OVERRIDE?: string;
 }

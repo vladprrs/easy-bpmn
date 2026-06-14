@@ -1,12 +1,16 @@
-# Quickstart: SAGA Orchestrator Validation (M1 + M2 + M3)
+# Quickstart: SAGA Orchestrator Validation (M1 + M2 + M3 + M4)
 
 This guide describes the end-to-end validation scenarios for the transaction-saga implementation:
 scenarios 1–9 are the named M1 constitution-critical gates; scenarios 10–14 are the M2
 conditional-saga gates (exclusiveGateway + FEEL + cycles); scenarios 15–26 are the M3
 time-&-failure-taxonomy gates (boundary/intermediate timers, `eventBasedGateway`, free error
-routing, the incident-kind split + `retryable`) — each mapping to a green integration test named
-next to it. The M3 design source is
-`docs/superpowers/specs/2026-06-11-m3-time-failure-taxonomy-design.md` (§7 gates).
+routing, the incident-kind split + `retryable`); scenarios 27–30 are the M4 concurrency gates
+(block-structured parallel AND / inclusive OR, the token frontier, branch-local variable merge, and
+parallel-branch compensation) — each mapping to a green integration test named next to it — followed by
+the **M4 manual Workflow-mode matrix** (the Workflow-mode-only concurrency behaviours, **re-validated GREEN
+on real Cloudflare Workflows 2026-06-14**; the L6.6 multi-wait defect is resolved by TASK-54). The M3 design source is
+`docs/superpowers/specs/2026-06-11-m3-time-failure-taxonomy-design.md` (§7 gates); the M4 source is
+`docs/superpowers/specs/2026-06-13-m4-concurrency-design.md` (§14 testing & exit criteria).
 
 ## Prerequisites
 
@@ -22,7 +26,7 @@ next to it. The M3 design source is
 
 ```bash
 npm install
-npx wrangler d1 migrations apply easy_bpmn --local   # applies 0001 … 0006 (MVP, saga, topology, conditional, backfill, timers)
+npx wrangler d1 migrations apply easy_bpmn --local   # applies 0001 … 0007 (MVP, saga, topology, conditional, backfill, timers, tokens)
 npm run test
 npm run dev
 ```
@@ -33,8 +37,10 @@ Expected setup outcome:
 - Local Worker API is available at `http://localhost:8787`.
 - Local D1 database has the MVP schema plus the saga ledger, jobs lease/DLQ columns, worker
   credentials, incident `kind`/`resolution`, the `(workspace_id, status)` list index, the M2
-  `occurrence`/`output_applied` columns, conditional topology columns, `gateway_decisions`, and the
-  M3 `timers` + `timer_outcomes` tables (migration `0006_timers.sql`).
+  `occurrence`/`output_applied` columns, conditional topology columns, `gateway_decisions`, the
+  M3 `timers` + `timer_outcomes` tables (migration `0006_timers.sql`), and the M4 `execution_tokens`
+  read-model + `join_arrivals`/`join_completions` join facts + `gateway_decisions.activated_flow_ids` +
+  `saga_steps.token_id` (migration `0007_tokens.sql`).
 - Workflow and Durable Object bindings are available in local development.
 
 ## Scenario 1: Happy Saga Commits (gate: happy-saga-commit)
@@ -429,11 +435,177 @@ exhaustion incident (Hazard inside a transaction); lease-expiry exhaustion now t
 
 Exercise the `timeout` split and the hygiene fixes.
 
-Expected outcome (design §7 gate 12, §5): an un-leasable job → `jobActivationTimeout`; an un-guarded
-service-task / receive-task wait cap → `waitTimeout`; a hard FEEL error → `conditionFailure`;
+Expected outcome (design §7 gate 12, §5): an un-leasable job → `jobActivationTimeout` (also the sole
+liveness backstop for an un-guarded service-task wait under M4 single-wake; an un-guarded receive-task /
+message-catch wait carries no modeled deadline and is **indefinite** per standard BPMN, so the M3
+`waitTimeout` cap is **retired/unproduced**); a hard FEEL error → `conditionFailure`;
 `setIncidentResolution` resolves a single incident by id (no longer all of the instance's open
 incidents); inspection lists **all** open incidents; an empty-ledger `/cancel` closes them all as
 `operatorResolved`. A fired model timer never creates an incident.
+
+---
+
+The M4 scenarios below exercise block-structured parallel (`parallelGateway`) and inclusive
+(`inclusiveGateway`) gateways, the token frontier, branch-local variable scopes, and
+parallel-branch compensation. The design source is
+`docs/superpowers/specs/2026-06-13-m4-concurrency-design.md` (§14 testing & exit criteria).
+
+## Scenario 27: AND Split / Join (gate: parallel-and-split-join — `tests/integration/parallel-gateway.test.ts`)
+
+A `parallelGateway` split fans out into two or more concurrent service-task branches; the
+matching AND join waits for a token from every activated branch before producing the post-join
+token; the instance completes once the token frontier is empty.
+
+Expected outcome: both branch jobs become leasable simultaneously (real worker-side parallelism);
+each completed branch records a `join_arrivals` row via `INSERT OR IGNORE`; the last arrival
+fires the `join_completions` plain-INSERT claim in the same `dbBatch` as the merged-overlay
+write and the produced-token row; the instance reaches `completed` via the atomic last-token-out
+conditional UPDATE when the frontier empties.
+
+## Scenario 28: OR Split / Join (gate: inclusive-or-split-join — `tests/integration/inclusive-gateway.test.ts`)
+
+An `inclusiveGateway` split evaluates FEEL conditions on its outgoing flows in document order;
+only the true-condition flows are activated (the activated set is recorded in
+`gateway_decisions.activated_flow_ids`). The matching OR join waits for exactly the recorded
+activated subset (keyed by origin branch, not incoming flow). A `default` flow is taken when no
+condition is true; zero activation with no default raises a `noPath` incident.
+
+Expected outcome: an instance with exactly one true-condition branch activates one job and one
+branch token; the OR join fires when that branch's token arrives; with no `default` and no true
+condition the engine settles a terminal `noPath` incident (Hazard inside a transaction; no
+auto-compensation); with a `default` flow it is taken as the activated singleton; the recorded
+`activated_flow_ids` set is reused verbatim on rewalk and never re-evaluated.
+
+## Scenario 29: Branch-Local Variable Merge at the Join (gate: branch-local-variable-merge — `tests/integration/parallel-gateway.test.ts`)
+
+Each branch token carries its own `variables_overlay` delta; service-task output writes inside
+a branch go to that token's own overlay and are invisible to sibling branches before the join
+merge. At the join the deltas are merged into the post-join token in **split out-flow document
+order** (later-in-order wins on key conflict); the merge is shallow (top-level key union).
+
+Expected outcome: branch A writes key `aResult` and branch B writes key `bResult`; both are
+present in the post-join scope; when both branches write the same key `shared`, the value from
+the branch whose out-flow appears later in the split's `outgoing[]` (document order) wins; a
+branch-A write is not visible when branch B reads the same key before the join — branch B reads
+the pre-split scope value.
+
+## Scenario 30: Parallel Transaction Compensation (gate: parallel-branch-compensation — `tests/integration/parallel-compensation.test.ts`)
+
+A business error in one branch (or an operator `/cancel`) begins scope cancel while a sibling
+branch is still in-flight (a straggler). The compensation reverse pass (a) records the live-token
+cohort, (b) arms per-token terminators so the quiescence barrier never depends on a future poll,
+(c) ledgers straggler completes that arrive after cancel begins, (d) compensates each causal
+chain in lineage-ordered reverse, and (e) settles `compensated` exactly once — only after the
+ledger is drained **and** all cohort tokens are terminal.
+
+Expected outcome: a straggler's late `complete` writes a `saga_steps` ledger row (`INSERT OR
+IGNORE`) but does not advance the instance; the compensating drive ledgers the straggler before
+running the reverse pass; within each branch lineage the compensation steps run in strict
+descending-seq order; cross-branch order is unconstrained (no happens-before relation across
+independent branches); the quiescence barrier prevents the `compensated` terminal transition
+while any cohort token is still live; the instance settles `compensated` exactly once.
+
+## M4 manual Workflow-mode matrix
+
+> **Re-validated GREEN on REAL Cloudflare Workflows 2026-06-14** (`bpmn.rntme.com`, Worker
+> Version `f194b722-7de1-42e6-a96c-4a24fc94b09d` = the fixed single-wake build, incl. the
+> compensation fix; remote D1 migration `0007_tokens.sql` applied; R2 `easy-bpmn-overlays`
+> enabled; `EXECUTION_MODE=workflow`). **Result: PASS — the AND-join completes, the L6.6
+> multi-wait defect is resolved by TASK-54 (a single per-instance `bpmn_wake` event + re-walk
+> from canonical D1).** This gate now **passes** and **M4 is closed**. (Earlier scenarios first
+> ran on Version `6028765a-49c4-…` and were re-confirmed on `f194b722` after the compensation fix.)
+>
+> _Previously (L6.6, 2026-06-13, Version `1993c802-bf27-4b16-bd29-82d0159b4982`): the
+> workflow-mode multi-wait AND/OR-join hung after the second branch — see "Root cause (RESOLVED)"
+> below._
+
+The direct-mode integration tests (Scenarios 27–30) cover all concurrent-join *logic* via the D1
+replay predicates + the deterministic DFS traversal and pass in CI. The behaviours below only
+manifest when a real Cloudflare Workflow drives the instance (single-wake fan-in, step
+memoization across suspend/resume), which is exactly what direct-mode CI cannot reach — the reason
+this matrix is validated against real CF.
+
+### Substrate probes (real CF, `EXECUTION_MODE=workflow`)
+
+All probes below were run against `bpmn.rntme.com` on the fixed single-wake build (Version
+`f194b722`). Instances persist in prod D1 as identifiable `workspaceId="default"` test data.
+
+| Probe | Real CF | Instance | Result |
+|-------|---------|----------|--------|
+| Sequential `Start→A→B→End` (two job-result events in sequence) | **PASS** | — | workflow-mode multi-event resume works for a linear chain |
+| AND-join `PARALLEL_BPMN` (fork → A‖B → join → C → End; complete branch B then A — the 2nd completion is the exact L6.6 trigger) | **PASS** | `pi_ec0a9d47-7fa0-4392-aa0e-5bb65b64ff44` | **completed** (elem E); the join fired once after both branches arrived; **the L6.6 hang is GONE** |
+| single-token **live message** apply-from-D1 (`outcome=correlated`) | **PASS** | `pi_40653d8e-7eb8-4550-a448-9e8b784e95aa` | completed (End_1) |
+| **order-saga** forward service-task chain | **PASS** | `pi_1f28e98a-b484-4a05-a5bf-3b48a7a21487` | completed (SagaDone) |
+| **eventBasedGateway** message-branch live apply-from-D1 (`correlated`) | **PASS** | `pi_7e5e6562-10e7-43a6-8410-426920ccbdcb` | completed (Approved) |
+| **conditional** XOR saga | **PASS** | `pi_5fbb920f-1352-4270-88b0-3c1f421d87e5` | completed (OrderPlaced) |
+| **timer-saga** (armed PT30M boundary timer, happy-path commit) | **PASS** | `pi_c630f358-396f-42c4-823d-379a3436c643` | completed (SagaDone) |
+| **parallel cancel + reverse compensation** (fork/join saga, post-join settle-fail → Tx_cancel → reverse-compensate both branches) | **PASS** | `pi_b378e6c6-b239-4bd7-93e6-4c32a2a3c4e9` | **compensated** (both branches, elem Failed); quiescence held to `compensated` |
+| single-token **order-saga `/cancel` + compensation** (2 comp steps) | **PASS** | `pi_75184ac2-1685-40c4-8c16-25cf707a13f9` | **compensated** (elem SagaFailed) |
+
+**Evidence (real CF):** the AND-join instance `pi_ec0a9d47` reaches `completed` (elem E) — completing
+branch B then A resumes the Workflow on the single `bpmn_wake`, the engine re-walks from D1, the join
+fires exactly once, and the token proceeds through C to End. The two compensation rows above prove the
+single wake also drives the multi-step reverse compensation pass to a clean `compensated` terminal
+(the bug found-and-fixed during this re-validation — see "Fix (shipped, TASK-54)" below).
+
+### The six matrix scenarios
+
+WM-1 and WM-6 are **externally forceable** through the public API and **PASS** on real CF (the
+AND-join and the parallel-cancel + reverse-compensation substrate probes above). WM-2/3/4/5 turn on
+conditions that **cannot be injected from outside the platform** (a real Workflow crash is isolate
+eviction; forced replay and precise near-simultaneous timing are not API-triggerable), so their
+replay-stability is **covered by the workflow-mode replay harnesses in CI** — they run under the
+same single `bpmn_wake` proven green on real CF above.
+
+| # | Scenario | Status |
+|---|----------|--------|
+| WM-1 | Two parallel branches, deliver A then B → each applies exactly once, join proceeds, no duplicate-step-name error | **PASS** (real CF) — AND-join `pi_ec0a9d47`: completed branch B then A, the join fired once, the instance reached End (elem E) |
+| WM-2 | Crash/restart mid-race after delivering A → re-walk fast-forwards A write-free, re-races B, no re-apply | **Covered** (CI replay harness; not externally forceable — a real Workflow crash is platform isolate eviction). `tests/integration/loop-replay-workflow.test.ts`, `xor-replay-workflow.test.ts` (memoizing `step.do` + crash-after-commit + scripted-wake) |
+| WM-3 | Deliver A and B near-simultaneously then force replay → identical final state regardless of race winner | **Covered** (CI replay harness; not externally forceable — forced replay / precise near-simultaneous timing cannot be injected from outside the platform). Replay harnesses above |
+| WM-4 | One branch times out while a sibling is live → no `unhandledRejection`, the sibling completes | **Covered** (CI replay harness; not externally forceable). The single-wake re-walk reconciles overdue timers against D1 on each wake; replay harnesses above |
+| WM-5 | In-region loops approaching the budget → graceful `stepBudget`/`concurrencyLimit` incident, not an opaque errored Workflow | **Covered** — the caps are CI-tested (`tests/integration/parallel-caps.test.ts`); the wake mechanism they run under is the same single wake proven green on real CF above |
+| WM-6 | Cancel a region with parked + in-flight straggler branches → quiescence barrier + reverse compensation across suspend/resume | **PASS** (real CF) — parallel cancel+compensation `pi_b378e6c6`: both branches reverse-compensated, the quiescence barrier held to `compensated` (elem Failed) |
+
+### Root cause (RESOLVED — historical, L6.6 2026-06-13)
+
+_This was the **R-cf-multiwait** risk flagged in the design (§5.2, decision 3, the risk register);
+it is **now fixed** by the single-wake engine (TASK-54). Recorded here for history._
+
+Cloudflare Workflows re-invokes `run()` from the top on every event (deterministic replay,
+memoizing `step.do`/`step.waitForEvent` by name). The original token-frontier rewalk
+(`runInstance` → `driveFrontier` → `raceParkedWaits`) issued **a different set of
+`step.waitForEvent` calls on each re-invocation**: when one branch's job completed, that branch
+shifted from a `step.waitForEvent` to a `step.do` apply, so the per-replay step sequence diverged
+(invocation #1 issued `waitForEvent(A)` + `waitForEvent(B)`; invocation #2 issued
+`step.do(svc-apply:B)` + `waitForEvent(A)`). A `Promise.race` over multiple concurrent
+`step.waitForEvent` does not compose with Cloudflare's one-suspension-point-at-a-time replay
+model, so the surviving branch's later `sendEvent` never resumed the Workflow and the join hung.
+
+### Fix (shipped, TASK-54)
+
+The workflow-mode wait was replaced with a **replay-stable** mechanism: a **single per-instance
+`step.waitForEvent` on one stable `bpmn_wake` event type** (every job-result / message / timer
+`sendEvent`s that one type), with the engine re-walking and reconciling against canonical D1 on
+each wake (the "advisory winner, D1 is the truth" philosophy from §5.2). That keeps the `step.*`
+sequence identical across replays regardless of which branches have completed. Leaf branches park
+write-free and apply-from-D1 on the next wake. The direct-mode join logic (Scenarios 27–30) was
+unaffected and served as the regression net.
+
+A bug was **found and fixed during this re-validation** (the value of the real-CF gate): the
+single-wake migration (Task 6) had deleted `runCompensation`'s per-comp-job `waitFor` suspend, and
+the single wake was wired only into the forward `loop` — so multi-step compensation busy-spun in
+workflow mode (a parallel saga got stuck `compensating` after the first comp step). Fixed by
+mirroring the forward `issueWake` into the compensation reverse pass (commit `aa87864` + CI guard
+`tests/integration/compensation-replay-workflow.test.ts`; `2e877fd` comment). Re-validated GREEN —
+the two compensation rows in the probe table above.
+
+### Current production state (2026-06-14)
+
+`bpmn.rntme.com` serves the **fixed single-wake M4** (Version `f194b722`). Single-token M0–M3
+flows, the AND/OR-join, and reverse compensation all **complete** in workflow mode. The validation
+instances above remain in prod D1 as identifiable `workspaceId="default"` test data; one pre-fix
+instance (`pi_0a6b98a7-…`) remains stuck `compensating` on the now-superseded build (orphaned,
+harmless — pre-revenue, no users).
 
 ## Workflow-mode-only paths (manual validation)
 
@@ -478,5 +650,14 @@ Expected validation outcome:
   (message/timer/buffered/tie-break); receive-task boundary timer; multi-error-boundary + catch-all
   routing; error-path-then-compensate ledger integrity; standalone message catch; abnormal-exit timer
   settlement; `retryable=false` + lease-expiry exhaustion; the incident-kind split + hygiene. The
-  Workflow-mode-only paths above are validated manually.
+  M3 Workflow-mode-only paths above are validated manually.
+- The four M4 direct-mode gates pass (Scenarios 27–30): AND split/join with frontier-empty
+  completion; OR split/join with recorded activation subset; branch-local variable merge in split
+  out-flow document order; parallel-branch compensation with straggler ledger, per-token terminators,
+  lineage-ordered reverse, and quiescence barrier. **The M4 manual Workflow-mode matrix was
+  re-validated GREEN on real Cloudflare Workflows (2026-06-14, Worker Version `f194b722`): the
+  AND-join completes (the L6.6 multi-wait hang is resolved by TASK-54's single `bpmn_wake` +
+  re-walk-from-D1), WM-1 and WM-6 PASS on real CF, and WM-2/3/4/5 are covered by the workflow-mode
+  replay harnesses in CI (not externally forceable on the live platform). M4 is closed.** See the
+  "M4 manual Workflow-mode matrix" section above for the (resolved) root cause + the shipped fix.
 - No external workflow infrastructure (Camunda/Zeebe/broker/cluster) is deployed.

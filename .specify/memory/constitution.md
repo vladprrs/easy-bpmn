@@ -1,4 +1,53 @@
 <!--
+Sync Impact Report — 2.3.1 -> 2.4.0 (2026-06-14)
+Rationale (MINOR): materially widens product scope — it removes "advanced
+Operate-style UI" from the MVP exclusion list and opens the M-UI / Operator
+Console milestone (a read-only operator console) while PRESERVING every existing
+principle (per the versioning policy: "MINOR = ... materially expand guidance
+while preserving existing principles"; same class as the M2/M3/M4 scope-widening
+amendments). No core principle is redefined or removed: Principle V (Auditability
+& Operator Clarity) already MANDATES that operators inspect instance status,
+current element, variables, and history and that errors explain what/where/next —
+the console is the UI realisation of that existing principle, not a new one. The
+console introduces NO new BPMN construct (Principle I's accepted set is unchanged)
+and changes no execution / immutability / idempotency / correlation / saga
+semantics (Principles II-IV, VI verbatim).
+Source: docs/superpowers/specs/2026-06-14-operator-console-ui-design.md (the
+adversarially-reviewed operator-console design) + its implementation plan
+docs/superpowers/plans/2026-06-14-operator-console-ui.md.
+Scope of the amendment (what M-UI authorises):
+- A read-only React SPA served by the SAME Worker as static assets (same-origin),
+  plus new read/aggregation API endpoints (projects/attention/sagas, instance
+  jobs+attempts, message search, raw BPMN XML, an SSE history live-tail) and a
+  session-cookie auth layer (`/ui/login|logout|me`). All inspection reads D1 only
+  (the existing inspection invariant is unchanged); the SPA exposes NO Cloudflare
+  Workflow internals.
+- The ONLY write surface remains the two EXISTING operator controls (cancel,
+  retry). The console adds no new write/mutation verb and no instance-start UI.
+Modified sections:
+- MVP Scope and Platform Constraints: "or advanced Operate-style UI unless this
+  constitution is amended first" REMOVED from the exclusion list (a visual BPMN
+  modeler stays excluded — the console is a viewer, never an editor); the
+  milestone parenthetical notes M-UI adds the read-only console; an in-scope recap
+  paragraph for the M-UI console is appended (mirroring the M2/M3/M4 recaps).
+Unchanged principles:
+- I-VI verbatim (Principle V already covers operator inspection; the console is its
+  UI surface). No accepted BPMN construct added or removed.
+Templates requiring updates:
+- checked: .specify/templates/plan-template.md (Constitution Check — no
+  BPMN-profile or saga-ordering change; the UI milestone carries the standard
+  audit-history / operator-visible-error / inspection-reads-D1 gates already
+  present).
+- checked: .specify/templates/spec-template.md (no construct-set change).
+- checked: AGENTS.md / tasks-template.md (no construct list change).
+Follow-up TODOs:
+- openapi.yaml + runtime-contracts.md amended in lockstep with the new endpoints
+  (per the governance gate); check:docs stays green.
+- M5 (composition) still requires its own amendment before widening the BPMN
+  profile further; M-UI widens only the operator-UI scope, not the profile.
+-->
+
+<!--
 PATCH addendum — 2.3.0 -> 2.3.1 (2026-06-14)
 Rationale (PATCH): clarifies wording only — no principle is redefined, removed,
 or scope-widened (per the versioning policy: "PATCH = clarify wording … or make
@@ -262,12 +311,13 @@ the M3 message `intermediateCatchEvent`), non-transaction
 subprocesses, `callActivity`, ad-hoc subprocesses, multi-instance / loop
 characteristics (`multiInstanceLoopCharacteristics` /
 `standardLoopCharacteristics` markers — distinct from the accepted cycles on
-the token path), process migration, full Zeebe/Camunda compatibility, a visual
-BPMN modeler, or advanced Operate-style UI unless this constitution is amended
-first. (Each of these is added only by its own later milestone amendment —
-M5 composition; the M4 in-instance concurrency set — block-structured
-`parallelGateway` (AND) and `inclusiveGateway` (OR) — is added by THIS amendment,
-as the M3 time-&-failure-taxonomy set was by the prior one.)
+the token path), process migration, full Zeebe/Camunda compatibility, or a visual
+BPMN modeler unless this constitution is amended first. (Each of these is added
+only by its own later milestone amendment — M5 composition; the **M-UI read-only
+operator console** is added by the M-UI amendment (a viewer + the existing
+cancel/retry controls, never an editor); the M4 in-instance concurrency set —
+block-structured `parallelGateway` (AND) and `inclusiveGateway` (OR) — is added by
+the M4 amendment, as the M3 time-&-failure-taxonomy set was by the prior one.)
 
 The accepted saga set — the `bpmn:transaction` scope, compensation / error /
 cancel boundary events, the `isForCompensation` handler, `bpmn:association`, the
@@ -291,6 +341,20 @@ region is rejected with element ids), and the concurrency runtime has since
 **fully shipped** across the M4 runtime layers (re-validated GREEN on real
 Cloudflare Workflows 2026-06-14). Only `parallel` and `inclusive` were removed from the exclusion list
 above (`complex` stays). Nothing else was removed.
+
+The M-UI amendment additionally removed **only** "advanced Operate-style UI" from
+the exclusion list above (a visual BPMN modeler and any instance-start /
+model-editing write surface stay excluded). The accepted **M-UI operator
+console** — a read-only React SPA served same-origin by the Worker, session-cookie
+auth (`/ui/login|logout|me`), read/aggregation endpoints
+(projects/attention/sagas, instance jobs+attempts, message search, raw BPMN XML,
+an SSE history live-tail), BPMN viewing with a live execution overlay, and the
+EXISTING cancel/retry operator controls — is in scope as of the M-UI amendment
+(Principle V — the console is the UI surface of the operator-clarity principle, not
+a new principle). It adds no BPMN construct (Principle I unchanged) and changes no
+execution / immutability / idempotency / correlation / saga semantics. All console
+inspection reads D1 only; no Cloudflare Workflow internal is exposed (the existing
+inspection invariant is preserved).
 
 The first demo flow MUST run without requiring users to deploy their own workflow
 cluster, broker, BPMN engine, or dedicated operations stack.
@@ -335,4 +399,4 @@ Plans with unresolved constitution violations MUST NOT proceed to implementation
 until the violation is either removed or explicitly accepted through the
 Complexity Tracking section.
 
-**Version**: 2.3.1 | **Ratified**: 2026-06-07 | **Last Amended**: 2026-06-14
+**Version**: 2.4.0 | **Ratified**: 2026-06-07 | **Last Amended**: 2026-06-14

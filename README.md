@@ -5,15 +5,16 @@ running Camunda/Zeebe, a broker, or a workflow cluster. `easy-bpmn` is a BPMN-li
 **saga orchestrator**: it turns canonical BPMN models into durable, compensating
 sagas with pull/external-task workers and operator visibility.
 
-Shipped milestones (M0–M4); **M5 (composition) is next**:
+Shipped milestones (M0–M4 + the M-UI operator console); **M5 (composition) is next**:
 
 - **M0** — linear happy path: Start Event → Service Task (remote worker) → Receive Task (await message) → End Event.
 - **M1** — canonical transaction-saga: `bpmn:transaction` scope, compensation, error/cancel boundary events, operator cancel/retry.
 - **M2** — conditional sagas: `exclusiveGateway`, FEEL `conditionExpression`s, default flows, token-path cycles.
 - **M3** — time & failure taxonomy: interrupting boundary/intermediate timers, message intermediate catch, `eventBasedGateway`, free error routing.
 - **M4** — concurrency: block-structured (SESE) `parallelGateway` (AND) / `inclusiveGateway` (OR), token frontier, AND/OR-join barrier, branch-local variable merge, parallel-branch compensation.
+- **M-UI** — operator console: a **read-only** React SPA (in [`spa/`](spa/)) served same-origin by the Worker (Cloudflare Static Assets), session-cookie auth, project/saga/attention rollups, instance jobs+attempts, message search, raw BPMN XML, an SSE history live-tail, and BPMN viewing with a live execution overlay. Read-only except the existing `cancel`/`retry`; all inspection reads D1. See [`spa/README.md`](spa/README.md).
 
-Governed by [`.specify/memory/constitution.md`](.specify/memory/constitution.md) (v2.3.1).
+Governed by [`.specify/memory/constitution.md`](.specify/memory/constitution.md) (v2.4.0).
 The active implementation spec is
 [`specs/002-saga-orchestrator/`](specs/002-saga-orchestrator/) (`spec.md`, `plan.md`,
 `data-model.md`, `quickstart.md`, `contracts/`). `specs/001-bpmn-lite-orchestrator-mvp/`

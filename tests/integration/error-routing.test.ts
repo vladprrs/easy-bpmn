@@ -73,7 +73,7 @@ describe("free error-boundary routing — matching precedence (AC#1, §7 gate 7)
     // An UNDECLARED code (no bpmn:error) hits the catch-all — proving the
     // catch-all catches ANY business code, including undeclared ones.
     { code: "TOTALLY_UNDECLARED", taskType: "svc-c", path: "svcC", others: ["svcA", "svcB"] },
-  ])("routes $code to its boundary's alternate path ($path)", async ({ code, taskType, path, others }) => {
+  ])("[C-ERR-PRECEDENCE-01] routes $code to its boundary's alternate path ($path)", async ({ code, taskType, path, others }) => {
     const token = await mintWorkerToken();
     const { instance } = await publishAndStart(routerSaga({ catchAll: true }), {
       correlationKey: `route-${code}`,

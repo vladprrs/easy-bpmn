@@ -18,7 +18,7 @@ const WAKE_SLACK_MS = 5000;
  * Ceiling on the wake backstop when no modeled deadline applies (external job/message
  * waits). A lost wake recovers within this bound; D1 read-your-writes consistency
  * makes the tickle the reliable primary path, so this is a rare fallback. Tunable
- * (design §8). Defaults to one hour, matching the legacy SVC_WAIT_TIMEOUT.
+ * (design §8). Defaults to one hour.
  */
 export const MAX_WAKE_BACKSTOP_MS = 60 * 60 * 1000;
 

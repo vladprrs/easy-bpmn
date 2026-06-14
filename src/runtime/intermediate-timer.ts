@@ -67,9 +67,10 @@ async function catchTimerFired(env: Env, instanceId: string, elementId: string, 
  *   2. First visit → arm + park (persist-before-advance), then arm the DO.
  *      A rewalk landing on a still-`armed` catch re-arms the DO idempotently
  *      (self-heal, design §4.2) and re-parks.
- *   3. Direct mode parks (the DO alarm resumes inline via fireTimer). Workflow
- *      mode waits on the per-visit event type, SIZED to the timer (§4.2), with
- *      the lost-alarm backstop settling overdue on a timeout wake.
+ *   3. Direct mode parks (the DO alarm resumes inline via fireTimer). Under
+ *      single-wake (TASK-54) the driver PARKS; the single `loop` wake
+ *      (`wakeBackstop`-sized to the timer, §4.2) covers it, with the lost-alarm
+ *      backstop settling overdue on a wake.
  */
 export async function driveIntermediateCatch(
   env: Env,

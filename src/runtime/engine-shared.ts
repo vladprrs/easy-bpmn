@@ -28,8 +28,6 @@ export interface DriveResult {
   status: DriveStatus;
 }
 
-export const SVC_WAIT_TIMEOUT = "1 hour";
-
 export async function loadInst(env: Env, instanceId: string): Promise<InstanceRow> {
   const row = await getInstanceRow(env.DB, instanceId);
   if (!row) throw new Error(`Process instance ${instanceId} not found`);

@@ -993,7 +993,10 @@ async function driveReceiveTask(
 }
 
 type RegisterOutcome =
-  | { kind: "waiting"; workflowEventType: string; subscriptionId: string }
+  // Single-wake (TASK-54): `driveReceiveTask` reads only `reg.kind` for the parked
+  // case, so the old `workflowEventType` / `subscriptionId` fields (a per-message
+  // wait type, now the constant WAKE_TYPE) are no longer consumed and were dropped.
+  | { kind: "waiting" }
   | { kind: "correlated"; event: MessageEventPayload }
   // This visit's message was applied concurrently — nothing to register.
   | { kind: "applied" }
@@ -1062,7 +1065,7 @@ async function registerReceive(env: Env, instanceId: string, graph: ExecutionGra
     ]);
     if (arm) await armTimerDO(env, arm.timerId, arm.fireAt);
   }
-  return { kind: "waiting", workflowEventType, subscriptionId };
+  return { kind: "waiting" };
 }
 
 async function applyMessage(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, next: string, event: MessageEventPayload, activeTokenId?: string): Promise<{ next: string }> {

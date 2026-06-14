@@ -23,7 +23,7 @@
 
 import type { Env } from "../env";
 import type { ExecutionGraph, GraphNode, TimerTriggerSpec } from "../bpmn/graph";
-import { ONE_HOUR_MS, isTerminalInstanceStatus, isoIsBefore, nowIso } from "../util";
+import { isTerminalInstanceStatus, isoIsBefore, nowIso } from "../util";
 import { dbBatch } from "../persistence/db";
 import { historyStmt } from "../persistence/history";
 import {
@@ -297,25 +297,6 @@ export async function cancelArmedTimersForInstance(env: Env, instanceId: string)
 export async function timerHasFired(env: Env, instanceId: string, tb: TimerBoundary, occ: number): Promise<boolean> {
   const outcome = await getTimerOutcome(env.DB, timerIdFor(instanceId, tb.boundaryId, occ));
   return outcome?.outcome === "fired";
-}
-
-/**
- * Workflow-mode waitForEvent timeout SIZED to one timer (design §4.2):
- * `max(SVC_WAIT_TIMEOUT, fire_at − now + slack)` so a long timer costs O(1) steps
- * and the sized timeout doubles as the lost-alarm backstop. The shared piece,
- * keyed by raw `timerId`, reused by the boundary wait (`timerGuardedTimeout`) and
- * the intermediate-catch wait (intermediate-timer.ts). Workflow-mode-only.
- */
-export async function timerSizedTimeout(env: Env, timerId: string): Promise<string> {
-  const trow = await getTimer(env.DB, timerId);
-  const fireAtMs = trow ? new Date(trow.fireAt).getTime() : Date.now();
-  const untilMs = Math.max(ONE_HOUR_MS, fireAtMs - Date.now() + 5000);
-  return `${Math.ceil(untilMs / 1000)} seconds`;
-}
-
-/** Boundary-wait variant of {@link timerSizedTimeout} (host activity + occurrence). */
-export async function timerGuardedTimeout(env: Env, instanceId: string, tb: TimerBoundary, occ: number): Promise<string> {
-  return timerSizedTimeout(env, timerIdFor(instanceId, tb.boundaryId, occ));
 }
 
 /** Best-effort broker supersede for a receive-task boundary fire (mirrors registerReceive's broker call). */

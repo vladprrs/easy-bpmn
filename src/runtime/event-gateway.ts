@@ -150,7 +150,9 @@ export type EbgOutcome =
  *      rewalk re-registers idempotently (self-heal) — either may resolve via an
  *      early-buffered message claimed at registration.
  *   4. Direct mode parks; the broker delivery / timer alarm resumes inline.
- *   5. Workflow mode waits on the per-visit gateway event type, sized to the timer.
+ *   5. Under single-wake (TASK-54) the driver PARKS; the single `loop` wake fires
+ *      on the constant WAKE_TYPE (timer sizing is now `wakeBackstop` in wake.ts)
+ *      and the re-walk reconciles every branch from canonical D1.
  */
 export async function driveEventBasedGateway(
   env: Env,
@@ -287,8 +289,9 @@ async function parkEventBasedGateway(
           messageName: m.branch.messageName,
           correlationKey: inst.correlation_key,
           brokerKey: m.brokerKey,
-          // EBG exception (design §4.5): every branch subscription stores the EBG
-          // visit's wait type, so ONE waitForEvent is woken by any branch.
+          // Vestige (TASK-54): the subscription stores the constant WAKE_TYPE in
+          // `workflow_event_type` (the per-visit gateway type was removed); the single
+          // `loop` wake fires on the one constant type and the re-walk reconciles branches.
           workflowEventType: gwEventType,
           status: "active",
           expiresAt,

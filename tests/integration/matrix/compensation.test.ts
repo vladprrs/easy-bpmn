@@ -412,4 +412,68 @@ describe("matrix: saga compensation under concurrency (direct mode)", () => {
     expect(await statusOf(id)).toBe("compensated");
     expect(await liveTokens(id)).toHaveLength(0);
   });
+
+  // -------------------------------------------------------------------------
+  it("[C-IDEMP-COMP-DUP-01] a duplicate compensation /complete is a stable no-op — compensated once, no second audit, ledger identical to single-delivery", async () => {
+    const token = await mintWorkerToken();
+    const { instance } = await publishAndStart(PARALLEL_SAGA_MULTISTEP_BPMN, {
+      correlationKey: "icd1",
+      variables: { failSettle: true },
+    });
+    expect(instance.status).toBe(201);
+    const id = instance.body.instanceId;
+
+    await leaseAndComplete(token, "ms-a1", {});
+    await leaseAndComplete(token, "ms-a2", {});
+    await leaseAndComplete(token, "ms-b1", {});
+    await leaseAndComplete(token, "ms-b2", {});
+    await failSettle(token);
+
+    // Drive the reverse pass, but when comp-ms-a2's job is leased, complete it and
+    // immediately re-POST the SAME complete (same jobId+lockToken) — the at-least-once
+    // duplicate. It must return the stable prior outcome and never advance twice.
+    const compTypes = ["comp-ms-a1", "comp-ms-a2", "comp-ms-b1", "comp-ms-b2"];
+    let dupDone = false;
+    for (let r = 0; r < 80 && !TERMINAL.includes(await statusOf(id)); r++) {
+      let progressed = false;
+      for (const t of compTypes) {
+        const act = await authedPost("/jobs/activate", token, { taskType: t, workerId: "comp-w" });
+        for (const job of (act.body.jobs ?? []) as any[]) {
+          progressed = true;
+          const first = await complete(token, job, {});
+          expect(first.status).toBe(200);
+          if (t === "comp-ms-a2" && !dupDone) {
+            const dup = await complete(token, job, {}); // SAME jobId + lockToken
+            expect(dup.status).toBe(200);
+            // Idempotent replay: the duplicate returns the STABLE prior outcome (not a
+            // second advance). The no-double-apply proof is the count===1 assertions below.
+            expect(dup.body).toEqual(first.body);
+            expect(dup.body.outcome).toBe("completed");
+            dupDone = true;
+          }
+        }
+      }
+      if (!progressed) break;
+    }
+    expect(dupDone).toBe(true);
+    expect(await statusOf(id)).toBe("compensated");
+
+    // comp-ms-a2 flipped to compensated EXACTLY once: one comp job, one
+    // compensationCompleted audit event for element A2 (the duplicate added neither).
+    expect(await compJobCount(id, "A2")).toBe(1);
+    expect((await compCompletedElements(id)).filter((e) => e === "A2")).toHaveLength(1);
+    expect((await stepOf(id, "A2"))!.compensationStatus).toBe("compensated");
+
+    // The rest of branch A (comp-ms-a1) and branch B compensated normally; final
+    // ledger is identical to a single-delivery run (all four compensated, one comp
+    // job each), and the per-lineage reverse order held.
+    for (const el of ["A1", "A2", "B1", "B2"]) {
+      expect((await stepOf(id, el))!.compensationStatus).toBe("compensated");
+      expect(await compJobCount(id, el)).toBe(1);
+    }
+    const order = await compStartedElements(id);
+    expect(order.indexOf("A2")).toBeLessThan(order.indexOf("A1"));
+    expect(order.indexOf("B2")).toBeLessThan(order.indexOf("B1"));
+    expect(await liveTokens(id)).toHaveLength(0);
+  });
 });

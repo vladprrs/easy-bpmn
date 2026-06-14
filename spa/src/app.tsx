@@ -31,7 +31,7 @@ export default function App() {
 
   if (meQ.isLoading) {
     return (
-      <div className="grid min-h-full place-items-center text-slate-500">
+      <div className="grid min-h-full place-items-center text-content-muted">
         <div className="flex items-center gap-2">
           <Activity className="h-5 w-5 animate-pulse text-accent" /> starting operator console…
         </div>

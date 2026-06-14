@@ -20,6 +20,17 @@ import type { DiagramOverlay } from "../components/BpmnViewer";
 
 const BpmnViewer = lazy(() => import("../components/BpmnViewer"));
 
+const LIVE_STATUSES = new Set(["running", "starting", "waiting", "compensating"]);
+
+function formatDuration(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
 function mergeEvents(prev: HistoryEvent[], next: HistoryEvent[]): HistoryEvent[] {
   if (next.length === 0) return prev;
   const seen = new Set(prev.map((e) => e.historyEventId));
@@ -190,6 +201,10 @@ export function Instance() {
   if (!instance) return null;
 
   const hasSaga = !!instance.saga || index.hasTransaction;
+  const liveStep = overlay.current.length ? index.nameOf(overlay.current[0]) : null;
+  const startMs = instance.startedAt ? new Date(instance.startedAt).getTime() : null;
+  const endMs = instance.completedAt ? new Date(instance.completedAt).getTime() : Date.now();
+  const elapsedLabel = startMs ? `${LIVE_STATUSES.has(status) ? "elapsed" : "ran"} ${formatDuration(endMs - startMs)}` : "";
 
   return (
     <div className="mx-auto max-w-6xl">
@@ -207,7 +222,7 @@ export function Instance() {
           <div className="space-y-1">
             <div className="flex items-center gap-2">
               <StatusBadge status={status} />
-              <span className="font-mono text-sm text-slate-300">{instance.instanceId}</span>
+              <span className="font-mono text-sm text-content">{instance.instanceId}</span>
             </div>
             <div className="grid gap-0.5">
               <KeyVal k="business key">{instance.businessKey || "—"}</KeyVal>
@@ -245,10 +260,25 @@ export function Instance() {
         )}
       </Card>
 
+      {/* Live progress strip (runtime kit chrome) — present-tense, factual. */}
+      {LIVE_STATUSES.has(status) && (
+        <div className="glass mb-4 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-card px-4 py-2.5">
+          <span className="relative flex h-2.5 w-2.5">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-info/60 motion-reduce:hidden" />
+            <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-info" />
+          </span>
+          <span className="text-sm font-semibold text-content">
+            {status.charAt(0).toUpperCase() + status.slice(1)}
+          </span>
+          {liveStep && <span className="truncate text-sm text-content-secondary">· {liveStep}</span>}
+          {elapsedLabel && <span className="ml-auto font-mono text-xs text-content-muted">{elapsedLabel}</span>}
+        </div>
+      )}
+
       {/* Spine: diagram with live overlay */}
       <div className="mb-4">
         {versionXml.data ? (
-          <Suspense fallback={<Card className="grid h-40 place-items-center text-xs text-slate-500">loading diagram…</Card>}>
+          <Suspense fallback={<Card className="grid h-40 place-items-center text-xs text-content-muted">loading diagram…</Card>}>
             <BpmnViewer
               bpmnXml={versionXml.data.bpmnXml}
               elements={version.data?.elements ?? []}
@@ -257,7 +287,7 @@ export function Instance() {
             />
           </Suspense>
         ) : (
-          <Card className="grid h-32 place-items-center text-xs text-slate-500">loading diagram…</Card>
+          <Card className="grid h-32 place-items-center text-xs text-content-muted">loading diagram…</Card>
         )}
       </div>
 
@@ -289,14 +319,14 @@ export function Instance() {
 
       {tab === "waiting" && (
         <Panel>
-          <Card className="divide-y divide-ink-700">
+          <Card className="divide-y divide-line">
             {instance.subscriptions?.map((s) => (
               <div key={s.subscriptionId} className="px-4 py-2.5 text-sm">
                 <div className="flex items-center gap-2">
                   <Badge tone="info">{s.messageName}</Badge>
-                  <span className="font-mono text-xs text-slate-400">{index.nameOf(s.elementId)}</span>
+                  <span className="font-mono text-xs text-content-secondary">{index.nameOf(s.elementId)}</span>
                 </div>
-                <div className="mt-1 font-mono text-xs text-slate-500">
+                <div className="mt-1 font-mono text-xs text-content-muted">
                   key {s.correlationKey} · {s.bufferedCount} buffered{s.expiresAt ? ` · expires ${relativeTime(s.expiresAt)}` : ""}
                 </div>
               </div>
@@ -308,15 +338,15 @@ export function Instance() {
       {tab === "saga" && (
         <Panel>
           {!instance.saga ? (
-            <Card className="p-4 text-sm text-slate-500">No compensation scope in this process.</Card>
+            <Card className="p-4 text-sm text-content-muted">No compensation scope in this process.</Card>
           ) : (
             <div className="grid gap-4 md:grid-cols-2">
               <Card className="p-4">
-                <div className="mb-2 text-xs uppercase tracking-wide text-slate-500">Ledger · phase {instance.saga.phase}</div>
+                <div className="mb-2 text-xs uppercase tracking-wide text-content-muted">Ledger · phase {instance.saga.phase}</div>
                 <ol className="space-y-1">
                   {instance.saga.steps.map((s) => (
                     <li key={`${s.elementId}-${s.seq}`} className="flex items-center justify-between text-sm">
-                      <span className="font-mono text-slate-300">
+                      <span className="font-mono text-content">
                         #{s.seq} {index.nameOf(s.elementId)}
                       </span>
                       <Badge tone={s.compensationStatus === "compensated" ? "ok" : s.compensationStatus === "failed" ? "danger" : "muted"}>
@@ -327,14 +357,14 @@ export function Instance() {
                 </ol>
               </Card>
               <Card className="p-4">
-                <div className="mb-2 text-xs uppercase tracking-wide text-slate-500">If cancelled, compensates (reverse order)</div>
+                <div className="mb-2 text-xs uppercase tracking-wide text-content-muted">If cancelled, compensates (reverse order)</div>
                 {preview.length === 0 ? (
-                  <div className="text-sm text-slate-500">Nothing pending to compensate.</div>
+                  <div className="text-sm text-content-muted">Nothing pending to compensate.</div>
                 ) : (
                   <ol className="space-y-1">
                     {preview.map((p) => (
                       <li key={`${p.elementId}-${p.seq}`} className="flex items-center justify-between text-sm">
-                        <span className="font-mono text-slate-300">{index.nameOf(p.elementId)}</span>
+                        <span className="font-mono text-content">{index.nameOf(p.elementId)}</span>
                         <span className="font-mono text-xs text-warn">{p.compensationTaskType || p.compensationElementId || "—"}</span>
                       </li>
                     ))}
@@ -349,46 +379,46 @@ export function Instance() {
       {tab === "incidents" && (
         <Panel>
           {(instance.openIncidents ?? []).length === 0 && (
-            <Card className="p-4 text-sm text-slate-500">No open incidents.</Card>
+            <Card className="p-4 text-sm text-content-muted">No open incidents.</Card>
           )}
           {(instance.openIncidents ?? []).map((inc) => (
             <Card key={inc.incidentId} className="mb-3 p-4">
               <div className="mb-1 flex items-center gap-2">
                 <Badge tone="danger">{inc.kind || "incident"}</Badge>
-                <span className="font-mono text-xs text-slate-400">{index.nameOf(inc.elementId)}</span>
-                <span className="ml-auto text-xs text-slate-500">retry #{inc.retryCount}</span>
+                <span className="font-mono text-xs text-content-secondary">{index.nameOf(inc.elementId)}</span>
+                <span className="ml-auto text-xs text-content-muted">retry #{inc.retryCount}</span>
               </div>
-              <div className="text-sm text-slate-300">{inc.reason}</div>
+              <div className="text-sm text-content">{inc.reason}</div>
               {inc.payloadContext && <div className="mt-2"><JsonView value={inc.payloadContext} /></div>}
             </Card>
           ))}
           {/* Attempts drill-down (per worker_attempts). */}
-          <div className="mt-2 text-xs uppercase tracking-wide text-slate-500">Jobs &amp; worker attempts</div>
+          <div className="mt-2 text-xs uppercase tracking-wide text-content-muted">Jobs &amp; worker attempts</div>
           {jobsQ.data?.jobs.map((j) => (
             <Card key={j.jobId} className="mb-2 p-3">
               <div className="flex items-center justify-between text-sm">
-                <span className="font-mono text-slate-300">
+                <span className="font-mono text-content">
                   {index.nameOf(j.elementId)} {j.isCompensation && <Badge tone="warn">comp</Badge>}
                 </span>
-                <span className="flex items-center gap-2 text-xs text-slate-500">
+                <span className="flex items-center gap-2 text-xs text-content-muted">
                   {j.taskType} · <Badge tone={j.status === "completed" ? "ok" : j.status === "failed" ? "danger" : "muted"}>{j.status}</Badge>
                   {j.errorCode && <span className="text-danger">{j.errorCode}</span>}
                 </span>
               </div>
               {j.attempts.length > 0 && (
-                <ol className="mt-2 space-y-1 border-l border-ink-700 pl-3">
+                <ol className="mt-2 space-y-1 border-l border-line pl-3">
                   {j.attempts.map((a) => (
                     <li key={a.attemptNumber} className="text-xs">
-                      <span className="text-slate-400">#{a.attemptNumber}</span>{" "}
+                      <span className="text-content-secondary">#{a.attemptNumber}</span>{" "}
                       <Badge tone={a.status === "succeeded" ? "ok" : a.status === "failed" ? "danger" : "muted"}>{a.status}</Badge>
                       {a.error && <span className="ml-1 text-danger">{a.error}</span>}
-                      <span className="ml-1 text-slate-600">{relativeTime(a.startedAt)}</span>
+                      <span className="ml-1 text-content-muted">{relativeTime(a.startedAt)}</span>
                     </li>
                   ))}
                 </ol>
               )}
               {(j.activationExpiresAt || j.lockExpiresAt) && (
-                <div className="mt-1 font-mono text-[11px] text-slate-600">
+                <div className="mt-1 font-mono text-[11px] text-content-muted">
                   {j.activationExpiresAt && `DLQ ${relativeTime(j.activationExpiresAt)} `}
                   {j.lockExpiresAt && `· lease ${relativeTime(j.lockExpiresAt)}`}
                 </div>
@@ -403,15 +433,15 @@ export function Instance() {
           <div className="grid gap-4 md:grid-cols-2">
             {instance.timers?.length ? (
               <Card className="p-4">
-                <div className="mb-2 text-xs uppercase tracking-wide text-slate-500">Timers</div>
+                <div className="mb-2 text-xs uppercase tracking-wide text-content-muted">Timers</div>
                 {instance.timers.map((t) => (
                   <div key={t.timerId} className="flex items-center justify-between text-sm">
-                    <span className="font-mono text-slate-300">
-                      {index.nameOf(t.elementId)} <span className="text-slate-600">{t.kind}</span>
+                    <span className="font-mono text-content">
+                      {index.nameOf(t.elementId)} <span className="text-content-muted">{t.kind}</span>
                     </span>
                     <span className="flex items-center gap-2 text-xs">
                       <Badge tone={t.status === "fired" ? "warn" : t.status === "armed" ? "accent" : "muted"}>{t.status}</Badge>
-                      <span className="text-slate-500">{relativeTime(t.fireAt)}</span>
+                      <span className="text-content-muted">{relativeTime(t.fireAt)}</span>
                     </span>
                   </div>
                 ))}
@@ -419,10 +449,10 @@ export function Instance() {
             ) : null}
             {instance.tokens?.length ? (
               <Card className="p-4">
-                <div className="mb-2 text-xs uppercase tracking-wide text-slate-500">Token frontier</div>
+                <div className="mb-2 text-xs uppercase tracking-wide text-content-muted">Token frontier</div>
                 {instance.tokens.map((t) => (
                   <div key={t.tokenId} className="flex items-center justify-between text-sm">
-                    <span className="font-mono text-slate-300">{index.nameOf(t.positionElementId)}</span>
+                    <span className="font-mono text-content">{index.nameOf(t.positionElementId)}</span>
                     <Badge tone={["active", "waiting", "arrivedAtJoin"].includes(t.status) ? "accent" : "muted"}>{t.status}</Badge>
                   </div>
                 ))}
@@ -434,21 +464,24 @@ export function Instance() {
 
       {/* Cancel confirmation with compensation preview (MoT-3). */}
       {confirming === "cancel" && (
-        <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4" onClick={() => setConfirming(null)}>
-          <Card className="w-full max-w-md p-5" >
-            <div className="mb-2 text-base font-semibold text-slate-100">Cancel this instance?</div>
-            <p className="mb-3 text-sm text-slate-400">
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-content-strong/30 p-4 backdrop-blur-sm"
+          onClick={() => setConfirming(null)}
+        >
+          <Card className="w-full max-w-md p-5 shadow-lg">
+            <div className="mb-2 text-base font-semibold text-content-strong">Cancel this instance?</div>
+            <p className="mb-3 text-sm text-content-secondary">
               Cancelling triggers compensation. The following completed steps will be compensated in reverse order:
             </p>
             {preview.length === 0 ? (
-              <div className="mb-3 rounded border border-ink-700 bg-ink-900 p-3 text-sm text-slate-500">
+              <div className="mb-3 rounded border border-line bg-surface-card p-3 text-sm text-content-muted">
                 Nothing pending to compensate — the instance will move to a terminal state.
               </div>
             ) : (
-              <ol className="mb-3 max-h-48 space-y-1 overflow-auto rounded border border-ink-700 bg-ink-900 p-3">
+              <ol className="mb-3 max-h-48 space-y-1 overflow-auto rounded border border-line bg-surface-card p-3">
                 {preview.map((p) => (
                   <li key={`${p.elementId}-${p.seq}`} className="flex items-center justify-between text-sm">
-                    <span className="font-mono text-slate-300">{index.nameOf(p.elementId)}</span>
+                    <span className="font-mono text-content">{index.nameOf(p.elementId)}</span>
                     <span className="font-mono text-xs text-warn">{p.compensationTaskType || "—"}</span>
                   </li>
                 ))}

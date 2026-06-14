@@ -21,19 +21,19 @@ export function Sagas() {
     <div className="mx-auto max-w-5xl">
       <Breadcrumb items={[{ label: "Projects", to: "/console" }, { label: projectId }]} />
       <div className="mb-4 mt-2 flex items-center justify-between">
-        <h1 className="text-lg font-semibold text-slate-100">Sagas</h1>
+        <h1 className="text-lg font-semibold text-content-strong">Sagas</h1>
         <div className="flex items-center gap-2">
           <Link
             to={`/console/p/${encodeURIComponent(projectId)}/attention`}
             className={`flex items-center gap-1 rounded-md border px-2.5 py-1.5 text-sm ${
-              attentionCount > 0 ? "border-danger/50 bg-danger/10 text-danger" : "border-ink-600 text-slate-400"
+              attentionCount > 0 ? "border-danger/50 bg-danger/10 text-danger" : "border-line-strong text-content-secondary"
             }`}
           >
             <AlertTriangle className="h-4 w-4" /> Attention {attentionCount > 0 && <b>{attentionCount}</b>}
           </Link>
           <Link
             to={`/console/p/${encodeURIComponent(projectId)}/messages`}
-            className="flex items-center gap-1 rounded-md border border-ink-600 px-2.5 py-1.5 text-sm text-slate-400 hover:text-slate-200"
+            className="flex items-center gap-1 rounded-md border border-line-strong px-2.5 py-1.5 text-sm text-content-secondary hover:text-content"
           >
             <Inbox className="h-4 w-4" /> Messages
           </Link>
@@ -47,12 +47,12 @@ export function Sagas() {
           <Link key={s.sagaId} to={`/console/sagas/${encodeURIComponent(s.sagaId)}`}>
             <Card className="p-4 transition hover:border-accent/40">
               <div className="mb-2 flex items-center justify-between gap-2">
-                <span className="flex min-w-0 items-center gap-2 font-medium text-slate-100">
+                <span className="flex min-w-0 items-center gap-2 font-medium text-content-strong">
                   <Workflow className="h-4 w-4 shrink-0 text-accent" /> <span className="truncate">{s.name}</span>
                 </span>
                 {s.hasTransaction && <Badge tone="info">saga</Badge>}
               </div>
-              <div className="mb-2 text-xs text-slate-500">
+              <div className="mb-2 text-xs text-content-muted">
                 v{s.activeVersionId ? "" : "—"}
                 {s.versionCount} version{s.versionCount === 1 ? "" : "s"} · last activity {relativeTime(s.lastActivityAt)}
               </div>
@@ -61,7 +61,7 @@ export function Sagas() {
           </Link>
         ))}
         {sagas.data && sagas.data.sagas.length === 0 && (
-          <Card className="col-span-full p-8 text-center text-sm text-slate-500">
+          <Card className="col-span-full p-8 text-center text-sm text-content-muted">
             No published sagas in this project yet.
           </Card>
         )}

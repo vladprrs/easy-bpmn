@@ -29,6 +29,21 @@ const MARKER = {
   compensated: "ebpmn-compensated",
 };
 
+/** Map a BPMN element type to its easy·bpmn category marker (pastel canvas colour).
+ * Lets a non-BPMN user read the diagram by colour: events green, intermediate blue,
+ * boundary purple, end coral, gateways slate, activities neutral. */
+function categoryClass(type: string): string | null {
+  const t = type.toLowerCase();
+  if (t === "startevent") return "ebpmn-cat-event";
+  if (t === "endevent") return "ebpmn-cat-end";
+  if (t === "boundaryevent") return "ebpmn-cat-boundary";
+  if (t.startsWith("intermediate")) return "ebpmn-cat-intermediate";
+  if (t.endsWith("gateway")) return "ebpmn-cat-gateway";
+  if (t.endsWith("task") || t.endsWith("subprocess") || t === "transaction" || t === "callactivity")
+    return "ebpmn-cat-task";
+  return null;
+}
+
 async function hasDi(xml: string): Promise<boolean> {
   return /<bpmndi:BPMNDiagram|<BPMNDiagram/.test(xml);
 }
@@ -68,7 +83,19 @@ export default function BpmnViewer({
         const xml = (await hasDi(bpmnXml)) ? bpmnXml : await layoutProcess(bpmnXml);
         await viewer.importXML(xml);
         if (disposed) return;
-        viewer.get("canvas").zoom("fit-viewport", "auto");
+        const canvas0 = viewer.get("canvas");
+        canvas0.zoom("fit-viewport", "auto");
+        // Static pastel category tint by element type (independent of the live overlay).
+        for (const el of elements) {
+          const cls = categoryClass(el.type);
+          if (cls) {
+            try {
+              canvas0.addMarker(el.elementId, cls);
+            } catch {
+              /* element not in this diagram — skip */
+            }
+          }
+        }
         viewer.on("element.click", (e: any) => {
           const id = e?.element?.id;
           if (id) onSelectElement(id);
@@ -90,6 +117,9 @@ export default function BpmnViewer({
       appliedMarkers.current = [];
       overlayIds.current = [];
     };
+    // `elements` is intentionally omitted: it changes with bpmnXml (same version) and
+    // a new array identity each render would otherwise re-import the diagram in a loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bpmnXml, onSelectElement]);
 
   // Apply / refresh the live overlay (on overlay change once the diagram is ready).
@@ -152,7 +182,7 @@ export default function BpmnViewer({
   if (failed) {
     // Degradation: element-list fallback (design §10).
     return (
-      <div className="rounded-lg border border-ink-700 bg-ink-850 p-3">
+      <div className="rounded-card border border-line bg-surface-card p-3 shadow-sm">
         <div className="mb-2 text-xs text-warn">Diagram unavailable ({failed}). Showing the element list.</div>
         <ul className="grid max-h-[50vh] grid-cols-2 gap-1 overflow-auto md:grid-cols-3">
           {elements
@@ -169,11 +199,11 @@ export default function BpmnViewer({
                         ? "border-danger/50 bg-danger/10 text-danger"
                         : isCurrent
                           ? "border-ok/50 bg-ok/10 text-ok"
-                          : "border-ink-700 bg-ink-900 text-slate-300"
+                          : "border-line bg-surface-card text-content"
                     }`}
                     title={e.elementId}
                   >
-                    <span className="text-slate-500">{e.type}</span> {e.name || e.elementId}
+                    <span className="text-content-muted">{e.type}</span> {e.name || e.elementId}
                   </button>
                 </li>
               );
@@ -184,9 +214,9 @@ export default function BpmnViewer({
   }
 
   return (
-    <div className="relative rounded-lg border border-ink-700 bg-ink-850">
-      <div ref={hostRef} className="h-[420px] w-full" />
-      {!ready && <div className="absolute inset-0 grid place-items-center text-xs text-slate-500">rendering diagram…</div>}
+    <div className="relative overflow-hidden rounded-card border border-line bg-surface-card shadow-sm">
+      <div ref={hostRef} className="bpmn-canvas h-[420px] w-full" />
+      {!ready && <div className="absolute inset-0 grid place-items-center text-xs text-content-muted">rendering diagram…</div>}
     </div>
   );
 }

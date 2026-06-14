@@ -1,0 +1,266 @@
+/* easy·bpmn design-system tokens — ported from the Claude Design handoff bundle
+ * (easy-bpmn-design-system/project/tokens/*). Light UI: teal-led, soft pastel BPMN
+ * category families, subtle liquid-glass, calm motion. This file is the conceptual
+ * source of truth for everything Tailwind utilities don't cover (glass, shadows,
+ * rings, radii, motion, BPMN category + runtime-state colours, dot-grid canvas).
+ * The key palette hexes are also mirrored into tailwind.config.js so the `bg-…/15`
+ * opacity utilities keep working. Keep the two in sync. */
+
+:root {
+  /* ---- Neutral graphite ramp (chrome, text, edges) ---- */
+  --gray-0: #ffffff;
+  --gray-25: #fbfcfd;
+  --gray-50: #f6f8fa;
+  --gray-100: #eef2f6;
+  --gray-200: #e3e9f0;
+  --gray-300: #d3dbe5;
+  --gray-400: #aab6c4;
+  --gray-500: #7d8b9b;
+  --gray-600: #5b6776;
+  --gray-700: #404a57;
+  --gray-800: #2a323c;
+  --gray-900: #181d24;
+
+  /* ---- Teal / sea-green — PRIMARY brand ---- */
+  --teal-50: #e6f7f3;
+  --teal-100: #c8efe6;
+  --teal-200: #97e0d1;
+  --teal-300: #5fccb8;
+  --teal-400: #2db49d;
+  --teal-500: #109b86;
+  --teal-600: #0c7e6e;
+  --teal-700: #0a6457;
+
+  /* ---- Events — mint / emerald green ---- */
+  --green-50: #e9f8ef;
+  --green-100: #ccefd9;
+  --green-200: #a3e3bd;
+  --green-300: #6fd49a;
+  --green-400: #34bb73;
+  --green-500: #1f9d57;
+  --green-600: #167f46;
+  --green-700: #115f35;
+
+  /* ---- Intermediate / runtime — blue ---- */
+  --blue-50: #eaf2fe;
+  --blue-100: #d3e4fd;
+  --blue-200: #aecdfa;
+  --blue-300: #7fb0f5;
+  --blue-400: #4f8eed;
+  --blue-500: #2f74e0;
+  --blue-600: #235fc0;
+  --blue-700: #1b4a98;
+
+  /* ---- Boundary / special — purple / lavender ---- */
+  --purple-50: #f1edfd;
+  --purple-100: #e3dbfb;
+  --purple-200: #cbbcf6;
+  --purple-300: #b29ef0;
+  --purple-400: #9376e8;
+  --purple-500: #7c5ce0;
+  --purple-600: #6745c7;
+  --purple-700: #51369d;
+
+  /* ---- End / stop / error — coral red ---- */
+  --red-50: #fdecec;
+  --red-100: #fbd9d7;
+  --red-200: #f6bab5;
+  --red-300: #f0958d;
+  --red-400: #e86b61;
+  --red-500: #e0524a;
+  --red-600: #c63d36;
+  --red-700: #9e2e29;
+
+  /* ---- Gateways — teal-graphite (desaturated, decision-point) ---- */
+  --slate-50: #eef3f3;
+  --slate-100: #dde7e6;
+  --slate-200: #c0d1cf;
+  --slate-300: #97b1ae;
+  --slate-400: #6b8a86;
+  --slate-500: #4d6e6a;
+  --slate-600: #3a5552;
+  --slate-700: #2a3e3c;
+
+  /* ---- Warning — amber / orange ---- */
+  --amber-50: #fdf4e3;
+  --amber-100: #fae6c2;
+  --amber-200: #f4d28c;
+  --amber-300: #efbd5a;
+  --amber-400: #e6a330;
+  --amber-500: #cf8a18;
+  --amber-600: #a86d10;
+
+  /* ======================= SEMANTIC ALIASES ======================= */
+
+  /* Surfaces & chrome */
+  --surface-page: var(--gray-50);
+  --surface-canvas: #f4f7f9;
+  --surface-card: var(--gray-0);
+  --surface-raised: var(--gray-0);
+  --surface-sunken: var(--gray-100);
+  --surface-hover: var(--gray-100);
+  --surface-active: var(--gray-200);
+
+  /* Text */
+  --text-strong: var(--gray-900);
+  --text-body: var(--gray-800);
+  --text-secondary: var(--gray-600);
+  --text-muted: var(--gray-500);
+  --text-on-accent: #ffffff;
+  --text-link: var(--teal-600);
+
+  /* Borders / hairlines */
+  --border-subtle: var(--gray-200);
+  --border-default: var(--gray-300);
+  --border-strong: var(--gray-400);
+  --hairline: rgba(40, 55, 72, 0.1);
+
+  /* Primary action */
+  --accent: var(--teal-500);
+  --accent-hover: var(--teal-600);
+  --accent-press: var(--teal-700);
+  --accent-soft: var(--teal-50);
+  --accent-ring: rgba(16, 155, 134, 0.35);
+
+  /* ---- BPMN category tokens: surface / border / icon / ink ---- */
+  --cat-event-surface: var(--green-50);
+  --cat-event-border: var(--green-400);
+  --cat-event-icon: var(--green-600);
+  --cat-event-ink: var(--green-700);
+
+  --cat-inter-surface: var(--blue-50);
+  --cat-inter-border: var(--blue-400);
+  --cat-inter-icon: var(--blue-600);
+  --cat-inter-ink: var(--blue-700);
+
+  --cat-boundary-surface: var(--purple-50);
+  --cat-boundary-border: var(--purple-400);
+  --cat-boundary-icon: var(--purple-600);
+  --cat-boundary-ink: var(--purple-700);
+
+  --cat-end-surface: var(--red-50);
+  --cat-end-border: var(--red-500);
+  --cat-end-icon: var(--red-600);
+  --cat-end-ink: var(--red-700);
+
+  --cat-gateway-surface: var(--slate-50);
+  --cat-gateway-border: var(--slate-400);
+  --cat-gateway-icon: var(--slate-600);
+  --cat-gateway-ink: var(--slate-700);
+
+  --cat-task-surface: var(--gray-0);
+  --cat-task-border: var(--gray-300);
+  --cat-task-icon: var(--blue-500);
+  --cat-task-ink: var(--gray-900);
+
+  --cat-edge: var(--gray-500);
+  --cat-edge-strong: var(--gray-700);
+
+  /* ---- Runtime / interaction state colours ---- */
+  --state-selected: var(--teal-500);
+  --state-selected-ring: rgba(16, 155, 134, 0.3);
+  --state-focus: var(--blue-500);
+  --state-focus-ring: rgba(47, 116, 224, 0.35);
+  --state-running: var(--blue-500);
+  --state-running-ring: rgba(47, 116, 224, 0.28);
+  --state-completed: var(--green-500);
+  --state-completed-ring: rgba(31, 157, 87, 0.26);
+  --state-error: var(--red-500);
+  --state-error-ring: rgba(224, 82, 74, 0.3);
+  --state-warning: var(--amber-500);
+  --state-warning-ring: rgba(207, 138, 24, 0.3);
+
+  /* ---- Typography ---- */
+  --font-sans: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", Roboto,
+    Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", monospace;
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+  --tracking-tight: -0.02em;
+  --tracking-normal: 0;
+  --tracking-label: 0.06em;
+  --tracking-wide: 0.12em;
+  --leading-tight: 1.18;
+  --leading-snug: 1.32;
+  --leading-normal: 1.5;
+
+  /* ---- Spacing / radius / stroke ---- */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-task: 12px;
+  --radius-lg: 14px;
+  --radius-card: 16px;
+  --radius-xl: 20px;
+  --radius-pill: 999px;
+  --stroke-hairline: 1px;
+  --stroke-thin: 1.5px;
+  --stroke-base: 2px;
+  --stroke-emphasis: 2.5px;
+  --stroke-thick: 3px;
+  --stroke-edge: 2px;
+
+  /* ---- Elevation shadows (soft, cool-tinted) ---- */
+  --shadow-xs: 0 1px 2px rgba(20, 30, 45, 0.06);
+  --shadow-sm: 0 1px 3px rgba(20, 30, 45, 0.08), 0 1px 2px rgba(20, 30, 45, 0.04);
+  --shadow-md: 0 4px 12px rgba(20, 30, 45, 0.1), 0 1px 3px rgba(20, 30, 45, 0.06);
+  --shadow-lg: 0 12px 32px rgba(20, 30, 45, 0.14), 0 2px 8px rgba(20, 30, 45, 0.06);
+  --shadow-xl: 0 24px 60px rgba(20, 30, 45, 0.18), 0 4px 12px rgba(20, 30, 45, 0.08);
+  --shadow-node: 0 1px 2px rgba(20, 30, 45, 0.06), 0 2px 6px rgba(20, 30, 45, 0.05);
+  --shadow-node-hover: 0 2px 4px rgba(20, 30, 45, 0.08), 0 6px 16px rgba(20, 30, 45, 0.1);
+
+  /* ---- Glass / liquid surfaces (subtle, ~30%) ---- */
+  --glass-bg: rgba(255, 255, 255, 0.62);
+  --glass-bg-soft: rgba(255, 255, 255, 0.48);
+  --glass-border: rgba(255, 255, 255, 0.7);
+  --glass-hairline: rgba(40, 55, 72, 0.08);
+  --glass-blur: 14px;
+  --glass-shadow: 0 8px 28px rgba(20, 30, 45, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.6);
+
+  /* ---- Focus / selection rings ---- */
+  --ring-width: 3px;
+  --ring-focus: 0 0 0 var(--ring-width) var(--state-focus-ring);
+  --ring-selected: 0 0 0 var(--ring-width) var(--state-selected-ring);
+
+  /* ---- Canvas texture: subtle dot grid ---- */
+  --canvas-dot: rgba(60, 80, 100, 0.1);
+  --canvas-grid-size: 22px;
+
+  /* ---- Motion ---- */
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --dur-fast: 120ms;
+  --dur-base: 200ms;
+  --dur-slow: 320ms;
+}
+
+/* Dot-grid canvas surface used by the runtime diagram view. */
+.bpmn-canvas {
+  background-color: var(--surface-canvas);
+  background-image: radial-gradient(var(--canvas-dot) 1.2px, transparent 1.2px);
+  background-size: var(--canvas-grid-size) var(--canvas-grid-size);
+  background-position: -1px -1px;
+}
+
+/* Liquid-glass surface utility — floating chrome only, never diagram nodes. */
+.glass {
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.4);
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.4);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+}
+
+/* Tiny technical uppercase label (inspector keys). */
+.tech-label {
+  font-size: 12px;
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--text-muted);
+}

@@ -29,24 +29,27 @@ export function Login() {
   };
 
   return (
-    <div className="grid min-h-full place-items-center px-4">
-      <form onSubmit={submit} className="w-full max-w-sm rounded-xl border border-ink-700 bg-ink-850 p-6 shadow-xl">
-        <div className="mb-5 flex items-center gap-2 text-lg font-semibold text-slate-100">
-          <Activity className="h-6 w-6 text-accent" /> easy-bpmn console
+    <div className="grid min-h-full place-items-center px-4" style={{ background: "var(--wash-teal)" }}>
+      <form
+        onSubmit={submit}
+        className="w-full max-w-sm rounded-card border border-line bg-surface-card p-6 shadow-lg"
+      >
+        <div className="mb-5 flex items-center gap-2 text-lg font-semibold tracking-[-0.01em] text-content-strong">
+          <Activity className="h-6 w-6 text-accent" /> easy<span className="text-accent">·</span>bpmn console
         </div>
-        <label className="mb-1 block text-xs uppercase tracking-wide text-slate-500">Operator</label>
+        <label className="mb-1 block text-xs uppercase tracking-wide text-content-muted">Operator</label>
         <input
           value={username}
           onChange={(e) => setUsername(e.target.value)}
           autoFocus
-          className="mb-3 w-full rounded-md border border-ink-600 bg-ink-900 px-3 py-2 text-sm text-slate-200 outline-none focus:border-accent"
+          className="mb-3 w-full rounded-md border border-line-strong bg-surface-card px-3 py-2 text-sm text-content outline-none transition focus:border-accent focus:ring-[3px] focus:ring-accent/25"
         />
-        <label className="mb-1 block text-xs uppercase tracking-wide text-slate-500">Password</label>
+        <label className="mb-1 block text-xs uppercase tracking-wide text-content-muted">Password</label>
         <input
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
-          className="mb-4 w-full rounded-md border border-ink-600 bg-ink-900 px-3 py-2 text-sm text-slate-200 outline-none focus:border-accent"
+          className="mb-4 w-full rounded-md border border-line-strong bg-surface-card px-3 py-2 text-sm text-content outline-none transition focus:border-accent focus:ring-[3px] focus:ring-accent/25"
         />
         {error && <div className="mb-3 rounded border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">{error}</div>}
         <Button type="submit" variant="primary" disabled={busy}>

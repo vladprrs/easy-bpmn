@@ -17,7 +17,7 @@ export function Tabs({
   onChange: (id: string) => void;
 }) {
   return (
-    <div className="flex flex-wrap gap-1 border-b border-ink-700">
+    <div className="flex flex-wrap gap-1 border-b border-line">
       {tabs
         .filter((t) => !t.hidden)
         .map((t) => (
@@ -27,12 +27,14 @@ export function Tabs({
             className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium transition ${
               active === t.id
                 ? "border-accent text-accent"
-                : "border-transparent text-slate-400 hover:text-slate-200"
+                : "border-transparent text-content-secondary hover:text-content"
             }`}
           >
             {t.label}
             {t.badge != null && t.badge > 0 && (
-              <span className="ml-1.5 rounded-full bg-ink-700 px-1.5 text-xs text-slate-300">{t.badge}</span>
+              <span className="ml-1.5 rounded-full bg-surface-sunken px-1.5 text-xs text-content-secondary">
+                {t.badge}
+              </span>
             )}
           </button>
         ))}

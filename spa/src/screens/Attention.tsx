@@ -26,7 +26,7 @@ export function Attention() {
       <Breadcrumb
         items={[{ label: "Projects", to: "/console" }, { label: projectId, to: `/console/p/${projectId}` }, { label: "Attention" }]}
       />
-      <h1 className="mb-4 mt-2 flex items-center gap-2 text-lg font-semibold text-slate-100">
+      <h1 className="mb-4 mt-2 flex items-center gap-2 text-lg font-semibold text-content-strong">
         <AlertTriangle className="h-5 w-5 text-danger" /> Needs attention
       </h1>
       {isLoading && <Spinner />}
@@ -37,26 +37,26 @@ export function Attention() {
         </Card>
       )}
       {data && data.items.length > 0 && (
-        <Card className="divide-y divide-ink-700">
+        <Card className="divide-y divide-line">
           {data.items.map((it) => {
             const r = REASON[it.reason] ?? { tone: "danger" as Tone, label: it.reason };
             return (
               <Link
                 key={it.instanceId}
                 to={`/console/instances/${encodeURIComponent(it.instanceId)}`}
-                className="flex items-center justify-between gap-3 px-4 py-2.5 hover:bg-ink-800/50"
+                className="flex items-center justify-between gap-3 px-4 py-2.5 hover:bg-surface-sunken/50"
               >
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
                     <Badge tone={r.tone}>{r.label}</Badge>
-                    <span className="truncate text-sm text-slate-200">{it.sagaName || it.sagaId || "—"}</span>
+                    <span className="truncate text-sm text-content">{it.sagaName || it.sagaId || "—"}</span>
                   </div>
-                  <div className="truncate font-mono text-xs text-slate-500">
+                  <div className="truncate font-mono text-xs text-content-muted">
                     {it.businessKey ? `${it.businessKey} · ` : ""}
                     {it.correlationKey} · at {it.currentElementId || "—"}
                   </div>
                 </div>
-                <span className="shrink-0 text-xs text-slate-500">{relativeTime(it.since)}</span>
+                <span className="shrink-0 text-xs text-content-muted">{relativeTime(it.since)}</span>
               </Link>
             );
           })}

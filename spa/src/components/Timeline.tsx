@@ -37,26 +37,26 @@ export function Timeline({
   return (
     <div className="flex flex-col">
       <div className="mb-2 flex items-center justify-between">
-        <div className="flex items-center gap-2 text-xs text-slate-500">
+        <div className="flex items-center gap-2 text-xs text-content-muted">
           <span>{shown.length} events</span>
           {selectedElement && (
             <button
               onClick={() => onSelectElement(null)}
-              className="flex items-center gap-1 rounded bg-ink-800 px-1.5 py-0.5 text-accent hover:bg-ink-700"
+              className="flex items-center gap-1 rounded bg-surface-sunken px-1.5 py-0.5 text-accent hover:bg-surface-active"
             >
               <Filter className="h-3 w-3" /> {index.nameOf(selectedElement)} <X className="h-3 w-3" />
             </button>
           )}
         </div>
         {liveInfo && (
-          <span className="flex items-center gap-1 text-xs text-slate-400">
+          <span className="flex items-center gap-1 text-xs text-content-secondary">
             <Radio className="h-3 w-3" />
             <Dot tone={liveInfo.tone} /> {liveInfo.text}
           </span>
         )}
       </div>
       <ol className="max-h-[60vh] space-y-1 overflow-auto pr-1">
-        {shown.length === 0 && <li className="p-4 text-center text-xs text-slate-600">no events</li>}
+        {shown.length === 0 && <li className="p-4 text-center text-xs text-content-muted">no events</li>}
         {shown.map((e) => {
           const h = humanize(e.type);
           const detail = describeEvent(e, index.nameOf);
@@ -64,8 +64,8 @@ export function Timeline({
             <li
               key={e.historyEventId}
               onClick={() => e.elementId && onSelectElement(e.elementId)}
-              className={`group flex cursor-pointer items-start gap-2 rounded-md border border-transparent px-2 py-1.5 hover:border-ink-600 hover:bg-ink-800/60 ${
-                selectedElement && e.elementId === selectedElement ? "bg-ink-800/60" : ""
+              className={`group flex cursor-pointer items-start gap-2 rounded-md border border-transparent px-2 py-1.5 hover:border-line-strong hover:bg-surface-sunken/60 ${
+                selectedElement && e.elementId === selectedElement ? "bg-surface-sunken/60" : ""
               }`}
             >
               <span className="mt-1.5">
@@ -73,12 +73,12 @@ export function Timeline({
               </span>
               <div className="min-w-0 flex-1">
                 <div className="flex items-baseline justify-between gap-2">
-                  <span className="text-sm text-slate-200">{h.title}</span>
-                  <span className="shrink-0 font-mono text-[10px] text-slate-600" title={formatTime(e.businessTime)}>
+                  <span className="text-sm text-content">{h.title}</span>
+                  <span className="shrink-0 font-mono text-[10px] text-content-muted" title={formatTime(e.businessTime)}>
                     {relativeTime(e.businessTime)}
                   </span>
                 </div>
-                {detail && <div className="truncate text-xs text-slate-500">{detail}</div>}
+                {detail && <div className="truncate text-xs text-content-muted">{detail}</div>}
               </div>
             </li>
           );

@@ -58,11 +58,11 @@ export function SagaDetail() {
     <div className="mx-auto max-w-6xl">
       <Breadcrumb items={[{ label: "Projects", to: "/console" }, { label: "Sagas", to: `/console/p/${workspaceId}` }, { label: saga.data?.name ?? sagaId }]} />
       <div className="mb-3 mt-2 flex items-center justify-between">
-        <h1 className="flex items-center gap-2 text-lg font-semibold text-slate-100">
+        <h1 className="flex items-center gap-2 text-lg font-semibold text-content-strong">
           <Workflow className="h-5 w-5 text-accent" /> {saga.data?.name ?? sagaId}
           {saga.data?.hasTransaction && <Badge tone="info">saga</Badge>}
         </h1>
-        {activeVersionId && <span className="font-mono text-xs text-slate-500">active version {activeVersionId.slice(-8)}</span>}
+        {activeVersionId && <span className="font-mono text-xs text-content-muted">active version {activeVersionId.slice(-8)}</span>}
       </div>
 
       {saga.error && <ErrorState error={saga.error} />}
@@ -70,7 +70,7 @@ export function SagaDetail() {
       {/* Calm "view BPMN" job — the active version's diagram. */}
       <div className="mb-4">
         {activeVersionId && versionXml.data ? (
-          <Suspense fallback={<Card className="grid h-40 place-items-center text-xs text-slate-500">loading diagram…</Card>}>
+          <Suspense fallback={<Card className="grid h-40 place-items-center text-xs text-content-muted">loading diagram…</Card>}>
             <BpmnViewer
               bpmnXml={versionXml.data.bpmnXml}
               elements={elements}
@@ -79,7 +79,7 @@ export function SagaDetail() {
             />
           </Suspense>
         ) : (
-          <Card className="grid h-32 place-items-center text-xs text-slate-500">
+          <Card className="grid h-32 place-items-center text-xs text-content-muted">
             {activeVersionId ? "loading diagram…" : "no published version"}
           </Card>
         )}
@@ -97,13 +97,13 @@ export function SagaDetail() {
       {tab === "instances" && (
         <Panel>
           <div className="mb-3 flex flex-wrap items-center gap-2">
-            <div className="flex items-center gap-1 rounded-md border border-ink-600 bg-ink-900 px-2">
-              <Search className="h-4 w-4 text-slate-500" />
+            <div className="flex items-center gap-1 rounded-md border border-line-strong bg-surface-card px-2 transition focus-within:border-accent focus-within:ring-[3px] focus-within:ring-accent/20">
+              <Search className="h-4 w-4 text-content-muted" />
               <input
                 placeholder="business / correlation key"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                className="bg-transparent py-1.5 text-sm text-slate-200 outline-none"
+                className="bg-transparent py-1.5 text-sm text-content outline-none"
               />
             </div>
             {STATUS_FILTERS.map((s) => (
@@ -111,7 +111,7 @@ export function SagaDetail() {
                 key={s}
                 onClick={() => toggleStatus(s)}
                 className={`rounded-full border px-2 py-0.5 text-xs ${
-                  statuses.includes(s) ? "border-accent bg-accent/20 text-accent" : "border-ink-600 text-slate-400"
+                  statuses.includes(s) ? "border-accent bg-accent/20 text-accent" : "border-line-strong text-content-secondary"
                 }`}
               >
                 {s}
@@ -120,27 +120,27 @@ export function SagaDetail() {
           </div>
           {instances.isLoading && <Spinner />}
           {instances.error && <ErrorState error={instances.error} />}
-          <Card className="divide-y divide-ink-700">
+          <Card className="divide-y divide-line">
             {instances.data?.instances.map((i) => (
               <Link
                 key={i.instanceId}
                 to={`/console/instances/${encodeURIComponent(i.instanceId)}`}
-                className="flex items-center justify-between gap-3 px-4 py-2.5 hover:bg-ink-800/50"
+                className="flex items-center justify-between gap-3 px-4 py-2.5 hover:bg-surface-sunken/50"
               >
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
                     <StatusBadge status={i.status} />
-                    <span className="truncate font-mono text-xs text-slate-300">{i.businessKey || i.correlationKey}</span>
+                    <span className="truncate font-mono text-xs text-content">{i.businessKey || i.correlationKey}</span>
                   </div>
-                  <div className="truncate font-mono text-[11px] text-slate-500">
+                  <div className="truncate font-mono text-[11px] text-content-muted">
                     at {index.nameOf(i.currentElementId || "") || "—"}
                   </div>
                 </div>
-                <span className="shrink-0 text-xs text-slate-500">{relativeTime(i.updatedAt)}</span>
+                <span className="shrink-0 text-xs text-content-muted">{relativeTime(i.updatedAt)}</span>
               </Link>
             ))}
             {instances.data && instances.data.instances.length === 0 && (
-              <div className="p-6 text-center text-sm text-slate-500">No instances match.</div>
+              <div className="p-6 text-center text-sm text-content-muted">No instances match.</div>
             )}
           </Card>
         </Panel>
@@ -148,15 +148,15 @@ export function SagaDetail() {
 
       {tab === "versions" && (
         <Panel>
-          <Card className="divide-y divide-ink-700">
+          <Card className="divide-y divide-line">
             {saga.data?.versions.map((v) => (
               <div key={v.definitionVersionId} className="flex items-center justify-between px-4 py-2.5 text-sm">
                 <div>
-                  <span className="font-medium text-slate-200">v{v.versionNumber}</span>
+                  <span className="font-medium text-content">v{v.versionNumber}</span>
                   {v.definitionVersionId === activeVersionId && <Badge tone="ok">active</Badge>}
-                  <span className="ml-2 font-mono text-xs text-slate-500">{v.definitionVersionId.slice(-8)}</span>
+                  <span className="ml-2 font-mono text-xs text-content-muted">{v.definitionVersionId.slice(-8)}</span>
                 </div>
-                <div className="text-xs text-slate-500">
+                <div className="text-xs text-content-muted">
                   {v.instanceCount} instance{v.instanceCount === 1 ? "" : "s"} · {relativeTime(v.publishedAt)}
                 </div>
               </div>

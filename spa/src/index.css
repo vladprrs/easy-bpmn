@@ -1,9 +1,11 @@
+@import "./styles/tokens.css";
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
-  color-scheme: dark;
+  color-scheme: light;
 }
 
 html,
@@ -13,54 +15,120 @@ body,
 }
 
 body {
-  @apply bg-ink-950 text-slate-200 antialiased;
+  @apply bg-surface-page text-content antialiased;
   margin: 0;
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: var(--leading-normal);
+  text-rendering: optimizeLegibility;
 }
 
-/* bpmn-js viewer surface tweaks for the dark console. */
+/* ============================================================
+ * bpmn-js diagram — easy·bpmn light re-theme
+ * The viewer wrapper carries `.bpmn-canvas` (light dot-grid). Category tints +
+ * runtime-state outlines are applied via canvas.addMarker(...) by BpmnViewer.
+ * Cascade order matters: base → category tint → runtime state (state wins).
+ * ============================================================ */
 .bjs-container {
   background: transparent !important;
 }
 
-/* Live-overlay element markers (applied via canvas.addMarker by BpmnViewer). */
+/* Pastel BPMN category surfaces — "read the canvas by colour". */
+.djs-element.ebpmn-cat-event .djs-visual > :first-child {
+  fill: var(--cat-event-surface) !important;
+  stroke: var(--cat-event-border) !important;
+}
+.djs-element.ebpmn-cat-intermediate .djs-visual > :first-child {
+  fill: var(--cat-inter-surface) !important;
+  stroke: var(--cat-inter-border) !important;
+}
+.djs-element.ebpmn-cat-boundary .djs-visual > :first-child {
+  fill: var(--cat-boundary-surface) !important;
+  stroke: var(--cat-boundary-border) !important;
+}
+.djs-element.ebpmn-cat-end .djs-visual > :first-child {
+  fill: var(--cat-end-surface) !important;
+  stroke: var(--cat-end-border) !important;
+  stroke-width: 3px !important; /* "final" weight */
+}
+.djs-element.ebpmn-cat-gateway .djs-visual > :first-child {
+  fill: var(--cat-gateway-surface) !important;
+  stroke: var(--cat-gateway-border) !important;
+}
+.djs-element.ebpmn-cat-task .djs-visual > :first-child {
+  fill: var(--cat-task-surface) !important;
+  stroke: var(--cat-task-border) !important;
+}
+
+/* Runtime-state outlines (override the category stroke; keep the surface tint). */
 .djs-element.ebpmn-traversed .djs-visual > :first-child {
-  stroke: #5b9dff !important;
+  stroke: var(--state-completed) !important; /* completed green path */
+  stroke-width: 2.5px !important;
 }
 .djs-element.ebpmn-current .djs-visual > :first-child {
-  stroke: #3fb950 !important;
+  stroke: var(--state-running) !important; /* running blue */
   stroke-width: 3px !important;
 }
 .djs-element.ebpmn-failed .djs-visual > :first-child {
-  stroke: #f85149 !important;
+  stroke: var(--state-error) !important; /* coral */
   stroke-width: 3px !important;
 }
 .djs-element.ebpmn-compensated .djs-visual > :first-child {
-  stroke: #d29922 !important;
+  stroke: var(--state-warning) !important; /* amber */
   stroke-dasharray: 4 3 !important;
 }
 
-.ebpmn-overlay-badge {
-  font: 600 10px/1.4 ui-monospace, monospace;
-  padding: 1px 5px;
-  border-radius: 6px;
-  white-space: nowrap;
-  color: #0a0c10;
-  background: #5b9dff;
+/* Calm breathing outline on the live (running) element. */
+@keyframes ebpmn-stroke-pulse {
+  0%,
+  100% {
+    stroke-opacity: 1;
+  }
+  50% {
+    stroke-opacity: 0.45;
+  }
 }
-.ebpmn-overlay-badge.ok {
-  background: #3fb950;
-}
-.ebpmn-overlay-badge.danger {
-  background: #f85149;
-  color: #fff;
-}
-.ebpmn-overlay-badge.warn {
-  background: #d29922;
+@media (prefers-reduced-motion: no-preference) {
+  .djs-element.ebpmn-current .djs-visual > :first-child {
+    animation: ebpmn-stroke-pulse 2.2s var(--ease-standard) infinite;
+  }
 }
 
-/* Thin scrollbars for dense panels. */
+/* Marching-ants on a selected / highlighted edge. */
+@keyframes ebpmn-march {
+  to {
+    stroke-dashoffset: -16;
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .djs-connection.ebpmn-edge-selected .djs-visual > :first-child {
+    stroke-dasharray: 6 4 !important;
+    animation: ebpmn-march 0.7s linear infinite;
+  }
+}
+
+/* Overlay badges — DS pill: solid state colour, white text, soft shadow. */
+.ebpmn-overlay-badge {
+  font: var(--weight-semibold) 10px/1.4 var(--font-sans);
+  padding: 2px 7px;
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+  color: #fff;
+  background: var(--state-running);
+  box-shadow: var(--shadow-sm);
+}
+.ebpmn-overlay-badge.ok {
+  background: var(--state-completed);
+}
+.ebpmn-overlay-badge.danger {
+  background: var(--state-error);
+}
+.ebpmn-overlay-badge.warn {
+  background: var(--state-warning);
+}
+
+/* Thin scrollbars for dense panels — light. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: #273141 transparent;
+  scrollbar-color: var(--border-default) transparent;
 }

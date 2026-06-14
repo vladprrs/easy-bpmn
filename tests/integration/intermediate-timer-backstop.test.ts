@@ -66,8 +66,9 @@ async function historyTypes(instanceId: string): Promise<string[]> {
 }
 
 const PAST = "2000-01-01T00:00:00Z";
-// In the future but under workerd's ~year-2189 setAlarm cap so a self-heal re-arm
-// (armTimerDO) does not throw inside the JobScheduler DO.
+// Only needs to be after `now`: the not-yet-due UNIT case calls
+// settleOverdueTimersForInstance directly, which just `continue`s past a not-yet-due
+// timer (no DO re-arm, no armTimerDO) — so the sweep simply treats it as pending and skips it.
 const FUTURE = "2100-01-01T00:00:00Z";
 
 describe("Intermediate-catch lost-alarm backstop (TASK-54, design §4.2 / Q2)", () => {

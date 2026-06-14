@@ -175,6 +175,9 @@ describe("gateway decision replay — workflow-mode single-wake memoization harn
     // TaskLow NEVER ran. (The whole run lands on completion in this one invocation —
     // the single-wake engine drives across parks via wakes rather than per-wait runs.)
     h.executed.length = 0;
+    // NOTE: this handler runs INSIDE the wake, whose throws issueWake swallows in its
+    // catch — a failed in-handler expect() does NOT surface as a clean assertion error;
+    // it spins the re-walk until a stepBudget incident settles (bounded, not a hang).
     h.waitScript.set("wake#0", async () => {
       const job = await getForwardJob(env.DB, instanceId, "TaskHigh", 0);
       expect(job).toBeTruthy();

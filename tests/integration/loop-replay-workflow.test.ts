@@ -164,6 +164,9 @@ describe("loop replay — workflow-mode single-wake memoization harness", () => 
         (e: unknown) => ({ ok: false as const, e: String(e) }),
       );
 
+    // NOTE: these handlers run INSIDE the wake, whose throws issueWake swallows in its
+    // catch — so a failed in-handler expect() does NOT surface as a clean assertion error;
+    // it spins the re-walk until a stepBudget incident settles (bounded, not a hang).
     // A wake that completes TaskA's job at `occ` — the re-walk then applies it.
     const completeJob = (occ: number, output: Record<string, unknown>) => async (): Promise<WaitOutcome> => {
       const job = await getForwardJob(env.DB, instanceId, "TaskA", occ);
@@ -257,8 +260,10 @@ describe("loop replay — workflow-mode single-wake memoization harness", () => 
     expect(histAfter.serviceTaskCompleted).toBe(2);
     expect(histAfter.instanceStarted).toBe(1);
     expect(histAfter.receiveTaskWaiting).toBe(2);
-    // The only new bookkeeping in run 3 is iteration 2's job-created (svc-create:TaskA#2);
-    // the two applied iterations did not re-emit history.
+    // The only NEW service-job-created row in run 3 is TaskA#2's (delta +1, asserted
+    // below). Run 3 ALSO emits iteration-1's message work: recv:Recv#1 + msg:Recv#1 land
+    // messageCorrelated and receiveTaskWaiting (both go 1→2 above) — those are not unique
+    // to run 3's bookkeeping, only the serviceTaskJobCreated delta is.
     expect(histAfter.serviceTaskJobCreated).toBe(3);
     expect((histAfter.serviceTaskJobCreated ?? 0) - (histBefore.serviceTaskJobCreated ?? 0)).toBe(1);
 

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Activity, LogIn } from "lucide-react";
+import { LogIn } from "lucide-react";
 import { ApiError, api } from "../api/client";
 import { useApp } from "../store";
 import { Button } from "../components/ui";
@@ -29,32 +29,36 @@ export function Login() {
   };
 
   return (
-    <div className="grid min-h-full place-items-center px-4" style={{ background: "var(--wash-teal)" }}>
-      <form
-        onSubmit={submit}
-        className="w-full max-w-sm rounded-card border border-line bg-surface-card p-6 shadow-lg"
-      >
-        <div className="mb-5 flex items-center gap-2 text-lg font-semibold tracking-[-0.01em] text-content-strong">
-          <Activity className="h-6 w-6 text-accent" /> easy<span className="text-accent">·</span>bpmn console
+    <div className="stage-field grid min-h-screen place-items-center px-4">
+      <form onSubmit={submit} className="anim-rise w-full max-w-sm">
+        <div className="mb-6 text-center">
+          <div className="font-display text-2xl tracking-[-0.02em] text-content-strong">
+            easy<span className="text-accent">·</span>bpmn
+          </div>
+          <div className="mt-1 text-sm text-content-secondary">operator console</div>
         </div>
-        <label className="mb-1 block text-xs uppercase tracking-wide text-content-muted">Operator</label>
-        <input
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          autoFocus
-          className="mb-3 w-full rounded-md border border-line-strong bg-surface-card px-3 py-2 text-sm text-content outline-none transition focus:border-accent focus:ring-[3px] focus:ring-accent/25"
-        />
-        <label className="mb-1 block text-xs uppercase tracking-wide text-content-muted">Password</label>
-        <input
-          type="password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          className="mb-4 w-full rounded-md border border-line-strong bg-surface-card px-3 py-2 text-sm text-content outline-none transition focus:border-accent focus:ring-[3px] focus:ring-accent/25"
-        />
-        {error && <div className="mb-3 rounded border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">{error}</div>}
-        <Button type="submit" variant="primary" disabled={busy}>
-          <LogIn className="h-4 w-4" /> {busy ? "Signing in…" : "Sign in"}
-        </Button>
+        <div className="rounded-2xl border border-line bg-surface-card/90 p-6 shadow-lg backdrop-blur">
+          <label className="tech-label mb-1.5 block">Operator</label>
+          <input
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            autoFocus
+            className="mb-3 w-full rounded-lg border border-line bg-surface-card px-3 py-2 text-sm text-content outline-none transition focus:border-accent focus:ring-[3px] focus:ring-accent/25"
+          />
+          <label className="tech-label mb-1.5 block">Password</label>
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            className="mb-4 w-full rounded-lg border border-line bg-surface-card px-3 py-2 text-sm text-content outline-none transition focus:border-accent focus:ring-[3px] focus:ring-accent/25"
+          />
+          {error && (
+            <div className="mb-3 rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">{error}</div>
+          )}
+          <Button type="submit" variant="primary" disabled={busy}>
+            <LogIn className="h-4 w-4" /> {busy ? "Signing in…" : "Sign in"}
+          </Button>
+        </div>
       </form>
     </div>
   );

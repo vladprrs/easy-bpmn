@@ -1,0 +1,77 @@
+/* Self-hosted type trio (visual-design-brief §3.2): a distinctive display/UI/mono
+ * set that leaves the system stack behind. All free/OFL, subsetted woff2, lazy via
+ * font-display:swap. Served from /fonts (Vite copies spa/public → dist root, which the
+ * Worker serves same-origin as static assets).
+ *   · Clash Display (Fontshare) — the hero voice: headlines, big numbers, health line.
+ *   · General Sans (Fontshare) — UI/body: tables, labels, controls, running text.
+ *   · Commit Mono (OFL) — the data texture: ids, keys, timestamps, JSON, element ids. */
+
+@font-face {
+  font-family: "Clash Display";
+  src: url("/fonts/clash-display-500.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Clash Display";
+  src: url("/fonts/clash-display-600.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "General Sans";
+  src: url("/fonts/general-sans-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "General Sans";
+  src: url("/fonts/general-sans-500.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "General Sans";
+  src: url("/fonts/general-sans-600.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Commit Mono";
+  src: url("/fonts/commit-mono-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Commit Mono";
+  src: url("/fonts/commit-mono-500.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Commit Mono";
+  src: url("/fonts/commit-mono-700.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Metric-tuned fallback for the body face — minimises the swap reflow (CLS) while
+ * General Sans loads. Numbers approximate General Sans against Arial. */
+@font-face {
+  font-family: "General Sans Fallback";
+  src: local("Arial");
+  size-adjust: 97%;
+  ascent-override: 95%;
+  descent-override: 24%;
+  line-gap-override: 0%;
+}

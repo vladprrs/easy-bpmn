@@ -9,6 +9,7 @@ import { getInstanceRow } from "../persistence/instances";
 import {
   STALE_COMPENSATING_MS,
   getSagaDetail,
+  getSagaHeatmap,
   getVersionXml,
   listAttention,
   listInstanceJobs,
@@ -97,6 +98,13 @@ export async function handleSagaDetail(env: Env, request: Request, sagaId: strin
   const detail = await getSagaDetail(env.DB, sagaId);
   if (!detail) throw new NotFoundError(`Saga ${sagaId} not found.`);
   return json(detail, 200);
+}
+
+export async function handleSagaHeatmap(env: Env, request: Request, sagaId: string): Promise<Response> {
+  await requireSession(env, request);
+  const heatmap = await getSagaHeatmap(env.DB, sagaId);
+  if (!heatmap) throw new NotFoundError(`Saga ${sagaId} not found.`);
+  return json(heatmap, 200);
 }
 
 // ---- Instance diagnostics (§9, §12) ---------------------------------------

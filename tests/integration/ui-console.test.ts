@@ -168,6 +168,28 @@ describe("M-UI projects / sagas / attention (§6, §12)", () => {
     expect(inc.reason).toBe("incident");
     expect(inc.sagaId).toBeTruthy();
   });
+
+  it("GET /sagas/{sagaId}/heatmap aggregates live instances per element (gated, 404 on miss)", async () => {
+    const { draftId } = await publishAndStart(SAGA_BPMN, {
+      correlationKey: "ui-heatmap-1",
+      variables: { qty: 1, amount: 10 },
+    });
+
+    const r = await raw("GET", `/sagas/${draftId}/heatmap`, { cookie });
+    expect(r.status).toBe(200);
+    expect(r.body.sagaId).toBe(draftId);
+    expect(Array.isArray(r.body.nodes)).toBe(true);
+    expect(typeof r.body.totalLive).toBe("number");
+    expect(typeof r.body.generatedAt).toBe("string");
+
+    // Gated: no cookie ⇒ 401.
+    const anon = await raw("GET", `/sagas/${draftId}/heatmap`);
+    expect(anon.status).toBe(401);
+
+    // Unknown saga ⇒ 404.
+    const missing = await raw("GET", "/sagas/does-not-exist/heatmap", { cookie });
+    expect(missing.status).toBe(404);
+  });
 });
 
 describe("M-UI instance diagnostics (§9, §12)", () => {

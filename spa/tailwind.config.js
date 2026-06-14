@@ -12,6 +12,8 @@ export default {
         // aliases in src/styles/tokens.css — keep the two in sync.
         surface: {
           page: "#f6f8fa", // --gray-50
+          field: "#fbfdfc", // --field (tinted a hair toward teal) — the stage field
+          fieldSunk: "#f4f8f7", // --field-sunk
           canvas: "#f4f7f9", // --surface-canvas
           card: "#ffffff", // --gray-0
           raised: "#ffffff",
@@ -51,17 +53,46 @@ export default {
         },
       },
       fontFamily: {
-        sans: [
-          "-apple-system",
-          "BlinkMacSystemFont",
+        // The self-hosted trio (see src/styles/fonts.css + tokens.css).
+        display: [
+          '"Clash Display"',
+          '"General Sans"',
+          '"General Sans Fallback"',
+          "ui-sans-serif",
           "system-ui",
-          "Segoe UI",
-          "Roboto",
-          "Helvetica",
-          "Arial",
           "sans-serif",
         ],
-        mono: ["ui-monospace", "SFMono-Regular", "Menlo", "Consolas", "monospace"],
+        sans: [
+          '"General Sans"',
+          '"General Sans Fallback"',
+          "ui-sans-serif",
+          "system-ui",
+          "-apple-system",
+          "Segoe UI",
+          "Roboto",
+          "sans-serif",
+        ],
+        mono: [
+          '"Commit Mono"',
+          "ui-monospace",
+          '"JetBrains Mono"',
+          "SFMono-Regular",
+          "Menlo",
+          "Consolas",
+          "monospace",
+        ],
+      },
+      fontSize: {
+        // Fixed rem scale (app UI). Few sizes, high contrast; display steps ≥1.4×.
+        "2xs": ["0.6875rem", { lineHeight: "1rem", letterSpacing: "0.01em" }],
+        xs: ["0.75rem", { lineHeight: "1.1rem" }],
+        sm: ["0.8125rem", { lineHeight: "1.25rem" }],
+        base: ["0.875rem", { lineHeight: "1.45rem" }],
+        md: ["1rem", { lineHeight: "1.55rem" }],
+        lg: ["1.25rem", { lineHeight: "1.5rem" }],
+        xl: ["1.75rem", { lineHeight: "1.15", letterSpacing: "-0.02em" }],
+        "2xl": ["2.5rem", { lineHeight: "1.04", letterSpacing: "-0.025em" }],
+        hero: ["3.5rem", { lineHeight: "1", letterSpacing: "-0.03em" }],
       },
       borderRadius: {
         sm: "6px",
@@ -70,12 +101,14 @@ export default {
         lg: "14px",
         card: "16px",
         xl: "20px",
+        "2xl": "26px",
       },
       boxShadow: {
         xs: "0 1px 2px rgba(20,30,45,0.06)",
         sm: "0 1px 3px rgba(20,30,45,0.08), 0 1px 2px rgba(20,30,45,0.04)",
         md: "0 4px 12px rgba(20,30,45,0.10), 0 1px 3px rgba(20,30,45,0.06)",
         lg: "0 12px 32px rgba(20,30,45,0.14), 0 2px 8px rgba(20,30,45,0.06)",
+        xl: "0 24px 60px rgba(20,30,45,0.18), 0 4px 12px rgba(20,30,45,0.08)",
         node: "0 1px 2px rgba(20,30,45,0.06), 0 2px 6px rgba(20,30,45,0.05)",
         glass: "0 8px 28px rgba(20,30,45,0.12), inset 0 1px 0 rgba(255,255,255,0.6)",
       },

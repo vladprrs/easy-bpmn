@@ -79,6 +79,22 @@ export interface SagaDetail {
   versions: SagaVersionSummary[];
 }
 
+// ---- Per-saga living heatmap (§6, §12 — aggregate per-element density) ------
+
+export interface SagaHeatmapNode {
+  elementId: string; // = process_instances.current_element_id
+  count: number; // live instances currently placed at this element
+  byStatus: StatusCounts; // e.g. { running: 3, waiting: 1, incident: 2 }
+}
+
+export interface SagaHeatmap {
+  sagaId: string; // = draft_id
+  activeVersionId: string | null;
+  totalLive: number; // sum of node counts
+  nodes: SagaHeatmapNode[];
+  generatedAt: string; // ISO timestamp
+}
+
 // ---- Instance jobs + worker attempts (§9, §12) ----------------------------
 
 export interface WorkerAttemptView {

@@ -11,8 +11,9 @@ info:
     never trusts a body workspaceId for job access. The API does not leak Cloudflare
     Workflow internals (no workflowInstanceId is required from worker or operator callers).
     The M-UI operator-console endpoints (read/aggregation/auth: /ui/login, /ui/logout,
-    /ui/me, /projects, /attention, /sagas, GET /messages, instance jobs, raw BPMN, and an
-    SSE history live-tail) were added in lockstep with constitution v2.4.0. The session-gated
+    /ui/me, /projects, /attention, /sagas, the saga heatmap, GET /messages, instance jobs,
+    raw BPMN, and an SSE history live-tail) were added in lockstep with constitution v2.4.0.
+    The session-gated
     ones carry an `operatorSession` cookie; all of them read D1 only (the inspection invariant
     is preserved).
 servers:
@@ -629,6 +630,30 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SagaDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /sagas/{sagaId}/heatmap:
+    get:
+      summary: Per-element live-instance density (the aggregate "living heatmap")
+      operationId: getSagaHeatmap
+      security:
+        - operatorSession: []
+      description: >
+        Live instances for one saga (draft_id) grouped by current_element_id + status,
+        powering the aggregate living-heatmap mode. Only "placed" instances are counted
+        (current_element_id set AND a non-terminal status); terminal instances are excluded.
+        Reads D1 only.
+      parameters:
+        - $ref: "#/components/parameters/SagaId"
+      responses:
+        "200":
+          description: Per-node live-instance density for the saga
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SagaHeatmap"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -1619,6 +1644,41 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/SagaVersionSummary"
+    SagaHeatmapNode:
+      type: object
+      required: [elementId, count, byStatus]
+      properties:
+        elementId:
+          type: string
+          description: The current_element_id live instances are placed at.
+        count:
+          type: integer
+          description: Live instances currently placed at this element.
+        byStatus:
+          type: object
+          additionalProperties:
+            type: integer
+          description: Live-instance counts grouped by status (only non-zero buckets are guaranteed).
+    SagaHeatmap:
+      type: object
+      required: [sagaId, activeVersionId, totalLive, nodes, generatedAt]
+      properties:
+        sagaId:
+          type: string
+          description: The draft_id grouping all versions of one saga.
+        activeVersionId:
+          type: string
+          nullable: true
+        totalLive:
+          type: integer
+          description: Sum of all node counts (live, placed instances).
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/SagaHeatmapNode"
+        generatedAt:
+          type: string
+          format: date-time
     WorkerAttemptView:
       type: object
       required: [attemptNumber, status, startedAt]

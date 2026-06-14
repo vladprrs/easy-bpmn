@@ -1,3 +1,4 @@
+@import "./styles/fonts.css";
 @import "./styles/tokens.css";
 
 @tailwind base;
@@ -18,22 +19,54 @@ body {
   @apply bg-surface-page text-content antialiased;
   margin: 0;
   font-family: var(--font-sans);
-  font-size: 14px;
+  font-size: var(--text-base);
   line-height: var(--leading-normal);
+  font-feature-settings: "ss01", "cv01";
   text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background: var(--current-wash);
+  color: var(--text-strong);
+}
+
+/* ---- Type-trio utilities ------------------------------------------------- */
+.font-display {
+  font-family: var(--font-display);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-tight);
+  line-height: var(--leading-tight);
+}
+.font-data {
+  font-family: var(--font-mono);
+  font-feature-settings: "ss02", "cv02", "calt";
+}
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* The calm dot-grid "field" the current crosses (tinted a hair toward teal). */
+.stage-field {
+  background-color: var(--field);
+  background-image: radial-gradient(var(--canvas-dot) 1.1px, transparent 1.1px);
+  background-size: var(--canvas-grid-size) var(--canvas-grid-size);
+  background-position: -1px -1px;
 }
 
 /* ============================================================
- * bpmn-js diagram — easy·bpmn light re-theme
- * The viewer wrapper carries `.bpmn-canvas` (light dot-grid). Category tints +
- * runtime-state outlines are applied via canvas.addMarker(...) by BpmnViewer.
- * Cascade order matters: base → category tint → runtime state (state wins).
+ * bpmn-js diagram — easy·bpmn light re-theme.
+ * Cascade order matters: base → category tint → runtime state → living flow.
  * ============================================================ */
 .bjs-container {
   background: transparent !important;
 }
+.bjs-powered-by {
+  display: none !important;
+}
 
-/* Pastel BPMN category surfaces — "read the canvas by colour". */
+/* Pastel BPMN category surfaces — "read the canvas by colour" (FROZEN palette). */
 .djs-element.ebpmn-cat-event .djs-visual > :first-child {
   fill: var(--cat-event-surface) !important;
   stroke: var(--cat-event-border) !important;
@@ -62,23 +95,74 @@ body {
 
 /* Runtime-state outlines (override the category stroke; keep the surface tint). */
 .djs-element.ebpmn-traversed .djs-visual > :first-child {
-  stroke: var(--state-completed) !important; /* completed green path */
+  stroke: var(--state-completed) !important;
   stroke-width: 2.5px !important;
 }
 .djs-element.ebpmn-current .djs-visual > :first-child {
-  stroke: var(--state-running) !important; /* running blue */
+  stroke: var(--state-running) !important;
   stroke-width: 3px !important;
 }
 .djs-element.ebpmn-failed .djs-visual > :first-child {
-  stroke: var(--state-error) !important; /* coral */
+  stroke: var(--state-error) !important;
   stroke-width: 3px !important;
 }
 .djs-element.ebpmn-compensated .djs-visual > :first-child {
-  stroke: var(--state-warning) !important; /* amber */
+  stroke: var(--state-warning) !important;
   stroke-dasharray: 4 3 !important;
 }
 
-/* Calm breathing outline on the live (running) element. */
+/* Selected element (element↔narration link) — a calm teal ring, state colours win. */
+.djs-element.ebpmn-selected .djs-visual > :first-child,
+.djs-connection.ebpmn-selected .djs-visual > path {
+  stroke: var(--state-selected) !important;
+  stroke-width: 3px !important;
+}
+
+/* ============================================================
+ * The living flow (visual-design-brief §3.4) — the one memorable thing.
+ * Current is teal liveness on EDGES + travelling tokens; node colour stays
+ * semantic. Luminosity-on-pale: a soft bloom + bright core, never neon-on-dark.
+ * Every motion has a fully-legible static floor (reduced-motion below).
+ * ============================================================ */
+
+/* A live edge: teal current with a soft bloom, fading in as it's reached. */
+.djs-connection.ebpmn-flow-live .djs-visual > path {
+  stroke: var(--current) !important;
+  stroke-width: 2.5px !important;
+  stroke-opacity: 0.92;
+  filter: drop-shadow(0 0 2.5px var(--current-glow));
+  transition:
+    stroke 0.5s var(--ease-out),
+    stroke-opacity 0.5s var(--ease-out);
+}
+/* A settled edge: the finished circuit, calm green glow, no motion. */
+.djs-connection.ebpmn-flow-done .djs-visual > path {
+  stroke: var(--settle) !important;
+  stroke-width: 2.25px !important;
+  stroke-opacity: 0.92;
+  filter: drop-shadow(0 0 2.5px var(--settle-wash));
+}
+/* A stalled / failed path interrupts in coral. */
+.djs-connection.ebpmn-flow-interrupt .djs-visual > path {
+  stroke: var(--interrupt) !important;
+  stroke-width: 2.5px !important;
+  filter: drop-shadow(0 0 2px var(--interrupt-wash));
+}
+
+/* The travelling token — a bright core in a soft halo, riding the edge (SMIL). */
+.ebpmn-flow-token {
+  pointer-events: none;
+}
+.ebpmn-flow-token .core {
+  fill: var(--current-bright);
+  filter: drop-shadow(0 0 4px var(--current-glow)) drop-shadow(0 0 9px var(--current-glow));
+}
+.ebpmn-flow-token .halo {
+  fill: var(--current-glow);
+  opacity: 0.5;
+}
+
+/* Live frontier node: breathing outline + teal bloom. */
 @keyframes ebpmn-stroke-pulse {
   0%,
   100% {
@@ -88,28 +172,79 @@ body {
     stroke-opacity: 0.45;
   }
 }
-@media (prefers-reduced-motion: no-preference) {
-  .djs-element.ebpmn-current .djs-visual > :first-child {
-    animation: ebpmn-stroke-pulse 2.2s var(--ease-standard) infinite;
-  }
+.djs-element.ebpmn-current .djs-visual > :first-child {
+  filter: drop-shadow(0 0 5px var(--current-glow));
+}
+/* Settled node: the completed circuit's calm green ambient. */
+.djs-element.ebpmn-settled .djs-visual > :first-child {
+  filter: drop-shadow(0 0 4px var(--settle-wash));
 }
 
-/* Marching-ants on a selected / highlighted edge. */
+/* Flow along a live edge (current) + draw-in. */
+@keyframes ebpmn-flow-march {
+  to {
+    stroke-dashoffset: -24;
+  }
+}
+/* Marching-ants on a selected / highlighted edge (kept). */
 @keyframes ebpmn-march {
   to {
     stroke-dashoffset: -16;
   }
 }
+
 @media (prefers-reduced-motion: no-preference) {
-  .djs-connection.ebpmn-edge-selected .djs-visual > :first-child {
+  .djs-element.ebpmn-current .djs-visual > :first-child {
+    animation: ebpmn-stroke-pulse 2.2s var(--ease-standard) infinite;
+  }
+  .djs-connection.ebpmn-flow-live .djs-visual > path {
+    stroke-dasharray: 5 7 !important;
+    animation: ebpmn-flow-march 1.05s linear infinite;
+  }
+  .djs-connection.ebpmn-edge-selected .djs-visual > path {
     stroke-dasharray: 6 4 !important;
     animation: ebpmn-march 0.7s linear infinite;
   }
 }
 
-/* Overlay badges — DS pill: solid state colour, white text, soft shadow. */
+/* Reduced motion: the static illuminated path IS the floor. No travelling light,
+ * no marching dashes — but live/done/interrupt edges + current/settled nodes keep
+ * their colour & glow, so no information lives only in animation. */
+@media (prefers-reduced-motion: reduce) {
+  .ebpmn-flow-token {
+    display: none;
+  }
+  .djs-connection.ebpmn-flow-live .djs-visual > path {
+    stroke-dasharray: none !important;
+  }
+}
+
+/* ============================================================
+ * Aggregate "living heatmap" — per-node instance density (no per-token motion).
+ * Density raises a teal bloom; a node where runs are failing goes coral-hot.
+ * ============================================================ */
+.djs-element.ebpmn-heat-1 .djs-visual > :first-child {
+  filter: drop-shadow(0 0 3px var(--current-wash));
+}
+.djs-element.ebpmn-heat-2 .djs-visual > :first-child {
+  stroke: var(--current) !important;
+  filter: drop-shadow(0 0 5px var(--current-glow));
+}
+.djs-element.ebpmn-heat-3 .djs-visual > :first-child {
+  stroke: var(--current) !important;
+  stroke-width: 3px !important;
+  filter: drop-shadow(0 0 8px var(--current-glow)) drop-shadow(0 0 16px var(--current-wash));
+}
+.djs-element.ebpmn-heat-hot .djs-visual > :first-child {
+  stroke: var(--interrupt) !important;
+  stroke-width: 3px !important;
+  filter: drop-shadow(0 0 8px var(--interrupt-wash)) drop-shadow(0 0 16px var(--interrupt-wash));
+}
+
+/* ---- Overlay badges — DS pill: solid tone, white text, soft shadow. -------- */
 .ebpmn-overlay-badge {
-  font: var(--weight-semibold) 10px/1.4 var(--font-sans);
+  font:
+    var(--weight-semibold) 10px/1.4 var(--font-sans);
   padding: 2px 7px;
   border-radius: var(--radius-pill);
   white-space: nowrap;
@@ -126,9 +261,63 @@ body {
 .ebpmn-overlay-badge.warn {
   background: var(--state-warning);
 }
+.ebpmn-overlay-badge.accent {
+  background: var(--accent);
+}
+/* Density count pill for aggregate mode — mono numerals, teal current. */
+.ebpmn-overlay-badge.flow {
+  background: var(--accent);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.ebpmn-overlay-badge.flow.hot {
+  background: var(--state-error);
+}
+
+/* ---- App-shell entrance + reveal motion ---------------------------------- */
+@keyframes ebpmn-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes ebpmn-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.anim-rise {
+  animation: ebpmn-rise 0.5s var(--ease-out) both;
+}
+.anim-fade {
+  animation: ebpmn-fade 0.4s var(--ease-out) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .anim-rise,
+  .anim-fade {
+    animation-duration: 0.01ms;
+  }
+}
 
 /* Thin scrollbars for dense panels — light. */
 * {
   scrollbar-width: thin;
   scrollbar-color: var(--border-default) transparent;
+}
+*::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border-default);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
 }

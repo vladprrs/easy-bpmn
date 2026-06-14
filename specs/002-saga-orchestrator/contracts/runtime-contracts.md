@@ -479,8 +479,8 @@ existing root API contract are **unchanged**.
 **Rules**:
 
 - **All inspection reads D1 (inspection invariant preserved).** Every new endpoint
-  (`/projects`, `/attention`, `/sagas`, `/sagas/{sagaId}`, `GET /messages`,
-  `GET /instances/{id}/jobs`, the extended `GET /instances/{id}` `subscriptions` block,
+  (`/projects`, `/attention`, `/sagas`, `/sagas/{sagaId}`, `/sagas/{sagaId}/heatmap`,
+  `GET /messages`, `GET /instances/{id}/jobs`, the extended `GET /instances/{id}` `subscriptions` block,
   `GET /definitions/versions/{id}/bpmn`, and the SSE live-tail) reads canonical D1 state only;
   none touches Cloudflare Workflow internals. `workflowInstanceId` is still never required from a
   caller.
@@ -510,3 +510,9 @@ existing root API contract are **unchanged**.
   **5 minutes** — **not** every `compensating` instance (a healthy reverse pass advancing within the
   window is excluded). Each item's `reason` (`incident | compensationFailed | staleCompensating`) and
   `since` (the instance `updated_at`) are surfaced.
+- **Per-saga living heatmap.** `GET /sagas/{sagaId}/heatmap` is a per-element live-instance density
+  aggregation: live instances for the saga (`draft_id`) grouped by `current_element_id` and status,
+  **live statuses only** (`running`/`starting`/`waiting`/`compensating`/`incident`/`compensationFailed`;
+  terminal instances no longer sit at a node and are excluded), read-only from D1, powering the aggregate
+  "living heatmap" mode. **Edge throughput intensity is derived client-side from node density in v1** (no
+  per-edge counter is stored).

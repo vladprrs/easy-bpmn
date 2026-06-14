@@ -14,6 +14,7 @@ import type {
   ProcessInstanceInspection,
   ProjectRollup,
   SagaDetail,
+  SagaHeatmap,
   SagaSummary,
 } from "./types";
 
@@ -83,6 +84,7 @@ export const api = {
   attention: (projectId?: string) => req<{ items: AttentionItem[] }>("GET", `/attention${qs({ projectId })}`),
   sagas: (projectId?: string) => req<{ sagas: SagaSummary[] }>("GET", `/sagas${qs({ projectId })}`),
   sagaDetail: (sagaId: string) => req<SagaDetail>("GET", `/sagas/${encodeURIComponent(sagaId)}`),
+  sagaHeatmap: (sagaId: string) => req<SagaHeatmap>("GET", `/sagas/${encodeURIComponent(sagaId)}/heatmap`),
 
   // Instances
   instances: (q: { workspaceId: string; status?: string; search?: string; sagaId?: string; cursor?: number; limit?: number }) =>

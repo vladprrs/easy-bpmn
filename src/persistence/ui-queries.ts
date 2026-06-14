@@ -12,6 +12,7 @@ import type {
   MessageSearchItem,
   ProjectRollup,
   SagaDetail,
+  SagaHeatmap,
   SagaSummary,
   StatusCounts,
   SubscriptionView,
@@ -245,6 +246,53 @@ export async function getSagaDetail(db: D1Database, draftId: string): Promise<Sa
       publishedAt: v.published_at,
       instanceCount: instanceCounts.get(v.definition_version_id) ?? 0,
     })),
+  };
+}
+
+// ---- Per-saga living heatmap (per-element live-instance density) -----------
+// Live = current_element_id set AND a non-terminal status (the instance still
+// sits at a node). Terminal statuses (completed/compensated/cancelled) are
+// excluded; incident/compensationFailed are what make a node "hot".
+
+export async function getSagaHeatmap(db: D1Database, draftId: string): Promise<SagaHeatmap | null> {
+  const draft = await dbFirst<{
+    draft_id: string;
+    latest_published_version_id: string | null;
+  }>(db, `SELECT draft_id, latest_published_version_id FROM drafts WHERE draft_id = ?`, [draftId]);
+  if (!draft) return null;
+
+  const rows = await dbAll<{ element_id: string; status: string; n: number }>(
+    db,
+    `SELECT pi.current_element_id AS element_id, pi.status AS status, COUNT(*) AS n
+       FROM process_instances pi
+       JOIN definition_versions dv ON pi.definition_version_id = dv.definition_version_id
+      WHERE dv.draft_id = ?
+        AND pi.current_element_id IS NOT NULL
+        AND pi.status IN ('running','starting','waiting','compensating','incident','compensationFailed')
+      GROUP BY pi.current_element_id, pi.status`,
+    [draftId],
+  );
+
+  const byNode = new Map<string, { count: number; byStatus: StatusCounts }>();
+  for (const r of rows) {
+    const node = byNode.get(r.element_id) ?? { count: 0, byStatus: {} };
+    node.count += r.n;
+    node.byStatus[r.status] = r.n;
+    byNode.set(r.element_id, node);
+  }
+  const nodes = Array.from(byNode.entries()).map(([elementId, v]) => ({
+    elementId,
+    count: v.count,
+    byStatus: v.byStatus,
+  }));
+  const totalLive = nodes.reduce((sum, n) => sum + n.count, 0);
+
+  return {
+    sagaId: draft.draft_id,
+    activeVersionId: draft.latest_published_version_id,
+    totalLive,
+    nodes,
+    generatedAt: new Date().toISOString(),
   };
 }
 

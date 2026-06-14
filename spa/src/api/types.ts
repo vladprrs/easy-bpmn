@@ -54,6 +54,25 @@ export interface SagaDetail {
   versions: SagaVersionSummary[];
 }
 
+// ---- Aggregate "living heatmap" (per-node instance density) ----------------
+
+export interface SagaHeatmapNode {
+  elementId: string;
+  /** Live instances currently placed at this element. */
+  count: number;
+  /** Density split by status (a node dominated by incident/compensationFailed runs hot). */
+  byStatus: StatusCounts;
+}
+
+export interface SagaHeatmap {
+  sagaId: string;
+  activeVersionId: string | null;
+  /** Sum of node counts — live instances placed somewhere in the process now. */
+  totalLive: number;
+  nodes: SagaHeatmapNode[];
+  generatedAt: string;
+}
+
 export interface InstanceListItem {
   instanceId: string;
   status: string;

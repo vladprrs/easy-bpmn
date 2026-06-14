@@ -170,11 +170,26 @@
   --state-warning: var(--amber-500);
   --state-warning-ring: rgba(207, 138, 24, 0.3);
 
-  /* ---- Typography ---- */
-  --font-sans: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", Roboto,
-    Helvetica, Arial, sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
-    "Liberation Mono", monospace;
+  /* ---- Typography: the self-hosted trio (see styles/fonts.css) ---- */
+  --font-display: "Clash Display", "General Sans", "General Sans Fallback",
+    ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "General Sans", "General Sans Fallback", ui-sans-serif, system-ui,
+    -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "Commit Mono", ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo,
+    Monaco, Consolas, monospace;
+
+  /* Fixed rem type scale (app UI — no fluid type). Few sizes, high contrast:
+   * the display steps step ≥1.4×; the dense data steps stay tight. */
+  --text-2xs: 0.6875rem; /* 11px — .tech-label micro-caps, badges */
+  --text-xs: 0.75rem; /* 12px — metadata, mono detail */
+  --text-sm: 0.8125rem; /* 13px — secondary UI */
+  --text-base: 0.875rem; /* 14px — body / tables / controls */
+  --text-md: 1rem; /* 16px — lead text */
+  --text-lg: 1.25rem; /* 20px — sub-headlines */
+  --text-xl: 1.75rem; /* 28px — instance headline */
+  --text-2xl: 2.5rem; /* 40px — process headline (Clash Display) */
+  --text-hero: 3.5rem; /* 56px — big duration / throughput numerals */
+
   --weight-regular: 400;
   --weight-medium: 500;
   --weight-semibold: 600;
@@ -233,10 +248,39 @@
   /* ---- Motion ---- */
   --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
   --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
   --dur-fast: 120ms;
   --dur-base: 200ms;
   --dur-slow: 320ms;
+
+  /* ============================================================
+   * "Living Systems" — the current. OKLCH (perceptually-uniform),
+   * pragmatic migration: NEW liveness/flow work only. Node category fills +
+   * runtime-state outlines stay on the frozen hex palette above. The current is
+   * a motion overlay on EDGES + travelling tokens, so it never fights node colour.
+   * Luminosity-on-pale, never neon-glow-on-dark: soft bloom + a bright core.
+   * ============================================================ */
+  --current: oklch(0.64 0.115 178); /* live current — luminous teal (= brand) */
+  --current-bright: oklch(0.82 0.13 182); /* the travelling token core */
+  --current-wash: oklch(0.64 0.115 178 / 0.16); /* edge illumination wash */
+  --current-glow: oklch(0.7 0.13 180 / 0.55); /* soft bloom around tokens */
+  --settle: oklch(0.66 0.15 156); /* completed circuit settles to green */
+  --settle-wash: oklch(0.66 0.15 156 / 0.14);
+  --interrupt: oklch(0.62 0.19 27); /* a path that stalls/fails — coral */
+  --interrupt-wash: oklch(0.62 0.19 27 / 0.14);
+
+  /* Tinted-toward-teal field + chrome (chroma ~0.004–0.008 — felt, not seen). */
+  --field: oklch(0.987 0.004 195); /* the calm stage the current crosses */
+  --field-sunk: oklch(0.968 0.006 196);
+  --chrome-tint: oklch(0.99 0.005 195 / 0.72); /* slim floating top bar */
+  --chrome-border: oklch(0.9 0.008 200 / 0.9);
+  --hairline-teal: oklch(0.62 0.04 190 / 0.16);
+
+  /* Flow timing. */
+  --flow-travel: 2.6s; /* one token traversal of an edge */
+  --flow-illuminate: 600ms; /* a segment drawing itself */
+  --flow-settle: 900ms; /* the finished glow easing in */
 }
 
 /* Dot-grid canvas surface used by the runtime diagram view. */

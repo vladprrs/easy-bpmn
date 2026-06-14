@@ -12,6 +12,7 @@ import {
   handleMessageSearch,
   handleProjects,
   handleSagaDetail,
+  handleSagaHeatmap,
   handleSagas,
   handleVersionBpmn,
 } from "./handlers";
@@ -39,6 +40,7 @@ export async function handleUiRoute(
   if (seg[0] === "sagas") {
     if (seg.length === 1 && method === "GET") return handleSagas(env, request, url);
     if (seg.length === 2 && method === "GET") return handleSagaDetail(env, request, seg[1]!);
+    if (seg.length === 3 && seg[2] === "heatmap" && method === "GET") return handleSagaHeatmap(env, request, seg[1]!);
   }
 
   // Instance diagnostics (jobs + SSE live-tail) ------------------------------

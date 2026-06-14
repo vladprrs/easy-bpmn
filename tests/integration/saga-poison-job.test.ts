@@ -26,7 +26,7 @@ async function compensationJobCount(instanceId: string): Promise<number> {
 }
 
 describe("poison-job termination (TASK-23 design §4.3)", () => {
-  it("re-opens an un-applicable completion up to the threshold, then terminates kind='poison' (no compensation)", async () => {
+  it("[C-BRANCH-POISON-01] re-opens an un-applicable completion up to the threshold, then terminates kind='poison' (no compensation)", async () => {
     // Start with ~0.6 MiB of variables; a 0.6 MiB completion output merges to > 1 MiB.
     const { instance } = await publishAndStart(DEMO_BPMN, { correlationKey: "poison-1", variables: { seed: HALF_MIB } });
     const instanceId = instance.body.instanceId;

@@ -43,8 +43,14 @@ const fileHasMarker = (file, id) =>
 
 function checkMode(r, mode, file) {
   if (!r.modes.includes(mode)) return;
-  const bucket = r.phase <= ACTIVE_PHASE ? failures : warnings;
-  if (!file) { failures.push(`${r.id}: declares '${mode}' but has no ${mode}File`); return; }
+  // Workflow-mode (Layer B) coverage always lands at least one phase after the
+  // direct-mode (Layer A) half of the same scenario: a `phase:1` C-* scenario
+  // proves its semantics in direct mode at Phase 1, but its suspend/resume
+  // re-run is Phase 2/3 work. So a missing workflow marker is never a Phase-1
+  // failure — it is a deferred-phase warning until MATRIX_PHASE is raised.
+  const effectivePhase = mode === "workflow" ? Math.max(r.phase, 2) : r.phase;
+  const bucket = effectivePhase <= ACTIVE_PHASE ? failures : warnings;
+  if (!file) { bucket.push(`${r.id}: declares '${mode}' but has no ${mode}File`); return; }
   if (!fileHasMarker(file, r.id)) {
     bucket.push(`${r.id}: no "[${r.id}]" marker found in ${file} (${mode} mode, phase ${r.phase})`);
   }

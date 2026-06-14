@@ -63,8 +63,8 @@ describe("matrix: publish-validation rejects (direct mode)", () => {
       // The rejection must name a real model element (the offending element id),
       // not just emit a generic reason. Assert at least one element id declared in
       // the fixture is echoed back in the response.
-      const fixtureIds = [...bpmn.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]);
-      const namesAnElement = fixtureIds.some((fid) => text.includes(fid));
+      const fixtureIds = [...bpmn.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1] ?? "");
+      const namesAnElement = fixtureIds.some((fid) => fid !== "" && text.includes(fid));
       expect(namesAnElement, `${id}: response should name an offending element id`).toBe(true);
     });
   }

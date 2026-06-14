@@ -14,7 +14,8 @@
     "test:contract": "vitest run tests/contract",
     "test:integration": "vitest run tests/integration",
     "check:matrix": "node scripts/check-matrix.mjs",
-    "test:matrix": "vitest run tests/matrix tests/integration/matrix"
+    "test:matrix": "vitest run tests/matrix tests/integration/matrix",
+    "test:wf": "vitest run --config tests/workflow-mode/run.config.ts"
   },
   "dependencies": {
     "bpmn-moddle": "^10.0.0",

@@ -29,11 +29,16 @@ export const MAX_WAKE_BACKSTOP_MS = 60 * 60 * 1000;
  * Returns a Cloudflare-Workflows duration string ("N seconds").
  */
 export async function wakeBackstop(env: Env, instanceId: string): Promise<string> {
+  // TEST-ONLY: Layer-B self-heal tests lower the ceiling via a wrangler-dev var so
+  // a genuinely lost wake recovers inside a bounded poll window (design §4.1).
+  // Never set in production (wrangler.jsonc declares it nowhere).
+  const override = Number((env as { MAX_WAKE_BACKSTOP_OVERRIDE?: string }).MAX_WAKE_BACKSTOP_OVERRIDE);
+  const ceiling = Number.isFinite(override) && override > 0 ? override : MAX_WAKE_BACKSTOP_MS;
   const timer = await getEarliestArmedTimerForInstance(env.DB, instanceId);
-  let ms = MAX_WAKE_BACKSTOP_MS;
+  let ms = ceiling;
   if (timer) {
     const untilMs = new Date(timer.fireAt).getTime() - Date.now() + WAKE_SLACK_MS;
-    ms = Math.min(MAX_WAKE_BACKSTOP_MS, Math.max(WAKE_SLACK_MS, untilMs));
+    ms = Math.min(ceiling, Math.max(WAKE_SLACK_MS, untilMs));
   }
   return `${Math.ceil(ms / 1000)} seconds`;
 }

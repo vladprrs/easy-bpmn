@@ -47,7 +47,7 @@ describe("concurrency caps (M4-L6, direct mode)", () => {
     expect(STEP_BUDGET_SOFT).toBe(20000);
   });
 
-  it("a fan-out exceeding MAX_CONCURRENT_TOKENS settles a terminal concurrencyLimit incident", async () => {
+  it("[C-CAP-TRIO-01] a fan-out exceeding MAX_CONCURRENT_TOKENS settles a terminal concurrencyLimit incident", async () => {
     // A single AND split fanning out FOUR branches; the test-only override lowers
     // the cap to 2 so the fan-out (0 live + 4 activated > 2) trips at the split.
     const branches = ["f1", "f2", "f3", "f4"];
@@ -89,7 +89,7 @@ describe("concurrency caps (M4-L6, direct mode)", () => {
     expect(inst.body.incident.payloadContext.cap).toBe(2);
   });
 
-  it("crossing STEP_BUDGET_SOFT settles a graceful stepBudget incident (below the platform ceiling)", async () => {
+  it("[C-CAP-TRIO-01] crossing STEP_BUDGET_SOFT settles a graceful stepBudget incident (below the platform ceiling)", async () => {
     // An AND split with a pure-gateway self-loop on one branch — within ONE drive
     // pass it burns runStep calls until the (lowered) soft budget trips, before
     // MAX_ELEMENT_OCCURRENCES (1000). The graceful incident, not an opaque errored
@@ -138,7 +138,7 @@ describe("join-time payload bound (M4-L6, design §9.1)", () => {
   const complete = (token: string, job: { jobId: string; lockToken: string }, outputVariables: Record<string, unknown>) =>
     authedPost(`/jobs/${job.jobId}/complete`, token, { lockToken: job.lockToken, outputVariables });
 
-  it("a merged overlay exceeding MAX_EVENT_PAYLOAD_BYTES raises a poison incident (never a silent truncation)", async () => {
+  it("[C-CAP-TRIO-01] a merged overlay exceeding MAX_EVENT_PAYLOAD_BYTES raises a poison incident (never a silent truncation)", async () => {
     const token = await mintWorkerToken();
     const { instance } = await publishAndStart(PARALLEL_BPMN, { correlationKey: "bigjoin", variables: {} });
     const id = instance.body.instanceId;

@@ -329,7 +329,7 @@ describe("eventBasedGateway — rewalk fast-forward (M3-L4 AC#1: replay-stable)"
 });
 
 describe("eventBasedGateway INSIDE a parallel branch — branch-scoped payload (M4-L6.4, carried blocker #1)", () => {
-  it("the winning message payload lands on the BRANCH overlay (not root), then merges up at the join", async () => {
+  it("[C-BRANCH-EBG-01] the winning message payload lands on the BRANCH overlay (not root), then merges up at the join", async () => {
     const token = await mintWorkerToken();
     const { instance } = await publishAndStart(EBG_IN_BRANCH, { correlationKey: "ebgbr1", variables: {} });
     const id = instance.body.instanceId;

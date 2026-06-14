@@ -53,8 +53,8 @@ void main(){
   vec2 q = uv * vec2(u_res.x / u_res.y, 1.0) * 2.3;
   float t = u_time * 0.045;
   float n = fbm(q + vec2(t, -t * 0.55) + fbm(q * 0.6 - t * 0.3));
-  float band = smoothstep(0.48, 0.98, n);
-  float ambA = band * u_ambient;
+  float band = smoothstep(0.3, 0.96, n);
+  float ambA = (0.3 + 0.7 * band) * u_ambient; // a soft floor everywhere + flowing bands
 
   vec3 colAcc = mix(teal, tealHi, band) * ambA;
   float aAcc = ambA;
@@ -253,7 +253,7 @@ export class AuroraField {
     });
     gl.uniform2f(this.u.u_res, this.canvas.width, this.canvas.height);
     gl.uniform1f(this.u.u_time, this.now);
-    gl.uniform1f(this.u.u_ambient, 0.18);
+    gl.uniform1f(this.u.u_ambient, 0.32);
     gl.uniform1i(this.u.u_count, spots.length);
     if (this.u.u_spots) gl.uniform4fv(this.u.u_spots, flat);
     if (this.u.u_spotcol) gl.uniform3fv(this.u.u_spotcol, cols);

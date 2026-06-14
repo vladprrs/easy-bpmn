@@ -241,6 +241,9 @@
   --ring-focus: 0 0 0 var(--ring-width) var(--state-focus-ring);
   --ring-selected: 0 0 0 var(--ring-width) var(--state-selected-ring);
 
+  /* ---- Overlay scrim (unifies Drawer / palette / confirm dialogs) ---- */
+  --scrim: rgba(24, 29, 36, 0.28);
+
   /* ---- Canvas texture: subtle dot grid ---- */
   --canvas-dot: rgba(60, 80, 100, 0.1);
   --canvas-grid-size: 22px;

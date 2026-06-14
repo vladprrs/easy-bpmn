@@ -1,13 +1,10 @@
-// GlassRenderer — a high-priority bpmn-js BaseRenderer that redraws every flow
-// node as a luminous "liquid glass" shape (frosted body + specular sheen +
-// refraction + soft elevation), with custom line-icons instead of bpmn-js's
-// default corner glyphs. Runtime state / flow / heat / selection still arrive as
-// marker CSS classes on the .djs-element group; this renderer only owns the
-// resting visual vocabulary, so the existing living-flow machinery is untouched.
-//
-// Connections are intentionally NOT handled here — the default renderer keeps
-// drawing them as a single <path> child of .djs-visual, which preserves both the
-// travelling-token injection and the flow-edge CSS. We restyle those edges in CSS.
+// GlassRenderer — a high-priority bpmn-js BaseRenderer that redraws flow nodes as
+// luminous glass tiles and sequence flows as rounded connectors with a chevron
+// arrowhead that inherits the edge colour. Activities use a left-aligned "tile"
+// composition: a vivid filled category icon-chip + a bold name, with depth from a
+// glass rim + deep soft shadow rather than a heavy Camunda-style border. Runtime
+// state / flow / heat / selection still arrive as marker CSS classes; this renderer
+// owns the resting vocabulary.
 
 import BaseRenderer from "diagram-js/lib/draw/BaseRenderer";
 import { is, isAny, getBusinessObject } from "bpmn-js/lib/util/ModelUtil";
@@ -16,9 +13,10 @@ import { ensureGlassDefs, diamondPath } from "./glass";
 import { ICONS, FILLED_ICONS, type IconKey } from "./icons";
 
 const HIGH_PRIORITY = 1500;
-const TASK_RADIUS = 13;
+const TASK_RADIUS = 15;
 
 type Cat = "task" | "event" | "inter" | "boundary" | "end" | "gateway";
+type Pt = { x: number; y: number };
 
 export default class GlassRenderer extends BaseRenderer {
   static $inject = ["eventBus", "textRenderer"];
@@ -30,7 +28,8 @@ export default class GlassRenderer extends BaseRenderer {
   }
 
   canRender(element: any): boolean {
-    return !element.labelTarget && isAny(element, ["bpmn:Event", "bpmn:Gateway", "bpmn:Activity"]);
+    if (element.labelTarget) return false;
+    return isAny(element, ["bpmn:Event", "bpmn:Gateway", "bpmn:Activity"]) || is(element, "bpmn:SequenceFlow");
   }
 
   drawShape(parent: SVGElement, element: any): SVGElement {
@@ -48,46 +47,58 @@ export default class GlassRenderer extends BaseRenderer {
     return g;
   }
 
+  drawConnection(parent: SVGElement, element: any): SVGElement {
+    ensureGlassDefs(parent);
+    const path = el("path", { d: roundedConnector(element.waypoints, 7), fill: "none", "marker-end": "url(#ebpmn-arrow)" }, "ebpmn-edge");
+    svgAppend(parent, path);
+    return path;
+  }
+
   // ---- Activity (task / subprocess / call activity) -----------------------
   private drawActivity(g: SVGElement, element: any) {
     const { width: w, height: h } = element;
+    const R = TASK_RADIUS;
     const clipId = `ebpmn-clip-${safeId(element.id)}`;
-    appendClip(g, clipId, el("rect", { x: 0, y: 0, width: w, height: h, rx: TASK_RADIUS }));
+    appendClip(g, clipId, el("rect", { x: 0, y: 0, width: w, height: h, rx: R }));
 
-    svgAppend(g, el("rect", { x: 0, y: 0, width: w, height: h, rx: TASK_RADIUS, fill: "url(#ebpmn-frost)", filter: "url(#ebpmn-elev)" }, "ebpmn-shape"));
+    svgAppend(g, el("rect", { x: 0, y: 0, width: w, height: h, rx: R, fill: "url(#ebpmn-frost)", filter: "url(#ebpmn-elev)" }, "ebpmn-shape"));
     const inner = el("g", { "clip-path": `url(#${clipId})` });
-    svgAppend(inner, el("rect", { x: 0, y: 0, width: w, height: h, rx: TASK_RADIUS }, "ebpmn-tint"));
-    svgAppend(inner, el("rect", { x: -3, y: -3, width: w + 6, height: h * 0.66, rx: TASK_RADIUS, fill: "url(#ebpmn-sheen)", filter: "url(#ebpmn-liquid)" }, "ebpmn-sheen"));
+    svgAppend(inner, el("rect", { x: 0, y: 0, width: w, height: h, rx: R }, "ebpmn-tint"));
+    svgAppend(inner, el("rect", { x: -3, y: -3, width: w + 6, height: h * 0.7, rx: R, fill: "url(#ebpmn-sheen)", filter: "url(#ebpmn-liquid)" }, "ebpmn-sheen"));
     svgAppend(g, inner);
-    svgAppend(g, el("rect", { x: 0.75, y: 0.75, width: w - 1.5, height: h - 1.5, rx: TASK_RADIUS - 0.75, fill: "none" }, "ebpmn-stroke"));
+    // Glass rim (bright inner edge) + the thin state stroke — no heavy border.
+    svgAppend(g, el("rect", { x: 1, y: 1, width: w - 2, height: h - 2, rx: R - 1, fill: "none" }, "ebpmn-rim"));
+    svgAppend(g, el("rect", { x: 0.6, y: 0.6, width: w - 1.2, height: h - 1.2, rx: R - 0.6, fill: "none" }, "ebpmn-stroke"));
 
-    // A small corner icon (replaces bpmn-js's default glyph). The label stays
-    // centred across the full width so it reads cleanly without cramped wrapping.
+    // Left icon chip (vivid filled category colour, white glyph) — the colour anchor.
     const ic = iconFor(element);
+    let labelX = 14;
     if (ic) {
-      const chip = el("g", { transform: "translate(11 11)" }, "ebpmn-chip");
-      svgAppend(chip, el("rect", { x: -2, y: -2, width: 24, height: 24, rx: 7, fill: "none" }, "ebpmn-chip-bg"));
-      svgAppend(chip, iconSvg(ic.key, ic.filled, 0, 0, 20));
+      const cs = Math.min(h - 20, 40);
+      const chip = el("g", { transform: `translate(13 ${(h - cs) / 2})` }, "ebpmn-chip");
+      svgAppend(chip, el("rect", { x: 0, y: 0, width: cs, height: cs, rx: 11 }, "ebpmn-chip-bg"));
+      svgAppend(chip, iconSvg(ic.key, ic.filled, cs * 0.22, cs * 0.22, cs * 0.56));
       svgAppend(g, chip);
+      labelX = 13 + cs + 11;
     }
 
     const name = getBusinessObject(element)?.name;
     if (name) {
       const text = this.textRenderer.createText(name, {
-        box: { width: w, height: h },
-        align: "center-middle",
-        padding: { top: ic ? 16 : 8, right: 9, bottom: 8, left: 9 },
-        style: { fontFamily: FONT, fontSize: 12, fontWeight: 600, fill: INK, lineHeight: 1.2 },
+        box: { width: w - labelX - 12, height: h },
+        align: "left-middle",
+        padding: 1,
+        style: { fontFamily: FONT, fontSize: 13, fontWeight: 600, fill: INK, lineHeight: 1.18 },
       });
+      svgAttr(text, { transform: `translate(${labelX} 0)` });
       svgClasses(text).add("ebpmn-label");
       svgAppend(g, text);
     }
 
-    // Sub-process collapse marker (BPMN [+]).
     if (isAny(element, ["bpmn:SubProcess", "bpmn:Transaction", "bpmn:CallActivity"])) {
-      const mk = el("g", { transform: `translate(${w / 2 - 9} ${h - 18})` }, "ebpmn-marker");
-      svgAppend(mk, el("rect", { x: 0, y: 0, width: 18, height: 14, rx: 3, fill: "none" }, "ebpmn-marker-box"));
-      svgAppend(mk, el("path", { d: "M9 3.5v7M5.5 7h7" }, "ebpmn-glyph"));
+      const mk = el("g", { transform: `translate(${w - 26} ${h - 19})` }, "ebpmn-marker");
+      svgAppend(mk, el("rect", { x: 0, y: 0, width: 15, height: 13, rx: 3, fill: "none" }, "ebpmn-marker-box"));
+      svgAppend(mk, el("path", { d: "M7.5 3v7M4 6.5h7" }, "ebpmn-glyph"));
       svgAppend(g, mk);
     }
   }
@@ -104,23 +115,22 @@ export default class GlassRenderer extends BaseRenderer {
     svgAppend(g, el("circle", { cx, cy, r, fill: "url(#ebpmn-disc-frost)", filter: "url(#ebpmn-elev)" }, "ebpmn-shape"));
     const inner = el("g", { "clip-path": `url(#${clipId})` });
     svgAppend(inner, el("circle", { cx, cy, r }, "ebpmn-tint"));
-    svgAppend(inner, el("ellipse", { cx, cy: cy - r * 0.28, rx: r * 0.92, ry: r * 0.62, fill: "url(#ebpmn-sheen)", filter: "url(#ebpmn-liquid)" }, "ebpmn-sheen"));
+    svgAppend(inner, el("ellipse", { cx, cy: cy - r * 0.3, rx: r * 0.92, ry: r * 0.6, fill: "url(#ebpmn-sheen)", filter: "url(#ebpmn-liquid)" }, "ebpmn-sheen"));
     svgAppend(g, inner);
-    // Outer ring (the state-coloured stroke target).
-    svgAppend(g, el("circle", { cx, cy, r: r - 1, fill: "none" }, "ebpmn-stroke"));
-    // Intermediate / boundary get the BPMN double ring.
+    svgAppend(g, el("circle", { cx, cy, r: r - 1.5, fill: "none" }, "ebpmn-rim"));
+    svgAppend(g, el("circle", { cx, cy, r: r - 0.75, fill: "none" }, "ebpmn-stroke"));
     if (cat === "inter" || cat === "boundary") {
       svgAppend(g, el("circle", { cx, cy, r: r - 4, fill: "none" }, "ebpmn-stroke-inner"));
     }
 
     const ic = iconFor(element);
-    if (ic) svgAppend(g, iconSvg(ic.key, ic.filled, cx - r * 0.58, cy - r * 0.58, r * 1.16));
+    if (ic) svgAppend(g, iconSvg(ic.key, ic.filled, cx - r * 0.56, cy - r * 0.56, r * 1.12));
   }
 
   // ---- Gateway (exclusive / parallel / inclusive / event-based) -----------
   private drawGateway(g: SVGElement, element: any) {
     const { width: w, height: h } = element;
-    const d = diamondPath(w, h, 6);
+    const d = diamondPath(w, h, 7);
     const clipId = `ebpmn-clip-${safeId(element.id)}`;
     appendClip(g, clipId, el("path", { d }));
 
@@ -143,7 +153,7 @@ export const glassRendererModule = {
 // ============================ helpers ====================================
 
 const FONT = "'General Sans', 'General Sans Fallback', ui-sans-serif, system-ui, sans-serif";
-const INK = "#1b222c";
+const INK = "#19212c";
 
 function el(tag: string, attrs: Record<string, any>, cls?: string): SVGElement {
   const node = svgCreate(tag);
@@ -159,7 +169,6 @@ function appendClip(g: SVGElement, id: string, shape: SVGElement) {
   svgAppend(g, clip);
 }
 
-/** A nested 24-grid icon, positioned at (x,y) scaled to `size`. */
 function iconSvg(key: IconKey, filled: boolean, x: number, y: number, size: number): SVGElement {
   const sv = el("svg", { x, y, width: size, height: size, viewBox: "0 0 24 24", overflow: "visible" }, "ebpmn-icon");
   for (const d of ICONS[key]) {
@@ -169,6 +178,35 @@ function iconSvg(key: IconKey, filled: boolean, x: number, y: number, size: numb
     svgAppend(sv, p);
   }
   return sv;
+}
+
+/** A polyline through the waypoints with rounded corners. */
+function roundedConnector(pts: Pt[], r: number): string {
+  if (!pts || pts.length < 2) return "";
+  if (pts.length === 2) return `M${pts[0].x},${pts[0].y}L${pts[1].x},${pts[1].y}`;
+  let d = `M${pts[0].x},${pts[0].y}`;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const p0 = pts[i - 1];
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    const a = toward(p1, p0, Math.min(r, dist(p0, p1) / 2));
+    const b = toward(p1, p2, Math.min(r, dist(p1, p2) / 2));
+    d += `L${round(a.x)},${round(a.y)}Q${round(p1.x)},${round(p1.y)} ${round(b.x)},${round(b.y)}`;
+  }
+  const last = pts[pts.length - 1];
+  d += `L${last.x},${last.y}`;
+  return d;
+}
+
+function dist(a: Pt, b: Pt) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+function toward(from: Pt, to: Pt, len: number): Pt {
+  const d = dist(from, to) || 1;
+  return { x: from.x + ((to.x - from.x) / d) * len, y: from.y + ((to.y - from.y) / d) * len };
+}
+function round(n: number) {
+  return Math.round(n * 100) / 100;
 }
 
 function drawGatewayGlyph(g: SVGElement, element: any, w: number, h: number) {
@@ -187,7 +225,6 @@ function drawGatewayGlyph(g: SVGElement, element: any, w: number, h: number) {
   } else if (is(element, "bpmn:ComplexGateway")) {
     svgAppend(wrap, el("path", { d: `M${cx} ${cy - s}V${cy + s}M${cx - s} ${cy}H${cx + s}M${cx - s * 0.7} ${cy - s * 0.7}L${cx + s * 0.7} ${cy + s * 0.7}M${cx - s * 0.7} ${cy + s * 0.7}L${cx + s * 0.7} ${cy - s * 0.7}` }, "ebpmn-glyph"));
   } else {
-    // Exclusive (and default) — the X.
     const d = s * 0.78;
     svgAppend(wrap, el("path", { d: `M${cx - d} ${cy - d}L${cx + d} ${cy + d}M${cx - d} ${cy + d}L${cx + d} ${cy - d}` }, "ebpmn-glyph"));
   }
@@ -238,7 +275,7 @@ function iconFor(element: any): { key: IconKey; filled: boolean } | null {
     const def = bo?.eventDefinitions?.[0]?.$type as string | undefined;
     if (def && EVENT_DEF_ICON[def]) return { key: EVENT_DEF_ICON[def], filled: isThrow };
     if (is(element, "bpmn:StartEvent")) return { key: "play", filled: false };
-    return null; // plain end event — bare ring
+    return null;
   }
 
   if (is(element, "bpmn:ServiceTask")) return { key: "service", filled: false };
@@ -250,7 +287,7 @@ function iconFor(element: any): { key: IconKey; filled: boolean } | null {
   if (is(element, "bpmn:ManualTask")) return { key: "manual", filled: false };
   if (is(element, "bpmn:CallActivity")) return { key: "call", filled: false };
   if (isAny(element, ["bpmn:SubProcess", "bpmn:Transaction"])) return { key: "subprocess", filled: false };
-  return null; // plain task — icon-less, just the label
+  return null;
 }
 
 function safeId(id: string): string {

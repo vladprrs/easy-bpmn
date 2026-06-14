@@ -9,10 +9,10 @@
 
 import { useEffect, useRef, useState } from "react";
 import NavigatedViewer from "bpmn-js/lib/NavigatedViewer";
-import { layoutProcess } from "bpmn-auto-layout";
 import "bpmn-js/dist/assets/diagram-js.css";
 import { glassRendererModule } from "./bpmn/GlassRenderer";
 import { AuroraField, type Hotspot } from "./bpmn/AuroraField";
+import { layoutDiagram } from "./bpmn/layout";
 import type { BpmnElement } from "../api/types";
 import type { DiagramOverlay, FlowPlan, HeatPlan } from "../lib/flow";
 
@@ -117,7 +117,7 @@ export default function LivingDiagram({
             /* font API hiccup — proceed with fallback metrics */
           }
         }
-        const xml = hasDi(bpmnXml) ? bpmnXml : await layoutProcess(bpmnXml);
+        const xml = hasDi(bpmnXml) ? bpmnXml : await layoutDiagram(bpmnXml);
         await viewer.importXML(xml);
         if (disposed) return;
         const canvas = viewer.get("canvas");

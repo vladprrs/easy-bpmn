@@ -10,6 +10,7 @@ import { AlertTriangle, CornerDownLeft, Inbox, Play, Search, GitBranch, Workflow
 import { api } from "../api/client";
 import type { AttentionItem, SagaSummary } from "../api/types";
 import { StatusBadge } from "../components/StatusBadge";
+import { summarize } from "./model";
 
 type Row =
   | { kind: "process"; id: string; label: string; sub: string; go: () => void }
@@ -58,11 +59,12 @@ export function CommandPalette({
     const out: Row[] = [];
 
     for (const s of sagas.filter((s) => match(s.name)).slice(0, 6)) {
+      const sum = summarize(s.counts);
       out.push({
         kind: "process",
         id: s.sagaId,
         label: s.name,
-        sub: "process",
+        sub: sum.live > 0 ? `${sum.live} live now` : sum.total > 0 ? `${sum.total} run${sum.total === 1 ? "" : "s"}` : "no runs yet",
         go: () => navigate(`/console/p/${encodeURIComponent(s.sagaId)}`),
       });
     }
@@ -93,6 +95,12 @@ export function CommandPalette({
   }, [q, sagas, attention, runsQ.data, navigate, onOpenSurface]);
 
   useEffect(() => setActive((a) => Math.min(a, Math.max(0, rows.length - 1))), [rows.length]);
+
+  // Keep the keyboard-active row in view when arrowing past the fold.
+  useEffect(() => {
+    const el = listRef.current?.querySelectorAll<HTMLElement>('[role="option"]')[active];
+    el?.scrollIntoView({ block: "nearest" });
+  }, [active]);
 
   if (!open) return null;
 
@@ -126,28 +134,32 @@ export function CommandPalette({
 
   return (
     <div
-      className="fixed inset-0 z-[400] flex items-start justify-center bg-content-strong/25 p-4 pt-[12vh] backdrop-blur-sm"
+      className="fixed inset-0 z-[400] flex items-start justify-center bg-scrim p-4 pt-[12vh] backdrop-blur-sm"
       onMouseDown={onClose}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Command palette"
         className="anim-rise w-full max-w-xl overflow-hidden rounded-xl border border-line bg-surface-card shadow-xl"
         onMouseDown={(e) => e.stopPropagation()}
         onKeyDown={onKey}
       >
         <div className="flex items-center gap-2.5 border-b border-line px-4 py-3">
-          <Search className="h-4 w-4 text-content-muted" />
+          <Search className="h-4 w-4 shrink-0 text-content-muted" />
           <input
             ref={inputRef}
             value={q}
             onChange={(e) => setQ(e.target.value)}
+            aria-label="Search processes, runs and alerts"
             placeholder="Switch process, find a run by key, jump to an alert…"
             className="w-full bg-transparent text-md text-content outline-none placeholder:text-content-muted"
           />
-          <span className="hidden items-center gap-1 text-2xs text-content-muted sm:flex">
+          <span className="hidden shrink-0 items-center gap-1 whitespace-nowrap text-2xs text-content-muted sm:flex">
             <CornerDownLeft className="h-3 w-3" /> to open · esc to close
           </span>
         </div>
-        <div ref={listRef} className="max-h-[52vh] overflow-auto p-1.5">
+        <div ref={listRef} role="listbox" aria-label="Results" className="max-h-[52vh] overflow-auto p-1.5">
           {rows.length === 0 && (
             <div className="px-4 py-10 text-center text-sm text-content-muted">
               {q.trim().length >= 2 ? "Nothing matches." : "Type to search runs, or pick a process."}
@@ -156,6 +168,8 @@ export function CommandPalette({
           {rows.map((r, i) => (
             <button
               key={`${r.kind}-${r.id}`}
+              role="option"
+              aria-selected={i === active}
               onMouseEnter={() => setActive(i)}
               onClick={() => activate(r)}
               className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition ${

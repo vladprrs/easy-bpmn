@@ -13,10 +13,6 @@ export function Kbd({ children }: { children: ReactNode }) {
   );
 }
 
-export function GlassPanel({ children, className = "" }: { children: ReactNode; className?: string }) {
-  return <div className={`glass rounded-card ${className}`}>{children}</div>;
-}
-
 /** Anchored popover. `trigger` renders the button (gets {open, toggle, ref}); `children`
  *  renders the panel (gets a `close` fn). Light-dismiss on outside-click + Escape. */
 export function Popover({

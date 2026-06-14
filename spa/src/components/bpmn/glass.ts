@@ -8,32 +8,29 @@ import { append as svgAppend, create as svgCreate, innerSVG } from "tiny-svg";
 const DEFS_ID = "ebpmn-glass-defs";
 
 const DEFS_MARKUP = `
-  <linearGradient id="ebpmn-frost" x1="0" y1="0" x2="0.25" y2="1">
-    <stop offset="0" stop-color="#ffffff" stop-opacity="0.82"/>
-    <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.5"/>
-    <stop offset="1" stop-color="#ffffff" stop-opacity="0.34"/>
+  <linearGradient id="ebpmn-frost" x1="0" y1="0" x2="0.18" y2="1">
+    <stop offset="0" stop-color="#ffffff" stop-opacity="0.74"/>
+    <stop offset="1" stop-color="#ffffff" stop-opacity="0.32"/>
   </linearGradient>
-  <linearGradient id="ebpmn-sheen" x1="0" y1="0" x2="0.3" y2="1">
-    <stop offset="0" stop-color="#ffffff" stop-opacity="0.95"/>
-    <stop offset="0.42" stop-color="#ffffff" stop-opacity="0.14"/>
+  <linearGradient id="ebpmn-sheen" x1="0" y1="0" x2="0.18" y2="1">
+    <stop offset="0" stop-color="#ffffff" stop-opacity="1"/>
+    <stop offset="0.45" stop-color="#ffffff" stop-opacity="0.22"/>
     <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
   </linearGradient>
-  <linearGradient id="ebpmn-rim" x1="0" y1="0" x2="0" y2="1">
-    <stop offset="0" stop-color="#ffffff" stop-opacity="0.95"/>
-    <stop offset="1" stop-color="#ffffff" stop-opacity="0.25"/>
-  </linearGradient>
-  <filter id="ebpmn-elev" x="-40%" y="-40%" width="180%" height="180%" color-interpolation-filters="sRGB">
-    <feDropShadow dx="0" dy="2.5" stdDeviation="4" flood-color="#141e2d" flood-opacity="0.16"/>
+  <filter id="ebpmn-elev" x="-60%" y="-60%" width="220%" height="220%" color-interpolation-filters="sRGB">
+    <feDropShadow dx="0" dy="4" stdDeviation="7" flood-color="#13233c" flood-opacity="0.22"/>
   </filter>
   <filter id="ebpmn-liquid" x="-25%" y="-25%" width="150%" height="150%" color-interpolation-filters="sRGB">
     <feTurbulence type="fractalNoise" baseFrequency="0.013 0.021" numOctaves="2" seed="11" result="noise"/>
     <feDisplacementMap in="SourceGraphic" in2="noise" scale="7" xChannelSelector="R" yChannelSelector="G"/>
   </filter>
-  <radialGradient id="ebpmn-disc-frost" cx="0.38" cy="0.3" r="0.85">
-    <stop offset="0" stop-color="#ffffff" stop-opacity="0.9"/>
-    <stop offset="0.6" stop-color="#ffffff" stop-opacity="0.52"/>
-    <stop offset="1" stop-color="#ffffff" stop-opacity="0.32"/>
+  <radialGradient id="ebpmn-disc-frost" cx="0.36" cy="0.26" r="0.92">
+    <stop offset="0" stop-color="#ffffff" stop-opacity="0.92"/>
+    <stop offset="1" stop-color="#ffffff" stop-opacity="0.4"/>
   </radialGradient>
+  <marker id="ebpmn-arrow" viewBox="0 0 12 12" refX="9.5" refY="6" markerWidth="11" markerHeight="11" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
+    <path d="M3.2 2.6 L9.4 6 L3.2 9.4" fill="none" stroke="context-stroke" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
 `;
 
 /** Inject the glass <defs> into the SVG root once. Safe to call per shape. */

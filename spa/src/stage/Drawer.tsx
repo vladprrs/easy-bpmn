@@ -84,11 +84,19 @@ export function Drawer({
     if (open && !tabs.includes(tab)) onTab(tabs[0] ?? "messages");
   }, [open, tabs, tab, onTab]);
 
+  // Escape closes the slide-over (consistent with the palette and confirm dialogs).
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-[300] flex justify-end" role="dialog" aria-modal>
-      <div className="absolute inset-0 bg-content-strong/20 backdrop-blur-[2px]" onClick={onClose} />
+    <div className="fixed inset-0 z-[300] flex justify-end" role="dialog" aria-modal aria-label="Instance details">
+      <div className="absolute inset-0 bg-scrim backdrop-blur-sm" onClick={onClose} />
       <aside className="anim-rise relative flex h-full w-full max-w-[30rem] flex-col border-l border-line bg-surface-card shadow-xl">
         <div className="flex items-center gap-1 overflow-x-auto border-b border-line px-2 py-1.5">
           {tabs.map((t) => (

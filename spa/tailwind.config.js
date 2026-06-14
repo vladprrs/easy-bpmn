@@ -42,7 +42,12 @@ export default {
         ok: "#1f9d57", // completed (green-500)
         info: "#2f74e0", // running / intermediate (blue-500)
         warn: "#cf8a18", // warning (amber-500)
-        danger: "#e0524a", // end / error (coral red-500)
+        danger: {
+          DEFAULT: "#e0524a", // end / error (coral red-500)
+          hover: "#c63d36", // red-600 — destructive button hover
+        },
+        // Modal/drawer overlay scrim (mirrors --scrim in tokens.css).
+        scrim: "rgba(24,29,36,0.28)",
         // BPMN category accents (canvas markers + legend chips).
         cat: {
           event: "#1f9d57",

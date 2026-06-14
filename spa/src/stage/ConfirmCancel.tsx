@@ -3,6 +3,7 @@
 // will compensate, in reverse order. The server stays authoritative (a 409 → "state
 // changed, refresh"). A "Preview reverse flow" toggle animates it on the diagram.
 
+import { useEffect } from "react";
 import { Ban, PlayCircle } from "lucide-react";
 import type { CompensationPreviewItem } from "../lib/compensation";
 import type { ElementIndex } from "../lib/elements";
@@ -27,10 +28,17 @@ export function ConfirmCancel({
   onConfirm: () => void;
   onClose: () => void;
 }) {
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
   if (!open) return null;
   return (
-    <div className="fixed inset-0 z-[400] grid place-items-center bg-content-strong/30 p-4 backdrop-blur-sm" onMouseDown={onClose}>
-      <div className="anim-rise w-full max-w-md rounded-xl border border-line bg-surface-card p-5 shadow-xl" onMouseDown={(e) => e.stopPropagation()}>
+    <div className="fixed inset-0 z-[400] grid place-items-center bg-scrim p-4 backdrop-blur-sm" onMouseDown={onClose}>
+      <div role="dialog" aria-modal="true" aria-label="Cancel this run" className="anim-rise w-full max-w-md rounded-xl border border-line bg-surface-card p-5 shadow-xl" onMouseDown={(e) => e.stopPropagation()}>
         <div className="mb-1 text-base font-semibold text-content-strong">Cancel this run?</div>
         <p className="mb-3 text-sm text-content-secondary">
           Cancelling triggers compensation. These completed steps roll back, in reverse order:

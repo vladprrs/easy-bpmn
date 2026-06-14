@@ -32,6 +32,15 @@ body {
   color: var(--text-strong);
 }
 
+/* Consistent keyboard-focus ring across all interactive chrome. Mouse clicks stay
+ * ring-free (:focus-visible). Inputs and the <Button> primitive draw their own ring
+ * (they set outline-none), so this is the baseline for everything else — popover
+ * triggers, drawer tabs, palette rows, transport controls, icon buttons. */
+:where(a, button, [role="button"], [role="option"], [role="tab"]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* ---- Type-trio utilities ------------------------------------------------- */
 .font-display {
   font-family: var(--font-display);
@@ -77,27 +86,39 @@ body {
 }
 
 /* ---- Glass primitives (category-independent) ----------------------------- */
+.ebpmn-shape {
+  pointer-events: all;
+}
 .ebpmn-tint {
-  fill: var(--cat-task-surface);
-  fill-opacity: 0.34;
+  fill: var(--accent);
+  fill-opacity: 0.08; /* tasks aren't pure white — a faint teal so glass reads */
 }
 .ebpmn-sheen {
-  opacity: 0.9;
+  opacity: 0.95;
   pointer-events: none;
 }
+/* The bright inner edge that reads as "glass" — replaces the heavy border. */
+.ebpmn-rim {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.72);
+  stroke-width: 1px;
+}
+/* State stroke: a thin hairline at rest, coloured only when a state is active. */
 .ebpmn-stroke {
   fill: none;
   stroke: var(--cat-task-border);
-  stroke-width: 1.4px;
+  stroke-opacity: 0.45;
+  stroke-width: 1px;
   transition:
-    stroke 0.45s var(--ease-out),
-    stroke-width 0.45s var(--ease-out);
+    stroke 0.4s var(--ease-out),
+    stroke-width 0.4s var(--ease-out),
+    stroke-opacity 0.4s var(--ease-out);
 }
 .ebpmn-stroke-inner {
   fill: none;
   stroke: var(--cat-inter-border);
-  stroke-width: 1.1px;
-  opacity: 0.75;
+  stroke-width: 1px;
+  opacity: 0.6;
 }
 .ebpmn-icon {
   color: var(--cat-task-icon);
@@ -106,7 +127,7 @@ body {
 .ebpmn-icon path {
   fill: none;
   stroke: currentColor;
-  stroke-width: 2;
+  stroke-width: 2.1;
   stroke-linecap: round;
   stroke-linejoin: round;
   vector-effect: non-scaling-stroke;
@@ -115,11 +136,12 @@ body {
   fill: currentColor;
   stroke: none;
 }
+/* Icon chip on activities — a VIVID filled category colour with a white glyph. */
 .ebpmn-chip-bg {
-  fill: var(--cat-task-surface);
-  fill-opacity: 0.65;
-  stroke: rgba(255, 255, 255, 0.65);
-  stroke-width: 1px;
+  fill: var(--accent);
+}
+.ebpmn-chip .ebpmn-icon {
+  color: #fff;
 }
 .ebpmn-glyph {
   fill: none;
@@ -132,16 +154,26 @@ body {
   fill: none;
   stroke: var(--cat-task-icon);
   stroke-width: 1.1px;
-  opacity: 0.55;
+  opacity: 0.5;
 }
 .ebpmn-marker .ebpmn-glyph {
   stroke: var(--cat-task-icon);
-  opacity: 0.7;
+  opacity: 0.6;
+}
+/* Sequence-flow connectors — custom rounded path, chevron arrow inherits stroke. */
+.ebpmn-edge {
+  stroke: var(--cat-edge);
+  stroke-width: 1.6px;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 /* Internal task label + bpmn external labels (events/gateways) → the type trio. */
 .ebpmn-label,
 .djs-label {
   font-family: var(--font-sans);
+}
+.ebpmn-label {
+  letter-spacing: -0.005em;
 }
 .djs-label {
   fill: var(--text-secondary);
@@ -185,11 +217,12 @@ body {
 
 .ebpmn-c-end .ebpmn-tint {
   fill: var(--cat-end-surface);
-  fill-opacity: 0.5;
+  fill-opacity: 0.62;
 }
 .ebpmn-c-end .ebpmn-stroke {
   stroke: var(--cat-end-border);
-  stroke-width: 2.6px;
+  stroke-width: 1.8px;
+  stroke-opacity: 0.85;
 }
 .ebpmn-c-end .ebpmn-icon {
   color: var(--cat-end-icon);
@@ -197,21 +230,20 @@ body {
 
 .ebpmn-c-gateway .ebpmn-tint {
   fill: var(--cat-gateway-surface);
-  fill-opacity: 0.46;
+  fill-opacity: 0.55;
 }
 .ebpmn-c-gateway .ebpmn-stroke {
   stroke: var(--cat-gateway-border);
+  stroke-opacity: 0.7;
 }
 .ebpmn-c-gateway .ebpmn-glyph {
   stroke: var(--cat-gateway-icon);
 }
 
-.ebpmn-c-task .ebpmn-icon {
-  color: var(--cat-task-icon);
-}
+/* Activity chips stay the vivid brand teal (see .ebpmn-chip-bg); the task body
+ * carries only a faint teal tint so it reads as glass, not a white box. */
 .ebpmn-c-task .ebpmn-chip-bg {
-  fill: var(--accent-soft);
-  fill-opacity: 0.85;
+  fill: var(--accent);
 }
 
 /* Non-interrupting boundary = dashed ring; transaction = a hair heavier. */
@@ -250,37 +282,42 @@ body {
   }
 }
 
-/* ---- Runtime-state outlines (override category stroke; keep the glass) ---- */
+/* ---- Runtime state: a THIN coloured edge + a glow bloom (no heavy frame) --- */
 .djs-element.ebpmn-traversed .ebpmn-stroke {
   stroke: var(--state-completed);
-  stroke-width: 2.2px;
+  stroke-opacity: 1;
+  stroke-width: 1.6px;
 }
 .djs-element.ebpmn-current .ebpmn-stroke {
   stroke: var(--state-running);
-  stroke-width: 2.6px;
+  stroke-opacity: 1;
+  stroke-width: 1.8px;
 }
 .djs-element.ebpmn-failed .ebpmn-stroke {
   stroke: var(--state-error);
-  stroke-width: 2.8px;
+  stroke-opacity: 1;
+  stroke-width: 1.8px;
 }
 .djs-element.ebpmn-compensated .ebpmn-stroke {
   stroke: var(--state-warning);
+  stroke-opacity: 1;
   stroke-dasharray: 4 3;
 }
 .djs-element.ebpmn-selected .ebpmn-stroke {
   stroke: var(--state-selected);
-  stroke-width: 2.8px;
+  stroke-opacity: 1;
+  stroke-width: 2px;
 }
 
-/* State bloom on the whole glass node (luminosity-on-pale). */
+/* State bloom on the whole glass node — the state's main signal now (luminous). */
 .djs-element.ebpmn-current .ebpmn-node {
-  filter: drop-shadow(0 0 7px var(--current-glow));
+  filter: drop-shadow(0 0 10px var(--current-glow));
 }
 .djs-element.ebpmn-settled .ebpmn-node {
-  filter: drop-shadow(0 0 5px var(--settle-wash));
+  filter: drop-shadow(0 0 6px var(--settle-wash));
 }
 .djs-element.ebpmn-failed .ebpmn-node {
-  filter: drop-shadow(0 0 7px var(--interrupt-wash));
+  filter: drop-shadow(0 0 10px var(--interrupt-wash));
 }
 
 @keyframes ebpmn-stroke-pulse {
@@ -299,20 +336,14 @@ body {
  * selectors and the token injection are unchanged from the prior design.
  * ============================================================ */
 
-/* Idle sequence flows: rounded graphite with a soft white casing so the line
- * reads cleanly over the luminous aurora (teal-on-teal would otherwise vanish). */
+/* Idle connectors are custom-rendered (.ebpmn-edge); this just guarantees the
+ * single <path> child reads calmly over the field. The chevron arrowhead inherits
+ * the path's stroke via context-stroke, so it always matches the edge colour. */
 .djs-connection .djs-visual > path {
-  stroke: var(--cat-edge-strong);
-  stroke-width: 1.8px;
+  stroke: var(--cat-edge);
+  stroke-width: 1.6px;
   stroke-linecap: round;
   stroke-linejoin: round;
-  filter: drop-shadow(0 0 1.4px rgba(255, 255, 255, 0.9));
-}
-/* Recolour the shared arrowheads to match the calm edge ink. */
-.djs-container marker path,
-.bjs-container marker path {
-  fill: var(--cat-edge-strong);
-  stroke: none;
 }
 
 .djs-connection.ebpmn-flow-live .djs-visual > path {

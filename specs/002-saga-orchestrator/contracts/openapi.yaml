@@ -1094,12 +1094,19 @@ components:
           description: >
             Incident taxonomy. `timeout` is LEGACY (M1) — retained for backward
             compatibility but never written by current code: M3-L1 split it into
-            `jobActivationTimeout` (un-leasable-job DLQ) and `waitTimeout`
-            (un-guarded service-task / receive-task wait caps). `conditionFailure`
-            is a hard FEEL evaluation error on an exclusiveGateway flow. The
-            compensation-wait cap deliberately stays `compensationFailure`. M4-L6
-            adds `concurrencyLimit` (a split fan-out exceeded MAX_CONCURRENT_TOKENS
-            live tokens) and `stepBudget` (the per-drive step counter crossed
+            `jobActivationTimeout` (un-leasable-job DLQ) and `waitTimeout`. Under
+            M4 single-wake (TASK-54) `waitTimeout` is RETIRED and now UNPRODUCED:
+            adopting standard-BPMN semantics, an un-guarded receive-task / message
+            intermediate catch (no modeled deadline) waits INDEFINITELY rather than
+            capping, and un-guarded service-task liveness is the DLQ
+            `jobActivationTimeout` — no engine-level wait cap remains. The value is
+            kept as a documented-but-vestigial kind (enum retirement deferred to the
+            dead-code sweep). `conditionFailure` is a hard FEEL evaluation error on
+            an exclusiveGateway flow. `compensationFailure` is the compensation
+            RETRY-EXHAUSTION terminal (a compensation job that exhausts its retries);
+            the compensation path never enters the wait taxonomy. M4-L6 adds
+            `concurrencyLimit` (a split fan-out exceeded MAX_CONCURRENT_TOKENS live
+            tokens) and `stepBudget` (the per-drive step counter crossed
             STEP_BUDGET_SOFT — a graceful incident below the platform step ceiling).
           enum: [serviceTaskFailure, compensationFailure, timeout, poison, loopLimit, noPath, jobActivationTimeout, waitTimeout, conditionFailure, concurrencyLimit, stepBudget]
         resolution:

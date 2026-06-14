@@ -1,4 +1,20 @@
 <!--
+PATCH addendum — 2.3.0 -> 2.3.1 (2026-06-14)
+Rationale (PATCH): clarifies wording only — no principle is redefined, removed,
+or scope-widened (per the versioning policy: "PATCH = clarify wording … or make
+non-semantic refinements"). Records the M4 single-wake (TASK-54) standard-BPMN
+un-guarded-wait semantics in Principle IV: an un-guarded receive task / message
+intermediate catch (no modeled deadline) waits INDEFINITELY; un-guarded Service
+Task liveness is the job-activation DLQ (`jobActivationTimeout`); the M3 leaf
+`waitTimeout` durable-wait cap is RETIRED (its incident kind is now unproduced,
+kept as a vestigial enum value until the dead-code sweep). `compensationFailure`
+remains the compensation retry-exhaustion terminal (Principle VI — unchanged, and
+its "MUST NOT silently block forever" clause already reads as retry-exhaustion).
+Aligned in lockstep: docs/bpmn/09-easy-bpmn-profile.md (the DLQ/liveness note) and
+specs/002-saga-orchestrator/contracts/openapi.yaml (Incident.kind description).
+Templates: no change (no construct-set or quality-gate change). The 2.2.0 -> 2.3.0
+Sync Impact Report below is unchanged.
+
 Sync Impact Report
 Version change: 2.2.0 -> 2.3.0
 Rationale (MINOR): materially expands Principle I's accepted construct set with
@@ -171,9 +187,14 @@ External messages MUST correlate by message name plus correlation key to exactly
 one eligible waiting process instance. Missing, ambiguous, duplicate, or late
 messages MUST have deterministic outcomes and clear API responses. A Receive
 Task wait state MUST be durable, and applying a received payload MUST be atomic
-with the transition that continues the instance. Human work remains outside the
-platform; the platform receives only the fact of that work as a BPMN-compatible
-message.
+with the transition that continues the instance. An **un-guarded** receive task
+or message `intermediateCatchEvent` — one carrying **no modeled deadline** (no
+boundary timer) — has no timeout and waits **indefinitely** (standard BPMN: no
+deadline ⇒ no expiry); operational liveness for an un-guarded **Service Task**
+instead comes from the job-activation DLQ (`jobActivationTimeout`), not an
+engine-level wait cap (M4 single-wake, TASK-54; the prior M3 leaf `waitTimeout`
+cap is retired). Human work remains outside the platform; the platform receives
+only the fact of that work as a BPMN-compatible message.
 
 Rationale: event correlation is the bridge between external systems and durable
 process execution, so weak matching would make the core flow unreliable.
@@ -311,4 +332,4 @@ Plans with unresolved constitution violations MUST NOT proceed to implementation
 until the violation is either removed or explicitly accepted through the
 Complexity Tracking section.
 
-**Version**: 2.3.0 | **Ratified**: 2026-06-07 | **Last Amended**: 2026-06-13
+**Version**: 2.3.1 | **Ratified**: 2026-06-07 | **Last Amended**: 2026-06-14

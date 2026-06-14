@@ -33,7 +33,7 @@ The profile grows one milestone at a time, each guarded by a constitution amendm
   `conditionExpression` (via `feelin`) on flows leaving an exclusiveGateway, the gateway-owned `default`
   flow, and **cycles on the token path** (occurrence-discriminated iterations). Documented here;
   execution semantics in [`03-gateways.md`](./03-gateways.md).
-- **M3 (current) → time & failure taxonomy** (timers, per-step timeouts, error catalog):
+- **M3 (current) → time & failure taxonomy** (timers, the job-activation DLQ, error catalog):
   [`01-events.md`](./01-events.md). The M3 construct set — interrupting boundary `timerEventDefinition` on
   a `serviceTask`/`receiveTask`, timer/message `intermediateCatchEvent`, the `bpmn:eventBasedGateway`, and
   free error-boundary routing — is **accepted in constitution v2.2.0** and was **opened per validator
@@ -46,6 +46,13 @@ The profile grows one milestone at a time, each guarded by a constitution amendm
   Durable Object alarm. It is *not* a model-level timer (no BPMN timer event); general (model-level) timers
   are the staged M3 set above. Retry backoff (exponential + jitter, base 1s / factor 2 / cap 30s) and
   poison-job termination (`kind=poison`, no compensation) ship in M1 too.
+  **M4 single-wake (TASK-54) — un-guarded-wait liveness (standard BPMN):** the single `bpmn_wake` replaced
+  the per-leaf multi-wait and retired the M3 leaf wait CAPS. An UN-GUARDED **service task** (no boundary
+  timer) keeps operational liveness ONLY via this job-activation DLQ `jobActivationTimeout`; an UN-GUARDED
+  **receive task** / **message `intermediateCatchEvent`** (no boundary timer, no modeled deadline) has no
+  deadline and waits **indefinitely** — the M3 leaf `waitTimeout` durable-wait cap is **retired** and the
+  `waitTimeout` incident kind is now **unproduced** (kept as a vestigial enum value until the dead-code
+  sweep). `compensationFailure` remains the compensation **retry-exhaustion** terminal.
 - **M4: concurrency — SHIPPED** (constitution v2.3.0) — block-structured (SESE) `parallelGateway` (AND)
   and `inclusiveGateway` (OR) regions: a token frontier (multiple concurrent tokens per instance), the
   AND/OR join barrier, branch-local variable scopes merging at the join, frontier-empty completion, and
@@ -512,7 +519,9 @@ expression — each with the offending element id.
 - **M2 — conditional sagas: SHIPPED** (constitution v2.1.0; this profile + [`03-gateways.md`](./03-gateways.md)).
 - **M3 — time & failure taxonomy: SHIPPED** (constitution v2.2.0; opened per validator layer, now complete) —
   interrupting boundary timers, timer/message intermediate catch, `eventBasedGateway` (the timer/message
-  race), free error routing, per-step timeouts, error catalog. [`01-events.md`](./01-events.md).
+  race), free error routing, the job-activation DLQ, error catalog. (The M3 leaf `waitTimeout` durable-wait
+  cap was retired under M4 single-wake — un-guarded waits are indefinite per standard BPMN; see the DLQ note
+  above.) [`01-events.md`](./01-events.md).
 - **M4 — concurrency: SHIPPED** (constitution v2.3.0) — block-structured (SESE) `parallelGateway` (AND) +
   `inclusiveGateway` (OR), the token frontier, AND/OR joins, branch-local variable merge, frontier-empty
   completion, and parallel-branch (straggler-catching) compensation; plus the concurrency caps, R2 overlay

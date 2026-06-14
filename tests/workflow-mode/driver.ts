@@ -186,9 +186,15 @@ export async function getInstance(instanceId: string) {
   return j("GET", `/instances/${instanceId}`);
 }
 
+/** GET /instances/{id}/history → the events array (the endpoint wraps it as {events}). */
 export async function getHistory(instanceId: string) {
   const r = await j("GET", `/instances/${instanceId}/history`);
-  return (r.body ?? []) as Array<Record<string, any>>;
+  return (r.body?.events ?? []) as Array<Record<string, any>>;
+}
+
+/** Convenience: count history events of a given `type` (exactly-once audit assertions). */
+export function countHistoryType(events: Array<Record<string, any>>, type: string): number {
+  return events.filter((e) => e.type === type).length;
 }
 
 export async function cancelInstance(instanceId: string) {

@@ -1,0 +1,17 @@
+<!doctype html>
+<!--
+  Placeholder so wrangler's `assets.directory` (./spa/dist) exists before the Vite
+  build runs. The wrangler `build` hook (`npm --prefix spa run build`) overwrites this
+  with the real SPA + ./spa/dist/assets/* (gitignored) on every deploy / dry-run. The
+  backend test pool only needs this directory to exist; it never loads it.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>easy-bpmn operator console</title>
+  </head>
+  <body>
+    <div id="root">Operator console build not present. Run: npm run build:ui</div>
+  </body>
+</html>

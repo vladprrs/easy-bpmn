@@ -14,7 +14,11 @@
     "test:contract": "vitest run tests/contract",
     "test:integration": "vitest run tests/integration",
     "check:matrix": "node scripts/check-matrix.mjs",
-    "test:matrix": "vitest run tests/matrix tests/integration/matrix"
+    "test:matrix": "vitest run tests/matrix tests/integration/matrix",
+    "dev:ui": "npm --prefix spa run dev",
+    "build:ui": "npm --prefix spa run build",
+    "typecheck:ui": "npm --prefix spa run typecheck",
+    "test:ui": "npm --prefix spa run test"
   },
   "dependencies": {
     "bpmn-moddle": "^10.0.0",

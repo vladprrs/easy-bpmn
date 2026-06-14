@@ -32,6 +32,7 @@ import {
 import { listLiveTokens, setTokenStatusStmt } from "../persistence/tokens";
 import { armCohortLeaseExpiryTerminators } from "./forward-task";
 import { loadInst, type RunStep, type WaitForEvent, type DriveResult } from "./engine-shared";
+import { WAKE_TYPE, wakeBackstop } from "./wake";
 
 /** The failure-path target of the cancel boundary attached to transaction `scopeId`. */
 function cancelBoundaryTarget(graph: ExecutionGraph, scopeId: string): string | null {
@@ -94,6 +95,15 @@ async function runCompensation(
   // instances behave EXACTLY as before (no token rows of interest, the filter is a
   // no-op, the barrier reduces to "ledger empty ⇒ compensated").
   const isRegion = !!graph.regions;
+  // Single-wake the reverse pass (TASK-54): `compWakeSeq` mirrors the forward loop's
+  // `wakeSeq` and RESETS to 0 on each runCompensation invocation. On a CF replay the
+  // walk re-derives the cursor from the ledger; already-compensated steps replay their
+  // memoized markStepCompensated/comp-create runSteps and re-issue their cached
+  // `comp-wake#k` (CF returns the cached event, no re-suspend) before the walk reaches
+  // the live pending step, so the k-th `comp-wake` always maps deterministically to the
+  // k-th still-pending comp step. The `comp-wake` prefix is distinct from the forward
+  // `wake#k`, so a forward→cancel→compensate drive never collides step names.
+  let compWakeSeq = 0;
   // eslint-disable-next-line no-constant-condition
   while (true) {
     // M4-L5 (design §8.3): before the reverse pass, catch stragglers + drain
@@ -135,6 +145,18 @@ async function runCompensation(
       return "failed";
     }
     if (!waitFor) return "waiting"; // direct mode parks at 'compensating'; resume re-runs this pass
+    // Workflow mode (TASK-54): the comp job is created but not yet terminal — issue ONE
+    // replay-stable bpmn_wake (sequential `comp-wake#k`) and re-read after the worker's
+    // /jobs/complete tickles the Workflow. Mirrors the forward loop's issueWake; without
+    // this the reverse pass busy-spins on the created job (it never suspends so the worker
+    // can never complete it). A wake TIMEOUT (lost tickle) self-heals: catch → re-read.
+    const timeout = await wakeBackstop(env, instanceId);
+    try {
+      await waitFor({ name: `comp-wake#${compWakeSeq}`, workflowEventType: WAKE_TYPE, timeout });
+    } catch {
+      /* lost/expired wake → self-heal: fall through to re-read the ledger */
+    }
+    compWakeSeq += 1;
     // loop re-reads the (now terminal) comp job
   }
 }

@@ -435,8 +435,10 @@ exhaustion incident (Hazard inside a transaction); lease-expiry exhaustion now t
 
 Exercise the `timeout` split and the hygiene fixes.
 
-Expected outcome (design §7 gate 12, §5): an un-leasable job → `jobActivationTimeout`; an un-guarded
-service-task / receive-task wait cap → `waitTimeout`; a hard FEEL error → `conditionFailure`;
+Expected outcome (design §7 gate 12, §5): an un-leasable job → `jobActivationTimeout` (also the sole
+liveness backstop for an un-guarded service-task wait under M4 single-wake; an un-guarded receive-task /
+message-catch wait carries no modeled deadline and is **indefinite** per standard BPMN, so the M3
+`waitTimeout` cap is **retired/unproduced**); a hard FEEL error → `conditionFailure`;
 `setIncidentResolution` resolves a single incident by id (no longer all of the instance's open
 incidents); inspection lists **all** open incidents; an empty-ledger `/cancel` closes them all as
 `operatorResolved`. A fired model timer never creates an incident.
@@ -523,7 +525,7 @@ reason this matrix is a blocking gate.
 | Probe | Real CF | Local miniflare | Notes |
 |-------|---------|-----------------|-------|
 | Sequential `Start→A→B→End` (two job-result events in sequence) | **PASS** | **PASS** | workflow-mode multi-event resume works for a linear chain — isolates the defect to the multi-wait |
-| AND-join `PARALLEL_BPMN` (fan-out + two concurrent `step.waitForEvent`) | **FAIL** | **FAIL** | fan-out OK; join correctly holds before the 2nd branch; but completing the 2nd branch never resumes the Workflow → join never fires → instance stuck `running` (no self-heal over minutes; the 1-hour `SVC_WAIT_TIMEOUT` is the only backstop) |
+| AND-join `PARALLEL_BPMN` (fan-out + two concurrent `step.waitForEvent`) | **FAIL** | **FAIL** | fan-out OK; join correctly holds before the 2nd branch; but completing the 2nd branch never resumes the Workflow → join never fires → instance stuck `running` (no self-heal — under the old multi-wait the instance hangs indefinitely; this is the L6.6 defect M4 single-wake / TASK-54 replaces. The M3 leaf `waitTimeout`/`SVC_WAIT_TIMEOUT` cap is now retired, so there is no engine-level backstop here) |
 
 **Evidence (real CF):** instance `pi_abd7ca7f-…` history ends
 `… serviceTaskCompleted(B) → branchArrivedAtJoin(B) → jobCompleted(A)` with **no**

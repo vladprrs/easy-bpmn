@@ -183,10 +183,13 @@ rotate/clear the token:
   node in the scope (M3 free routing; routing to a cancel end event triggers the transaction's
   cancel → compensation, the canonical M1 shape). See the M3 Timer/Race-Decider/Failure-Taxonomy
   contract below.
-- **Un-guarded wait cap / hard condition error** — an un-guarded service-task or receive-task wait
-  hitting the 1-hour safety-net cap raises **`kind=waitTimeout`** (the M3 split of the overloaded
-  `timeout`); a hard FEEL evaluation error raises **`kind=conditionFailure`**. A wait guarded by a
-  modeled timer never raises `waitTimeout`.
+- **Un-guarded wait liveness / hard condition error** — under M4 single-wake (TASK-54) un-guarded
+  waits follow **standard BPMN**: a receive-task / message intermediate catch carrying **no modeled
+  deadline** waits **indefinitely** (no deadline ⇒ no timeout), and un-guarded **service-task**
+  liveness comes from the job-activation DLQ (**`kind=jobActivationTimeout`**), not an engine wait
+  cap. The M3 leaf **`waitTimeout`** cap is therefore **retired and now unproduced** (kept as a
+  vestigial enum value until the dead-code sweep). A hard FEEL evaluation error raises
+  **`kind=conditionFailure`**.
 
 `errorRef`/boundary catching is by the Error's **`@id`** (QName); the worker's `fail.errorCode`
 matches the Error's **`@errorCode`** (wire value). Multi-boundary + catch-all routing and richer
@@ -352,11 +355,13 @@ all standard BPMN — no new extension binding.
   token-path node in the same scope (the M1 "must target a cancel end" rule is lifted). An error
   handled by an alternate path inside a transaction leaves the saga ledger untouched — all completed
   steps stay compensatable until the scope cancels or commits.
-- **Wait cap vs modeled timer.** A wait guarded by an armed modeled timer never raises `waitTimeout`;
+- **Modeled-timer wait.** A wait guarded by an armed modeled timer never raises `waitTimeout`;
   in Workflow mode its `waitForEvent` timeout is sized to `fire_at` (a 7-day timer costs O(1) steps)
   and doubles as the lost-alarm backstop — on any wake the engine settles overdue timers
-  (`fire_at <= now`) exactly as the alarm would. Un-guarded waits keep the fixed 1-hour cap →
-  `waitTimeout`.
+  (`fire_at <= now`) exactly as the alarm would. Un-guarded waits carry **no** engine wait cap: under
+  M4 single-wake a receive-task / message-catch wait is **indefinite** (standard BPMN), and un-guarded
+  service-task liveness is the DLQ `jobActivationTimeout` — the M3 `waitTimeout` cap is
+  retired/unproduced.
 
 ## Concurrency Contract (M4 — token frontier + AND/OR joins + branch-local vars)
 

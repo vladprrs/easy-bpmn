@@ -457,8 +457,10 @@ code).
 
 - `jobActivationTimeout` — nobody leases the `taskType` before `activation_expires_at` (the DLQ
   expiry; the lone M1 job-level timer).
-- `waitTimeout` — an **un-guarded** service-task / receive-task wait hits the 1-hour safety-net cap
-  (a wait guarded by a modeled timer never raises it).
+- `waitTimeout` — **retired and now unproduced under M4 single-wake (TASK-54):** un-guarded waits
+  follow standard BPMN — a receive-task / message-catch wait with no modeled deadline is
+  **indefinite**, and un-guarded service-task liveness is the DLQ `jobActivationTimeout`, not an
+  engine wait cap. Kept as a vestigial enum value (above) until the dead-code sweep.
 - `conditionFailure` — a hard FEEL evaluation error (deferred from M2; previously masked as
   `serviceTaskFailure`).
 

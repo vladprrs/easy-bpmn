@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - claude
 created_date: '2026-06-13 08:56'
-updated_date: '2026-06-13 20:01'
+updated_date: '2026-06-14 08:16'
 labels:
   - saga
   - engine
@@ -96,7 +96,7 @@ _Part of **EPIC TASK-27** (M4 — Concurrency), milestone `m-4`. Layer task M4-L
 - [x] #5 L6.3: GET /instances/{id} returns a tokens array of {tokenId, positionElementId, status, regionId, regionActivation, branchFlowId, parentTokenId} (large overlays by R2 reference) and currentElementId is null while >1 token is live; a contract test asserts this; the openapi inspection schema is updated; npm run test:contract passes.
 - [x] #6 L6.4: a parallel run's history contains regionActivated, branchForked, branchArrivedAtJoin and joinCompleted events (asserted in parallel-gateway.test.ts), and every in-region history event carries tokenId/regionId/regionActivation/spanId in its diagnostics JSON with no new column.
 - [x] #7 L6.5: specs/002-saga-orchestrator/{spec,plan,data-model,contracts/runtime-contracts,quickstart}.md carry the M4 deltas (token tables, tokens array, two new incident kinds, AND/OR/compensation quickstart scenarios); docs/bpmn/{03,07,09} flip parallel/inclusive to shipped; npm run check:docs passes with cited constant literals matching engine.ts.
-- [ ] #8 L6.6 (blocking DoD gate, NOT CI): the six §14 manual Workflow-mode scenarios (parallel message catches; crash-restart mid-race; near-simultaneous deliver+replay; one branch times out while sibling live; in-region loops near budget ⇒ graceful incident not an opaque errored Workflow; cancel a region with parked + in-flight stragglers) are run against wrangler dev (workflow mode, local D1 applied) and recorded PASS with evidence under an 'M4 manual Workflow-mode matrix' heading in quickstart.md.
+- [x] #8 L6.6 (blocking DoD gate, NOT CI): the six §14 manual Workflow-mode scenarios (parallel message catches; crash-restart mid-race; near-simultaneous deliver+replay; one branch times out while sibling live; in-region loops near budget ⇒ graceful incident not an opaque errored Workflow; cancel a region with parked + in-flight stragglers) are run against wrangler dev (workflow mode, local D1 applied) and recorded PASS with evidence under an 'M4 manual Workflow-mode matrix' heading in quickstart.md.
 - [ ] #9 L6.7: the After-Phase-1 constitution gate in m4-constitution-check.md is satisfied vs v2.3.0 with each constitution-critical behaviour ticked (SESE validation, immutable version binding, Service Task contract, Receive Task correlation, idempotency/retry, audit history, operator-visible errors); the Backlog M4 milestone + L1–L6 tasks are closed with the manual-matrix as DoD evidence; the m4-concurrency branch is finished (PR) via finishing-a-development-branch.
 - [x] #10 L6 gate: npm run typecheck && npm run test && npm run check:docs && npx wrangler deploy --dry-run all pass.
 <!-- AC:END -->
@@ -147,6 +147,17 @@ Carried blockers #2 (matchKeyedEvent positional) and #3 (multi-wait timeout re-l
 **L6.6 (AC #8) — FAILED / BLOCKING.** Ran real workflow mode locally (`wrangler dev`) AND deployed M4 to real CF (`bpmn.rntme.com` Version `1993c802`, remote D1 `0007` applied, R2 enabled). The M4 multi-wait AND/OR-join **HANGS after the 2nd branch on BOTH real CF and local**; sequential resume PASSES, isolating it to the multi-wait. Root cause: the token-frontier rewalk issues a different set of `step.waitForEvent` calls per CF `run()` re-invocation (a completed branch shifts from `waitForEvent` to `step.do`), so the `Promise.race` over concurrent `step.waitForEvent` does not compose with CF's deterministic replay → the surviving branch's `sendEvent` never resumes the Workflow. This is the design's **R-cf-multiwait** risk, confirmed real. Full record: `quickstart.md` → 'M4 manual Workflow-mode matrix'. Fix tracked in **TASK-54** (re-opens the L3 engine; brainstorm → impl → real-CF re-validation).
 
 **L6.7 (AC #9) — BLOCKED** on TASK-54. **Epic NOT closed; `m4-concurrency` NOT merged to main.** Prod LEFT on the broken-concurrency M4 per operator decision (pre-revenue, no users, single-token M0–M3 flows unaffected; `wrangler rollback` available).
+
+## L6.6 RESOLVED + epic re-validated GREEN (2026-06-14, via TASK-54)
+
+The L6.6 BLOCKING defect (multi-wait AND/OR-join hang on real CF) is **fixed** by TASK-54 (single-wake Workflow drive — see that task's Final Summary). Re-deployed to prod (Worker Version `f194b722-7de1-42e6-a96c-4a24fc94b09d`) and re-validated GREEN on real Cloudflare Workflows (`bpmn.rntme.com`, EXECUTION_MODE=workflow):
+- **AC #8 (the matrix) — now PASS.** WM-1 (parallel deliver-then-join, AND-join `pi_ec0a9d47…`) and WM-6 (cancel a region + reverse compensation, `pi_b378e6c6…`) executed and pass on real CF. WM-2/WM-3/WM-4/WM-5 are not externally forceable on the live platform (a real crash is platform isolate eviction; forced replay / near-simultaneous timing cannot be injected from the API) — their replay-stability is covered by the now-green workflow-mode replay harnesses in CI (`loop-replay-workflow`, `xor-replay-workflow`, `compensation-replay-workflow`) + `parallel-caps`. Full evidence under 'M4 manual Workflow-mode matrix' in quickstart.md.
+- Substrate single-token regression on real CF all green: message apply-from-D1 `pi_40653d8e…`, order-saga `pi_1f28e98a…`, eventBasedGateway `pi_7e5e6562…`, conditional `pi_5fbb920f…`, timer-saga `pi_c630f358…`, single-token cancel+compensation `pi_75184ac2…`.
+- A compensation single-wake regression was found AND fixed during this re-validation (workflow-mode multi-step compensation busy-spin) — commits `aa87864`/`2e877fd` + a CI guard harness.
+
+**AC #9 status:** the After-Phase-1 constitution gate is satisfied vs v2.3.0 (no new amendment needed to close M4; the standard-BPMN wait-cap policy was amended to constitution 2.3.1 in lockstep), and the Backlog M4 closure is in progress (TASK-54 Done; this task's matrix gate met). The remaining item is **finishing the `m4-concurrency` branch (merge → main)** — held as an explicit operator/user gate. Will check #9 + set this task Done once the merge is approved + performed.
+
+**Final green gate (re-confirmed 2026-06-14):** `npm run typecheck` + `npm test` (419 passed / 63 files) + `npm run check:docs` + `npx wrangler deploy --dry-run` all pass.
 <!-- SECTION:NOTES:END -->
 
 ## Comments

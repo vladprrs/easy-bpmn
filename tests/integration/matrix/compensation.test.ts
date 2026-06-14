@@ -182,4 +182,59 @@ describe("matrix: saga compensation under concurrency (direct mode)", () => {
     expect(await statusOf(id)).toBe("compensated");
     expect(await liveTokens(id)).toHaveLength(0);
   });
+
+  // -------------------------------------------------------------------------
+  it("[C-COMP-FAILED-01] one compensator exhausts retries → compensationFailed incident; sibling lineage compensated; operator-resumable, no double-apply", async () => {
+    const token = await mintWorkerToken();
+    const { instance } = await publishAndStart(PARALLEL_SAGA_BPMN, {
+      correlationKey: "cf1",
+      variables: { failSettle: true },
+    });
+    expect(instance.status).toBe(201);
+    const id = instance.body.instanceId;
+
+    // Forward both branches in a controlled order so seq(branchA)=1 < seq(branchB)=2.
+    // The reverse pass then compensates branchB FIRST (it succeeds) and branchA last
+    // (we exhaust it) — proving the sibling lineage is unaffected by the failure.
+    await leaseAndComplete(token, "branch-a", {});
+    await leaseAndComplete(token, "branch-b", {});
+    await failSettle(token);
+
+    // comp-b (highest seq) is the first comp job → complete it (sibling lineage).
+    await complete(token, await leaseOne(token, "comp-b"), {});
+    expect((await stepOf(id, "branchB"))!.compensationStatus).toBe("compensated");
+
+    // comp-a is now created → exhaust its 3 retries (comp-a retries=3) → compensationFailed.
+    await exhaustCompensator(token, id, "comp-a", 3);
+
+    const failed = await get(`/instances/${id}`);
+    expect(failed.body.status).toBe("compensationFailed");
+    expect(failed.body.incident.kind).toBe("compensationFailure");
+    expect(failed.body.incident.elementId).toBe("branchA");
+    expect(failed.body.incident.resolution).toBe("open");
+    // The sibling lineage stayed compensated; the failed step is `failed`, not double-applied.
+    expect((await stepOf(id, "branchB"))!.compensationStatus).toBe("compensated");
+    expect((await stepOf(id, "branchA"))!.compensationStatus).toBe("failed");
+    expect(await compJobCount(id, "branchB")).toBe(1); // comp-b ran exactly once
+    expect((await compCompletedElements(id)).filter((e) => e === "branchB")).toHaveLength(1);
+
+    // Operator-resumable: /retry resets ONLY the failed comp step → compensating (non-4xx).
+    const retry = await post(`/instances/${id}/retry`, {});
+    expect(retry.status).toBe(200);
+    expect(retry.body.status).toBe("compensating");
+
+    // The reset comp-a re-runs (fresh attempt budget) and succeeds → terminal compensated.
+    const c = await leaseOne(token, "comp-a");
+    expect(c.attempt).toBe(1);
+    await complete(token, c, {});
+
+    const done = await get(`/instances/${id}`);
+    expect(done.body.status).toBe("compensated");
+    expect((await stepOf(id, "branchA"))!.compensationStatus).toBe("compensated");
+    // No double-apply: each branch compensated exactly once.
+    expect(await compJobCount(id, "branchA")).toBe(1);
+    expect(await compJobCount(id, "branchB")).toBe(1);
+    expect((await compCompletedElements(id)).filter((e) => e === "branchB")).toHaveLength(1);
+    expect(await liveTokens(id)).toHaveLength(0);
+  });
 });

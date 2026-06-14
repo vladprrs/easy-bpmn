@@ -327,4 +327,44 @@ describe("matrix: saga compensation under concurrency (direct mode)", () => {
     expect(await compJobCount(id, "branchB")).toBe(1);
     expect(await liveTokens(id)).toHaveLength(0);
   });
+
+  // -------------------------------------------------------------------------
+  it("[C-COMP-NESTEDTX-BRANCH-01] an inner-tx-committed step is never re-compensated by the outer cancel; outer-scope branch steps are", async () => {
+    const token = await mintWorkerToken();
+    const { instance } = await publishAndStart(PARALLEL_NESTEDTX_BRANCH_BPMN, {
+      correlationKey: "cnx1",
+      variables: { failSettle: true },
+    });
+    expect(instance.status).toBe(201);
+    const id = instance.body.instanceId;
+
+    // Branch A: inner transaction (ntx-a1 → inner none-end COMMIT) then ntx-a2.
+    // Completing ntx-a1 drives the inner none-end → the inner tx commits → ntx-a1's
+    // step is terminalized `committed`.
+    await leaseAndComplete(token, "ntx-a1", {});
+    expect((await stepOf(id, "a1"))!.compensationStatus).toBe("committed");
+    await leaseAndComplete(token, "ntx-a2", {});
+    // Branch B: a single outer-scope compensatable task.
+    await leaseAndComplete(token, "ntx-b", {});
+
+    // failSettle → outer Tx_outer_cancel → reverse pass over the OUTER scope.
+    await failSettle(token);
+    const terminal = await driveComps(token, id, ["comp-ntx-a1", "comp-ntx-a2", "comp-ntx-b"]);
+    expect(terminal).toBe("compensated");
+
+    // The inner-committed step stays `committed` and is NEVER re-compensated: no
+    // comp-ntx-a1 job is ever created.
+    expect((await stepOf(id, "a1"))!.compensationStatus).toBe("committed");
+    expect(await compJobCount(id, "a1")).toBe(0);
+    expect((await compStartedElements(id)).includes("a1")).toBe(false);
+
+    // The outer-scope branch steps ARE compensated in their lineages.
+    expect((await stepOf(id, "a2"))!.compensationStatus).toBe("compensated");
+    expect((await stepOf(id, "branchB"))!.compensationStatus).toBe("compensated");
+    expect(await compJobCount(id, "a2")).toBe(1);
+    expect(await compJobCount(id, "branchB")).toBe(1);
+
+    expect(await statusOf(id)).toBe("compensated");
+    expect(await liveTokens(id)).toHaveLength(0);
+  });
 });

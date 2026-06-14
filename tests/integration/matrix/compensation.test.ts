@@ -367,4 +367,49 @@ describe("matrix: saga compensation under concurrency (direct mode)", () => {
     expect(await statusOf(id)).toBe("compensated");
     expect(await liveTokens(id)).toHaveLength(0);
   });
+
+  // -------------------------------------------------------------------------
+  it("[C-COMP-LOOP-BRANCH-01] a looped branch step compensates every occurrence in reverse over ONE branch token; sibling compensated independently", async () => {
+    const token = await mintWorkerToken();
+    const { instance } = await publishAndStart(PARALLEL_LOOP_BRANCH_BPMN, {
+      correlationKey: "clb1",
+      variables: { failSettle: true },
+    });
+    expect(instance.status).toBe(201);
+    const id = instance.body.instanceId;
+
+    // Loop branch A's pl-a three times: the merge gateway Xa reads `loopAgain` from
+    // the (branch-local) variables, which pl-a's output sets. true → re-execute via
+    // Xm; the 3rd pass exits via the default to the join. → occurrences #0,#1,#2.
+    await leaseAndComplete(token, "pl-a", { loopAgain: true }); // occ 0
+    await leaseAndComplete(token, "pl-a", { loopAgain: true }); // occ 1
+    await leaseAndComplete(token, "pl-a", { loopAgain: false }); // occ 2 (exit)
+    // Sibling branch B.
+    await leaseAndComplete(token, "pl-b", {});
+
+    await failSettle(token);
+    const terminal = await driveComps(token, id, ["comp-pl-a", "comp-pl-b"]);
+    expect(terminal).toBe("compensated");
+
+    // Three occurrence-keyed ledger rows for the looped element svcA (pl-a)…
+    const svcA = (await steps(id)).filter((s) => s.elementId === "svcA").sort((a, b) => a.occurrence - b.occurrence);
+    expect(svcA.map((s) => s.occurrence)).toEqual([0, 1, 2]);
+    const svcATokenId = svcA[0]!.tokenId;
+    // …all carrying the SAME branch token id (one lineage looping in place)…
+    expect(new Set(svcA.map((s) => s.tokenId)).size).toBe(1);
+    expect(svcATokenId).toBeTruthy();
+    // …compensated in REVERSE occurrence order (#2, #1, #0).
+    const svcAStarted = (await historyOf(id, "compensationStarted")).filter((e) => e.elementId === "svcA");
+    expect(svcAStarted.map((e) => e.occurrence)).toEqual([2, 1, 0]);
+    expect(await compJobCount(id, "svcA")).toBe(3);
+    for (const s of svcA) expect(s.compensationStatus).toBe("compensated");
+
+    // Sibling B compensated independently, distinct lineage (cross-branch unconstrained).
+    const svcB = await stepOf(id, "svcB");
+    expect(svcB!.compensationStatus).toBe("compensated");
+    expect(svcB!.tokenId).not.toBe(svcATokenId);
+
+    expect(await statusOf(id)).toBe("compensated");
+    expect(await liveTokens(id)).toHaveLength(0);
+  });
 });

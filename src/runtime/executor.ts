@@ -4,7 +4,7 @@
 import type { Env } from "../env";
 import type { JobResultEvent, MessageEventPayload, ProcessWorkflowParams } from "../contracts/workflow-events";
 import { recordTerminalIncident, runInstance } from "./engine";
-import { workflowJobEventTypeFor } from "../bpmn/profile";
+import { WAKE_TYPE } from "./wake";
 
 export interface DeliverArgs {
   workflowInstanceId: string;
@@ -61,22 +61,15 @@ class WorkflowExecutor implements Executor {
 
   async deliver(args: DeliverArgs): Promise<void> {
     const instance = await this.env.PROCESS_WORKFLOW.get(args.workflowInstanceId);
-    // Honor the subscription's STORED wake type (M3-L4, §4.5) — for an EBG branch
-    // it is the per-visit gateway type; for a receiveTask / standalone catch it is
-    // byte-identical to workflowEventTypeFor(messageName).
-    await instance.sendEvent({
-      type: args.workflowEventType,
-      payload: args.event,
-    });
+    // TASK-54: contentless tickle — the engine re-walks and applies the correlated
+    // message from D1 (apply-from-D1). One constant type = replay-stable.
+    await instance.sendEvent({ type: WAKE_TYPE, payload: { kind: "message" } });
   }
 
   async deliverJobResult(args: DeliverJobArgs): Promise<void> {
     try {
       const instance = await this.env.PROCESS_WORKFLOW.get(args.workflowInstanceId);
-      await instance.sendEvent({
-        type: workflowJobEventTypeFor(args.event.jobId),
-        payload: args.event,
-      });
+      await instance.sendEvent({ type: WAKE_TYPE, payload: { kind: "jobResult" } });
     } catch {
       // The Workflow has terminated (after an incident, or an operator /cancel
       // that ended it) and cannot resume from this event. Drive the engine inline
@@ -110,7 +103,7 @@ class WorkflowExecutor implements Executor {
     // re-reads the decider from D1 and routes down the boundary path either way.
     try {
       const instance = await this.env.PROCESS_WORKFLOW.get(args.instanceId);
-      await instance.sendEvent({ type: args.workflowEventType, payload: { outcome: "timerFired", timerId: args.timerId } });
+      await instance.sendEvent({ type: WAKE_TYPE, payload: { kind: "timerFired", timerId: args.timerId } });
     } catch {
       try {
         await runInstance(this.env, args.instanceId, { runStep: inlineStep, waitFor: null });

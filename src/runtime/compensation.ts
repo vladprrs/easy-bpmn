@@ -96,13 +96,18 @@ async function runCompensation(
   // no-op, the barrier reduces to "ledger empty ⇒ compensated").
   const isRegion = !!graph.regions;
   // Single-wake the reverse pass (TASK-54): `compWakeSeq` mirrors the forward loop's
-  // `wakeSeq` and RESETS to 0 on each runCompensation invocation. On a CF replay the
-  // walk re-derives the cursor from the ledger; already-compensated steps replay their
-  // memoized markStepCompensated/comp-create runSteps and re-issue their cached
-  // `comp-wake#k` (CF returns the cached event, no re-suspend) before the walk reaches
-  // the live pending step, so the k-th `comp-wake` always maps deterministically to the
-  // k-th still-pending comp step. The `comp-wake` prefix is distinct from the forward
-  // `wake#k`, so a forward→cancel→compensate drive never collides step names.
+  // `wakeSeq` and RESETS to 0 on each runCompensation invocation. Replay-safety does
+  // NOT rest on the wake name selecting a step — the wake is a pure TICKLE (its return
+  // is discarded, a timeout is swallowed); which step is compensated is decided solely
+  // by the ledger (`eligible[0]`, the highest-seq still-pending step). That selection is
+  // replay-deterministic: the saga_steps ledger is append-only with monotonic per-scope
+  // `seq`, `selectScopeStepsForCompensation` excludes already-`compensated` rows and
+  // orders `seq DESC`, so the pending set only shrinks across replays. A reused
+  // `comp-wake#k` name returns its cached event immediately (no re-suspend); the consumed
+  // namespace is finite (≤ #comp steps), so `compWakeSeq` always reaches a fresh name → a
+  // real suspend → the worker completes the job → the re-read advances the cursor. The
+  // `comp-wake` prefix is distinct from the forward `wake#k`, so a forward→cancel→
+  // compensate drive never collides step names.
   let compWakeSeq = 0;
   // eslint-disable-next-line no-constant-condition
   while (true) {

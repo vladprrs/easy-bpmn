@@ -1,7 +1,9 @@
 # E2E Combination Matrix — Design
 
-**Status:** Approved (design) · **Date:** 2026-06-13 · **Branch:** `m4-concurrency`
+**Status:** SHIPPED (Phases 1–3) · **Date:** 2026-06-13 (design), 2026-06-14 (implemented) · **Branch:** `e2e-combination-matrix`
 **Owner topic:** comprehensive e2e tests for *all supported elements, all corners, and their combinations*, across **direct-mode** and **Workflow-mode**.
+
+> **Implementation status (2026-06-14).** All 60 scenarios carry `[id]` markers; `check:matrix` defaults to `MATRIX_PHASE=3` (0 warnings). **Phase 1** (Layer A direct): every C-* + the 11 R-* rejects — green in CI (`npm test`). **Phase 2** (workflow-mode harness): `tests/workflow-mode/driver.ts` (BASE_URL HTTP driver) + `run.config.ts` (node runner, `npm run test:wf`) + W-REG-LINEAR/TIMER. **Phase 3** (closure gate): `concurrency.wf.test.ts` (8 real W-* + 4 `@needs-real-cf` skips) + `matrix.wf.test.ts` (19 real C-* re-runs + 17 `@needs-override`/`@needs-real-cf` skips). The `W-BUFFERED-STRAND-01` hole (§7) is FIXED (`registerReceive` records apply-from-D1 provenance atomically at buffer-claim; white-box `tests/integration/matrix/misc.test.ts`). **Layer B caveat:** local miniflare Workflow state degrades under accumulated instances — run `test:wf` from a clean `.wrangler/state` with `--var MAX_WAKE_BACKSTOP_OVERRIDE:8000`. Scenarios needing crash/lost-tickle injection, cap/TTL overrides, or the tx/compensation reverse-pass (tickle-flaky under wrangler-dev) are `it.skip @needs-real-cf`/`@needs-override` — the real-CF DoD gate (§4.3); semantics fully covered direct-mode.
 
 > Source-of-truth note: this design is grounded in the actual engine code (every claim below is traceable to a `file:line` citation in Appendix A/B). Where the prompt's mental model and the code disagreed, the code wins — see the corrections in §8.
 

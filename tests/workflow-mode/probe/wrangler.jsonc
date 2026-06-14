@@ -1,0 +1,12 @@
+{
+  "name": "cf-wf-probe",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "kv_namespaces": [{ "binding": "STATE", "id": "220bd2b5009c4943b7bc616c72edc565" }],
+  "workflows": [
+    { "binding": "PROBE_A", "name": "probe-a", "class_name": "ProbeA" },
+    { "binding": "PROBE_B", "name": "probe-b", "class_name": "ProbeB" },
+    { "binding": "PROBE_C", "name": "probe-c", "class_name": "ProbeC" }
+  ]
+}

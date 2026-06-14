@@ -11,7 +11,8 @@ import { useEffect, useRef, useState } from "react";
 import NavigatedViewer from "bpmn-js/lib/NavigatedViewer";
 import { layoutProcess } from "bpmn-auto-layout";
 import "bpmn-js/dist/assets/diagram-js.css";
-import "bpmn-js/dist/assets/bpmn-font/css/bpmn.css";
+import { glassRendererModule } from "./bpmn/GlassRenderer";
+import { AuroraField, type Hotspot } from "./bpmn/AuroraField";
 import type { BpmnElement } from "../api/types";
 import type { DiagramOverlay, FlowPlan, HeatPlan } from "../lib/flow";
 
@@ -27,18 +28,6 @@ const MARKER = {
   settled: "ebpmn-settled",
   selected: "ebpmn-selected",
 };
-
-function categoryClass(type: string): string | null {
-  const t = type.toLowerCase();
-  if (t === "startevent") return "ebpmn-cat-event";
-  if (t === "endevent") return "ebpmn-cat-end";
-  if (t === "boundaryevent") return "ebpmn-cat-boundary";
-  if (t.startsWith("intermediate")) return "ebpmn-cat-intermediate";
-  if (t.endsWith("gateway")) return "ebpmn-cat-gateway";
-  if (t.endsWith("task") || t.endsWith("subprocess") || t === "transaction" || t === "callactivity")
-    return "ebpmn-cat-task";
-  return null;
-}
 
 function hasDi(xml: string): boolean {
   return /<bpmndi:BPMNDiagram|<BPMNDiagram/.test(xml);
@@ -70,7 +59,9 @@ export default function LivingDiagram({
   onSelectElement: (id: string | null) => void;
 }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const viewerRef = useRef<any>(null);
+  const auroraRef = useRef<AuroraField | null>(null);
   // Stable click callback so the (expensive) import effect never re-runs on a new
   // parent-render identity of onSelectElement.
   const onSelectRef = useRef(onSelectElement);
@@ -81,6 +72,16 @@ export default function LivingDiagram({
   const [failed, setFailed] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
 
+  // The aurora field owns its own WebGL canvas + RAF loop. It's created lazily in
+  // the import effect (the canvas only exists on the non-fallback branch) and torn
+  // down here on unmount.
+  useEffect(() => {
+    return () => {
+      auroraRef.current?.dispose();
+      auroraRef.current = null;
+    };
+  }, []);
+
   // ---- Import (only on XML change) ----------------------------------------
   useEffect(() => {
     let disposed = false;
@@ -90,31 +91,68 @@ export default function LivingDiagram({
       setFailed(bpmnXml ? null : "No BPMN XML available.");
       return;
     }
-    const viewer = new NavigatedViewer({ container: hostRef.current });
+    const viewer = new NavigatedViewer({
+      container: hostRef.current,
+      additionalModules: [glassRendererModule],
+    });
     viewerRef.current = viewer;
     let ro: ResizeObserver | undefined;
+    if (canvasRef.current && !auroraRef.current) {
+      auroraRef.current = new AuroraField(canvasRef.current);
+    }
+    const aurora = auroraRef.current;
 
     (async () => {
       try {
+        // Load the label font BEFORE import so diagram-js measures (and therefore
+        // wraps) labels with the real General Sans metrics, not a fallback — else
+        // text is measured narrow, never wraps, and overflows the node.
+        if (typeof document !== "undefined" && document.fonts?.load) {
+          try {
+            await Promise.all([
+              document.fonts.load('600 13px "General Sans"'),
+              document.fonts.load('500 13px "General Sans"'),
+            ]);
+          } catch {
+            /* font API hiccup — proceed with fallback metrics */
+          }
+        }
         const xml = hasDi(bpmnXml) ? bpmnXml : await layoutProcess(bpmnXml);
         await viewer.importXML(xml);
         if (disposed) return;
         const canvas = viewer.get("canvas");
         canvas.zoom("fit-viewport", "auto");
-        for (const el of elements) {
-          const cls = categoryClass(el.type);
-          if (cls) {
-            try {
-              canvas.addMarker(el.elementId, cls);
-            } catch {
-              /* element not in this diagram — skip */
-            }
-          }
-        }
         viewer.on("element.click", (e: any) => {
           const id = e?.element?.id;
           if (id) onSelectRef.current(id);
         });
+        // Hover: lift the node you're reading, let its peers recede (CSS-driven).
+        const host = hostRef.current;
+        viewer.on("element.hover", (e: any) => {
+          const id = e?.element?.id;
+          if (!id || !host) return;
+          host.classList.add("ebpmn-hovering");
+          try {
+            canvas.addMarker(id, "ebpmn-hover");
+          } catch {
+            /* gone */
+          }
+        });
+        viewer.on("element.out", (e: any) => {
+          const id = e?.element?.id;
+          if (!id || !host) return;
+          host.classList.remove("ebpmn-hovering");
+          try {
+            canvas.removeMarker(id, "ebpmn-hover");
+          } catch {
+            /* gone */
+          }
+        });
+        // The aurora field reads node geometry + the live viewbox transform so its
+        // light tracks the diagram through pan/zoom.
+        aurora?.attach(viewer);
+        // The circuit powers up: nodes ignite left→right, edges ink in after.
+        playEntrance(viewer);
         // Near-full-bleed: re-fit on container resize.
         if (hostRef.current && "ResizeObserver" in window) {
           ro = new ResizeObserver(() => {
@@ -135,6 +173,7 @@ export default function LivingDiagram({
     return () => {
       disposed = true;
       ro?.disconnect();
+      aurora?.detach();
       try {
         viewer.destroy();
       } catch {
@@ -236,6 +275,21 @@ export default function LivingDiagram({
 
     // Selection highlight.
     if (selectedElement) addMarker(selectedElement, MARKER.selected);
+
+    // Feed the aurora field the live light pools (it resolves geometry itself).
+    const spots: Hotspot[] =
+      mode === "aggregate"
+        ? heat.nodes.map((n) => ({
+            id: n.elementId,
+            kind: n.hot ? "hot" : n.tier >= 2 ? "live" : "settle",
+            weight: n.hot ? 1 : 0.5 + n.tier * 0.25,
+          }))
+        : [
+            ...overlay.current.map((id) => ({ id, kind: "live" as const })),
+            ...overlay.failed.map((f) => ({ id: f.elementId, kind: "hot" as const })),
+            ...flow.settledNodes.map((id) => ({ id, kind: "settle" as const, weight: 0.8 })),
+          ];
+    auroraRef.current?.setHotspots(spots);
   }, [overlay, flow, heat, mode, reverse, selectedElement, ready]);
 
   if (failed) {
@@ -243,8 +297,9 @@ export default function LivingDiagram({
   }
 
   return (
-    <div className="relative h-full w-full">
-      <div ref={hostRef} className="stage-field h-full w-full" />
+    <div className="stage-field relative h-full w-full overflow-hidden">
+      <canvas ref={canvasRef} className="ebpmn-aurora pointer-events-none absolute inset-0 h-full w-full" />
+      <div ref={hostRef} className="ebpmn-host absolute inset-0 h-full w-full" />
       {!ready && (
         <div className="anim-fade absolute inset-0 grid place-items-center text-sm text-content-muted">
           <span className="font-data">rendering diagram…</span>
@@ -298,6 +353,48 @@ function injectTokens(registry: any, edgeIds: string[], reverse: boolean, store:
     visual.appendChild(g);
     store.current.push(g);
   }
+}
+
+/** The diagram "powers up" on load: nodes ignite left→right with a soft scale-in,
+ *  edges + labels ink in just after. WAAPI so it composes with the resting CSS;
+ *  inline styles are cleared on finish. A no-op under reduced motion (the diagram
+ *  simply appears — no information lives only in this motion). */
+function playEntrance(viewer: any) {
+  if (prefersReducedMotion()) return;
+  let registry: any;
+  try {
+    registry = viewer.get("elementRegistry");
+  } catch {
+    return;
+  }
+  const shapes = registry
+    .filter((el: any) => el.parent && !el.waypoints && !el.labelTarget && el.x != null)
+    .sort((a: any, b: any) => a.x - b.x || a.y - b.y);
+  shapes.forEach((el: any, i: number) => {
+    const node = registry.getGraphics(el)?.querySelector?.(".ebpmn-node") as (SVGElement & { animate?: any }) | null;
+    if (!node?.animate) return;
+    const anim = node.animate(
+      [
+        { opacity: 0, transform: "scale(0.86) translateY(8px)" },
+        { opacity: 1, transform: "none" },
+      ],
+      { duration: 460, delay: Math.min(i * 26, 720), easing: "cubic-bezier(0.16,1,0.3,1)", fill: "both" },
+    );
+    anim.onfinish = () => {
+      node.style.opacity = "";
+      node.style.transform = "";
+    };
+  });
+  registry
+    .filter((el: any) => el.waypoints || el.labelTarget)
+    .forEach((el: any) => {
+      const vis = registry.getGraphics(el)?.querySelector?.(".djs-visual") as (SVGElement & { animate?: any }) | null;
+      if (!vis?.animate) return;
+      const anim = vis.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 420, delay: 340, easing: "ease-out", fill: "both" });
+      anim.onfinish = () => {
+        vis.style.opacity = "";
+      };
+    });
 }
 
 function ElementListFallback({

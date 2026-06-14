@@ -56,8 +56,11 @@ body {
 }
 
 /* ============================================================
- * bpmn-js diagram — easy·bpmn light re-theme.
- * Cascade order matters: base → category tint → runtime state → living flow.
+ * Liquid-glass bpmn diagram. The custom GlassRenderer owns the resting shapes
+ * (frosted body · specular sheen · refraction · soft elevation · custom icons);
+ * the WebGL AuroraField lights the field behind. Runtime state / flow / heat /
+ * selection still arrive as marker classes on .djs-element, so they just restyle
+ * the glass here — the living-flow machinery is otherwise untouched.
  * ============================================================ */
 .bjs-container {
   background: transparent !important;
@@ -65,88 +68,272 @@ body {
 .bjs-powered-by {
   display: none !important;
 }
-
-/* Pastel BPMN category surfaces — "read the canvas by colour" (FROZEN palette). */
-.djs-element.ebpmn-cat-event .djs-visual > :first-child {
-  fill: var(--cat-event-surface) !important;
-  stroke: var(--cat-event-border) !important;
+.ebpmn-aurora {
+  z-index: 0;
 }
-.djs-element.ebpmn-cat-intermediate .djs-visual > :first-child {
-  fill: var(--cat-inter-surface) !important;
-  stroke: var(--cat-inter-border) !important;
-}
-.djs-element.ebpmn-cat-boundary .djs-visual > :first-child {
-  fill: var(--cat-boundary-surface) !important;
-  stroke: var(--cat-boundary-border) !important;
-}
-.djs-element.ebpmn-cat-end .djs-visual > :first-child {
-  fill: var(--cat-end-surface) !important;
-  stroke: var(--cat-end-border) !important;
-  stroke-width: 3px !important; /* "final" weight */
-}
-.djs-element.ebpmn-cat-gateway .djs-visual > :first-child {
-  fill: var(--cat-gateway-surface) !important;
-  stroke: var(--cat-gateway-border) !important;
-}
-.djs-element.ebpmn-cat-task .djs-visual > :first-child {
-  fill: var(--cat-task-surface) !important;
-  stroke: var(--cat-task-border) !important;
+.ebpmn-host {
+  z-index: 1;
+  background: transparent;
 }
 
-/* Runtime-state outlines (override the category stroke; keep the surface tint). */
-.djs-element.ebpmn-traversed .djs-visual > :first-child {
-  stroke: var(--state-completed) !important;
-  stroke-width: 2.5px !important;
+/* ---- Glass primitives (category-independent) ----------------------------- */
+.ebpmn-tint {
+  fill: var(--cat-task-surface);
+  fill-opacity: 0.34;
 }
-.djs-element.ebpmn-current .djs-visual > :first-child {
-  stroke: var(--state-running) !important;
-  stroke-width: 3px !important;
+.ebpmn-sheen {
+  opacity: 0.9;
+  pointer-events: none;
 }
-.djs-element.ebpmn-failed .djs-visual > :first-child {
-  stroke: var(--state-error) !important;
-  stroke-width: 3px !important;
+.ebpmn-stroke {
+  fill: none;
+  stroke: var(--cat-task-border);
+  stroke-width: 1.4px;
+  transition:
+    stroke 0.45s var(--ease-out),
+    stroke-width 0.45s var(--ease-out);
 }
-.djs-element.ebpmn-compensated .djs-visual > :first-child {
-  stroke: var(--state-warning) !important;
-  stroke-dasharray: 4 3 !important;
+.ebpmn-stroke-inner {
+  fill: none;
+  stroke: var(--cat-inter-border);
+  stroke-width: 1.1px;
+  opacity: 0.75;
+}
+.ebpmn-icon {
+  color: var(--cat-task-icon);
+  pointer-events: none;
+}
+.ebpmn-icon path {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+.ebpmn-icon path.filled {
+  fill: currentColor;
+  stroke: none;
+}
+.ebpmn-chip-bg {
+  fill: var(--cat-task-surface);
+  fill-opacity: 0.65;
+  stroke: rgba(255, 255, 255, 0.65);
+  stroke-width: 1px;
+}
+.ebpmn-glyph {
+  fill: none;
+  stroke: var(--cat-gateway-icon);
+  stroke-width: 2.2px;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.ebpmn-marker-box {
+  fill: none;
+  stroke: var(--cat-task-icon);
+  stroke-width: 1.1px;
+  opacity: 0.55;
+}
+.ebpmn-marker .ebpmn-glyph {
+  stroke: var(--cat-task-icon);
+  opacity: 0.7;
+}
+/* Internal task label + bpmn external labels (events/gateways) → the type trio. */
+.ebpmn-label,
+.djs-label {
+  font-family: var(--font-sans);
+}
+.djs-label {
+  fill: var(--text-secondary);
 }
 
-/* Selected element (element↔narration link) — a calm teal ring, state colours win. */
-.djs-element.ebpmn-selected .djs-visual > :first-child,
-.djs-connection.ebpmn-selected .djs-visual > path {
-  stroke: var(--state-selected) !important;
-  stroke-width: 3px !important;
+/* ---- Category families — "read the canvas by colour" (FROZEN palette) ----- */
+.ebpmn-c-event .ebpmn-tint {
+  fill: var(--cat-event-surface);
+  fill-opacity: 0.5;
+}
+.ebpmn-c-event .ebpmn-stroke {
+  stroke: var(--cat-event-border);
+}
+.ebpmn-c-event .ebpmn-icon {
+  color: var(--cat-event-icon);
+}
+
+.ebpmn-c-inter .ebpmn-tint {
+  fill: var(--cat-inter-surface);
+  fill-opacity: 0.5;
+}
+.ebpmn-c-inter .ebpmn-stroke,
+.ebpmn-c-inter .ebpmn-stroke-inner {
+  stroke: var(--cat-inter-border);
+}
+.ebpmn-c-inter .ebpmn-icon {
+  color: var(--cat-inter-icon);
+}
+
+.ebpmn-c-boundary .ebpmn-tint {
+  fill: var(--cat-boundary-surface);
+  fill-opacity: 0.5;
+}
+.ebpmn-c-boundary .ebpmn-stroke,
+.ebpmn-c-boundary .ebpmn-stroke-inner {
+  stroke: var(--cat-boundary-border);
+}
+.ebpmn-c-boundary .ebpmn-icon {
+  color: var(--cat-boundary-icon);
+}
+
+.ebpmn-c-end .ebpmn-tint {
+  fill: var(--cat-end-surface);
+  fill-opacity: 0.5;
+}
+.ebpmn-c-end .ebpmn-stroke {
+  stroke: var(--cat-end-border);
+  stroke-width: 2.6px;
+}
+.ebpmn-c-end .ebpmn-icon {
+  color: var(--cat-end-icon);
+}
+
+.ebpmn-c-gateway .ebpmn-tint {
+  fill: var(--cat-gateway-surface);
+  fill-opacity: 0.46;
+}
+.ebpmn-c-gateway .ebpmn-stroke {
+  stroke: var(--cat-gateway-border);
+}
+.ebpmn-c-gateway .ebpmn-glyph {
+  stroke: var(--cat-gateway-icon);
+}
+
+.ebpmn-c-task .ebpmn-icon {
+  color: var(--cat-task-icon);
+}
+.ebpmn-c-task .ebpmn-chip-bg {
+  fill: var(--accent-soft);
+  fill-opacity: 0.85;
+}
+
+/* Non-interrupting boundary = dashed ring; transaction = a hair heavier. */
+.ebpmn-noninterrupt .ebpmn-stroke,
+.ebpmn-noninterrupt .ebpmn-stroke-inner {
+  stroke-dasharray: 4 3;
+}
+.ebpmn-tx .ebpmn-stroke {
+  stroke-width: 2px;
+}
+
+/* ---- The node group is the unit of motion (entrance · hover · state bloom) -- */
+.ebpmn-node {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+.djs-shape .ebpmn-node {
+  transition:
+    transform 0.22s var(--ease-out),
+    opacity 0.22s var(--ease-out);
+}
+/* Hover: lift the node you're reading; let its peers recede. */
+.ebpmn-host.ebpmn-hovering .djs-element:not(.ebpmn-hover) {
+  opacity: 0.42;
+  transition: opacity 0.25s var(--ease-out);
+}
+.djs-shape.ebpmn-hover .ebpmn-node {
+  transform: scale(1.05);
+}
+.djs-shape.ebpmn-hover .ebpmn-shape {
+  filter: drop-shadow(0 9px 20px rgba(20, 30, 45, 0.2));
+}
+@media (prefers-reduced-motion: reduce) {
+  .djs-shape.ebpmn-hover .ebpmn-node {
+    transform: none;
+  }
+}
+
+/* ---- Runtime-state outlines (override category stroke; keep the glass) ---- */
+.djs-element.ebpmn-traversed .ebpmn-stroke {
+  stroke: var(--state-completed);
+  stroke-width: 2.2px;
+}
+.djs-element.ebpmn-current .ebpmn-stroke {
+  stroke: var(--state-running);
+  stroke-width: 2.6px;
+}
+.djs-element.ebpmn-failed .ebpmn-stroke {
+  stroke: var(--state-error);
+  stroke-width: 2.8px;
+}
+.djs-element.ebpmn-compensated .ebpmn-stroke {
+  stroke: var(--state-warning);
+  stroke-dasharray: 4 3;
+}
+.djs-element.ebpmn-selected .ebpmn-stroke {
+  stroke: var(--state-selected);
+  stroke-width: 2.8px;
+}
+
+/* State bloom on the whole glass node (luminosity-on-pale). */
+.djs-element.ebpmn-current .ebpmn-node {
+  filter: drop-shadow(0 0 7px var(--current-glow));
+}
+.djs-element.ebpmn-settled .ebpmn-node {
+  filter: drop-shadow(0 0 5px var(--settle-wash));
+}
+.djs-element.ebpmn-failed .ebpmn-node {
+  filter: drop-shadow(0 0 7px var(--interrupt-wash));
+}
+
+@keyframes ebpmn-stroke-pulse {
+  0%,
+  100% {
+    stroke-opacity: 1;
+  }
+  50% {
+    stroke-opacity: 0.5;
+  }
 }
 
 /* ============================================================
- * The living flow (visual-design-brief §3.4) — the one memorable thing.
- * Current is teal liveness on EDGES + travelling tokens; node colour stays
- * semantic. Luminosity-on-pale: a soft bloom + bright core, never neon-on-dark.
- * Every motion has a fully-legible static floor (reduced-motion below).
+ * The living flow — current is teal liveness on EDGES + travelling tokens.
+ * Edges are default-rendered (a single <path> child of .djs-visual), so these
+ * selectors and the token injection are unchanged from the prior design.
  * ============================================================ */
 
-/* A live edge: teal current with a soft bloom, fading in as it's reached. */
+/* Idle sequence flows: rounded graphite with a soft white casing so the line
+ * reads cleanly over the luminous aurora (teal-on-teal would otherwise vanish). */
+.djs-connection .djs-visual > path {
+  stroke: var(--cat-edge-strong);
+  stroke-width: 1.8px;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  filter: drop-shadow(0 0 1.4px rgba(255, 255, 255, 0.9));
+}
+/* Recolour the shared arrowheads to match the calm edge ink. */
+.djs-container marker path,
+.bjs-container marker path {
+  fill: var(--cat-edge-strong);
+  stroke: none;
+}
+
 .djs-connection.ebpmn-flow-live .djs-visual > path {
-  stroke: var(--current) !important;
-  stroke-width: 2.5px !important;
-  stroke-opacity: 0.92;
-  filter: drop-shadow(0 0 2.5px var(--current-glow));
+  stroke: var(--current-bright) !important;
+  stroke-width: 2.6px !important;
+  stroke-opacity: 1;
+  filter: drop-shadow(0 0 1.4px rgba(255, 255, 255, 0.95)) drop-shadow(0 0 4px var(--current-glow));
   transition:
     stroke 0.5s var(--ease-out),
     stroke-opacity 0.5s var(--ease-out);
 }
-/* A settled edge: the finished circuit, calm green glow, no motion. */
 .djs-connection.ebpmn-flow-done .djs-visual > path {
   stroke: var(--settle) !important;
-  stroke-width: 2.25px !important;
-  stroke-opacity: 0.92;
-  filter: drop-shadow(0 0 2.5px var(--settle-wash));
+  stroke-width: 2.3px !important;
+  stroke-opacity: 1;
+  filter: drop-shadow(0 0 1.4px rgba(255, 255, 255, 0.9)) drop-shadow(0 0 3px var(--settle-wash));
 }
-/* A stalled / failed path interrupts in coral. */
 .djs-connection.ebpmn-flow-interrupt .djs-visual > path {
   stroke: var(--interrupt) !important;
-  stroke-width: 2.5px !important;
-  filter: drop-shadow(0 0 2px var(--interrupt-wash));
+  stroke-width: 2.6px !important;
+  filter: drop-shadow(0 0 1.4px rgba(255, 255, 255, 0.9)) drop-shadow(0 0 3px var(--interrupt-wash));
 }
 
 /* The travelling token — a bright core in a soft halo, riding the edge (SMIL). */
@@ -162,31 +349,11 @@ body {
   opacity: 0.5;
 }
 
-/* Live frontier node: breathing outline + teal bloom. */
-@keyframes ebpmn-stroke-pulse {
-  0%,
-  100% {
-    stroke-opacity: 1;
-  }
-  50% {
-    stroke-opacity: 0.45;
-  }
-}
-.djs-element.ebpmn-current .djs-visual > :first-child {
-  filter: drop-shadow(0 0 5px var(--current-glow));
-}
-/* Settled node: the completed circuit's calm green ambient. */
-.djs-element.ebpmn-settled .djs-visual > :first-child {
-  filter: drop-shadow(0 0 4px var(--settle-wash));
-}
-
-/* Flow along a live edge (current) + draw-in. */
 @keyframes ebpmn-flow-march {
   to {
     stroke-dashoffset: -24;
   }
 }
-/* Marching-ants on a selected / highlighted edge (kept). */
 @keyframes ebpmn-march {
   to {
     stroke-dashoffset: -16;
@@ -194,7 +361,7 @@ body {
 }
 
 @media (prefers-reduced-motion: no-preference) {
-  .djs-element.ebpmn-current .djs-visual > :first-child {
+  .djs-element.ebpmn-current .ebpmn-stroke {
     animation: ebpmn-stroke-pulse 2.2s var(--ease-standard) infinite;
   }
   .djs-connection.ebpmn-flow-live .djs-visual > path {
@@ -207,9 +374,6 @@ body {
   }
 }
 
-/* Reduced motion: the static illuminated path IS the floor. No travelling light,
- * no marching dashes — but live/done/interrupt edges + current/settled nodes keep
- * their colour & glow, so no information lives only in animation. */
 @media (prefers-reduced-motion: reduce) {
   .ebpmn-flow-token {
     display: none;
@@ -220,25 +384,31 @@ body {
 }
 
 /* ============================================================
- * Aggregate "living heatmap" — per-node instance density (no per-token motion).
- * Density raises a teal bloom; a node where runs are failing goes coral-hot.
+ * Aggregate "living heatmap" — per-node instance density. The aurora carries
+ * the pooled light; the glass node picks up a matching bloom + stroke.
  * ============================================================ */
-.djs-element.ebpmn-heat-1 .djs-visual > :first-child {
+.djs-element.ebpmn-heat-1 .ebpmn-node {
   filter: drop-shadow(0 0 3px var(--current-wash));
 }
-.djs-element.ebpmn-heat-2 .djs-visual > :first-child {
-  stroke: var(--current) !important;
-  filter: drop-shadow(0 0 5px var(--current-glow));
+.djs-element.ebpmn-heat-2 .ebpmn-node {
+  filter: drop-shadow(0 0 6px var(--current-glow));
 }
-.djs-element.ebpmn-heat-3 .djs-visual > :first-child {
-  stroke: var(--current) !important;
-  stroke-width: 3px !important;
-  filter: drop-shadow(0 0 8px var(--current-glow)) drop-shadow(0 0 16px var(--current-wash));
+.djs-element.ebpmn-heat-2 .ebpmn-stroke {
+  stroke: var(--current);
 }
-.djs-element.ebpmn-heat-hot .djs-visual > :first-child {
-  stroke: var(--interrupt) !important;
-  stroke-width: 3px !important;
-  filter: drop-shadow(0 0 8px var(--interrupt-wash)) drop-shadow(0 0 16px var(--interrupt-wash));
+.djs-element.ebpmn-heat-3 .ebpmn-node {
+  filter: drop-shadow(0 0 9px var(--current-glow));
+}
+.djs-element.ebpmn-heat-3 .ebpmn-stroke {
+  stroke: var(--current);
+  stroke-width: 2.6px;
+}
+.djs-element.ebpmn-heat-hot .ebpmn-stroke {
+  stroke: var(--interrupt);
+  stroke-width: 2.6px;
+}
+.djs-element.ebpmn-heat-hot .ebpmn-node {
+  filter: drop-shadow(0 0 9px var(--interrupt-wash));
 }
 
 /* ---- Overlay badges — DS pill: solid tone, white text, soft shadow. -------- */

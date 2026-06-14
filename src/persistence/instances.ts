@@ -615,6 +615,33 @@ export async function finishAttempt(
   );
 }
 
+/**
+ * Finish the most recent still-`started` attempt of a job (M-UI §9 audit
+ * enrichment). Best-effort + idempotent: a duplicate worker callback finds no open
+ * attempt (the first finished it) and no-ops, so it never double-records. Populates
+ * the per-attempt request/response/error the operator console's Attempts drill-down
+ * reads via GET /instances/{id}/jobs.
+ */
+export async function finishLatestStartedAttempt(
+  db: D1Database,
+  jobId: string,
+  input: { status: "succeeded" | "failed"; responsePayload?: JsonObject | null; error?: string | null; now: string },
+): Promise<void> {
+  const row = await dbFirst<{ attempt_id: string }>(
+    db,
+    `SELECT attempt_id FROM worker_attempts WHERE job_id = ? AND status = 'started' ORDER BY rowid DESC LIMIT 1`,
+    [jobId],
+  );
+  if (!row) return;
+  await finishAttempt(db, {
+    attemptId: row.attempt_id,
+    status: input.status,
+    responsePayload: input.responsePayload ?? null,
+    error: input.error ?? null,
+    now: input.now,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Message subscriptions
 // ---------------------------------------------------------------------------

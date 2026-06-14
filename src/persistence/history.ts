@@ -126,6 +126,36 @@ export async function listInstanceHistory(
   return rows.map(mapHistory);
 }
 
+/**
+ * Cursor tail of an instance's history by SQLite `rowid` (M-UI §11, §12). Powers
+ * BOTH the SSE live-tail (`/instances/{id}/stream`) and its poll fallback
+ * (`GET /instances/{id}/history?since=`). `since=null` returns from the start.
+ * Each row carries its `cursor` (rowid) so the SSE handler can emit `id:<cursor>`
+ * per event and EventSource resumes with `Last-Event-ID` without gaps/dupes.
+ */
+export async function tailInstanceHistory(
+  db: D1Database,
+  instanceId: string,
+  since: number | null,
+  limit = 500,
+): Promise<{ rows: { cursor: number; event: HistoryEvent }[]; nextCursor: number | null }> {
+  const where = ["instance_id = ?"];
+  const params: unknown[] = [instanceId];
+  if (since != null) {
+    where.push("rowid > ?");
+    params.push(since);
+  }
+  params.push(limit);
+  const rows = await dbAll<HistoryRow & { cursor: number }>(
+    db,
+    `SELECT rowid AS cursor, * FROM history_events WHERE ${where.join(" AND ")} ORDER BY rowid ASC LIMIT ?`,
+    params,
+  );
+  const mapped = rows.map((r) => ({ cursor: r.cursor, event: mapHistory(r) }));
+  const nextCursor = mapped.length > 0 ? mapped[mapped.length - 1]!.cursor : since;
+  return { rows: mapped, nextCursor };
+}
+
 export async function listMessageHistory(
   db: D1Database,
   externalMessageId: string,

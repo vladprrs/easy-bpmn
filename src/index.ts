@@ -68,13 +68,14 @@ import {
   setDraftLatestVersion,
 } from "./persistence/definitions";
 import {
+  createAttempt,
   createInstance,
+  finishLatestStartedAttempt,
   getIncidentForInstance,
   getInstance,
   getInstanceRow,
   getOpenIncidentsForInstance,
   listActiveSubscriptionsForInstance,
-  listInstances,
   mergeInstanceVariables,
   resolveAllOpenIncidents,
   resolveIncident,
@@ -82,7 +83,9 @@ import {
   transitionStatusGuarded,
 } from "./persistence/instances";
 import { getExternalMessage, insertExternalMessage } from "./persistence/messages";
-import { listInstanceHistory, recordHistory } from "./persistence/history";
+import { listInstanceHistory, recordHistory, tailInstanceHistory } from "./persistence/history";
+import { handleUiRoute } from "./ui/router";
+import { listInstanceSubscriptions, listInstancesFiltered } from "./persistence/ui-queries";
 import { getIdempotentResult, putIdempotentResult } from "./persistence/idempotency";
 import { loadGraphForInstance, resumeInline } from "./runtime/engine";
 import { cancelArmedTimersForInstance, supersedeBrokerSubscription } from "./runtime/boundary-timer";
@@ -330,6 +333,10 @@ async function handleGetInstance(env: Env, instanceId: string): Promise<Response
   // loses meaning (multiple positions) and MUST be null per the L6.3 contract.
   const liveTokenCount = tokens.filter((t) => LIVE_TOKEN_STATUSES.includes(t.status)).length;
 
+  // M-UI (§9): the "Waiting on" block — active message subscriptions so a
+  // `waiting` instance shows WHAT it is waiting for (the most common stuck case).
+  const subscriptions = await listInstanceSubscriptions(env.DB, instanceId);
+
   const inspection: ProcessInstanceInspection = {
     ...instance,
     ...(liveTokenCount > 1 ? { currentElementId: null } : {}),
@@ -345,25 +352,46 @@ async function handleGetInstance(env: Env, instanceId: string): Promise<Response
     saga,
     ...(timers.length > 0 ? { timers } : {}),
     ...(tokens.length > 0 ? { tokens } : {}),
+    ...(subscriptions.length > 0 ? { subscriptions } : {}),
   };
   return json(inspection, 200);
 }
 
-async function handleGetInstanceHistory(env: Env, instanceId: string): Promise<Response> {
-  const instance = await getInstance(env.DB, instanceId);
+async function handleGetInstanceHistory(env: Env, instanceId: string, url: URL): Promise<Response> {
+  const instance = await getInstanceRow(env.DB, instanceId);
   if (!instance) throw new NotFoundError(`Process instance ${instanceId} not found.`);
-  const events = await listInstanceHistory(env.DB, instanceId);
-  return json({ events }, 200);
+  // M-UI (§11/§12): cursor delta when `?since=` is supplied (the SSE poll
+  // fallback). `since` absent ⇒ full history (back-compat) + a nextCursor so the
+  // SPA can switch to the live tail without a gap. `events` stays the same shape.
+  const sinceRaw = url.searchParams.get("since");
+  const sinceParsed = sinceRaw != null && sinceRaw !== "" ? parseInt(sinceRaw, 10) : null;
+  const since = sinceParsed != null && Number.isNaN(sinceParsed) ? null : sinceParsed;
+  const { rows, nextCursor } = await tailInstanceHistory(env.DB, instanceId, since);
+  return json({ events: rows.map((r) => r.event), nextCursor }, 200);
 }
 
 async function handleListInstances(env: Env, url: URL): Promise<Response> {
   const workspaceId = url.searchParams.get("workspaceId");
   if (!workspaceId) throw new BadRequestError("workspaceId query parameter is required.");
-  const status = url.searchParams.get("status") ?? undefined;
+  // M-UI (§12): `status` accepts a comma list (multi-status triage); new `search`
+  // (LIKE business/correlation key) and `sagaId` (join definition_versions.draft_id).
+  const statusRaw = url.searchParams.get("status");
+  const statuses = statusRaw
+    ? statusRaw.split(",").map((s) => s.trim()).filter(Boolean)
+    : undefined;
+  const search = url.searchParams.get("search") ?? undefined;
+  const sagaId = url.searchParams.get("sagaId") ?? undefined;
   const limit = Math.min(Math.max(1, parseInt(url.searchParams.get("limit") ?? "50", 10) || 50), 200);
   const cursorRaw = url.searchParams.get("cursor");
   const cursor = cursorRaw ? parseInt(cursorRaw, 10) : undefined;
-  const { items, nextCursor } = await listInstances(env.DB, { workspaceId, status, limit, cursor });
+  const { items, nextCursor } = await listInstancesFiltered(env.DB, {
+    workspaceId,
+    statuses,
+    search,
+    sagaId,
+    limit,
+    cursor,
+  });
   const response: InstanceListResponse = { instances: items, nextCursor };
   return json(response, 200);
 }
@@ -810,6 +838,19 @@ async function leaseOnce(
       type: "jobActivated",
       diagnostics: { jobId: r.job_id, workerId, attempt: r.attempt_count, traceId, isCompensation: r.is_compensation === 1 },
     });
+    // M-UI §9: record the per-attempt request the worker received (the Attempts
+    // drill-down). Finished on the worker's complete/fail callback.
+    await createAttempt(env.DB, {
+      jobId: r.job_id,
+      instanceId: r.instance_id,
+      attemptNumber: r.attempt_count,
+      requestPayload: {
+        variables: job.variables,
+        ...(job.originalInput !== undefined ? { originalInput: job.originalInput } : {}),
+        ...(job.capturedOutput !== undefined ? { capturedOutput: job.capturedOutput } : {}),
+      },
+      now,
+    });
   }
   return jobs;
 }
@@ -933,6 +974,7 @@ async function handleCompleteJob(env: Env, jobId: string, request: Request): Pro
 
   const ack: JobCallbackAck = { jobId, outcome: "completed", disposition: "applied" };
   await putIdempotentResult(env.DB, "workerCallback", idemKey, ack, now);
+  await finishLatestStartedAttempt(env.DB, jobId, { status: "succeeded", responsePayload: output, now });
   await recordHistory(env.DB, {
     workspaceId,
     instanceId: job.instance_id,
@@ -1004,6 +1046,11 @@ async function handleFailJob(env: Env, jobId: string, request: Request): Promise
 
   const ack: JobCallbackAck = { jobId, outcome: "failed", disposition: "applied" };
   await putIdempotentResult(env.DB, "workerCallback", idemKey, ack, now);
+  await finishLatestStartedAttempt(env.DB, jobId, {
+    status: "failed",
+    error: body.errorCode ? `${body.errorCode}: ${body.reason}` : body.reason,
+    now,
+  });
 
   if (willRetry) {
     // Technical retry: the job stays parked behind backoff and is re-handed by the
@@ -1048,6 +1095,12 @@ async function route(request: Request, env: Env): Promise<Response> {
     return json({ service: "easy-bpmn", status: "ok" }, 200);
   }
 
+  // M-UI operator console (design §7): consult the console sub-router first; it
+  // returns a Response for a UI route or null to fall through to the core API,
+  // so the published root contract is preserved exactly.
+  const uiResponse = await handleUiRoute(request, env, seg, method, url);
+  if (uiResponse) return uiResponse;
+
   if (seg[0] === "definitions") {
     if (seg[1] === "drafts") {
       if (seg.length === 2 && method === "POST") return handleCreateDraft(env, request);
@@ -1064,7 +1117,7 @@ async function route(request: Request, env: Env): Promise<Response> {
     if (seg.length === 1 && method === "GET") return handleListInstances(env, url);
     if (seg[1]) {
       if (seg.length === 2 && method === "GET") return handleGetInstance(env, seg[1]);
-      if (seg.length === 3 && seg[2] === "history" && method === "GET") return handleGetInstanceHistory(env, seg[1]);
+      if (seg.length === 3 && seg[2] === "history" && method === "GET") return handleGetInstanceHistory(env, seg[1], url);
       if (seg.length === 3 && seg[2] === "cancel" && method === "POST") return handleCancelInstance(env, seg[1], request);
       if (seg.length === 3 && seg[2] === "retry" && method === "POST") return handleRetryInstance(env, seg[1], request);
     }

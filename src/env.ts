@@ -17,6 +17,29 @@ export interface Env {
   OVERLAYS: R2Bucket;
   /** "workflow" (default/prod) or "direct" (deterministic test driver). */
   EXECUTION_MODE: string;
+
+  // --- M-UI / Operator Console (design §8) — all OPTIONAL so the Worker boots
+  // without UI secrets in dev/test. When UI_SESSION_SECRET is unset the session
+  // guard is a no-op pass-through (console disabled, existing API contract intact).
+  /** Operator login name checked by POST /ui/login. */
+  UI_USER?: string;
+  /** Operator login password checked by POST /ui/login (Worker secret in prod). */
+  UI_PASS?: string;
+  /** HMAC key for the signed session cookie (Worker secret in prod). */
+  UI_SESSION_SECRET?: string;
+  /** Default workspace surfaced to the SPA on boot (GET /ui/me). */
+  UI_DEFAULT_WORKSPACE?: string;
+  /**
+   * SSE live-tail connection budget in ms (design §11; default 25 000). Overridable
+   * so integration tests bound the stream to a few seconds instead of 25 s.
+   */
+  UI_STREAM_BUDGET_MS?: string;
+  /**
+   * Static-assets binding (the built SPA, design §7). Serving is assets-first +
+   * run_worker_first; the Worker does not call this directly, but wrangler exposes
+   * it, so it is declared for type-completeness.
+   */
+  ASSETS?: Fetcher;
   /**
    * TEST-ONLY cap overrides (M4-L6, design §9). Integration tests lower a
    * concurrency cap via these so a bomb fixture trips it without 256 real branches

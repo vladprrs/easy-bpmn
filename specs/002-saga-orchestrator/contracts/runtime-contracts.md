@@ -468,3 +468,45 @@ Like other forward Hazards, neither auto-compensates: inside a transaction the l
 - W3C `traceparent` passthrough is considered so worker-side APM can correlate.
 - M1 metrics are named (per-`taskType` job latency, retry counts, compensation outcomes); full
   dashboards are deferred.
+
+## Operator Console Contract (M-UI)
+
+Design: `docs/superpowers/specs/...m-ui-operator-console...`. Constitution v2.4.0. The operator
+console is **read-only**: it adds inspection/aggregation/auth endpoints and a live-tail, but **no new
+write verb** beyond the existing operator `/cancel` and `/retry`. The `/jobs/*` worker surface and the
+existing root API contract are **unchanged**.
+
+**Rules**:
+
+- **All inspection reads D1 (inspection invariant preserved).** Every new endpoint
+  (`/projects`, `/attention`, `/sagas`, `/sagas/{sagaId}`, `GET /messages`,
+  `GET /instances/{id}/jobs`, the extended `GET /instances/{id}` `subscriptions` block,
+  `GET /definitions/versions/{id}/bpmn`, and the SSE live-tail) reads canonical D1 state only;
+  none touches Cloudflare Workflow internals. `workflowInstanceId` is still never required from a
+  caller.
+- **Session-cookie auth gates the UI namespace only.** `POST /ui/login` validates operator
+  credentials and issues the **`ebpmn_session`** cookie — an **HMAC-signed** session token,
+  **HttpOnly + Secure + SameSite=Lax** — which the `operatorSession` security scheme requires on the
+  gated endpoints; `POST /ui/logout` clears it; `GET /ui/me` is the unauthenticated SPA boot probe
+  (`{ authenticated, workspaceId, authConfigured }`, `workspaceId` falling back to
+  `UI_DEFAULT_WORKSPACE`). When console auth is **unconfigured** the console runs open
+  (`authConfigured=false`) and login returns `400`; bad credentials return `401`. The pre-existing
+  worker-credential (`workerCredential`) contract on `/jobs/*` is untouched and orthogonal.
+- **SSE live-tail is a bounded delta-tail of D1.** `GET /instances/{id}/stream` (text/event-stream)
+  tails `history_events` keyed by **rowid**: each SSE message carries `id:<cursor>`, the stream
+  **honors `Last-Event-ID`** to resume after a gap, and the connection is **bounded (~25s)** before
+  the client reconnects (or polls `GET /instances/{id}/history?since=<cursor>`, which now returns
+  `nextCursor`). It **reads D1 only** — never Workflow state — so it is a pure projection of the
+  audit log.
+- **`worker_attempts` is now populated on the pull plane** (feeding the Attempts drill-down on
+  `GET /instances/{id}/jobs`): a row is created (`createAttempt`) when a job is **leased**
+  (`/jobs/activate`) and finished when the worker **completes/fails** it (`/jobs/{id}/complete` |
+  `/jobs/{id}/fail`), recording request/response/error and start/finish times. The write is
+  **idempotent** — a duplicate/stale callback (0-row `lock_token` update) does not append or
+  re-finish an attempt, matching the existing at-least-once worker-callback contract.
+- **Attention-set staleness predicate.** The cross-saga attention set (`/attention`, and the
+  per-project `attention` count on `/projects`) lists instances in `incident` or `compensationFailed`
+  status, **plus** "**stale compensating**" instances — `compensating` **AND** `updated_at` older than
+  **5 minutes** — **not** every `compensating` instance (a healthy reverse pass advancing within the
+  window is excluded). Each item's `reason` (`incident | compensationFailed | staleCompensating`) and
+  `since` (the instance `updated_at`) are surfaced.

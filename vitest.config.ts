@@ -16,6 +16,16 @@ export default defineConfig(async () => {
           bindings: {
             TEST_MIGRATIONS: migrations,
             EXECUTION_MODE: "direct",
+            // M-UI (§8): configure console auth in tests so the session-gated
+            // endpoints exercise the real 401/cookie path. Unset in dev ⇒ open
+            // console; set here ⇒ the new UI endpoints require a valid cookie.
+            UI_USER: "operator",
+            UI_PASS: "test-pass",
+            UI_SESSION_SECRET: "test-session-secret-please-change",
+            UI_DEFAULT_WORKSPACE: "default",
+            // Bound the SSE live-tail to ~3s in tests (prod default is 25s) so the
+            // stream smoke test never holds the pool open for a full window.
+            UI_STREAM_BUDGET_MS: "3000",
           },
           // M4-L6: a local R2 for the branch-overlay offload (design §9.1). Declared
           // here so unit/integration tests get env.OVERLAYS even though the worker

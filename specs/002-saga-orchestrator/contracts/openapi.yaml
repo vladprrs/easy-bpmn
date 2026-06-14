@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: easy-bpmn SAGA Orchestrator API (M1 — Canonical transaction-saga)
-  version: 0.2.0
+  version: 0.3.0
   description: >
     Product-facing API for the canonical-BPMN transaction-saga orchestrator. Retains the
     MVP surface (drafts, immutable versions, instances, external messages, history) and
@@ -10,6 +10,11 @@ info:
     per-workspace worker credential; the server derives workspaceId from the credential and
     never trusts a body workspaceId for job access. The API does not leak Cloudflare
     Workflow internals (no workflowInstanceId is required from worker or operator callers).
+    The M-UI operator-console endpoints (read/aggregation/auth: /ui/login, /ui/logout,
+    /ui/me, /projects, /attention, /sagas, GET /messages, instance jobs, raw BPMN, and an
+    SSE history live-tail) were added in lockstep with constitution v2.4.0. The session-gated
+    ones carry an `operatorSession` cookie; all of them read D1 only (the inspection invariant
+    is preserved).
 servers:
   - url: http://localhost:8787
     description: Local Wrangler development server
@@ -127,8 +132,23 @@ paths:
         - name: status
           in: query
           required: false
+          description: >
+            Accepts a single status OR a comma-separated list (multi-status filter), e.g.
+            `incident,compensationFailed`. Each value is an InstanceStatus.
           schema:
             $ref: "#/components/schemas/InstanceStatus"
+        - name: search
+          in: query
+          required: false
+          description: Free-text filter over businessKey / correlationKey / instanceId (M-UI).
+          schema:
+            type: string
+        - name: sagaId
+          in: query
+          required: false
+          description: Restrict to instances of one saga (draft_id) across all its versions (M-UI).
+          schema:
+            type: string
         - name: limit
           in: query
           required: false
@@ -170,8 +190,17 @@ paths:
     get:
       summary: Inspect business timeline and technical diagnostic history
       operationId: getProcessInstanceHistory
+      description: >
+        Also the SSE poll fallback (M-UI): pass `since=<rowid cursor>` to tail only events
+        newer than the cursor (the GET /instances/{id}/stream reconnect path).
       parameters:
         - $ref: "#/components/parameters/InstanceId"
+        - name: since
+          in: query
+          required: false
+          description: Return only history events with rowid greater than this cursor (delta tail).
+          schema:
+            type: integer
       responses:
         "200":
           description: History events
@@ -185,6 +214,10 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/HistoryEvent"
+                  nextCursor:
+                    type: integer
+                    nullable: true
+                    description: The highest rowid in this page; null when there are no events.
         "404":
           $ref: "#/components/responses/NotFound"
   /instances/{instanceId}/cancel:
@@ -373,6 +406,64 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PublishMessageResponse"
+    get:
+      summary: Search accepted external messages (operator console)
+      operationId: searchMessages
+      security:
+        - operatorSession: []
+      description: >
+        Cursor-paged external-message search for the operator console. `workspaceId` falls
+        back to UI_DEFAULT_WORKSPACE when omitted; `messageName`, `correlationKey`, and
+        `outcome` narrow the result. Reads D1 only.
+      parameters:
+        - name: workspaceId
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: messageName
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: correlationKey
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: outcome
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: A page of matched external messages
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [messages]
+                properties:
+                  messages:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MessageSearchItem"
+                  nextCursor:
+                    type: integer
+                    nullable: true
+        "401":
+          $ref: "#/components/responses/Unauthorized"
   /messages/{externalMessageId}:
     get:
       summary: Inspect an accepted external message and its final outcome
@@ -392,6 +483,229 @@ paths:
                 $ref: "#/components/schemas/ExternalMessage"
         "404":
           $ref: "#/components/responses/NotFound"
+  /ui/login:
+    post:
+      summary: Authenticate an operator and open a console session
+      operationId: uiLogin
+      description: >
+        Validates operator credentials; on success sets the `ebpmn_session` cookie
+        (HMAC-signed, HttpOnly + Secure + SameSite=Lax) that gates the UI-namespace
+        endpoints, via Set-Cookie. Not session-gated. Returns 400 when console auth is
+        unconfigured, 401 on bad credentials.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Authenticated; the `ebpmn_session` session cookie is set via Set-Cookie
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /ui/logout:
+    post:
+      summary: Clear the operator console session
+      operationId: uiLogout
+      description: Clears the `ebpmn_session` cookie (expired via Set-Cookie). Not session-gated.
+      responses:
+        "204":
+          description: Session cleared; the `ebpmn_session` cookie is expired via Set-Cookie
+  /ui/me:
+    get:
+      summary: Report console session + auth-configuration status
+      operationId: uiMe
+      description: >
+        SPA boot probe. Not session-gated. Reports whether the caller holds a valid session,
+        the default workspace for boot, and whether console auth is configured.
+      responses:
+        "200":
+          description: Session and auth-configuration status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeResponse"
+  /projects:
+    get:
+      summary: List project (workspace) rollups for the operator console
+      operationId: listProjects
+      security:
+        - operatorSession: []
+      description: Per-workspace saga + instance-status rollups with an attention count. Reads D1 only.
+      responses:
+        "200":
+          description: Project rollups
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [projects]
+                properties:
+                  projects:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ProjectRollup"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /attention:
+    get:
+      summary: Cross-saga attention set (incident / compensationFailed / stale compensating)
+      operationId: listAttention
+      security:
+        - operatorSession: []
+      description: >
+        Instances needing operator attention across one project. `projectId` falls back to
+        UI_DEFAULT_WORKSPACE when omitted. "Stale compensating" = compensating with updated_at
+        older than 5 minutes (NOT all compensating). Reads D1 only.
+      parameters:
+        - name: projectId
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Attention items
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AttentionItem"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /sagas:
+    get:
+      summary: List sagas (definition drafts) with version + instance-status rollups
+      operationId: listSagas
+      security:
+        - operatorSession: []
+      description: >
+        One row per saga (draft_id) with its active version, version count, transaction flag,
+        and instance-status counts. `projectId` falls back to UI_DEFAULT_WORKSPACE. Reads D1 only.
+      parameters:
+        - name: projectId
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Saga summaries
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sagas]
+                properties:
+                  sagas:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SagaSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /sagas/{sagaId}:
+    get:
+      summary: Inspect one saga and its published versions
+      operationId: getSaga
+      security:
+        - operatorSession: []
+      parameters:
+        - $ref: "#/components/parameters/SagaId"
+      responses:
+        "200":
+          description: Saga detail with per-version instance counts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SagaDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /instances/{instanceId}/jobs:
+    get:
+      summary: List an instance's service-task jobs with worker-attempt drill-down
+      operationId: getInstanceJobs
+      security:
+        - operatorSession: []
+      description: >
+        Forward and compensation jobs for one instance, each with its worker_attempts
+        (request/response/error per attempt). Reads D1 only.
+      parameters:
+        - $ref: "#/components/parameters/InstanceId"
+      responses:
+        "200":
+          description: Instance jobs with attempts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [jobs]
+                properties:
+                  jobs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/InstanceJobView"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /definitions/versions/{definitionVersionId}/bpmn:
+    get:
+      summary: Fetch the raw BPMN XML for a published version (diagram render source)
+      operationId: getDefinitionVersionBpmn
+      security:
+        - operatorSession: []
+      parameters:
+        - $ref: "#/components/parameters/DefinitionVersionId"
+      responses:
+        "200":
+          description: Raw BPMN XML and its content hash
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BpmnXmlResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /instances/{instanceId}/stream:
+    get:
+      summary: Live-tail an instance's history via Server-Sent Events
+      operationId: streamInstance
+      security:
+        - operatorSession: []
+      description: >
+        Server-Sent Events live-tail of this instance's history_events, keyed by rowid. Each
+        event carries `id:<cursor>`; the stream honors the Last-Event-ID request header to
+        resume after a gap. Bounded to ~25s, after which the client reconnects (or falls back
+        to GET /instances/{id}/history?since=<cursor>). Reads D1 only; never Workflow state.
+      parameters:
+        - $ref: "#/components/parameters/InstanceId"
+      responses:
+        "200":
+          description: >
+            An SSE stream (text/event-stream) of history-event deltas; each carries an
+            `id:<rowid cursor>`. The connection closes after ~25s and the client reconnects.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
 components:
   securitySchemes:
     workerCredential:
@@ -401,6 +715,14 @@ components:
         Per-workspace worker credential. The server resolves it to a workspace and derives
         workspaceId from it; the request body never carries a trusted workspaceId for job
         access. A missing or revoked credential is rejected as unauthorized.
+    operatorSession:
+      type: apiKey
+      in: cookie
+      name: ebpmn_session
+      description: >
+        Operator-console session cookie (HMAC-signed, HttpOnly + Secure + SameSite=Lax),
+        issued by POST /ui/login. Gates the M-UI read/aggregation endpoints. A missing,
+        invalid, or expired session is rejected as unauthorized.
   parameters:
     DraftId:
       name: draftId
@@ -422,6 +744,12 @@ components:
         type: string
     JobId:
       name: jobId
+      in: path
+      required: true
+      schema:
+        type: string
+    SagaId:
+      name: sagaId
       in: path
       required: true
       schema:
@@ -779,6 +1107,14 @@ components:
                 Single-token (M1/M2/M3) instances with no token rows omit this field.
               items:
                 $ref: "#/components/schemas/TokenView"
+            subscriptions:
+              type: array
+              description: >
+                Active message subscriptions (M-UI §9): what a `waiting` instance is waiting
+                for (message name, correlation key, expiry, buffered-message count). Present
+                when the instance has >=1 active subscription.
+              items:
+                $ref: "#/components/schemas/SubscriptionView"
     TokenView:
       type: object
       required: [tokenId, positionElementId, status, regionId, regionActivation, branchFlowId, parentTokenId]
@@ -1140,3 +1476,270 @@ components:
         details:
           type: object
           additionalProperties: true
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+      additionalProperties: false
+    LoginResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          const: true
+    MeResponse:
+      type: object
+      required: [authenticated, workspaceId, authConfigured]
+      properties:
+        authenticated:
+          type: boolean
+        workspaceId:
+          type: string
+          nullable: true
+          description: Default workspace for SPA boot (env UI_DEFAULT_WORKSPACE); null when unset.
+        authConfigured:
+          type: boolean
+          description: False when the console runs open (no credentials configured).
+    ProjectRollup:
+      type: object
+      required: [projectId, name, sagaCount, counts, attention]
+      properties:
+        projectId:
+          type: string
+          description: The workspace id.
+        name:
+          type: string
+        sagaCount:
+          type: integer
+        counts:
+          type: object
+          additionalProperties:
+            type: integer
+          description: Instance counts grouped by status (only non-zero buckets are guaranteed).
+        attention:
+          type: integer
+          description: Instances needing attention (incident + compensationFailed + stale compensating).
+    AttentionItem:
+      type: object
+      required:
+        - instanceId
+        - sagaId
+        - sagaName
+        - status
+        - currentElementId
+        - businessKey
+        - correlationKey
+        - reason
+        - since
+      properties:
+        instanceId:
+          type: string
+        sagaId:
+          type: string
+          nullable: true
+          description: The saga (draft_id) via the version join; null if unresolved.
+        sagaName:
+          type: string
+          nullable: true
+        status:
+          $ref: "#/components/schemas/InstanceStatus"
+        currentElementId:
+          type: string
+          nullable: true
+        businessKey:
+          type: string
+          nullable: true
+        correlationKey:
+          type: string
+        reason:
+          type: string
+          enum: [incident, compensationFailed, staleCompensating]
+          description: Why it is on the attention list.
+        since:
+          type: string
+          format: date-time
+          description: The instance's updated_at.
+    SagaSummary:
+      type: object
+      required: [sagaId, name, activeVersionId, versionCount, hasTransaction, counts, lastActivityAt]
+      properties:
+        sagaId:
+          type: string
+          description: The draft_id grouping all versions of one saga.
+        name:
+          type: string
+          description: The active version's process id (immutable), else the draft name.
+        activeVersionId:
+          type: string
+          nullable: true
+        versionCount:
+          type: integer
+        hasTransaction:
+          type: boolean
+          description: Whether the active version carries a bpmn:transaction scope (Saga-tab gate).
+        counts:
+          type: object
+          additionalProperties:
+            type: integer
+          description: Instance counts grouped by status (only non-zero buckets are guaranteed).
+        lastActivityAt:
+          type: string
+          nullable: true
+    SagaVersionSummary:
+      type: object
+      required: [definitionVersionId, versionNumber, publishedAt, instanceCount]
+      properties:
+        definitionVersionId:
+          type: string
+        versionNumber:
+          type: integer
+        publishedAt:
+          type: string
+          format: date-time
+        instanceCount:
+          type: integer
+    SagaDetail:
+      type: object
+      required: [sagaId, name, activeVersionId, hasTransaction, versions]
+      properties:
+        sagaId:
+          type: string
+        name:
+          type: string
+        activeVersionId:
+          type: string
+          nullable: true
+        hasTransaction:
+          type: boolean
+        versions:
+          type: array
+          items:
+            $ref: "#/components/schemas/SagaVersionSummary"
+    WorkerAttemptView:
+      type: object
+      required: [attemptNumber, status, startedAt]
+      properties:
+        attemptNumber:
+          type: integer
+        status:
+          type: string
+        request:
+          type: object
+          additionalProperties: true
+          nullable: true
+        response:
+          type: object
+          additionalProperties: true
+          nullable: true
+        error:
+          type: string
+          nullable: true
+        startedAt:
+          type: string
+          format: date-time
+        finishedAt:
+          type: string
+          format: date-time
+          nullable: true
+    InstanceJobView:
+      type: object
+      required:
+        - jobId
+        - elementId
+        - taskType
+        - status
+        - isCompensation
+        - attemptCount
+        - createdAt
+        - updatedAt
+        - attempts
+      properties:
+        jobId:
+          type: string
+        elementId:
+          type: string
+        taskType:
+          type: string
+        status:
+          type: string
+        isCompensation:
+          type: boolean
+        attemptCount:
+          type: integer
+        activationExpiresAt:
+          type: string
+          format: date-time
+          nullable: true
+        lockExpiresAt:
+          type: string
+          format: date-time
+          nullable: true
+        errorCode:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        attempts:
+          type: array
+          items:
+            $ref: "#/components/schemas/WorkerAttemptView"
+    MessageSearchItem:
+      type: object
+      required: [externalMessageId, messageName, correlationKey, finalOutcome, matchedInstanceId, reason, receivedAt]
+      properties:
+        externalMessageId:
+          type: string
+        messageName:
+          type: string
+        correlationKey:
+          type: string
+        finalOutcome:
+          type: string
+        matchedInstanceId:
+          type: string
+          nullable: true
+        reason:
+          type: string
+          nullable: true
+        receivedAt:
+          type: string
+          format: date-time
+    BpmnXmlResponse:
+      type: object
+      required: [definitionVersionId, bpmnXml, bpmnXmlHash]
+      properties:
+        definitionVersionId:
+          type: string
+        bpmnXml:
+          type: string
+        bpmnXmlHash:
+          type: string
+    SubscriptionView:
+      type: object
+      required: [subscriptionId, elementId, messageName, correlationKey, status, bufferedCount]
+      properties:
+        subscriptionId:
+          type: string
+        elementId:
+          type: string
+        messageName:
+          type: string
+        correlationKey:
+          type: string
+        status:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+          nullable: true
+        bufferedCount:
+          type: integer
+          description: Early messages buffered against this broker key (pre-correlation count).

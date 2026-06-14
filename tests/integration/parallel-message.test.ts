@@ -8,7 +8,7 @@ import { get, mintWorkerToken, publishAndStart, publishMessage, PARALLEL_MESSAGE
 // re-walk encounters. Both are exercised by delivering the SECOND branch's message
 // first, with a shared key whose document-order (later branch) winner is asserted.
 describe("parallelGateway AND with message catches in branches (M4-L3, direct mode)", () => {
-  it("routes each message to its own branch and merges payloads in document order", async () => {
+  it("[C-BRANCH-MSG-01] routes each message to its own branch and merges payloads in document order", async () => {
     await mintWorkerToken();
     const { instance } = await publishAndStart(PARALLEL_MESSAGE_DISTINCT_BPMN, { correlationKey: "pm1", variables: {} });
     const id = instance.body.instanceId;

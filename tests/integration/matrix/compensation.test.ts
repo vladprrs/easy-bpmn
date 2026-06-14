@@ -476,4 +476,55 @@ describe("matrix: saga compensation under concurrency (direct mode)", () => {
     expect(order.indexOf("B2")).toBeLessThan(order.indexOf("B1"));
     expect(await liveTokens(id)).toHaveLength(0);
   });
+
+  // -------------------------------------------------------------------------
+  it("[C-ERR-BRANCH-COMP-01] a failed+error-routed forward step owes no compensation; only the routed-to + sibling steps are ledgered and compensated", async () => {
+    const token = await mintWorkerToken();
+    const { instance } = await publishAndStart(PARALLEL_BRANCH_ERR_COMP_BPMN, {
+      correlationKey: "ebc1",
+      variables: { failSettle: true },
+    });
+    expect(instance.status).toBe(201);
+    const id = instance.body.instanceId;
+
+    // Branch A: ec-a (svcA) FAILS with business error E1 → its error boundary routes
+    // in-region to ec-alt (altA). ec-a, the failed step, owes NO compensation.
+    const ecA = await leaseOne(token, "ec-a");
+    const ecAFail = await authedPost(`/jobs/${ecA.jobId}/fail`, token, {
+      lockToken: ecA.lockToken,
+      reason: "branch A rejected",
+      errorCode: "E1",
+      retryable: false,
+    });
+    expect(ecAFail.status).toBe(200);
+    await leaseAndComplete(token, "ec-alt", {}); // altA → Xa → join
+    // Branch B.
+    await leaseAndComplete(token, "ec-b", {}); // svcB → join
+
+    await failSettle(token);
+    const terminal = await driveComps(token, id, ["comp-ec-alt", "comp-ec-b"]);
+    expect(terminal).toBe("compensated");
+
+    // No ledger row for the failed+routed forward step (svcA / ec-a), and no comp job.
+    expect(await stepOf(id, "svcA")).toBeUndefined();
+    expect(await compJobCount(id, "svcA")).toBe(0);
+    expect((await compStartedElements(id)).includes("svcA")).toBe(false);
+
+    // ec-alt (altA) and ec-b (svcB) each have a ledger row tagged with their OWN
+    // branch token, and each is compensated in its lineage.
+    const altA = await stepOf(id, "altA");
+    const svcB = await stepOf(id, "svcB");
+    expect(altA).toBeDefined();
+    expect(svcB).toBeDefined();
+    expect(altA!.tokenId).toBeTruthy();
+    expect(svcB!.tokenId).toBeTruthy();
+    expect(altA!.tokenId).not.toBe(svcB!.tokenId);
+    expect(altA!.compensationStatus).toBe("compensated");
+    expect(svcB!.compensationStatus).toBe("compensated");
+    expect(await compJobCount(id, "altA")).toBe(1);
+    expect(await compJobCount(id, "svcB")).toBe(1);
+
+    expect(await statusOf(id)).toBe("compensated");
+    expect(await liveTokens(id)).toHaveLength(0);
+  });
 });

@@ -13,6 +13,7 @@ makes a standard subset of BPMN 2.0 executable without Camunda/Zeebe. Implemente
 
 - **M3** — time & failure taxonomy (interrupting boundary/intermediate timers, message intermediate catch, `eventBasedGateway`, free error routing, the `timeout` incident-kind split + honored `retryable`) — **shipped** (constitution v2.2.0; the runtime opened per validator layer, now complete).
 - **M4** — concurrency (block-structured `parallelGateway` AND / `inclusiveGateway` OR (SESE), the token frontier, AND/OR-join barrier, branch-local variable merge, parallel-branch compensation) — **shipped** (constitution v2.3.0 added the construct set, with the single-wake un-guarded-wait semantics recorded in the v2.3.1 PATCH; the single-wake engine, TASK-54, **re-validated GREEN on real Cloudflare Workflows 2026-06-14**, Worker Version `f194b722` — the L6.6 multi-wait defect is resolved).
+- **M-UI** — operator console: a **read-only** React SPA (in `spa/`) served same-origin by the Worker via Cloudflare Static Assets, session-cookie auth (`/ui/login|logout|me`), read/aggregation endpoints (`/projects`, `/attention`, `/sagas`, `/instances/{id}/jobs`, `GET /messages` search, `/definitions/versions/{id}/bpmn`, `/instances/{id}/stream` SSE), plus `GET /instances` search/sagaId/multi-status, a `subscriptions` block on instance inspection, and a `?since=` history delta — **shipped** (constitution **v2.4.0** removed the "advanced Operate-style UI" exclusion). The only write surface is still the existing `cancel`/`retry`; all inspection reads D1 (the invariant is preserved). Backend in `src/ui/*` + `src/persistence/ui-queries.ts`; contract/integration in `tests/integration/ui-console.test.ts` + `tests/unit/ui-session.test.ts`.
 
 **M5 (composition) is the next milestone.** The Worker is live at `https://bpmn.rntme.com`
 (Cloudflare Workers + D1 + Durable Object broker + Workflow), with GitHub Actions CI/CD at the repo root.
@@ -166,7 +167,11 @@ npm run typecheck                                      # tsc --noEmit
 npm run check:docs                                     # docs consistency guard (CI enforced)
 npm run check:matrix                                   # e2e combination-matrix registry guard
 npm run test:matrix                                    # e2e combination matrix (direct + Workflow mode)
-npx wrangler deploy --dry-run                          # validate bindings/config
+npm run dev:ui                                          # M-UI operator console (Vite :5173, proxies API to :8787)
+npm run build:ui                                        # build the console SPA → spa/dist (served by the Worker)
+npm run test:ui                                         # SPA unit tests (humanization coverage, resolver, guards, compensation)
+npm run typecheck:ui                                    # SPA tsc --noEmit
+npx wrangler deploy --dry-run                          # validate bindings/config (reads spa/dist — build:ui first)
 ```
 
 The **e2e combination matrix** ([design](docs/superpowers/specs/2026-06-13-e2e-combination-matrix-design.md)) is a risk-curated suite of 60 end-to-end scenarios (49 valid + 11 publish-reject) covering every supported construct, weighted toward M4 concurrency, run in **both** execution modes: Layer A direct-mode (`vitest-pool-workers`, CI-gated semantics; the 11 rejects live here) and Layer B Workflow-mode (`wrangler dev` + real-CF smoke gate, asserted only over the public HTTP API). `tests/matrix/registry.ts` is the single source of truth; `npm run check:matrix` (sibling of `check:docs`, CI-gated) is the drift-guard — it fails when a registered scenario at/below the active `MATRIX_PHASE` lacks a `[<id>]` marker in its declared test file, when a must-cover construct tag is unreferenced, or when fewer than 11 reject scenarios are registered. `npm run test:matrix` runs the suites (`tests/matrix` + `tests/integration/matrix`). Phase 1 (scaffold + registry seed + drift-guard + npm scripts) is in place; the Layer A direct-mode tests and Workflow-mode Phases 2-3 are not yet authored.

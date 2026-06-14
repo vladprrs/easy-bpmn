@@ -2,6 +2,10 @@
 // types. zod is the validation boundary for untrusted input.
 
 import { z } from "zod";
+// M-UI (§9): the "Waiting on" block on instance inspection. Type-only import,
+// erases at compile time (ui.ts imports HistoryEvent from here — both type-only,
+// so no runtime cycle).
+import type { SubscriptionView } from "./ui";
 // Single source of the incident-kind taxonomy (M3-L1, TASK-39). Type-only, so it
 // erases at compile time — no runtime cycle despite instances.ts importing Incident
 // from here. The check:docs guard keeps IncidentKind ↔ the openapi enum in sync;
@@ -312,6 +316,12 @@ export interface ProcessInstanceInspection extends ProcessInstance {
    * Single-token (M1/M2/M3) instances with no token rows omit this field.
    */
   tokens?: TokenInspection[];
+  /**
+   * Active message subscriptions (M-UI §9): what a `waiting` instance is waiting
+   * for (message name, correlation key, expiry, buffered-message count). Present
+   * when the instance has ≥1 active subscription; the most common stuck case.
+   */
+  subscriptions?: SubscriptionView[];
 }
 
 // ---- Operator remediation verbs ----

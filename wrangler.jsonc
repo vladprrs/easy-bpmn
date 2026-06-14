@@ -7,6 +7,13 @@
   "observability": {
     "enabled": true
   },
+  // M-UI (§7): build the operator-console SPA into ./spa/dist before bundling, so a
+  // `wrangler deploy` (Cloudflare Workers Builds on push to main) always ships the
+  // current SPA — never the committed placeholder. Self-installing so it works in CI,
+  // local deploys, and the CF build environment without extra setup.
+  "build": {
+    "command": "npm --prefix spa install --no-audit --no-fund && npm --prefix spa run build"
+  },
   // Production custom domain. Wrangler provisions the DNS record + edge cert for
   // bpmn.rntme.com on deploy (the rntme.com zone is on this Cloudflare account).
   "routes": [
@@ -19,7 +26,11 @@
     // Execution driver: "workflow" uses real Cloudflare Workflows per instance
     // (production / `wrangler dev`); the test suite overrides this to "direct"
     // for deterministic, replay-free engine execution. See src/runtime/executor.ts.
-    "EXECUTION_MODE": "workflow"
+    "EXECUTION_MODE": "workflow",
+    // M-UI (§8): default workspace surfaced to the SPA on boot. UI_USER / UI_PASS /
+    // UI_SESSION_SECRET are Worker SECRETS (wrangler secret put …); when unset the
+    // console runs OPEN (single-operator local dev). Setting them gates the console.
+    "UI_DEFAULT_WORKSPACE": "default"
   },
   "d1_databases": [
     {
@@ -90,6 +101,36 @@
       "bucket_name": "easy-bpmn-overlays"
     }
   ],
+  // M-UI (design §7): one Worker serves BOTH the React SPA (built to ./spa/dist)
+  // and the JSON API, same-origin. Cloudflare Static Assets are assets-first, so
+  // `run_worker_first` pins every API prefix to the Worker regardless of request
+  // mode (a browser navigation to an API URL still returns JSON, not index.html).
+  // The SPA owns `/` (shell) and `/console/*` (client routes) — disjoint from the
+  // API namespace. `single-page-application` returns index.html for unmatched
+  // navigations so the client router handles `/console/*` deep-links.
+  "assets": {
+    "binding": "ASSETS",
+    "directory": "./spa/dist",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": [
+      "/ui/*",
+      "/projects",
+      "/projects/*",
+      "/attention",
+      "/attention/*",
+      "/sagas",
+      "/sagas/*",
+      "/instances",
+      "/instances/*",
+      "/messages",
+      "/messages/*",
+      "/definitions",
+      "/definitions/*",
+      "/jobs/*",
+      "/worker-credentials",
+      "/worker-credentials/*"
+    ]
+  },
   "migrations": [
     {
       "tag": "v1",

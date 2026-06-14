@@ -1,0 +1,66 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-ink-950 text-slate-200 antialiased;
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+/* bpmn-js viewer surface tweaks for the dark console. */
+.bjs-container {
+  background: transparent !important;
+}
+
+/* Live-overlay element markers (applied via canvas.addMarker by BpmnViewer). */
+.djs-element.ebpmn-traversed .djs-visual > :first-child {
+  stroke: #5b9dff !important;
+}
+.djs-element.ebpmn-current .djs-visual > :first-child {
+  stroke: #3fb950 !important;
+  stroke-width: 3px !important;
+}
+.djs-element.ebpmn-failed .djs-visual > :first-child {
+  stroke: #f85149 !important;
+  stroke-width: 3px !important;
+}
+.djs-element.ebpmn-compensated .djs-visual > :first-child {
+  stroke: #d29922 !important;
+  stroke-dasharray: 4 3 !important;
+}
+
+.ebpmn-overlay-badge {
+  font: 600 10px/1.4 ui-monospace, monospace;
+  padding: 1px 5px;
+  border-radius: 6px;
+  white-space: nowrap;
+  color: #0a0c10;
+  background: #5b9dff;
+}
+.ebpmn-overlay-badge.ok {
+  background: #3fb950;
+}
+.ebpmn-overlay-badge.danger {
+  background: #f85149;
+  color: #fff;
+}
+.ebpmn-overlay-badge.warn {
+  background: #d29922;
+}
+
+/* Thin scrollbars for dense panels. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #273141 transparent;
+}

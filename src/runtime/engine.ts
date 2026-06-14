@@ -55,7 +55,6 @@
 import type { Env } from "../env";
 import type { MessageEventPayload } from "../contracts/workflow-events";
 import type { ExecutionGraph, Flow, GraphNode, NodeType } from "../bpmn/graph";
-import { workflowEventTypeFor } from "../bpmn/profile";
 import { ExpressionEvaluationError, evaluateCondition, normalizeFeelValue } from "./expressions";
 import { brokerKeyOf, type RegisterSubscriptionResult } from "./broker-types";
 import { MAX_EVENT_PAYLOAD_BYTES, payloadByteSize } from "./payload";
@@ -91,7 +90,6 @@ import {
 import {
   loadInst,
   isTransactionScope,
-  SVC_WAIT_TIMEOUT,
   type RunStep,
   type WaitForEvent,
   type DriveResult,
@@ -102,9 +100,6 @@ import {
   syncFrontierReadModel,
   resolveScope,
   driveFrontier,
-  raceParkedWaits,
-  matchKeyedEvent,
-  WaitCollector,
   type DriveCaps,
   type LeafDrivers,
   type LeafOutcome,
@@ -121,10 +116,9 @@ import {
   convertOnFire,
   settleOverdueBoundaryTimerOnWake,
   timerBoundaryFor,
-  timerGuardedTimeout,
   timerHasFired,
 } from "./boundary-timer";
-import { getTimer, listTimersForInstance, timerIdFor } from "../persistence/timers";
+import { listTimersForInstance } from "../persistence/timers";
 import { driveIntermediateCatch, settleOverdueIntermediateCatchOnWake } from "./intermediate-timer";
 import { driveEventBasedGateway, settleOverdueEventGatewayTimerOnWake } from "./event-gateway";
 import { WAKE_TYPE, wakeBackstop } from "./wake";
@@ -134,7 +128,6 @@ import { WAKE_TYPE, wakeBackstop } from "./wake";
 // the shared types and the relocated public helpers so callers need NO edits.
 export type { RunStep, WaitOutcome, WaitForEvent, DriveStatus, DriveResult } from "./engine-shared";
 export { recordTerminalIncident, terminateUnleasableJob };
-export { workflowEventTypeFor };
 
 interface RunOptions {
   runStep: RunStep;
@@ -300,8 +293,10 @@ async function loop(
   waitFor: WaitForEvent | null,
   incomingEvent?: MessageEventPayload,
 ): Promise<DriveResult> {
-  // The delivered event flows to the receive leaf that matches it (consumed at the
-  // LIVE visit only); a region re-walk re-points it via matchKeyedEvent.
+  // The delivered event flows to the receive leaf that matches it BY NAME (consumed
+  // at the LIVE visit only). Under single-wake (TASK-54) a re-walk after a tickle has
+  // no in-flight `pending`; the matching receive leaf instead applies the correlated
+  // message from D1 (apply-from-D1). `pending` stays for the direct-mode first pass.
   let pending = incomingEvent;
 
   // Concurrency caps (M4-L6, design §9). The per-drive step budget wraps runStep so
@@ -327,7 +322,7 @@ async function loop(
   // returns a `LeafOutcome`; the existing per-kind drivers are reused verbatim,
   // threaded with `activeTokenId` (Task L3.2 branch-scoped reads/writes).
   const drivers: LeafDrivers = {
-    async driveLeaf(cur: string, occ: number, activeTokenId: string, collector: WaitCollector): Promise<LeafOutcome> {
+    async driveLeaf(cur: string, occ: number, activeTokenId: string): Promise<LeafOutcome> {
       const node = graph.nodes[cur]!;
       const tag = `${cur}#${occ}`;
       // TASK-54: leaf drivers NEVER suspend — they park (record the wait in D1) and
@@ -508,7 +503,6 @@ async function loop(
   // returns `waiting` (executor re-drives); workflow mode issues ONE bpmn_wake and
   // re-walks. Occurrence counting / loop cap / terminal completion are unchanged.
   if (!graph.regions) {
-    const scratch = new WaitCollector(); // unused: leaves park (Task 6); kept until Task 9 drops the param
     while (true) {
       const visits = new Map<string, number>();
       let cur: string = graph.startElementId;
@@ -520,7 +514,7 @@ async function loop(
           await drivers.raiseLoopLimit(cur, occ);
           return { status: "incident" };
         }
-        const r = await drivers.driveLeaf(cur, occ, rootTokenId(instanceId), scratch);
+        const r = await drivers.driveLeaf(cur, occ, rootTokenId(instanceId));
         if (r.kind === "next") {
           cur = r.next;
           continue;
@@ -543,11 +537,11 @@ async function loop(
   // ---- Concurrent regions (M4): the deterministic token-frontier DFS owns the ----
   // walk. One pass per drive in direct mode (the drive lock serialises siblings);
   // workflow mode issues ONE bpmn_wake per parked pass and re-walks (TASK-54: the
-  // single wake replaces the shrinking-membership multi-wait Promise.race that hung
-  // on real Cloudflare Workflows). `driveFrontier` still returns the (now-unused)
-  // collector until Task 9 drops it; `pending` stays for direct-mode first-pass apply.
+  // single wake replaced the shrinking-membership multi-wait Promise.race that hung
+  // on real Cloudflare Workflows). `driveFrontier` returns the FrontierResult
+  // directly; `pending` stays for the direct-mode first-pass apply.
   while (true) {
-    const { result } = await driveFrontier(env, graph, instanceId, drivers, MAX_ELEMENT_OCCURRENCES, caps);
+    const result = await driveFrontier(env, graph, instanceId, drivers, MAX_ELEMENT_OCCURRENCES, caps);
     if (result.incident) return { status: "incident" };
     if (result.compensate) return settleAfterCompensation(env, instanceId, graph, result.compensate.scopeId, runStep, waitFor);
     if (result.completed) return { status: "completed" };
@@ -599,21 +593,6 @@ async function settleFrontierCompletion(env: Env, instanceId: string, graph: Exe
     }).run();
   }
   return { status: "completed" };
-}
-
-/**
- * The COLLECTING waitFor (workflow-mode multi-wait, design §5.2): instead of
- * suspending the Workflow at the first branch's wait, it REGISTERS the wait in the
- * drive's `WaitCollector` (keyed by step name, deduped) and returns `parked`, so
- * the DFS keeps fanning out across siblings. After the DFS, `raceParkedWaits`
- * issues ONE `Promise.race` over every collected wait. Direct mode never builds
- * this (waitFor === null); it is recorded for the L6.7 manual matrix.
- */
-function collectingWaitFor(collector: WaitCollector, tokenId: string): WaitForEvent {
-  return async (sub) => {
-    collector.add({ name: sub.name, workflowEventType: sub.workflowEventType, timeout: sub.timeout, tokenId });
-    return { kind: "parked" };
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,61 +981,15 @@ async function driveReceiveTask(
     const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, graph, elementId, occ, next, reg.event, activeTokenId));
     return { kind: "next", next: r.next };
   }
-  if (!waitFor) return { kind: "waiting" };
-  // Self-healing re-arm (design §4.2): a rewalk landing on a still-armed timer
-  // re-arms the DO idempotently so a lost alarm is repaired by the next drive.
-  if (tb) {
-    const trow = await getTimer(env.DB, timerIdFor(instanceId, tb.boundaryId, occ));
-    if (trow?.status === "armed") await armTimerDO(env, trow.timerId, trow.fireAt);
-  }
-  // A timer-guarded wait is SIZED to the timer (so a long timer costs O(1) steps).
-  const timeout = tb ? await timerGuardedTimeout(env, instanceId, tb, occ) : SVC_WAIT_TIMEOUT;
-  const outcome = await waitFor({ name: `wait:${tag}`, workflowEventType: reg.workflowEventType, timeout });
-  // M4-L3 multi-wait: a region branch in workflow mode REGISTERED this wait and did
-  // not suspend — return parked (raceParkedWaits awaits it). Direct mode never hits this.
-  if (outcome.kind === "parked") return { kind: "waiting" };
-  // The timer may have fired (its wake, or a concurrent alarm) while we waited.
-  if (tb && (await timerHasFired(env, instanceId, tb, occ))) {
-    return { kind: "next", next: tb.node.next! };
-  }
-  if (outcome.kind === "timeout") {
-    // D1 is canonical: an inline drive (e.g. after a Workflow handover) may
-    // have applied this visit's message while we waited — advance, don't fail.
-    const fresh = await getSubscriptionForVisit(env.DB, instanceId, elementId, occ);
-    if (fresh?.status === "consumed") return { kind: "next", next };
-    if (tb) {
-      // Lost-alarm backstop (design §4.2, risk R5). A wait guarded by a modeled
-      // timer NEVER raises waitTimeout. The DO alarm is the PRIMARY firing
-      // mechanism; this timer-SIZED timeout doubles as the backstop for a lost/
-      // failed alarm: on this wake re-read D1 and settle an OVERDUE timer INLINE
-      // exactly as the alarm path would (superseding the subscription), RETURNING
-      // the boundary path to THIS drive loop. We are already inside a drive, so
-      // there is no executor wake here — that is what avoids the runtime/timers →
-      // executor → engine import cycle. (Workflow-mode-only; the DO-alarm fire path
-      // is the CI-tested mechanism.)
-      const settled = await settleOverdueBoundaryTimerOnWake(env, graph, instanceId, elementId, occ);
-      if (settled.kind === "fired") return { kind: "next", next: settled.next };
-      if (settled.kind === "reparked") return { kind: "waiting" }; // armed-but-early → re-armed; re-park
-      // fallThrough: a concurrent message apply settled the timer 'cancelled' (its
-      // transition rode the same batch) — re-read and advance if consumed, so a
-      // swallowed wake is not stranded.
-      const reread = await getSubscriptionForVisit(env.DB, instanceId, elementId, occ);
-      if (reread?.status === "consumed") return { kind: "next", next };
-      return { kind: "waiting" }; // still parked (e.g. a concurrent /cancel terminal) — re-park
-    }
-    // M3-L1 (TASK-39): the un-guarded receive-task wait cap is 'waitTimeout'
-    // (shared with the service-task wait cap), split out of the legacy 'timeout'.
-    await runStep(`recv-timeout:${tag}`, () => createIncident(env, instanceId, elementId, 0, `${node.type === "intermediateCatchEvent" ? "Message catch" : "Receive Task"} wait timed out.`, { messageName }, "waitTimeout"));
-    return { kind: "incident" };
-  }
-  const event = parseMessageEvent(outcome.payload);
-  const r = await runStep(`msg:${tag}`, () => applyMessage(env, instanceId, graph, elementId, occ, next, event, activeTokenId));
-  return { kind: "next", next: r.next };
-}
-
-function parseMessageEvent(payload: unknown): MessageEventPayload {
-  // The broker delivers a fully-formed MessageEventPayload; trust the runtime shape.
-  return payload as MessageEventPayload;
+  // Park (TASK-54): leaf drivers NEVER suspend — `waitFor` is always null here, so the
+  // active subscription stays parked and `loop` issues the single bpmn_wake after the
+  // drive. A re-walk after the tickle reconciles from canonical D1 (the apply-from-D1
+  // / consumed / timer fast-forwards above), and a modeled boundary timer fires via its
+  // DO alarm (or the lost-alarm backstop in `loop`). The old in-driver
+  // `waitFor`/timeout branch — including the `recv-timeout` → waitTimeout incident, the
+  // last producer of that retired kind — was UNREACHABLE in every mode and is removed.
+  // `waitFor` is kept in the signature to match the sibling leaf-driver shape.
+  return { kind: "waiting" };
 }
 
 type RegisterOutcome =
@@ -1088,7 +1021,10 @@ async function registerReceive(env: Env, instanceId: string, graph: ExecutionGra
   }
 
   const subscriptionId = active?.subscription_id ?? newId("sub");
-  const workflowEventType = workflowEventTypeFor(messageName);
+  // Vestige (TASK-54): `message_subscriptions.workflow_event_type` is kept NOT NULL but
+  // is no longer a per-message type — every wait/sendEvent uses the single WAKE_TYPE.
+  // No migration; the column is written WAKE_TYPE and read only as the (now constant) wake type.
+  const workflowEventType = WAKE_TYPE;
   const brokerKey = brokerKeyOf(inst.workspace_id, messageName, inst.correlation_key);
   const expiresAt = isoPlusMs(now, ONE_HOUR_MS);
 
@@ -1159,7 +1095,8 @@ async function applyMessage(env: Env, instanceId: string, graph: ExecutionGraph,
       messageName: event.messageName,
       correlationKey: inst.correlation_key,
       brokerKey: brokerKeyOf(inst.workspace_id, event.messageName, inst.correlation_key),
-      workflowEventType: workflowEventTypeFor(event.messageName),
+      // Vestige (TASK-54): the column is written the single WAKE_TYPE (kept NOT NULL, no migration).
+      workflowEventType: WAKE_TYPE,
       status: "consumed",
       expiresAt: isoPlusMs(now, ONE_HOUR_MS),
       consumedAt: now,

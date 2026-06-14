@@ -15,11 +15,11 @@
 // Keying (design §4.1): subscriptions + the timer branch are keyed by the
 // GATEWAY'S visit occurrence (the catches are not independently walked — the EBG
 // owns them); the winning branch advances the token straight to the catch's
-// single outgoing flow (the catch element itself is never re-dispatched). All
-// branches share ONE per-visit Workflow wake type (`workflowEventGatewayTypeFor`)
-// so a single `waitForEvent` is woken by any message delivery OR the timer fire —
-// the delivery path honors the STORED `workflow_event_type` for these subs
-// (executor.ts), the EBG exception to the receive-task symmetry contract.
+// single outgoing flow (the catch element itself is never re-dispatched). Under
+// single-wake (TASK-54) every branch subscription stores the constant `WAKE_TYPE`
+// in `workflow_event_type` (the old per-visit gateway type was removed): the
+// contentless bpmn_wake tickle re-walks the instance, and this driver reconciles
+// every branch from canonical D1 (decision row / apply-from-D1 / timer fire).
 //
 // This module owns: the engine dispatch (`driveEventBasedGateway`), the park +
 // broker-registration batch (`parkEventBasedGateway`), the message-wins apply
@@ -43,7 +43,6 @@ import {
   parseJson,
   type JsonObject,
 } from "../util";
-import { workflowEventGatewayTypeFor } from "../bpmn/profile";
 import { dbBatch } from "../persistence/db";
 import { historyStmt } from "../persistence/history";
 import {
@@ -79,6 +78,7 @@ import {
 } from "./boundary-timer";
 import { createIncident } from "./incidents";
 import { loadInst, type RunStep, type WaitForEvent } from "./engine-shared";
+import { WAKE_TYPE } from "./wake";
 
 // ---------------------------------------------------------------------------
 // Branch model
@@ -254,7 +254,10 @@ async function parkEventBasedGateway(
 ): Promise<ParkOutcome> {
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
-  const gwEventType = workflowEventGatewayTypeFor(gwId, occ);
+  // Vestige (TASK-54): every branch subscription stores the single WAKE_TYPE in
+  // `workflow_event_type` (the per-visit gateway type was removed; one bpmn_wake
+  // tickles the instance and the re-walk reconciles every branch from D1).
+  const gwEventType = WAKE_TYPE;
   const expiresAt = isoPlusMs(now, ONE_HOUR_MS);
 
   // Per-branch subscription identity (deterministic so a Workflow step retry that
@@ -614,7 +617,7 @@ export async function planEventGatewayTimerFire(
     kind: "fire",
     stmts,
     next,
-    wake: { instanceId, workflowEventType: workflowEventGatewayTypeFor(gwId, occ), timerId: timer.timerId },
+    wake: { instanceId, workflowEventType: WAKE_TYPE, timerId: timer.timerId },
     brokerSubs,
   };
 }

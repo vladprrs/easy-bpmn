@@ -11,11 +11,11 @@ export interface DeliverArgs {
   instanceId: string;
   elementId: string;
   /**
-   * The matched subscription's STORED Workflow wake type (M3-L4, TASK-46, §4.5):
-   * `sendEvent` fires on THIS type rather than re-deriving it from the message
-   * name. For a receiveTask / standalone message catch it equals
-   * workflowEventTypeFor(messageName); for an eventBasedGateway branch it is the
-   * per-visit gateway type, so a single waitForEvent is woken by any branch.
+   * The matched subscription's STORED Workflow wake type. VESTIGE under single-wake
+   * (TASK-54): the engine now waits on the SINGLE constant WAKE_TYPE, so `sendEvent`
+   * tickles on WAKE_TYPE regardless of this field's value (every subscription stores
+   * WAKE_TYPE). The re-walk after the tickle reconciles the matched receive/branch
+   * from D1. Carried only because the underlying column is kept NOT NULL (no migration).
    */
   workflowEventType: string;
   event: MessageEventPayload;

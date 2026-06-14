@@ -28,7 +28,6 @@
 import type { Env } from "../env";
 import type { ExecutionGraph, GraphNode } from "../bpmn/graph";
 import { isTerminalInstanceStatus, isoIsBefore, nowIso } from "../util";
-import { workflowTimerEventTypeFor } from "../bpmn/profile";
 import { dbBatch } from "../persistence/db";
 import { historyStmt } from "../persistence/history";
 import { applyTransitionStmt, getInstanceRow, type InstanceRow } from "../persistence/instances";
@@ -50,6 +49,7 @@ import {
   type WakeSettleOutcome,
 } from "./boundary-timer";
 import { loadInst, type RunStep, type WaitForEvent } from "./engine-shared";
+import { WAKE_TYPE } from "./wake";
 
 export type CatchOutcome = { kind: "next"; next: string } | { kind: "waiting" };
 
@@ -190,7 +190,7 @@ export async function planIntermediateCatchFire(
   return {
     kind: "fire",
     next,
-    wake: { instanceId, workflowEventType: workflowTimerEventTypeFor(timer.elementId, occ), timerId: timer.timerId },
+    wake: { instanceId, workflowEventType: WAKE_TYPE, timerId: timer.timerId },
     stmts: [
       insertTimerOutcomeStmt(env.DB, { timerId: timer.timerId, outcome: "fired", now }), // THE CLAIM
       flipTimerFiredStmt(env.DB, { timerId: timer.timerId, firedAt: now, now }),

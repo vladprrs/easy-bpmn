@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { jobResultEventSchema, messageEventPayloadSchema } from "../../src/contracts/workflow-events";
 import { activateJobsResponseSchema } from "../../src/contracts/api";
-import { workflowEventTypeFor } from "../../src/bpmn/profile";
+import { WAKE_TYPE } from "../../src/runtime/wake";
 import { DEMO_BPMN, PARALLEL_BPMN, createDraft, drainSampleWorkers, get, post, publishAndStart, publishDraft, startInstance } from "../helpers";
 
 // Cloudflare Workflows reject event types that don't match this pattern
@@ -9,14 +9,13 @@ import { DEMO_BPMN, PARALLEL_BPMN, createDraft, drainSampleWorkers, get, post, p
 const CF_EVENT_TYPE = /^[a-zA-Z0-9_][a-zA-Z0-9-_]*$/;
 
 describe("Runtime contracts", () => {
-  it("derives Workflow event types that satisfy the Cloudflare charset (no dots)", () => {
-    for (const name of ["ApprovalReceived", "order.completed", "a b/c", "héllo-世界", "x".repeat(200)]) {
-      const t = workflowEventTypeFor(name);
-      expect(t).toMatch(CF_EVENT_TYPE);
-      expect(t.length).toBeLessThanOrEqual(100);
-    }
-    // Symmetric: the same name always derives the same type (register == deliver).
-    expect(workflowEventTypeFor("ApprovalReceived")).toBe(workflowEventTypeFor("ApprovalReceived"));
+  it("waits/wakes on the single WAKE_TYPE, which satisfies the Cloudflare charset (no dots)", () => {
+    // Single-wake (TASK-54): the per-message/job/timer/gateway event-type derivation
+    // was removed — every step.waitForEvent / sendEvent uses the ONE constant WAKE_TYPE.
+    // The contract that remains is that this constant is a legal Cloudflare event type.
+    expect(WAKE_TYPE).toBe("bpmn_wake");
+    expect(WAKE_TYPE).toMatch(CF_EVENT_TYPE);
+    expect(WAKE_TYPE.length).toBeLessThanOrEqual(100);
   });
 
   it("validates the Workflow message event payload schema", () => {

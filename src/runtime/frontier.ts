@@ -7,8 +7,6 @@
 
 import type { Env } from "../env";
 import type { ExecutionGraph, RegionInfo } from "../bpmn/graph";
-import type { MessageEventPayload } from "../contracts/workflow-events";
-import type { WaitForEvent } from "./engine-shared";
 import { isTerminalInstanceStatus, nowIso, type JsonObject } from "../util";
 import { dbBatch } from "../persistence/db";
 import { rootTokenId, upsertTokenStmt, setTokenStatusStmt, listLiveTokens, getToken, parseOverlay, readOverlay, branchTokenId, parseTokenId, getJoinCompletion } from "../persistence/tokens";
@@ -94,7 +92,7 @@ export type LeafOutcome =
 
 export interface LeafDrivers {
   /** Drive ONE live leaf node for `activeTokenId`; the existing engine drive* fns. */
-  driveLeaf(cur: string, occ: number, activeTokenId: string, collector: WaitCollector): Promise<LeafOutcome>;
+  driveLeaf(cur: string, occ: number, activeTokenId: string): Promise<LeafOutcome>;
   /** Raise the terminal loopLimit incident for an element that exceeded the visit cap. */
   raiseLoopLimit(elementId: string, occ: number): Promise<void>;
   /** Raise the terminal concurrencyLimit incident: a split fan-out would exceed the live-token cap (M4-L6). */
@@ -115,28 +113,6 @@ export interface DriveCaps {
   maxConcurrentTokens: number;
   stepBudgetSoft: number;
   budget: { steps: number };
-}
-
-/** A frontier wait registered during the DFS (workflow-mode multi-wait, §5.2). */
-export interface ParkedWait {
-  name: string;
-  workflowEventType: string;
-  timeout: string;
-  tokenId: string;
-}
-
-/**
- * The in-pass wait map (design §5.2): a `step.waitForEvent` is registered at most
- * once per step name per `run()` invocation; `raceParkedWaits` iterates its values.
- */
-export class WaitCollector {
-  readonly waits = new Map<string, ParkedWait>();
-  add(w: ParkedWait): void {
-    if (!this.waits.has(w.name)) this.waits.set(w.name, w);
-  }
-  get size(): number {
-    return this.waits.size;
-  }
 }
 
 export interface FrontierResult {
@@ -161,8 +137,7 @@ function joinIndexOf(graph: ExecutionGraph): Map<string, RegionInfo> {
  * its join arrival — then settle the join and continue the post-join path on the
  * parent token EXACTLY ONCE per activation), records arrivals + claims completions
  * at joins, and drives/parks leaves via the engine's `driveLeaf`. Returns whether
- * anything parked / advanced / completed / hit an incident, plus the collected
- * waits (workflow-mode multi-wait).
+ * anything parked / advanced / completed / hit an incident.
  *
  * A non-region graph never hits a split/join — it walks one chain from the root
  * token via `driveLeaf`, reducing to the exact M0–M3 behaviour.
@@ -174,9 +149,8 @@ export async function driveFrontier(
   drivers: LeafDrivers,
   maxOccurrences: number,
   caps: DriveCaps,
-): Promise<{ result: FrontierResult; collector: WaitCollector }> {
+): Promise<FrontierResult> {
   const visits = new Map<string, number>();
-  const collector = new WaitCollector();
   const joinIndex = joinIndexOf(graph);
   let advanced = false;
   let completed = false;
@@ -283,7 +257,7 @@ export async function driveFrontier(
       }
 
       // ---- LEAF ----
-      const r = await drivers.driveLeaf(cur, occ, tokenId, collector);
+      const r = await drivers.driveLeaf(cur, occ, tokenId);
       if (r.kind === "completed") {
         completed = true;
         return;
@@ -308,46 +282,5 @@ export async function driveFrontier(
   }
 
   await walk(graph.startElementId, rootTokenId(instanceId));
-  return { result: { parked: liveTokens > 0, advanced, completed, incident, compensate }, collector };
-}
-
-/** A resolved multi-wait outcome: the winning token's delivered event, or a timeout. */
-export interface RaceOutcome {
-  tokenId?: string;
-  event?: MessageEventPayload;
-  timedOut: boolean;
-}
-
-/**
- * Workflow-mode multi-wait (design §5.2): one `Promise.race` over a
- * `step.waitForEvent` per collected wait, EACH individually try/caught to a
- * timeout so one branch's timeout never rejects the race or strands siblings. The
- * winner is advisory — the engine re-walks and reconciles against canonical D1.
- * NOT exercised in CI (direct mode never collects); recorded for the L6.6 matrix.
- */
-export async function raceParkedWaits(collector: WaitCollector, waitFor: WaitForEvent): Promise<RaceOutcome> {
-  const entries = [...collector.waits.values()];
-  if (entries.length === 0) return { timedOut: true };
-  const races = entries.map((w) =>
-    (async (): Promise<RaceOutcome> => {
-      try {
-        const outcome = await waitFor({ name: w.name, workflowEventType: w.workflowEventType, timeout: w.timeout });
-        if (outcome.kind === "event") return { tokenId: w.tokenId, event: outcome.payload as MessageEventPayload, timedOut: false };
-        return { tokenId: w.tokenId, timedOut: true };
-      } catch {
-        return { tokenId: w.tokenId, timedOut: true };
-      }
-    })(),
-  );
-  return Promise.race(races);
-}
-
-/**
- * The delivered event the next re-walk applies — at the token whose subscription
- * matches its `workflowEventType` + correlationKey (design §5.2), never
- * positionally. (L3: the engine applies a `pending` event at the matching receive
- * leaf; full origin-branch keying is exercised by the L6.6 manual matrix.)
- */
-export function matchKeyedEvent(outcome: RaceOutcome): MessageEventPayload | undefined {
-  return outcome.timedOut ? undefined : outcome.event;
+  return { parked: liveTokens > 0, advanced, completed, incident, compensate };
 }

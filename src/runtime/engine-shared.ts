@@ -11,11 +11,11 @@ import type { ExecutionGraph } from "../bpmn/graph";
 import { getInstanceRow, type InstanceRow } from "../persistence/instances";
 
 export type RunStep = <T>(name: string, fn: () => Promise<T>) => Promise<T>;
-// `parked` is the M4-L3 multi-wait sentinel: in a region graph in WORKFLOW mode the
-// frontier driver hands each leaf a COLLECTING waitFor that registers the wait in
-// the drive's WaitCollector and returns `parked` instead of suspending — the driver
-// returns 'waiting' and the post-DFS `raceParkedWaits` issues one Promise.race over
-// every collected wait (design §5.2). Direct mode (waitFor=null) never sees it.
+// `parked` is a VESTIGIAL WaitOutcome member: it was the M4-L3 multi-wait sentinel
+// returned by the collecting waitFor, but TASK-54 collapsed onto a single bpmn_wake
+// (the leaf drivers PARK and never suspend), so the multi-wait race machinery
+// (WaitCollector / collectingWaitFor / raceParkedWaits) was removed. No code path
+// now produces `parked`; the member is left in the union as a harmless no-op.
 export type WaitOutcome = { kind: "event"; payload: unknown } | { kind: "timeout" } | { kind: "parked" };
 export type WaitForEvent = (sub: {
   name: string;

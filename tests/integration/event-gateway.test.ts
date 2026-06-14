@@ -136,11 +136,12 @@ describe("eventBasedGateway — message wins (M3-L4 §7 gate 5)", () => {
     expect(t.status).toBe("armed");
     expect(t.gateway_id).toBe("EBG");
     expect(await historyTypes(id)).toContain("eventBasedGatewayWaiting");
-    // §4.5 storage: the branch subscription stores the per-VISIT GATEWAY wake type
-    // (not the per-message type), so one waitForEvent is woken by any branch — this
-    // is the value the workflow-mode delivery path honors.
+    // Single-wake storage (TASK-54): the per-visit gateway wake type was removed —
+    // every branch subscription stores the constant WAKE_TYPE in `workflow_event_type`
+    // (kept NOT NULL as a vestige). One contentless bpmn_wake tickles the instance and
+    // the re-walk reconciles whichever branch resolved from canonical D1.
     const subType = await env.DB.prepare(`SELECT workflow_event_type FROM message_subscriptions WHERE instance_id = ? AND element_id = 'onApprove'`).bind(id).first<{ workflow_event_type: string }>();
-    expect(subType?.workflow_event_type).toBe("bpmn_ebg_EBG_0");
+    expect(subType?.workflow_event_type).toBe("bpmn_wake");
 
     // The message wins: payload merged atomically with the transition to its branch.
     const pub = await publishMessage({ messageName: "EbgApprove", correlationKey: "ebg-msg", messageId: "ebg-msg-1", payload: { approver: "ada" } });

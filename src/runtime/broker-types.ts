@@ -44,12 +44,11 @@ export type BrokerPublishResult =
       workflowInstanceId: string;
       elementId: string;
       subscriptionId: string;
-      // The STORED Workflow wake type of the matched subscription (M3-L4, TASK-46,
-      // design §4.5): the delivery path sends `sendEvent` on THIS type rather than
-      // re-deriving it from the message name. For a receiveTask / standalone catch
-      // it equals workflowEventTypeFor(messageName) (byte-identical, no change); for
-      // an eventBasedGateway branch it is the per-visit gateway type so ONE
-      // waitForEvent is woken by whichever branch resolves.
+      // The STORED Workflow wake type of the matched subscription. VESTIGE under
+      // single-wake (TASK-54): every subscription stores the constant WAKE_TYPE, so
+      // this is no longer a per-message / per-gateway type. The delivery path tickles
+      // the instance on WAKE_TYPE and the engine re-walks + reconciles from D1; this
+      // field is carried only because the column is kept NOT NULL (no migration).
       workflowEventType: string;
       event: MessageEventPayload;
     }

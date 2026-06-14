@@ -24,7 +24,6 @@
 import type { Env } from "../env";
 import type { ExecutionGraph, GraphNode, TimerTriggerSpec } from "../bpmn/graph";
 import { ONE_HOUR_MS, isTerminalInstanceStatus, isoIsBefore, nowIso } from "../util";
-import { workflowJobEventTypeFor } from "../bpmn/profile";
 import { dbBatch } from "../persistence/db";
 import { historyStmt } from "../persistence/history";
 import {
@@ -38,6 +37,7 @@ import {
 } from "../persistence/instances";
 import { abandonJobOnTimerFireStmt } from "../persistence/jobs";
 import { brokerKeyOf } from "./broker-types";
+import { WAKE_TYPE } from "./wake";
 import { computeFireAt } from "./iso8601";
 import {
   flipTimerCancelledStmt,
@@ -381,7 +381,7 @@ export async function planBoundaryTimerFire(
     return {
       kind: "fire",
       next,
-      wake: { instanceId, workflowEventType: workflowJobEventTypeFor(job.job_id), timerId: timer.timerId },
+      wake: { instanceId, workflowEventType: WAKE_TYPE, timerId: timer.timerId },
       stmts: [
         insertTimerOutcomeStmt(env.DB, { timerId: timer.timerId, outcome: "fired", now }), // THE CLAIM
         flipTimerFiredStmt(env.DB, { timerId: timer.timerId, firedAt: now, now }),

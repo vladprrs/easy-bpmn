@@ -496,3 +496,215 @@ export const PARALLEL_LOOP_CROSS_BPMN = PARALLEL_BPMN.replace(
   '<bpmn:sequenceFlow id="s2" sourceRef="C" targetRef="E"/>',
   '<bpmn:sequenceFlow id="s2" sourceRef="C" targetRef="E"/>\n    <bpmn:sequenceFlow id="cross" sourceRef="C" targetRef="B"/>',
 );
+
+// =============================================================================
+// REJECT fixtures (Phase-1 Task 4.1). Each violates EXACTLY ONE profile/SESE
+// rule and MUST be rejected at publish with the offending element id. Validator
+// citations are src/bpmn/validator.ts (vN) and src/bpmn/regions.ts (rN). These
+// pair with tests/matrix/reject.test.ts; the four REUSED rejects
+// (R-JOIN-MISMATCH, R-SAMEMSG, R-INSTANTIATE from tests/helpers.ts; R-LOOP-CROSS
+// = PARALLEL_LOOP_CROSS_BPMN above) are imported there, not re-authored here.
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// R_BOUNDARY_ON_GW_BPMN — a boundaryEvent attached to a gateway. The validator's
+// explicit "Boundary events cannot be attached to gateways" message
+// (validator.ts:1016-1024) keys on exclusiveGateway, so the gateway here is a
+// 1-in/1-out exclusiveGateway pass-through (valid on its own — see
+// PASSTHROUGH_GATEWAY_BPMN) carrying an error boundary. (A parallelGateway host
+// instead trips the per-kind "boundary timer/error must attach to a service
+// task" rule, validator.ts:1102/1186 — same boundary∧gateway reason class, but
+// not the cited line; exclusiveGateway isolates the cited rule exactly.)
+// ---------------------------------------------------------------------------
+export const R_BOUNDARY_ON_GW_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions ${NS} id="D_bgw" targetNamespace="x">
+  <bpmn:process id="P_bgw" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:exclusiveGateway id="GW"/>
+    <bpmn:boundaryEvent id="bad_b" attachedToRef="GW"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:endEvent id="E"/>
+    <bpmn:endEvent id="E2"/>
+    ${flow("s0", "S", "GW")}
+    ${flow("ge", "GW", "E")}
+    ${flow("be", "bad_b", "E2")}
+  </bpmn:process>
+</bpmn:definitions>`;
+
+// ---------------------------------------------------------------------------
+// R_MERGE_UNCONTROLLED_BPMN — a 3-branch AND where two branches (A, B) merge at a
+// serviceTask M (2 incoming) while the third (C) bypasses M to the join, so M is
+// a region member (NOT the post-dominator) and rule 6 fires on it — an
+// uncontrolled merge: a non-gateway with >1 incoming inside a region
+// (regions.ts:188-200). A simple 2-branch all-merge at M would instead make M the
+// post-dominator and reject as "no matching join" (rule 3), so the bypass branch
+// is essential to isolate rule 6's "executed twice" reason.
+// ---------------------------------------------------------------------------
+export const R_MERGE_UNCONTROLLED_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions ${NS} id="D_unc" targetNamespace="x">
+  <bpmn:process id="P_unc" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:parallelGateway id="fork"/>
+    ${svc("A", "unc-a")}
+    ${svc("B", "unc-b")}
+    ${svc("C", "unc-c")}
+    ${svc("M", "unc-merge")}
+    <bpmn:parallelGateway id="join"/>
+    ${svc("post", "unc-post")}
+    <bpmn:endEvent id="E"/>
+    ${flow("s0", "S", "fork")}
+    ${flow("f1", "fork", "A")}
+    ${flow("f2", "fork", "B")}
+    ${flow("f3", "fork", "C")}
+    ${flow("am", "A", "M")}
+    ${flow("bm", "B", "M")}
+    ${flow("cj", "C", "join")}
+    ${flow("mj", "M", "join")}
+    ${flow("s1", "join", "post")}
+    ${flow("s2", "post", "E")}
+  </bpmn:process>
+</bpmn:definitions>`;
+
+// ---------------------------------------------------------------------------
+// R_JOIN_NOFORK_BPMN — a parallelGateway used as a JOIN (2 incoming, 1 outgoing)
+// fed by two branches of an exclusiveGateway split. An XOR split is NOT a
+// parallel/inclusive split, so no region matches this join: the "other half"
+// bijection check flags it as an unmatched multi-incoming parallel/inclusive
+// gateway (regions.ts:224-227). The XOR split carries one FEEL condition + a
+// default so it is itself valid and the only fault is the dangling join.
+// ---------------------------------------------------------------------------
+export const R_JOIN_NOFORK_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions ${NS_COND} id="D_nofork" targetNamespace="x">
+  <bpmn:process id="P_nofork" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:exclusiveGateway id="Xs" default="fb"/>
+    ${svc("A", "nf-a")}
+    ${svc("B", "nf-b")}
+    <bpmn:parallelGateway id="join"/>
+    <bpmn:endEvent id="E"/>
+    ${flow("s0", "S", "Xs")}
+    ${cond("fa", "Xs", "A", "go = true")}
+    ${flow("fb", "Xs", "B")}
+    ${flow("ja", "A", "join")}
+    ${flow("jb", "B", "join")}
+    ${flow("s1", "join", "E")}
+  </bpmn:process>
+</bpmn:definitions>`;
+
+// ---------------------------------------------------------------------------
+// R_MERGE_NONLAMINAR_BPMN — an improperly-nested pair of AND splits that share a
+// single join J: outer fork F1 → {F2, B}, inner fork F2 → {A, C}, all of A/B/C →
+// J. F1 matches J (J post-dominates F1 and is dominated by F1), but F2's ipdom is
+// ALSO J, which F2 does not dominate, so F2 trips the single-entry guard
+// ("region nesting must be properly balanced", regions.ts:163-165). NOTE: a TRUE
+// partial overlap (neither region nesting in the other) is unreachable — two
+// canonically-SESE dom/post-dom regions are always laminar, so the dedicated
+// laminar pairwise check (regions.ts:230-244) cannot fire for two regions that
+// both FORM; the interleaving is caught one step earlier as a single-entry
+// violation. See reject.test.ts / the task report.
+// ---------------------------------------------------------------------------
+export const R_MERGE_NONLAMINAR_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions ${NS} id="D_nonlam" targetNamespace="x">
+  <bpmn:process id="P_nonlam" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:parallelGateway id="F1"/>
+    <bpmn:parallelGateway id="F2"/>
+    ${svc("A", "nl-a")}
+    ${svc("B", "nl-b")}
+    ${svc("C", "nl-c")}
+    <bpmn:parallelGateway id="J"/>
+    <bpmn:endEvent id="E"/>
+    ${flow("s0", "S", "F1")}
+    ${flow("f1f2", "F1", "F2")}
+    ${flow("f1b", "F1", "B")}
+    ${flow("f2a", "F2", "A")}
+    ${flow("f2c", "F2", "C")}
+    ${flow("aj", "A", "J")}
+    ${flow("cj", "C", "J")}
+    ${flow("bj", "B", "J")}
+    ${flow("je", "J", "E")}
+  </bpmn:process>
+</bpmn:definitions>`;
+
+// ---------------------------------------------------------------------------
+// R_NONINT_TIMER_BPMN — a serviceTask with a NON-interrupting boundary timer
+// (cancelActivity="false"). Only interrupting boundary timers are supported; a
+// non-interrupting one needs a second token (validator.ts:493-499). The timer is
+// otherwise well-formed (static PT30S, one outgoing) so the cancelActivity bit is
+// the only fault. (timerBoundary() hardcodes cancelActivity="true", so the
+// boundary is written inline here.)
+// ---------------------------------------------------------------------------
+export const R_NONINT_TIMER_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions ${NS} id="D_nonint" targetNamespace="x">
+  <bpmn:process id="P_nonint" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    ${svc("svcA", "ni-a")}
+    <bpmn:boundaryEvent id="bt" cancelActivity="false" attachedToRef="svcA"><bpmn:timerEventDefinition><bpmn:timeDuration>PT30S</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+    ${svc("alt", "ni-alt")}
+    <bpmn:endEvent id="E"/>
+    ${flow("s0", "S", "svcA")}
+    ${flow("ae", "svcA", "E")}
+    ${flow("bt_alt", "bt", "alt")}
+    ${flow("alt_e", "alt", "E")}
+  </bpmn:process>
+</bpmn:definitions>`;
+
+// ---------------------------------------------------------------------------
+// R_COND_OFF_XOR_BPMN — a balanced AND region whose fork carries a
+// conditionExpression on one out-flow (f1). Conditions are only legal on
+// outgoing flows of an exclusive/inclusive gateway; a condition leaving a
+// parallelGateway is rejected on element presence (validator.ts:777-784). The
+// region is otherwise balanced, so the conditional fork flow is the only fault.
+// ---------------------------------------------------------------------------
+export const R_COND_OFF_XOR_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions ${NS_COND} id="D_condx" targetNamespace="x">
+  <bpmn:process id="P_condx" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:parallelGateway id="fork"/>
+    ${svc("A", "cx-a")}
+    ${svc("B", "cx-b")}
+    <bpmn:parallelGateway id="join"/>
+    <bpmn:endEvent id="E"/>
+    ${flow("s0", "S", "fork")}
+    ${cond("f1", "fork", "A", "go = true")}
+    ${flow("f2", "fork", "B")}
+    ${flow("ja", "A", "join")}
+    ${flow("jb", "B", "join")}
+    ${flow("s1", "join", "E")}
+  </bpmn:process>
+</bpmn:definitions>`;
+
+// ---------------------------------------------------------------------------
+// R_BRANCH_ESCAPE_BPMN — a member of an AND region edges OUT of the region
+// without passing through the join (branch confinement, regions.ts:204-211).
+// Branch B ends at an exclusiveGateway Xb that routes either to the join (normal)
+// or BACK to the pre-fork task P (default) — that back-edge target P is not a
+// region member, so Xb's escaping edge trips rule 5. (A serviceTask's own edge
+// could not escape without becoming a >1-outgoing "implicit split"; routing to a
+// post-join node would instead change the post-dominator and reject as "no
+// matching join". The pre-fork back-edge keeps the join match intact and isolates
+// the confinement reason; P's resulting 2 incoming flows are legal off-region.)
+// ---------------------------------------------------------------------------
+export const R_BRANCH_ESCAPE_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions ${NS_COND} id="D_escape" targetNamespace="x">
+  <bpmn:process id="P_escape" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    ${svc("P", "esc-p")}
+    <bpmn:parallelGateway id="fork"/>
+    ${svc("A", "esc-a")}
+    ${svc("B", "esc-b")}
+    <bpmn:exclusiveGateway id="Xb" default="xb_back"/>
+    <bpmn:parallelGateway id="join"/>
+    ${svc("post", "esc-post")}
+    <bpmn:endEvent id="E"/>
+    ${flow("s0", "S", "P")}
+    ${flow("p1", "P", "fork")}
+    ${flow("f1", "fork", "A")}
+    ${flow("f2", "fork", "B")}
+    ${flow("ja", "A", "join")}
+    ${flow("bxb", "B", "Xb")}
+    ${cond("xb_j", "Xb", "join", "done = true")}
+    ${flow("xb_back", "Xb", "P")}
+    ${flow("s1", "join", "post")}
+    ${flow("s2", "post", "E")}
+  </bpmn:process>
+</bpmn:definitions>`;

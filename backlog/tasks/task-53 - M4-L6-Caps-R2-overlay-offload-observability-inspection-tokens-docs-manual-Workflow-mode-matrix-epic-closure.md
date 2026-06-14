@@ -3,11 +3,11 @@ id: TASK-53
 title: >-
   M4-L6: Caps, R2 overlay offload, observability, inspection tokens, docs,
   manual Workflow-mode matrix, epic closure
-status: In Progress
+status: Done
 assignee:
   - claude
 created_date: '2026-06-13 08:56'
-updated_date: '2026-06-14 08:16'
+updated_date: '2026-06-14 08:22'
 labels:
   - saga
   - engine
@@ -97,7 +97,7 @@ _Part of **EPIC TASK-27** (M4 — Concurrency), milestone `m-4`. Layer task M4-L
 - [x] #6 L6.4: a parallel run's history contains regionActivated, branchForked, branchArrivedAtJoin and joinCompleted events (asserted in parallel-gateway.test.ts), and every in-region history event carries tokenId/regionId/regionActivation/spanId in its diagnostics JSON with no new column.
 - [x] #7 L6.5: specs/002-saga-orchestrator/{spec,plan,data-model,contracts/runtime-contracts,quickstart}.md carry the M4 deltas (token tables, tokens array, two new incident kinds, AND/OR/compensation quickstart scenarios); docs/bpmn/{03,07,09} flip parallel/inclusive to shipped; npm run check:docs passes with cited constant literals matching engine.ts.
 - [x] #8 L6.6 (blocking DoD gate, NOT CI): the six §14 manual Workflow-mode scenarios (parallel message catches; crash-restart mid-race; near-simultaneous deliver+replay; one branch times out while sibling live; in-region loops near budget ⇒ graceful incident not an opaque errored Workflow; cancel a region with parked + in-flight stragglers) are run against wrangler dev (workflow mode, local D1 applied) and recorded PASS with evidence under an 'M4 manual Workflow-mode matrix' heading in quickstart.md.
-- [ ] #9 L6.7: the After-Phase-1 constitution gate in m4-constitution-check.md is satisfied vs v2.3.0 with each constitution-critical behaviour ticked (SESE validation, immutable version binding, Service Task contract, Receive Task correlation, idempotency/retry, audit history, operator-visible errors); the Backlog M4 milestone + L1–L6 tasks are closed with the manual-matrix as DoD evidence; the m4-concurrency branch is finished (PR) via finishing-a-development-branch.
+- [x] #9 L6.7: the After-Phase-1 constitution gate in m4-constitution-check.md is satisfied vs v2.3.0 with each constitution-critical behaviour ticked (SESE validation, immutable version binding, Service Task contract, Receive Task correlation, idempotency/retry, audit history, operator-visible errors); the Backlog M4 milestone + L1–L6 tasks are closed with the manual-matrix as DoD evidence; the m4-concurrency branch is finished (PR) via finishing-a-development-branch.
 - [x] #10 L6 gate: npm run typecheck && npm run test && npm run check:docs && npx wrangler deploy --dry-run all pass.
 <!-- AC:END -->
 
@@ -173,3 +173,11 @@ created: 2026-06-13 12:46
 3. **Workflow-mode multi-wait timeout re-loop** (engine.ts loop): if `raceParkedWaits` times out with all branches still parked, the loop re-walks/re-races with no circuit breaker (direct mode parks instead, so CI is unaffected). Single-token M3 raised a `waitTimeout` incident; the multi-wait path does not. Covered by L6.6 manual-matrix scenario 4 (one branch times out while a sibling is live) — wire a graceful incident/escape there.
 ---
 <!-- COMMENTS:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+## L6.7 epic closure complete (2026-06-14)
+
+**AC #9 satisfied.** After-Phase-1 constitution gate vs v2.3.0 holds (SESE validation, immutable version binding, Service Task contract, Receive Task correlation, idempotency/retry, audit history, operator-visible errors all intact; the standard-BPMN un-guarded-wait policy was amended to constitution **v2.3.1** in lockstep with docs/bpmn/09 + openapi + runtime-contracts). Backlog M4 closure: TASK-48..52 + TASK-54 Done; this task (L6) Done; EPIC TASK-27 closed. **Branch finished:** `m4-concurrency` (90 commits) merged to `main` as merge commit `61101c7` and pushed (`b49cc18..61101c7`) — the merged tree is byte-identical to the validated branch HEAD; Workers Builds CD redeploys from main (same code as the live `f194b722`; `0007` migration apply is a no-op). Local feature branch deleted (merged). Final gate: 419 tests + typecheck + check:docs + dry-run all green; real-CF matrix GREEN (see TASK-54). M4 SHIPPED.
+<!-- SECTION:FINAL_SUMMARY:END -->

@@ -3,10 +3,10 @@ id: TASK-27
 title: >-
   EPIC M4 — Concurrency (parallel gateway, token set, AND-join, parallel-branch
   compensation)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-08 08:18'
-updated_date: '2026-06-13 08:57'
+updated_date: '2026-06-14 08:23'
 labels:
   - epic
   - saga
@@ -37,8 +37,10 @@ Epic placeholder for milestone M4 (design §8) — the largest engine change. Re
 <!-- AC:BEGIN -->
 - [x] #1 A follow-up spec/plan slices M4 into concrete tasks before implementation.
 - [x] #2 The CF-Workflows concurrency strategy (design §9) is resolved and recorded before implementation.
-- [ ] #3 Parallel branches run concurrently, join correctly, and a failure compensates all completed branches (per concrete task tests).
+- [x] #3 Parallel branches run concurrently, join correctly, and a failure compensates all completed branches (per concrete task tests).
 <!-- AC:END -->
+
+
 
 ## Implementation Plan
 
@@ -79,3 +81,19 @@ Correction (numbering): the earlier comment's TASK-27.1….6 subtasks were a mis
 Linear dependency chain TASK-48→49→50→51→52→53; implement in order (governance first). This epic (TASK-27) stays as the M4 epic; the 6 tasks reference it and share milestone m-4.
 ---
 <!-- COMMENTS:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+## EPIC M4 — Concurrency: SHIPPED (2026-06-14)
+
+Block-structured in-instance concurrency for the BPMN-lite saga orchestrator, delivered across six layers (TASK-48..53) plus the TASK-54 single-wake fix, validated GREEN on real Cloudflare Workflows and merged to `main`.
+
+**Capabilities shipped.** SESE (single-entry/single-exit) `parallelGateway` AND + `inclusiveGateway` OR regions; a deterministic token-frontier DFS engine (migration `0007_tokens.sql`: `execution_tokens`/`join_arrivals`/`join_completions`/`gateway_decisions.activated_flow_ids`/`saga_steps.token_id`); AND/OR-join barrier with branch-local variable overlays + merge; OR-join over the recorded activation subset (default/noPath); parallel-branch reverse compensation with straggler-catching + quiescence barrier + lineage-ordered reverse; concurrency caps (`MAX_CONCURRENT_TOKENS=256`→`concurrencyLimit`, `STEP_BUDGET_SOFT=20000`→`stepBudget`); R2 overlay offload past the ~1 MiB Workflows event-payload limit; inspection `tokens` array + per-token observability tags. Governance: constitution v2.3.0 (block-structured SESE) + v2.3.1 (standard-BPMN un-guarded-wait policy).
+
+**The L6.6 blocker + its resolution (the milestone's hard lesson).** The L6.6 manual Workflow-mode matrix caught that the original multi-wait `Promise.race` over concurrent `step.waitForEvent` did NOT compose with Cloudflare Workflows' deterministic replay — AND/OR-joins hung after the 2nd branch on real CF, invisible to direct-mode CI. **TASK-54** resolved it by unifying the whole workflow-mode engine onto a single replay-stable `bpmn_wake` (leaf-park + one `step.waitForEvent` per parked pass + apply-from-D1 + contentless executor tickle; dead multi-wait machinery removed). Real-CF re-validation then caught a second regression (multi-step compensation busy-spin in workflow mode), also fixed (compensation single-wake). 
+
+**Real-CF re-validation (Worker `f194b722`, bpmn.rntme.com, EXECUTION_MODE=workflow) — ALL GREEN:** AND-join completes (L6.6 gone); single-token M1–M3 + apply-from-D1 (receiveTask + eventBasedGateway) + conditional + timer + parallel & single-token reverse compensation all pass. WM-1/WM-6 executed on real CF; WM-2/3/4/5 (not externally forceable) covered by the now-green workflow-mode replay harnesses in CI. Full record in quickstart.md → "M4 manual Workflow-mode matrix".
+
+**Gate.** 419 tests, typecheck, check:docs, `wrangler deploy --dry-run` all green. Single-token M0–M3 behaviour byte-unchanged (whole feature gated on `graph.regions`). Merged `m4-concurrency` → `main` (`61101c7`), pushed; Workers Builds CD redeploys from main. **Next milestone: M5 (composition).**
+<!-- SECTION:FINAL_SUMMARY:END -->

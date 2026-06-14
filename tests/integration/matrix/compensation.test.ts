@@ -237,4 +237,94 @@ describe("matrix: saga compensation under concurrency (direct mode)", () => {
     expect((await compCompletedElements(id)).filter((e) => e === "branchB")).toHaveLength(1);
     expect(await liveTokens(id)).toHaveLength(0);
   });
+
+  // -------------------------------------------------------------------------
+  it("[C-COMP-FAILED-INFLIGHT-01] compensationFailed declared while a sibling forward job is still live; terminator/late-complete are guarded no-ops; /retry straggler-ledgers + compensates it", async () => {
+    const token = await mintWorkerToken();
+    const { instance } = await publishAndStart(PARALLEL_SAGA_BPMN, {
+      correlationKey: "cfi1",
+      variables: {},
+    });
+    expect(instance.status).toBe(201);
+    const id = instance.body.instanceId;
+
+    // Both branches in-flight (leased, nothing completed) → operator cancel leaves the
+    // cohort live with the compensation scope resolvable. branch-a (retries=2) is the
+    // still-in-flight sibling we re-lease later as a straggler; branch-b is completed
+    // late (post-cancel straggler) so its compensator (comp-b) can be exhausted.
+    const aLease = await leaseOne(token, "branch-a"); // locked, the live sibling
+    const bLease = await leaseOne(token, "branch-b");
+    const aJobId = aLease.jobId;
+
+    const cancelled = await post(`/instances/${id}/cancel`, {});
+    expect(cancelled.status).toBe(200);
+    expect(cancelled.body.status).toBe("compensating");
+
+    // Late-complete branch-b → straggler-ledgered → comp-b created. branch-a stays
+    // locked + live (the live sibling branchA token does NOT block branchB's lineage).
+    const bAck = await complete(token, bLease, { didWork: true });
+    expect(bAck.body.outcome).toBe("completed");
+    expect(await compJobCount(id, "branchB")).toBe(1);
+
+    // Exhaust comp-b's 3 retries → compensationFailed declared THE INSTANT comp-b fails,
+    // while branchA is still locked + live (the barrier does NOT wait for branchA).
+    await exhaustCompensator(token, id, "comp-b", 3);
+    expect(await statusOf(id)).toBe("compensationFailed");
+    const inc = (await get(`/instances/${id}`)).body.incident;
+    expect(inc.kind).toBe("compensationFailure");
+    expect(inc.elementId).toBe("branchB");
+    expect(inc.resolution).toBe("open");
+    // branchA is still in-flight + live; it owes no ledger row yet (never completed).
+    expect((await jobRow(aJobId))!.status).toBe("locked");
+    expect((await liveTokens(id)).length).toBeGreaterThanOrEqual(1);
+    expect(await stepOf(id, "branchA")).toBeUndefined();
+
+    // branchA's lease-expiry terminator firing on the now-compensationFailed instance
+    // is a GUARDED no-op (terminateUnleasableJob only acts when status==='compensating').
+    // Force the lease overdue, fire the JobScheduler alarm armed at cancel time.
+    await env.DB.prepare(`UPDATE service_task_jobs SET lock_expires_at = '2000-01-01T00:00:00Z' WHERE job_id = ?`)
+      .bind(aJobId)
+      .run();
+    const ran = await runDurableObjectAlarm(env.JOB_SCHEDULER.get(env.JOB_SCHEDULER.idFromName(aJobId)));
+    expect(ran).toBe(true); // an alarm WAS armed for the cohort job at cancel
+    expect((await jobRow(aJobId))!.status).toBe("locked"); // guarded: NOT failed
+    expect(await statusOf(id)).toBe("compensationFailed");
+
+    // A late branchA completion is NOT advanced past the terminal: the complete handler
+    // no-ops on a terminal instance (disposition 'ignored'); branchA stays locked.
+    const lateAck = await complete(token, aLease, { didWork: true });
+    expect(lateAck.status).toBe(200);
+    expect(lateAck.body.disposition).toBe("ignored");
+    expect(await statusOf(id)).toBe("compensationFailed");
+    expect((await jobRow(aJobId))!.status).toBe("locked");
+
+    // Fix comp-b + /retry → resumes compensating; the barrier re-scans.
+    const retry = await post(`/instances/${id}/retry`, {});
+    expect(retry.status).toBe(200);
+    expect(retry.body.status).toBe("compensating");
+
+    // The genuine straggler: branchA's lease lapsed (rewound above), so a reclaim
+    // re-hands it (attempt 2 of 2 — within budget) with a FRESH token; completing it
+    // under `compensating` straggler-ledgers branchA + consumes its token. (The
+    // original lease's lock token was poisoned by the late-complete idempotency,
+    // mirroring at-least-once redelivery.)
+    await authedPost("/jobs/activate", token, { taskType: "branch-a", workerId: "reclaim" }); // reclaim → backoff park
+    await rewindBackoff(id, "branch-a");
+    const aStraggler = await leaseOne(token, "branch-a");
+    expect(aStraggler.jobId).toBe(aJobId); // same forward job, re-leased
+    await complete(token, aStraggler, { didWork: true });
+
+    // Drain the reverse pass: branchA (straggler-ledgered) + branchB (reset) compensate.
+    const terminal = await driveComps(token, id, ["comp-a", "comp-b"]);
+    expect(terminal).toBe("compensated");
+
+    const aStep = await stepOf(id, "branchA");
+    expect(aStep).toBeDefined(); // straggler-ledgered
+    expect(aStep!.compensationStatus).toBe("compensated");
+    expect((await stepOf(id, "branchB"))!.compensationStatus).toBe("compensated");
+    // No double-apply: exactly one comp job per branch.
+    expect(await compJobCount(id, "branchA")).toBe(1);
+    expect(await compJobCount(id, "branchB")).toBe(1);
+    expect(await liveTokens(id)).toHaveLength(0);
+  });
 });

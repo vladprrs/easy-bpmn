@@ -136,6 +136,20 @@ body {
   fill: currentColor;
   stroke: none;
 }
+/* Expanded subprocess / transaction = a light translucent region the children sit on. */
+.ebpmn-region {
+  fill: rgba(248, 251, 253, 0.66);
+  stroke: var(--cat-task-border);
+  stroke-width: 1px;
+  stroke-opacity: 0.45;
+}
+.ebpmn-region-inner {
+  fill: none;
+  stroke: var(--cat-task-border);
+  stroke-width: 1px;
+  stroke-opacity: 0.4;
+}
+
 /* Icon chip on activities — a VIVID filled category colour with a white glyph. */
 .ebpmn-chip-bg {
   fill: var(--accent);

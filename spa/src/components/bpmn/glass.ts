@@ -8,13 +8,13 @@ import { append as svgAppend, create as svgCreate, innerSVG } from "tiny-svg";
 const DEFS_ID = "ebpmn-glass-defs";
 
 const DEFS_MARKUP = `
-  <linearGradient id="ebpmn-frost" x1="0" y1="0" x2="0.18" y2="1">
-    <stop offset="0" stop-color="#ffffff" stop-opacity="0.74"/>
-    <stop offset="1" stop-color="#ffffff" stop-opacity="0.32"/>
+  <linearGradient id="ebpmn-frost" x1="0" y1="0" x2="0.12" y2="1">
+    <stop offset="0" stop-color="#ffffff" stop-opacity="0.99"/>
+    <stop offset="1" stop-color="#f4f8fb" stop-opacity="0.95"/>
   </linearGradient>
-  <linearGradient id="ebpmn-sheen" x1="0" y1="0" x2="0.18" y2="1">
-    <stop offset="0" stop-color="#ffffff" stop-opacity="1"/>
-    <stop offset="0.45" stop-color="#ffffff" stop-opacity="0.22"/>
+  <linearGradient id="ebpmn-sheen" x1="0" y1="0" x2="0.1" y2="1">
+    <stop offset="0" stop-color="#ffffff" stop-opacity="0.9"/>
+    <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.3"/>
     <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
   </linearGradient>
   <filter id="ebpmn-elev" x="-60%" y="-60%" width="220%" height="220%" color-interpolation-filters="sRGB">
@@ -25,8 +25,8 @@ const DEFS_MARKUP = `
     <feDisplacementMap in="SourceGraphic" in2="noise" scale="7" xChannelSelector="R" yChannelSelector="G"/>
   </filter>
   <radialGradient id="ebpmn-disc-frost" cx="0.36" cy="0.26" r="0.92">
-    <stop offset="0" stop-color="#ffffff" stop-opacity="0.92"/>
-    <stop offset="1" stop-color="#ffffff" stop-opacity="0.4"/>
+    <stop offset="0" stop-color="#ffffff" stop-opacity="0.99"/>
+    <stop offset="1" stop-color="#eef4f8" stop-opacity="0.96"/>
   </radialGradient>
   <marker id="ebpmn-arrow" viewBox="0 0 12 12" refX="9.5" refY="6" markerWidth="11" markerHeight="11" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
     <path d="M3.2 2.6 L9.4 6 L3.2 9.4" fill="none" stroke="context-stroke" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>

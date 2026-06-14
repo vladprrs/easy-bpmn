@@ -40,8 +40,10 @@ export default class GlassRenderer extends BaseRenderer {
     if (isInterrupting(element) === false) svgClasses(g).add("ebpmn-noninterrupt");
 
     if (cat === "gateway") this.drawGateway(g, element);
-    else if (cat === "task") this.drawActivity(g, element);
-    else this.drawEvent(g, element, cat);
+    else if (cat === "task") {
+      if (isExpandedContainer(element)) this.drawExpanded(g, element);
+      else this.drawActivity(g, element);
+    } else this.drawEvent(g, element, cat);
 
     svgAppend(parent, g);
     return g;
@@ -64,33 +66,36 @@ export default class GlassRenderer extends BaseRenderer {
     svgAppend(g, el("rect", { x: 0, y: 0, width: w, height: h, rx: R, fill: "url(#ebpmn-frost)", filter: "url(#ebpmn-elev)" }, "ebpmn-shape"));
     const inner = el("g", { "clip-path": `url(#${clipId})` });
     svgAppend(inner, el("rect", { x: 0, y: 0, width: w, height: h, rx: R }, "ebpmn-tint"));
-    svgAppend(inner, el("rect", { x: -3, y: -3, width: w + 6, height: h * 0.7, rx: R, fill: "url(#ebpmn-sheen)", filter: "url(#ebpmn-liquid)" }, "ebpmn-sheen"));
+    svgAppend(inner, el("rect", { x: -3, y: -3, width: w + 6, height: h * 0.5, rx: R, fill: "url(#ebpmn-sheen)" }, "ebpmn-sheen"));
     svgAppend(g, inner);
     // Glass rim (bright inner edge) + the thin state stroke — no heavy border.
     svgAppend(g, el("rect", { x: 1, y: 1, width: w - 2, height: h - 2, rx: R - 1, fill: "none" }, "ebpmn-rim"));
     svgAppend(g, el("rect", { x: 0.6, y: 0.6, width: w - 1.2, height: h - 1.2, rx: R - 0.6, fill: "none" }, "ebpmn-stroke"));
 
-    // Left icon chip (vivid filled category colour, white glyph) — the colour anchor.
+    // Small vivid category chip in the TOP-LEFT corner — a colour accent, not a
+    // column. Keeps the full tile width for the label (standard 100px authored tasks
+    // would otherwise leave ~24px → catastrophic per-character wrapping).
     const ic = iconFor(element);
-    let labelX = 14;
     if (ic) {
-      const cs = Math.min(h - 20, 40);
-      const chip = el("g", { transform: `translate(13 ${(h - cs) / 2})` }, "ebpmn-chip");
-      svgAppend(chip, el("rect", { x: 0, y: 0, width: cs, height: cs, rx: 11 }, "ebpmn-chip-bg"));
-      svgAppend(chip, iconSvg(ic.key, ic.filled, cs * 0.22, cs * 0.22, cs * 0.56));
+      const cs = 22;
+      const chip = el("g", { transform: "translate(11 11)" }, "ebpmn-chip");
+      svgAppend(chip, el("rect", { x: 0, y: 0, width: cs, height: cs, rx: 7 }, "ebpmn-chip-bg"));
+      svgAppend(chip, iconSvg(ic.key, ic.filled, cs * 0.24, cs * 0.24, cs * 0.52));
       svgAppend(g, chip);
-      labelX = 13 + cs + 11;
     }
 
+    // Label: centered across the full tile, sitting below the corner chip's strip so
+    // it never collides with it. Whole words wrap; never per-character.
     const name = getBusinessObject(element)?.name;
     if (name) {
+      const top = ic ? 30 : 8;
       const text = this.textRenderer.createText(name, {
-        box: { width: w - labelX - 12, height: h },
-        align: "left-middle",
-        padding: 1,
-        style: { fontFamily: FONT, fontSize: 13, fontWeight: 600, fill: INK, lineHeight: 1.18 },
+        box: { width: w - 16, height: Math.max(16, h - top - 6) },
+        align: "center-middle",
+        padding: 0,
+        style: { fontFamily: FONT, fontSize: 12, fontWeight: 600, fill: INK, lineHeight: 1.16 },
       });
-      svgAttr(text, { transform: `translate(${labelX} 0)` });
+      svgAttr(text, { transform: `translate(8 ${top})` });
       svgClasses(text).add("ebpmn-label");
       svgAppend(g, text);
     }
@@ -100,6 +105,41 @@ export default class GlassRenderer extends BaseRenderer {
       svgAppend(mk, el("rect", { x: 0, y: 0, width: 15, height: 13, rx: 3, fill: "none" }, "ebpmn-marker-box"));
       svgAppend(mk, el("path", { d: "M7.5 3v7M4 6.5h7" }, "ebpmn-glyph"));
       svgAppend(g, mk);
+    }
+  }
+
+  // ---- Expanded subprocess / transaction (a region, not a tile) -----------
+  private drawExpanded(g: SVGElement, element: any) {
+    const { width: w, height: h } = element;
+    const R = TASK_RADIUS + 3;
+    // A light translucent region so the nested children read on top of it.
+    svgAppend(g, el("rect", { x: 0, y: 0, width: w, height: h, rx: R, filter: "url(#ebpmn-elev)" }, "ebpmn-region"));
+    svgAppend(g, el("rect", { x: 0.6, y: 0.6, width: w - 1.2, height: h - 1.2, rx: R - 0.6, fill: "none" }, "ebpmn-stroke"));
+    if (is(element, "bpmn:Transaction")) {
+      svgAppend(g, el("rect", { x: 3.5, y: 3.5, width: w - 7, height: h - 7, rx: R - 3, fill: "none" }, "ebpmn-region-inner"));
+    }
+    // Header: a small chip + the name, top-left (never centred — children live there).
+    const ic = iconFor(element);
+    let hx = 12;
+    if (ic) {
+      const cs = 20;
+      const chip = el("g", { transform: "translate(12 10)" }, "ebpmn-chip");
+      svgAppend(chip, el("rect", { x: 0, y: 0, width: cs, height: cs, rx: 6 }, "ebpmn-chip-bg"));
+      svgAppend(chip, iconSvg(ic.key, ic.filled, cs * 0.24, cs * 0.24, cs * 0.52));
+      svgAppend(g, chip);
+      hx = 12 + cs + 8;
+    }
+    const name = getBusinessObject(element)?.name;
+    if (name) {
+      const text = this.textRenderer.createText(name, {
+        box: { width: w - hx - 10, height: 22 },
+        align: "left-middle",
+        padding: 0,
+        style: { fontFamily: FONT, fontSize: 12.5, fontWeight: 600, fill: INK, lineHeight: 1.1 },
+      });
+      svgAttr(text, { transform: `translate(${hx} 10)` });
+      svgClasses(text).add("ebpmn-label");
+      svgAppend(g, text);
     }
   }
 
@@ -115,7 +155,7 @@ export default class GlassRenderer extends BaseRenderer {
     svgAppend(g, el("circle", { cx, cy, r, fill: "url(#ebpmn-disc-frost)", filter: "url(#ebpmn-elev)" }, "ebpmn-shape"));
     const inner = el("g", { "clip-path": `url(#${clipId})` });
     svgAppend(inner, el("circle", { cx, cy, r }, "ebpmn-tint"));
-    svgAppend(inner, el("ellipse", { cx, cy: cy - r * 0.3, rx: r * 0.92, ry: r * 0.6, fill: "url(#ebpmn-sheen)", filter: "url(#ebpmn-liquid)" }, "ebpmn-sheen"));
+    svgAppend(inner, el("ellipse", { cx, cy: cy - r * 0.3, rx: r * 0.92, ry: r * 0.6, fill: "url(#ebpmn-sheen)" }, "ebpmn-sheen"));
     svgAppend(g, inner);
     svgAppend(g, el("circle", { cx, cy, r: r - 1.5, fill: "none" }, "ebpmn-rim"));
     svgAppend(g, el("circle", { cx, cy, r: r - 0.75, fill: "none" }, "ebpmn-stroke"));
@@ -137,7 +177,7 @@ export default class GlassRenderer extends BaseRenderer {
     svgAppend(g, el("path", { d, fill: "url(#ebpmn-frost)", filter: "url(#ebpmn-elev)" }, "ebpmn-shape"));
     const inner = el("g", { "clip-path": `url(#${clipId})` });
     svgAppend(inner, el("path", { d }, "ebpmn-tint"));
-    svgAppend(inner, el("rect", { x: 0, y: -2, width: w, height: h * 0.6, fill: "url(#ebpmn-sheen)", filter: "url(#ebpmn-liquid)" }, "ebpmn-sheen"));
+    svgAppend(inner, el("rect", { x: 0, y: -2, width: w, height: h * 0.6, fill: "url(#ebpmn-sheen)" }, "ebpmn-sheen"));
     svgAppend(g, inner);
     svgAppend(g, el("path", { d, fill: "none" }, "ebpmn-stroke"));
 
@@ -247,6 +287,10 @@ function catOf(element: any): Cat {
   if (isAny(element, ["bpmn:IntermediateCatchEvent", "bpmn:IntermediateThrowEvent"])) return "inter";
   if (is(element, "bpmn:Event")) return "event";
   return "task";
+}
+
+function isExpandedContainer(element: any): boolean {
+  return isAny(element, ["bpmn:SubProcess", "bpmn:Transaction", "bpmn:AdHocSubProcess"]) && element.collapsed === false;
 }
 
 function isInterrupting(element: any): boolean | null {

@@ -52,26 +52,58 @@ function firstProcess(doc: Document): Element | null {
   return list.length ? list[0] : null;
 }
 
+const SUB = new Set(["subProcess", "transaction", "adHocSubProcess"]);
+const PADX = 26; // horizontal padding inside an expanded subprocess
+const HEADER = 36; // top space reserved for the subprocess chip + label
+const PADB = 22; // bottom padding inside an expanded subprocess
+
+interface Scope {
+  boxes: Map<string, Box>;
+  edges: Map<string, Pt[]>;
+  expanded: Set<string>;
+  width: number;
+  height: number;
+}
+
 function dagreLayout(xml: string): string | null {
   const doc = new DOMParser().parseFromString(xml, "application/xml");
   if (doc.getElementsByTagName("parsererror").length) return null;
   const proc = firstProcess(doc);
   if (!proc) return null;
+  const r = layoutScope(proc);
+  if (!r || !r.boxes.size) return null;
+  return emitDi(doc, proc.getAttribute("id") || "process", r.boxes, r.edges, r.expanded);
+}
 
-  // Flow nodes (direct children of the process; collapsed subprocesses count as one).
+/** Lay out one scope (process or expanded subprocess) into LOCAL coordinates with a
+ *  0-origin. Expanded subprocess children are laid out recursively and nested inside
+ *  the parent box, so a DI-less transaction-saga reads as a real region, not a tile
+ *  with edges dangling into empty space. */
+function layoutScope(scopeEl: Element): Scope | null {
   const nodes = new Map<string, { tag: string; w: number; h: number; attachedTo?: string }>();
-  for (const c of Array.from(proc.children)) {
+  const subScopes = new Map<string, Scope>();
+  for (const c of Array.from(scopeEl.children)) {
     const tag = c.localName;
     if (!FLOW.has(tag)) continue;
     const id = c.getAttribute("id");
     if (!id) continue;
+    if (SUB.has(tag)) {
+      const inner = layoutScope(c);
+      if (inner && inner.boxes.size) {
+        subScopes.set(id, inner);
+        nodes.set(id, { tag, w: inner.width + 2 * PADX, h: inner.height + HEADER + PADB });
+        continue;
+      }
+      // an empty / collapsed subprocess falls through to a plain tile
+    }
     const [w, h] = sizeFor(tag);
     nodes.set(id, { tag, w, h, attachedTo: tag === "boundaryEvent" ? c.getAttribute("attachedToRef") || undefined : undefined });
   }
   if (!nodes.size) return null;
 
   const flows: { id: string; s: string; t: string }[] = [];
-  for (const f of Array.from(proc.getElementsByTagNameNS(NS.bpmn, "sequenceFlow"))) {
+  for (const f of Array.from(scopeEl.children)) {
+    if (f.localName !== "sequenceFlow") continue;
     const id = f.getAttribute("id");
     const s = f.getAttribute("sourceRef");
     const t = f.getAttribute("targetRef");
@@ -79,11 +111,10 @@ function dagreLayout(xml: string): string | null {
   }
 
   const g = new dagre.graphlib.Graph({ multigraph: true });
-  g.setGraph({ rankdir: "LR", nodesep: 38, ranksep: 76, marginx: 28, marginy: 28, ranker: "network-simplex" });
+  g.setGraph({ rankdir: "LR", nodesep: 40, ranksep: 78, marginx: 14, marginy: 14, ranker: "network-simplex" });
   g.setDefaultEdgeLabel(() => ({}));
   for (const [id, n] of nodes) if (!n.attachedTo) g.setNode(id, { width: n.w, height: n.h });
 
-  // Boundary events aren't ranked nodes; their flows rank from the host instead.
   const eff = (id: string) => nodes.get(id)?.attachedTo || id;
   for (const f of flows) {
     const u = eff(f.s);
@@ -91,45 +122,64 @@ function dagreLayout(xml: string): string | null {
     if (u === v || !g.hasNode(u) || !g.hasNode(v)) continue;
     g.setEdge(u, v, {}, f.id);
   }
-
   dagre.layout(g);
 
-  const pos = new Map<string, Box>();
+  const boxes = new Map<string, Box>();
   for (const id of g.nodes()) {
     const nd = g.node(id);
     if (!nd) continue;
-    pos.set(id, { x: nd.x - nd.width / 2, y: nd.y - nd.height / 2, w: nd.width, h: nd.height });
+    boxes.set(id, { x: nd.x - nd.width / 2, y: nd.y - nd.height / 2, w: nd.width, h: nd.height });
   }
-  // Boundary events ride the bottom border of their host.
+  // Boundary events ride the bottom border of their host (0.72 along).
   for (const [id, n] of nodes) {
     if (!n.attachedTo) continue;
-    const host = pos.get(n.attachedTo);
-    pos.set(id, host ? { x: host.x + host.w * 0.72 - n.w / 2, y: host.y + host.h - n.h / 2, w: n.w, h: n.h } : { x: 0, y: 0, w: n.w, h: n.h });
+    const host = boxes.get(n.attachedTo);
+    boxes.set(id, host ? { x: host.x + host.w * 0.72 - n.w / 2, y: host.y + host.h - n.h / 2, w: n.w, h: n.h } : { x: 0, y: 0, w: n.w, h: n.h });
   }
 
-  const edgeWp = new Map<string, Pt[]>();
+  const edges = new Map<string, Pt[]>();
   for (const f of flows) {
-    const src = nodes.get(f.s)!;
-    if (src.attachedTo) {
-      const b = pos.get(f.s);
-      const t = pos.get(f.t);
-      if (b && t) edgeWp.set(f.id, route(b, t));
-      continue;
-    }
-    const ge = g.edge(eff(f.s), eff(f.t), f.id) as { points?: { x: number; y: number }[] } | undefined;
-    if (ge?.points && ge.points.length >= 2) {
-      edgeWp.set(f.id, ge.points.map((p) => [p.x, p.y] as Pt));
-    } else {
-      const s = pos.get(f.s);
-      const t = pos.get(f.t);
-      if (s && t) edgeWp.set(f.id, route(s, t));
-    }
+    const s = boxes.get(f.s);
+    const t = boxes.get(f.t);
+    if (s && t) edges.set(f.id, route(s, t));
   }
 
-  return emitDi(doc, proc.getAttribute("id") || "process", pos, edgeWp);
+  // Nest each expanded subprocess's children inside its box.
+  const expanded = new Set<string>();
+  for (const [id, inner] of subScopes) {
+    const base = boxes.get(id);
+    if (!base) continue;
+    expanded.add(id);
+    for (const e of inner.expanded) expanded.add(e);
+    const ox = base.x + PADX;
+    const oy = base.y + HEADER;
+    for (const [cid, b] of inner.boxes) boxes.set(cid, { x: b.x + ox, y: b.y + oy, w: b.w, h: b.h });
+    for (const [eid, pts] of inner.edges) edges.set(eid, pts.map(([x, y]) => [x + ox, y + oy] as Pt));
+  }
+
+  // Normalise to a 0-origin so the parent's offset math stays clean.
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = 0;
+  let maxY = 0;
+  for (const b of boxes.values()) {
+    minX = Math.min(minX, b.x);
+    minY = Math.min(minY, b.y);
+  }
+  for (const b of boxes.values()) {
+    b.x -= minX;
+    b.y -= minY;
+    maxX = Math.max(maxX, b.x + b.w);
+    maxY = Math.max(maxY, b.y + b.h);
+  }
+  for (const pts of edges.values()) for (const p of pts) {
+    p[0] -= minX;
+    p[1] -= minY;
+  }
+  return { boxes, edges, expanded, width: maxX, height: maxY };
 }
 
-function emitDi(doc: Document, procId: string, pos: Map<string, Box>, edges: Map<string, Pt[]>): string {
+function emitDi(doc: Document, procId: string, pos: Map<string, Box>, edges: Map<string, Pt[]>, expanded: Set<string>): string {
   const diagram = doc.createElementNS(NS.di, "bpmndi:BPMNDiagram");
   diagram.setAttribute("id", "BPMNDiagram_gen");
   const plane = doc.createElementNS(NS.di, "bpmndi:BPMNPlane");
@@ -140,6 +190,7 @@ function emitDi(doc: Document, procId: string, pos: Map<string, Box>, edges: Map
   for (const [id, b] of pos) {
     const sh = doc.createElementNS(NS.di, "bpmndi:BPMNShape");
     sh.setAttribute("bpmnElement", id);
+    if (expanded.has(id)) sh.setAttribute("isExpanded", "true");
     const bd = doc.createElementNS(NS.dc, "dc:Bounds");
     bd.setAttribute("x", String(Math.round(b.x)));
     bd.setAttribute("y", String(Math.round(b.y)));

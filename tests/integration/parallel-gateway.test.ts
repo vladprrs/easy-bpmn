@@ -7,7 +7,7 @@ const complete = (token: string, job: { jobId: string; lockToken: string }, outp
   authedPost(`/jobs/${job.jobId}/complete`, token, { lockToken: job.lockToken, outputVariables });
 
 describe("parallelGateway AND (M4-L3, direct mode)", () => {
-  it("fans out both branches (both jobs leasable at once), join waits for both, completes on empty frontier", async () => {
+  it("[C-AND-2BRANCH-01] fans out both branches (both jobs leasable at once), join waits for both, completes on empty frontier", async () => {
     const token = await mintWorkerToken();
     const { instance } = await publishAndStart(PARALLEL_BPMN, { correlationKey: "p1", variables: {} });
     const id = instance.body.instanceId;
@@ -43,7 +43,7 @@ describe("parallelGateway AND (M4-L3, direct mode)", () => {
     expect(rows.some((r) => r.branch_flow_id === "f2")).toBe(true);
   });
 
-  it("merges branch-local variables at the join in document order (later branch wins a conflict)", async () => {
+  it("[C-AND-VARMERGE-01] merges branch-local variables at the join in document order (later branch wins a conflict)", async () => {
     const token = await mintWorkerToken();
     const { instance } = await publishAndStart(PARALLEL_BPMN, { correlationKey: "p2", variables: { base: 1 } });
     const id = instance.body.instanceId;
@@ -93,7 +93,7 @@ describe("parallelGateway AND (M4-L3, direct mode)", () => {
     await complete(token, c, {});
   });
 
-  it("nested regions: the inner join output satisfies the enclosing branch at the outer join (L3.5)", async () => {
+  it("[C-AND-NESTED-01] nested regions: the inner join output satisfies the enclosing branch at the outer join (L3.5)", async () => {
     const token = await mintWorkerToken();
     const { instance } = await publishAndStart(NESTED_PARALLEL_BPMN, { correlationKey: "n1", variables: {} });
     const id = instance.body.instanceId;

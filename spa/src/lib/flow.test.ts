@@ -83,6 +83,38 @@ describe("deriveFlow", () => {
     expect(f.liveEdges).toEqual([]);
     expect(f.settledNodes).toEqual(["end"]);
   });
+
+  it("flags the success beat + orders the reverse sweep End→Start", () => {
+    const events = [ev("e", "start", 0), ev("e", "t1", 1), ev("e", "t2", 2), ev("e", "end", 3)];
+    const o = computeOverlay(inst({ status: "completed", currentElementId: "end" }), events);
+    const f = deriveFlow(adj, o, "completed");
+    expect(f.settled).toBe(true);
+    const ids = f.settleOrder!.map((s) => s.id);
+    expect(ids[0]).toBe("end"); // the sweep originates at the End event
+    expect(ids[ids.length - 1]).toBe("start"); // …and lands back at Start
+    expect(f.settleOrder!.filter((s) => s.kind === "node").map((s) => s.id)).toEqual(["end", "t2", "t1", "start"]);
+    // every node is followed by the edge that fed it (so light reads as flowing back)
+    expect(f.settleOrder!.slice(0, 4)).toEqual([
+      { id: "end", kind: "node" },
+      { id: "f3", kind: "edge" },
+      { id: "t2", kind: "node" },
+      { id: "f2", kind: "edge" },
+    ]);
+  });
+
+  it("does not fire the beat while running (no settle order)", () => {
+    const o = computeOverlay(inst({ currentElementId: "t2" }), [ev("e", "start", 0), ev("e", "t1", 1), ev("e", "t2", 2)]);
+    const f = deriveFlow(adj, o, "running");
+    expect(f.settled).toBe(false);
+    expect(f.settleOrder).toEqual([]);
+  });
+
+  it("does not fire the beat on a compensated roll-back", () => {
+    const events = [ev("e", "start", 0), ev("e", "t1", 1)];
+    const o = computeOverlay(inst({ status: "compensated" }), events);
+    const f = deriveFlow(adj, o, "compensated");
+    expect(f.settled).toBe(false);
+  });
 });
 
 describe("deriveHeat", () => {

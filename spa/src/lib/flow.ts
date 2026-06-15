@@ -24,6 +24,13 @@ export interface DiagramOverlay {
   badges: { elementId: string; text: string; tone: FlowTone }[];
 }
 
+/** One element of the "circuit settles on success" reverse sweep — a node or the
+ *  edge feeding it, emitted End→Start so the choreography can stagger backward. */
+export interface SettleStep {
+  id: string;
+  kind: "node" | "edge";
+}
+
 export interface FlowPlan {
   /** Edges carrying the live current (bright teal, marching). */
   liveEdges: string[];
@@ -35,6 +42,13 @@ export interface FlowPlan {
   tokenEdges: string[];
   /** Nodes that earn the finished-circuit settle glow. */
   settledNodes: string[];
+  /** The run reached a fully-successful, settled state — the one-shot "circuit
+   *  settles on success" beat trigger. Optional so the aggregate EMPTY_FLOW and
+   *  older callers stay valid; `deriveFlow` always sets it. */
+  settled?: boolean;
+  /** The traversed path ordered End→Start (each node followed by its incoming
+   *  edges) for the backward settle sweep. Empty unless `settled`. */
+  settleOrder?: SettleStep[];
 }
 
 export interface HeatNode {
@@ -194,7 +208,65 @@ export function deriveFlow(
     }
   }
 
-  return { liveEdges, doneEdges, interruptEdges, tokenEdges, settledNodes };
+  // The success beat fires ONLY on a fully-successful completion that has come to
+  // rest (no live frontier). "compensated" is a roll-back, not work-well-done, so
+  // it is deliberately excluded from the green settle signature.
+  const settled = status === "completed" && current.size === 0;
+  const settleOrder = settled ? buildSettleOrder(adj, traversed) : [];
+
+  return { liveEdges, doneEdges, interruptEdges, tokenEdges, settledNodes, settled, settleOrder };
+}
+
+/** Order the traversed path End→Start for the backward settle sweep. BFS levels
+ *  from the start frontier (cycle-safe), then emit nodes by descending level —
+ *  each node immediately followed by its incoming traversed edges — so the wave
+ *  reads as light flowing from the End event back toward Start. Pure + deterministic
+ *  (ties broken by id), so a re-derive replays the same choreography. */
+function buildSettleOrder(adj: Adjacency, traversed: Set<string>): SettleStep[] {
+  const tEdges = adj.edges.filter((e) => traversed.has(e.source) && traversed.has(e.target));
+  const bySource = new Map<string, Edge[]>();
+  const incoming = new Map<string, Edge[]>();
+  const hasIncoming = new Set<string>();
+  for (const e of tEdges) {
+    (bySource.get(e.source) ?? bySource.set(e.source, []).get(e.source)!).push(e);
+    (incoming.get(e.target) ?? incoming.set(e.target, []).get(e.target)!).push(e);
+    hasIncoming.add(e.target);
+  }
+
+  // Start frontier: explicit start events, else any traversed node with no
+  // traversed predecessor (handles odd / partial graphs).
+  let starts = [...traversed].filter((id) => (adj.typeOf.get(id) ?? "").toLowerCase() === "startevent");
+  if (starts.length === 0) starts = [...traversed].filter((id) => !hasIncoming.has(id));
+
+  const level = new Map<string, number>();
+  let frontier = [...new Set(starts)];
+  for (let depth = 0; frontier.length; depth++) {
+    const next: string[] = [];
+    for (const id of frontier) {
+      if (level.has(id)) continue;
+      level.set(id, depth);
+      for (const e of bySource.get(id) ?? []) if (!level.has(e.target)) next.push(e.target);
+    }
+    frontier = next;
+  }
+  for (const id of traversed) if (!level.has(id)) level.set(id, 0); // disconnected safety
+
+  const nodes = [...traversed].sort(
+    (a, b) => level.get(b)! - level.get(a)! || (a < b ? -1 : a > b ? 1 : 0),
+  );
+
+  const seq: SettleStep[] = [];
+  const placed = new Set<string>();
+  for (const n of nodes) {
+    seq.push({ id: n, kind: "node" });
+    for (const e of incoming.get(n) ?? []) {
+      if (placed.has(e.id)) continue;
+      placed.add(e.id);
+      seq.push({ id: e.id, kind: "edge" });
+    }
+  }
+  for (const e of tEdges) if (!placed.has(e.id)) seq.push({ id: e.id, kind: "edge" }); // any stragglers
+  return seq;
 }
 
 /** Aggregate density → heat tiers + throughput edges. A node where instances are

@@ -35,9 +35,10 @@ body {
 /* Consistent keyboard-focus ring across all interactive chrome. Mouse clicks stay
  * ring-free (:focus-visible). Inputs and the <Button> primitive draw their own ring
  * (they set outline-none), so this is the baseline for everything else — popover
- * triggers, drawer tabs, palette rows, transport controls, icon buttons. */
+ * triggers, drawer tabs, palette rows, transport controls, icon buttons.
+ * Focus is BLUE (--state-focus) so keyboard focus never reads as teal selection. */
 :where(a, button, [role="button"], [role="option"], [role="tab"]):focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--state-focus);
   outline-offset: 2px;
 }
 
@@ -64,6 +65,25 @@ body {
   background-position: -1px -1px;
 }
 
+/* ---- Chrome-surface refinements (refine the base utilities from tokens.css) ----
+ * These are loaded after the tokens import, so they win at equal specificity. */
+/* tech-label: darker secondary ink (gray-600 #5b6776 = 6.0:1 on white, up from the
+ * muted 4.5:1) at the tokenised micro size. */
+.tech-label {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+/* glass survives on EXACTLY ONE surface — the floating StageHeader shell. Give it a
+ * real delineating hairline + ONE tighter shadow (no invisible-white-border + 28px
+ * bloom combo). The translucent bg + backdrop blur stay from the token utility.
+ * This rule loads after @tailwind utilities, so its --shadow-md is AUTHORITATIVE
+ * over any shadow-* utility on the same element: the StageHeader's extra `shadow-sm`
+ * class is dead weight and should be dropped (the .glass elevation owns the shell). */
+.glass {
+  border: 1px solid var(--chrome-border);
+  box-shadow: var(--shadow-md);
+}
+
 /* ============================================================
  * Liquid-glass bpmn diagram. The custom GlassRenderer owns the resting shapes
  * (frosted body · specular sheen · refraction · soft elevation · custom icons);
@@ -85,30 +105,26 @@ body {
   background: transparent;
 }
 
-/* ---- Glass primitives (category-independent) ----------------------------- */
+/* ---- Node primitives (category-independent) ------------------------------ */
+/* The node body is a SOLID white card — no frost, no aurora bleed-through. */
 .ebpmn-shape {
+  fill: var(--surface-card);
   pointer-events: all;
 }
+/* A whisper-faint category wash over the white (≤8%) — the body still reads white;
+ * category identity is carried by the stroke + the vivid icon-chip, not this. */
 .ebpmn-tint {
   fill: var(--accent);
-  fill-opacity: 0.08; /* tasks aren't pure white — a faint teal so glass reads */
-}
-.ebpmn-sheen {
-  opacity: 0.95;
+  fill-opacity: 0.05;
   pointer-events: none;
 }
-/* The bright inner edge that reads as "glass" — replaces the heavy border. */
-.ebpmn-rim {
-  fill: none;
-  stroke: rgba(255, 255, 255, 0.72);
-  stroke-width: 1px;
-}
-/* State stroke: a thin hairline at rest, coloured only when a state is active. */
+/* The one category stroke: full-opacity at rest (the card's confident edge); a
+ * runtime state recolours it (state border wins over category — see below). */
 .ebpmn-stroke {
   fill: none;
   stroke: var(--cat-task-border);
-  stroke-opacity: 0.45;
-  stroke-width: 1px;
+  stroke-opacity: 1;
+  stroke-width: 1.5px;
   transition:
     stroke 0.4s var(--ease-out),
     stroke-width 0.4s var(--ease-out),
@@ -136,18 +152,19 @@ body {
   fill: currentColor;
   stroke: none;
 }
-/* Expanded subprocess / transaction = a light translucent region the children sit on. */
+/* Expanded subprocess / transaction = a solid pale region the children sit on
+ * (sunken vs the white child cards, so nesting reads without a glass blur). */
 .ebpmn-region {
-  fill: rgba(248, 251, 253, 0.66);
+  fill: var(--surface-page);
   stroke: var(--cat-task-border);
-  stroke-width: 1px;
-  stroke-opacity: 0.45;
+  stroke-width: 1.5px;
+  stroke-opacity: 0.8;
 }
 .ebpmn-region-inner {
   fill: none;
   stroke: var(--cat-task-border);
   stroke-width: 1px;
-  stroke-opacity: 0.4;
+  stroke-opacity: 0.6;
 }
 
 /* Icon chip on activities — a VIVID filled category colour with a white glyph. */
@@ -195,8 +212,8 @@ body {
 
 /* ---- Category families — "read the canvas by colour" (FROZEN palette) ----- */
 .ebpmn-c-event .ebpmn-tint {
-  fill: var(--cat-event-surface);
-  fill-opacity: 0.5;
+  fill: var(--cat-event-border);
+  fill-opacity: 0.07;
 }
 .ebpmn-c-event .ebpmn-stroke {
   stroke: var(--cat-event-border);
@@ -206,8 +223,8 @@ body {
 }
 
 .ebpmn-c-inter .ebpmn-tint {
-  fill: var(--cat-inter-surface);
-  fill-opacity: 0.5;
+  fill: var(--cat-inter-border);
+  fill-opacity: 0.07;
 }
 .ebpmn-c-inter .ebpmn-stroke,
 .ebpmn-c-inter .ebpmn-stroke-inner {
@@ -218,8 +235,8 @@ body {
 }
 
 .ebpmn-c-boundary .ebpmn-tint {
-  fill: var(--cat-boundary-surface);
-  fill-opacity: 0.5;
+  fill: var(--cat-boundary-border);
+  fill-opacity: 0.07;
 }
 .ebpmn-c-boundary .ebpmn-stroke,
 .ebpmn-c-boundary .ebpmn-stroke-inner {
@@ -230,25 +247,26 @@ body {
 }
 
 .ebpmn-c-end .ebpmn-tint {
-  fill: var(--cat-end-surface);
-  fill-opacity: 0.62;
+  fill: var(--cat-end-border);
+  fill-opacity: 0.08;
 }
+/* End = the stop: a heavier full-opacity ring (standard BPMN cue). */
 .ebpmn-c-end .ebpmn-stroke {
   stroke: var(--cat-end-border);
   stroke-width: 1.8px;
-  stroke-opacity: 0.85;
+  stroke-opacity: 1;
 }
 .ebpmn-c-end .ebpmn-icon {
   color: var(--cat-end-icon);
 }
 
 .ebpmn-c-gateway .ebpmn-tint {
-  fill: var(--cat-gateway-surface);
-  fill-opacity: 0.55;
+  fill: var(--cat-gateway-border);
+  fill-opacity: 0.06;
 }
 .ebpmn-c-gateway .ebpmn-stroke {
   stroke: var(--cat-gateway-border);
-  stroke-opacity: 0.7;
+  stroke-opacity: 1;
 }
 .ebpmn-c-gateway .ebpmn-glyph {
   stroke: var(--cat-gateway-icon);
@@ -285,10 +303,10 @@ body {
   transition: opacity 0.25s var(--ease-out);
 }
 .djs-shape.ebpmn-hover .ebpmn-node {
-  transform: scale(1.05);
+  transform: scale(1.04);
 }
 .djs-shape.ebpmn-hover .ebpmn-shape {
-  filter: drop-shadow(0 9px 20px rgba(20, 30, 45, 0.2));
+  filter: drop-shadow(0 5px 12px rgba(20, 30, 45, 0.14));
 }
 @media (prefers-reduced-motion: reduce) {
   .djs-shape.ebpmn-hover .ebpmn-node {
@@ -296,8 +314,10 @@ body {
   }
 }
 
-/* ---- Runtime state: a THIN coloured edge + a glow bloom (no heavy frame) --- */
-.djs-element.ebpmn-traversed .ebpmn-stroke {
+/* ---- Runtime state: recolour the solid card — border + body wash + one bloom.
+ * State border WINS over the category border (higher specificity, later source). - */
+.djs-element.ebpmn-traversed .ebpmn-stroke,
+.djs-element.ebpmn-settled .ebpmn-stroke {
   stroke: var(--state-completed);
   stroke-opacity: 1;
   stroke-width: 1.6px;
@@ -323,15 +343,40 @@ body {
   stroke-width: 2px;
 }
 
-/* State bloom on the whole glass node — the state's main signal now (luminous). */
+/* State body wash — tints the white card so state is unmistakable at low zoom.
+ * Selected is last so it wins when a node is both running/failed AND selected. */
+.djs-element.ebpmn-current .ebpmn-tint {
+  fill: var(--state-running);
+  fill-opacity: 0.12;
+}
+.djs-element.ebpmn-traversed .ebpmn-tint,
+.djs-element.ebpmn-settled .ebpmn-tint {
+  fill: var(--state-completed);
+  fill-opacity: 0.12;
+}
+.djs-element.ebpmn-failed .ebpmn-tint {
+  fill: var(--state-error);
+  fill-opacity: 0.14;
+}
+.djs-element.ebpmn-compensated .ebpmn-tint {
+  fill: var(--state-warning);
+  fill-opacity: 0.12;
+}
+.djs-element.ebpmn-selected .ebpmn-tint {
+  fill: var(--state-selected);
+  fill-opacity: 0.1;
+}
+
+/* ONE restrained shared bloom — same radius for every state, colour varies. The
+ * SHARP glow is reserved for the live current (token + live edge) only. */
 .djs-element.ebpmn-current .ebpmn-node {
-  filter: drop-shadow(0 0 10px var(--current-glow));
+  filter: drop-shadow(0 0 6px var(--current-glow));
 }
 .djs-element.ebpmn-settled .ebpmn-node {
   filter: drop-shadow(0 0 6px var(--settle-wash));
 }
 .djs-element.ebpmn-failed .ebpmn-node {
-  filter: drop-shadow(0 0 10px var(--interrupt-wash));
+  filter: drop-shadow(0 0 6px var(--interrupt-wash));
 }
 
 @keyframes ebpmn-stroke-pulse {
@@ -429,20 +474,80 @@ body {
 }
 
 /* ============================================================
+ * THE SIGNATURE — "the circuit settles on success". The whole effects budget.
+ * These are only RESTING styles for the light the beat injects; the choreography
+ * (the sprint, the bloom, the staggered backward sweep) is driven entirely by WAAPI
+ * in LivingDiagram, and every injected element self-removes on finish. The sharp
+ * glow is reserved for exactly two things: the live current and this beat.
+ * The beat never runs under reduced motion — the static settled-green IS the result.
+ * ============================================================ */
+/* (1) The final teal current sprinting into the End event — the brand current's
+ * last run, mirroring the travelling token so the two never visually drift. */
+.ebpmn-settle-sprint {
+  pointer-events: none;
+}
+.ebpmn-settle-sprint .core {
+  fill: var(--current-bright);
+  filter: drop-shadow(0 0 4px var(--current-glow)) drop-shadow(0 0 9px var(--current-glow));
+}
+.ebpmn-settle-sprint .halo {
+  fill: var(--current-glow);
+  opacity: 0.5;
+}
+/* (2) The End-event bloom — a single soft green ring expanding outward. */
+.ebpmn-settle-bloom {
+  fill: none;
+  stroke: var(--state-completed);
+  stroke-width: 2.5px;
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
+  filter: drop-shadow(0 0 5px var(--settle-wash));
+}
+/* (3a) A node catching the backward settle-light — a green ring, never a fill, so
+ * the card's label stays fully legible as the wave passes. */
+.ebpmn-settle-halo {
+  fill: none;
+  stroke: var(--settle);
+  stroke-width: 2px;
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
+  filter: drop-shadow(0 0 6px var(--settle-wash));
+}
+/* (3b) An edge catching the backward settle-light — a brighter green flow over the
+ * resting done-green path; the stagger across edges reads as the wave. */
+.ebpmn-settle-flash {
+  fill: none;
+  stroke: color-mix(in oklch, var(--settle) 72%, white);
+  stroke-width: 3.2px;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+  filter: drop-shadow(0 0 1.4px rgba(255, 255, 255, 0.9)) drop-shadow(0 0 5px var(--settle-wash));
+}
+/* Defensive: even if an element lingers, it must never show under reduced motion. */
+@media (prefers-reduced-motion: reduce) {
+  .ebpmn-settle-sprint,
+  .ebpmn-settle-bloom,
+  .ebpmn-settle-halo,
+  .ebpmn-settle-flash {
+    display: none;
+  }
+}
+
+/* ============================================================
  * Aggregate "living heatmap" — per-node instance density. The aurora carries
  * the pooled light; the glass node picks up a matching bloom + stroke.
  * ============================================================ */
-.djs-element.ebpmn-heat-1 .ebpmn-node {
-  filter: drop-shadow(0 0 3px var(--current-wash));
-}
-.djs-element.ebpmn-heat-2 .ebpmn-node {
+/* Density tier lives in the STROKE (teal weight climbs; hot → coral) + the mono
+ * count badge — not in a bloom gradient. The bloom is the same restrained one. */
+.djs-element.ebpmn-heat-1 .ebpmn-node,
+.djs-element.ebpmn-heat-2 .ebpmn-node,
+.djs-element.ebpmn-heat-3 .ebpmn-node {
   filter: drop-shadow(0 0 6px var(--current-glow));
 }
 .djs-element.ebpmn-heat-2 .ebpmn-stroke {
   stroke: var(--current);
-}
-.djs-element.ebpmn-heat-3 .ebpmn-node {
-  filter: drop-shadow(0 0 9px var(--current-glow));
+  stroke-width: 1.8px;
 }
 .djs-element.ebpmn-heat-3 .ebpmn-stroke {
   stroke: var(--current);
@@ -453,40 +558,44 @@ body {
   stroke-width: 2.6px;
 }
 .djs-element.ebpmn-heat-hot .ebpmn-node {
-  filter: drop-shadow(0 0 9px var(--interrupt-wash));
+  filter: drop-shadow(0 0 6px var(--interrupt-wash));
 }
 
-/* ---- Overlay badges — DS pill: solid tone, white text, soft shadow. -------- */
+/* ---- Overlay badges — DS pill: solid -600 tone, white text, soft shadow.
+ * Backgrounds drive off the -600 ramp so white text clears WCAG AA (≥4.5:1):
+ * blue-600 5.1:1 · green-600 5.4:1 · red-600 5.0:1 · teal-600 4.9:1 (all on #fff). */
 .ebpmn-overlay-badge {
   font:
-    var(--weight-semibold) 10px/1.4 var(--font-sans);
+    var(--weight-semibold) var(--text-2xs) / 1.4 var(--font-sans);
   padding: 2px 7px;
   border-radius: var(--radius-pill);
   white-space: nowrap;
-  color: #fff;
-  background: var(--state-running);
+  color: var(--text-on-accent);
+  background: var(--blue-600);
   box-shadow: var(--shadow-sm);
 }
 .ebpmn-overlay-badge.ok {
-  background: var(--state-completed);
+  background: var(--green-600);
 }
 .ebpmn-overlay-badge.danger {
-  background: var(--state-error);
+  background: var(--red-600);
 }
+/* Warn = dark-on-light amber (white-on-amber failed at 2.9:1); 5.8:1 on amber-100. */
 .ebpmn-overlay-badge.warn {
-  background: var(--state-warning);
+  background: var(--amber-100);
+  color: var(--amber-700);
 }
 .ebpmn-overlay-badge.accent {
-  background: var(--accent);
+  background: var(--teal-600);
 }
 /* Density count pill for aggregate mode — mono numerals, teal current. */
 .ebpmn-overlay-badge.flow {
-  background: var(--accent);
+  background: var(--teal-600);
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
 }
 .ebpmn-overlay-badge.flow.hot {
-  background: var(--state-error);
+  background: var(--red-600);
 }
 
 /* ---- App-shell entrance + reveal motion ---------------------------------- */

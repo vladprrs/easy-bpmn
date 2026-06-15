@@ -25,17 +25,18 @@ export function ProcessSwitcher({ sagas, current }: { sagas: SagaSummary[]; curr
   return (
     <Popover
       width={300}
+      ariaLabel="Switch process"
       trigger={({ toggle, ref, open }) => (
         <button
           ref={ref as any}
           onClick={toggle}
-          className="group flex items-center gap-2 rounded-lg px-2 py-1 text-left transition hover:bg-surface-hover"
+          className="group flex min-w-0 items-center gap-2 rounded-lg px-2 py-1 text-left transition hover:bg-surface-hover"
         >
           <Workflow className="h-4 w-4 shrink-0 text-accent" />
-          <span className="font-display text-lg leading-none text-content-strong">
+          <span className="min-w-0 max-w-[40vw] truncate font-display text-lg leading-none text-content-strong">
             {current?.name ?? "Process"}
           </span>
-          <ChevronDown className={`h-4 w-4 text-content-muted transition ${open ? "rotate-180" : ""}`} />
+          <ChevronDown className={`h-4 w-4 shrink-0 text-content-muted transition ${open ? "rotate-180" : ""}`} />
         </button>
       )}
     >
@@ -49,7 +50,7 @@ export function ProcessSwitcher({ sagas, current }: { sagas: SagaSummary[]; curr
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
                 placeholder="Filter processes"
-                className="w-full bg-transparent text-sm text-content outline-none placeholder:text-content-muted"
+                className="w-full bg-transparent text-sm text-content outline-none placeholder:text-content-secondary"
               />
             </div>
           )}
@@ -64,22 +65,23 @@ export function ProcessSwitcher({ sagas, current }: { sagas: SagaSummary[]; curr
                       navigate(`/console/p/${encodeURIComponent(s.sagaId)}`);
                       close();
                     }}
+                    aria-current={active || undefined}
                     className={`flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left transition hover:bg-surface-hover ${
                       active ? "bg-accent-soft" : ""
                     }`}
                   >
                     <Dot tone={toneOf(s)} />
                     <span className="min-w-0 flex-1 truncate text-sm font-medium text-content">{s.name}</span>
-                    <span className="font-data tabular text-2xs text-content-muted">
+                    <span className="font-data tabular text-2xs text-content-secondary">
                       {sum.live > 0 ? `${sum.live} live` : sum.total > 0 ? `${sum.total}` : "idle"}
-                      {sum.attention > 0 && <span className="ml-1 text-danger">!{sum.attention}</span>}
+                      {sum.attention > 0 && <span className="ml-1 text-[var(--red-700)]">!{sum.attention}</span>}
                     </span>
                   </button>
                 </li>
               );
             })}
             {filtered.length === 0 && (
-              <li className="px-3 py-6 text-center text-sm text-content-muted">No processes match.</li>
+              <li className="px-3 py-6 text-center text-sm text-content-secondary">No processes match.</li>
             )}
           </ul>
         </div>

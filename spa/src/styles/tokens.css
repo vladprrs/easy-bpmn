@@ -1,8 +1,10 @@
 /* easy·bpmn design-system tokens — ported from the Claude Design handoff bundle
  * (easy-bpmn-design-system/project/tokens/*). Light UI: teal-led, soft pastel BPMN
  * category families, subtle liquid-glass, calm motion. This file is the conceptual
- * source of truth for everything Tailwind utilities don't cover (glass, shadows,
- * rings, radii, motion, BPMN category + runtime-state colours, dot-grid canvas).
+ * source of truth for what Tailwind utilities do not cover (glass, shadows, rings,
+ * radii, motion, the --space-* rhythm for custom CSS, BPMN category + runtime-state
+ * colours, dot-grid canvas). Tailwind owns utility spacing (p-*, gap-*, m-*); the
+ * --space-* tokens here are only for hand-written CSS that needs the same rhythm.
  * The key palette hexes are also mirrored into tailwind.config.js so the `bg-…/15`
  * opacity utilities keep working. Keep the two in sync. */
 
@@ -89,6 +91,9 @@
   --amber-400: #e6a330;
   --amber-500: #cf8a18;
   --amber-600: #a86d10;
+  /* Dark-on-light amber INK for warn text/badges + compensation-target labels.
+   * AA: 5.8:1 on --amber-100 (#fae6c2), 6.3:1 on --surface-sunken (#eef2f6). */
+  --amber-700: #7a4f0c;
 
   /* ======================= SEMANTIC ALIASES ======================= */
 
@@ -105,7 +110,10 @@
   --text-strong: var(--gray-900);
   --text-body: var(--gray-800);
   --text-secondary: var(--gray-600);
-  --text-muted: var(--gray-500);
+  /* Darkened off the gray-500 chip (#7d8b9b ≈ 3.48:1 on white — fails AA) to a
+   * graphite that clears WCAG AA as text on both white (5.2:1) and --surface-sunken
+   * #eef2f6 (4.6:1). Raw --gray-500 stays for non-text decoration (dots, edges). */
+  --text-muted: #636e78;
   --text-on-accent: #ffffff;
   --text-link: var(--teal-600);
 
@@ -171,12 +179,12 @@
   --state-warning-ring: rgba(207, 138, 24, 0.3);
 
   /* ---- Typography: the self-hosted trio (see styles/fonts.css) ---- */
-  --font-display: "Clash Display", "General Sans", "General Sans Fallback",
-    ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Clash Display", "Clash Display Fallback", "General Sans",
+    "General Sans Fallback", ui-sans-serif, system-ui, sans-serif;
   --font-sans: "General Sans", "General Sans Fallback", ui-sans-serif, system-ui,
     -apple-system, "Segoe UI", Roboto, sans-serif;
-  --font-mono: "Commit Mono", ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo,
-    Monaco, Consolas, monospace;
+  --font-mono: "Commit Mono", "Commit Mono Fallback", ui-monospace, "JetBrains Mono",
+    SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 
   /* Fixed rem type scale (app UI — no fluid type). Few sizes, high contrast:
    * the display steps step ≥1.4×; the dense data steps stay tight. */
@@ -202,7 +210,19 @@
   --leading-snug: 1.32;
   --leading-normal: 1.5;
 
-  /* ---- Spacing / radius / stroke ---- */
+  /* ---- Spacing rhythm (hand-written CSS only; Tailwind owns p-, gap-, m- utils) ----
+   * 4pt grid with an intentionally non-linear climb (×1.33 / ×1.5 alternating) so
+   * spacing itself carries hierarchy; do not pad every surface equally. */
+  --space-2xs: 4px;
+  --space-xs: 8px;
+  --space-sm: 12px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --space-2xl: 48px;
+  --space-3xl: 64px;
+
+  /* ---- Radius / stroke ---- */
   --radius-xs: 4px;
   --radius-sm: 6px;
   --radius-md: 10px;
@@ -227,14 +247,12 @@
   --shadow-node: 0 1px 2px rgba(20, 30, 45, 0.06), 0 2px 6px rgba(20, 30, 45, 0.05);
   --shadow-node-hover: 0 2px 4px rgba(20, 30, 45, 0.08), 0 6px 16px rgba(20, 30, 45, 0.1);
 
-  /* ---- Glass / liquid surfaces (subtle, ~30%) ---- */
+  /* ---- Glass / liquid surface — the ONE StageHeader shell ----
+   * Only the translucent fill + blur live here; the delineating hairline + single
+   * shadow are authored on .glass in index.css (--chrome-border + --shadow-md), so
+   * the old soft/border/hairline/wide-bloom tokens were dead and were removed. */
   --glass-bg: rgba(255, 255, 255, 0.62);
-  --glass-bg-soft: rgba(255, 255, 255, 0.48);
-  --glass-border: rgba(255, 255, 255, 0.7);
-  --glass-hairline: rgba(40, 55, 72, 0.08);
   --glass-blur: 14px;
-  --glass-shadow: 0 8px 28px rgba(20, 30, 45, 0.12),
-    inset 0 1px 0 rgba(255, 255, 255, 0.6);
 
   /* ---- Focus / selection rings ---- */
   --ring-width: 3px;
@@ -252,10 +270,16 @@
   --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
-  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  /* No spring/overshoot easing token: the design system bans bounce/elastic, so
+   * the no-bounce rule is airtight at the token layer (use --ease-out family). */
   --dur-fast: 120ms;
   --dur-base: 200ms;
   --dur-slow: 320ms;
+  /* One shared resting "breath" cadence for idle liveness — boot, login, the chrome
+   * wordmark dot, and the stats health dot share this single heartbeat instead of
+   * three near-equal rhythms. Tied to --flow-travel (2.6s edge traversal) so the
+   * resting pulse and the moving current read as one system. */
+  --pulse: 2600ms;
 
   /* ============================================================
    * "Living Systems" — the current. OKLCH (perceptually-uniform),
@@ -264,7 +288,10 @@
    * a motion overlay on EDGES + travelling tokens, so it never fights node colour.
    * Luminosity-on-pale, never neon-glow-on-dark: soft bloom + a bright core.
    * ============================================================ */
-  --current: oklch(0.64 0.115 178); /* live current — luminous teal (= brand) */
+  /* Pinned to the EXACT oklch() of --teal-500 (#109b86 → oklch(0.618 0.111 178.3)).
+   * INVARIANT: --current and --teal-500 MUST keep the same hue (≈178°) so the live
+   * current on the edges never visually mismatches brand teal. */
+  --current: oklch(0.618 0.111 178.3);
   --current-bright: oklch(0.82 0.13 182); /* the travelling token core */
   --current-wash: oklch(0.64 0.115 178 / 0.16); /* edge illumination wash */
   --current-glow: oklch(0.7 0.13 180 / 0.55); /* soft bloom around tokens */
@@ -294,13 +321,12 @@
   background-position: -1px -1px;
 }
 
-/* Liquid-glass surface utility — floating chrome only, never diagram nodes. */
+/* Liquid-glass surface utility — floating chrome only, never diagram nodes.
+ * Fill + blur only; the hairline + elevation are added by .glass in index.css. */
 .glass {
   background: var(--glass-bg);
   -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.4);
   backdrop-filter: blur(var(--glass-blur)) saturate(1.4);
-  border: 1px solid var(--glass-border);
-  box-shadow: var(--glass-shadow);
 }
 
 /* Tiny technical uppercase label (inspector keys). */

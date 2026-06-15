@@ -30,7 +30,7 @@ export default {
           strong: "#181d24", // --gray-900
           DEFAULT: "#2a323c", // --gray-800
           secondary: "#5b6776", // --gray-600
-          muted: "#7d8b9b", // --gray-500
+          muted: "#636e78", // --text-muted (AA as text: 5.2:1 on white, 4.6:1 on surface-sunken). Raw --gray-500 stays for non-text decoration (dots/edges).
         },
         accent: {
           DEFAULT: "#109b86", // --teal-500

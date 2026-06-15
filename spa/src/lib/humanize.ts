@@ -32,7 +32,7 @@ const TABLE: Record<string, Humanized> = {
   serviceTaskCompleted: { tone: "ok", title: "Service step done" },
   jobFailed: { tone: "danger", title: "Worker reported a failure" },
   jobActivationExpired: { tone: "danger", title: "No worker took it in time" },
-  serviceTaskOutputRejected: { tone: "warn", title: "Output too large — rejected" },
+  serviceTaskOutputRejected: { tone: "warn", title: "Output rejected (too large)" },
   poisonJob: { tone: "danger", title: "Output repeatedly too large" },
   businessErrorCaught: { tone: "warn", title: "Business error caught" },
 
@@ -93,6 +93,62 @@ export function humanize(type: string): Humanized & { mapped: boolean } {
   return { tone: "muted", title: titleCase(type), mapped: false };
 }
 
+// ---- Process-name humanization (the StageHeader page <h1>) ------------------
+// Saga / definition ids arrive as opaque machine strings ('psaga-1781422408', a uuid,
+// a slug). The page headline deserves a confident human name; the raw id is demoted to
+// a quiet, copyable mono sub-line. `humanizeProcessName` walks candidates (process name
+// first, saga id last) and returns the first that yields real words; `isOpaqueId`
+// recognises a bare machine id so callers know when no human name could be salvaged.
+
+const ID_PREFIX = /^(p?saga|process|proc|definition|def|workflow|wf|instance|inst)[-_:.\s]+/i;
+const ID_SEP = /[-_./:\\]+/g;
+
+function titleToken(t: string): string {
+  if (/^[A-Z0-9]{1,4}$/.test(t)) return t; // keep short acronyms / versions (API, V2, SLA)
+  return t.charAt(0).toUpperCase() + t.slice(1).toLowerCase();
+}
+
+/** Extract a Title-Case name from one candidate, or `null` when it carries no word
+ *  (a pure id like 'psaga-1781422408'): strip a known id prefix, split kebab/snake/
+ *  camel, drop pure-numeric and long-hex id tokens, Title-Case what survives. */
+function wordsFrom(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const s = raw.trim();
+  if (!s) return null;
+  const stripped = s.replace(ID_PREFIX, "") || s;
+  const spaced = stripped
+    .replace(ID_SEP, " ")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .trim();
+  const kept = spaced.split(/\s+/).filter((t) => {
+    if (!t) return false;
+    if (/^\d+$/.test(t)) return false; // pure number — an id / timestamp fragment
+    if (/^[0-9a-f]{6,}$/i.test(t) && /\d/.test(t)) return false; // long hex — uuid chunk
+    return true;
+  });
+  if (!kept.some((t) => /[a-z]{2,}/i.test(t))) return null;
+  return kept.map(titleToken).join(" ");
+}
+
+/** True when the string reads as a machine id, not a human name — i.e. no human word
+ *  can be salvaged from it and it carries a digit (uuid, 'psaga-1781422408', a number). */
+export function isOpaqueId(raw: string | null | undefined): boolean {
+  if (!raw || !raw.trim()) return false;
+  return wordsFrom(raw) === null && /\d/.test(raw);
+}
+
+/** Turn a definition/process name or a saga id into a confident Title-Case headline.
+ *  Walks the candidates in order and returns the first that yields real words; when none
+ *  do (only opaque ids), returns "Untitled process" so the raw id can live quietly in
+ *  mono beneath the headline rather than masquerade as the title. */
+export function humanizeProcessName(...candidates: (string | null | undefined)[]): string {
+  for (const c of candidates) {
+    const name = wordsFrom(c);
+    if (name) return name;
+  }
+  return "Untitled process";
+}
+
 // ---- The spoken narration over the flow (full sentence, element woven in) ---
 
 type Narrator = (el: string | null) => string;
@@ -100,7 +156,7 @@ const at = (el: string | null) => (el ? ` at ${el}` : "");
 
 const NARRATION: Record<string, Narrator> = {
   instanceStarted: () => "The run began.",
-  instanceCompleted: () => "Every step landed — the run completed.",
+  instanceCompleted: () => "Every step landed. The run completed.",
   instanceCancelled: () => "The run was cancelled.",
   elementEntered: (el) => (el ? `Reached ${el}.` : "Advanced a step."),
   definitionDraftCreated: () => "A draft was created.",
@@ -143,7 +199,7 @@ const NARRATION: Record<string, Narrator> = {
   transactionCancelled: () => "The transaction is unwinding.",
   compensationStarted: () => "Rolling completed work back.",
   compensationCompleted: () => "Roll-back finished cleanly.",
-  compensationFailed: (el) => `Roll-back failed${at(el)} — this one needs you.`,
+  compensationFailed: (el) => `Roll-back failed${at(el)}. This one needs you.`,
   sagaFailed: () => "The saga couldn't fully roll back.",
 
   branchForked: () => "Work split into parallel branches.",

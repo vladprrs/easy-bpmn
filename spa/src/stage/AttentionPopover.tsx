@@ -23,6 +23,7 @@ export function AttentionPopover({ items }: { items: AttentionItem[] }) {
     <Popover
       align="end"
       width={340}
+      ariaLabel="Needs attention"
       trigger={({ toggle, ref }) => (
         <button
           ref={ref as any}
@@ -33,20 +34,24 @@ export function AttentionPopover({ items }: { items: AttentionItem[] }) {
           }`}
         >
           {n > 0 ? <AlertTriangle className="h-4 w-4" /> : <Check className="h-4 w-4 text-ok" />}
-          {n > 0 ? <span className="font-data tabular">{n}</span> : <span className="hidden sm:inline">clear</span>}
+          {n > 0 ? (
+            <span className="font-data tabular text-[color:var(--red-700)]">{n}</span>
+          ) : (
+            <span className="hidden sm:inline">clear</span>
+          )}
         </button>
       )}
     >
       {(close) => (
-        <div className="w-[340px]">
-          <div className="border-b border-line px-3.5 py-2.5 text-2xs font-semibold uppercase tracking-[0.08em] text-content-muted">
+        <div className="w-[min(340px,calc(100vw_-_2rem))]">
+          <div className="border-b border-line px-3.5 py-2.5 text-2xs font-semibold uppercase tracking-[0.08em] text-content-secondary">
             Needs attention · all processes
           </div>
           {n === 0 ? (
             <div className="flex flex-col items-center gap-1 px-4 py-8 text-center">
               <Check className="h-6 w-6 text-ok" />
               <div className="text-sm font-medium text-content">Nothing on fire</div>
-              <div className="text-xs text-content-muted">No incidents or stuck roll-backs anywhere.</div>
+              <div className="text-xs text-content-secondary">No incidents or stuck roll-backs anywhere.</div>
             </div>
           ) : (
             <ul className="max-h-[60vh] overflow-auto p-1.5">
@@ -63,10 +68,10 @@ export function AttentionPopover({ items }: { items: AttentionItem[] }) {
                     >
                       <div className="flex items-center gap-2">
                         <Badge tone={r.tone}>{r.label}</Badge>
-                        <span className="min-w-0 flex-1 truncate text-sm text-content">{it.sagaName || it.sagaId || "—"}</span>
-                        <span className="shrink-0 text-2xs text-content-muted">{relativeTime(it.since)}</span>
+                        <span className="min-w-0 flex-1 truncate text-sm text-content">{it.sagaName || it.sagaId || "unknown process"}</span>
+                        <span className="shrink-0 text-xs text-content-secondary">{relativeTime(it.since)}</span>
                       </div>
-                      <div className="mt-1 truncate font-data text-2xs text-content-muted">
+                      <div className="mt-1 truncate font-data text-xs text-content-secondary">
                         {it.businessKey ? `${it.businessKey} · ` : ""}
                         {it.correlationKey}
                       </div>

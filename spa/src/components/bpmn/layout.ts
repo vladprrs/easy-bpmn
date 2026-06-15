@@ -26,10 +26,14 @@ const FLOW = new Set([...EVENT, ...GATEWAY, ...ACTIVITY]);
 type Box = { x: number; y: number; w: number; h: number };
 type Pt = [number, number];
 
+// A task tile must stay wide enough that a 2-word label wraps to <= 2-3 whole-word
+// lines instead of one character per line (the P0 symptom this layout exists to kill).
+const MIN_TASK_W = 132;
+
 function sizeFor(tag: string): [number, number] {
   if (EVENT.has(tag)) return [44, 44];
   if (GATEWAY.has(tag)) return [54, 54];
-  return [156, 72]; // wider "tile" — fits the left icon-chip + bold label
+  return [Math.max(MIN_TASK_W, 156), 72]; // wide "tile" — fits the icon-chip + bold label
 }
 
 /** Lay out a DI-less BPMN document into a readable left-to-right flow. */
@@ -37,12 +41,13 @@ export async function layoutDiagram(xml: string): Promise<string> {
   try {
     const out = dagreLayout(xml);
     if (out) return out;
-  } catch {
-    /* fall through to the simple layouter */
+  } catch (err) {
+    console.warn("[living-diagram] dagre layout failed; falling back to bpmn-auto-layout", err);
   }
   try {
     return ensureEdges(await layoutProcess(xml));
-  } catch {
+  } catch (err) {
+    console.warn("[living-diagram] bpmn-auto-layout failed; rendering DI-less XML as-is", err);
     return xml;
   }
 }
@@ -88,13 +93,19 @@ function layoutScope(scopeEl: Element): Scope | null {
     const id = c.getAttribute("id");
     if (!id) continue;
     if (SUB.has(tag)) {
-      const inner = layoutScope(c);
-      if (inner && inner.boxes.size) {
-        subScopes.set(id, inner);
-        nodes.set(id, { tag, w: inner.width + 2 * PADX, h: inner.height + HEADER + PADB });
-        continue;
+      try {
+        const inner = layoutScope(c);
+        if (inner && inner.boxes.size) {
+          subScopes.set(id, inner);
+          nodes.set(id, { tag, w: inner.width + 2 * PADX, h: inner.height + HEADER + PADB });
+          continue;
+        }
+      } catch (err) {
+        // A nested scope that throws must NOT sink the whole diagram into the
+        // edge-less fallback — degrade just this region to a collapsed tile.
+        console.warn(`[living-diagram] nested scope layout failed for "${id}"; rendering it as a collapsed tile`, err);
       }
-      // an empty / collapsed subprocess falls through to a plain tile
+      // an empty / collapsed / failed subprocess falls through to a plain tile
     }
     const [w, h] = sizeFor(tag);
     nodes.set(id, { tag, w, h, attachedTo: tag === "boundaryEvent" ? c.getAttribute("attachedToRef") || undefined : undefined });
@@ -122,7 +133,12 @@ function layoutScope(scopeEl: Element): Scope | null {
     if (u === v || !g.hasNode(u) || !g.hasNode(v)) continue;
     g.setEdge(u, v, {}, f.id);
   }
-  dagre.layout(g);
+  try {
+    dagre.layout(g);
+  } catch (err) {
+    console.warn(`[living-diagram] dagre.layout threw for scope "${scopeEl.getAttribute("id") ?? "process"}"`, err);
+    return null;
+  }
 
   const boxes = new Map<string, Box>();
   for (const id of g.nodes()) {
@@ -210,6 +226,12 @@ function emitDi(doc: Document, procId: string, pos: Map<string, Box>, edges: Map
     }
     plane.appendChild(e);
   }
+  // Parity: every sequenceFlow should have emitted an edge (cross-scope flows whose
+  // ends live in different scopes are the only legitimate gap).
+  const flowCount = doc.getElementsByTagNameNS(NS.bpmn, "sequenceFlow").length;
+  if (edges.size !== flowCount) {
+    console.warn(`[living-diagram] dagre emitted ${edges.size} edges for ${flowCount} sequenceFlows`);
+  }
   doc.documentElement.appendChild(diagram);
   return new XMLSerializer().serializeToString(doc);
 }
@@ -228,20 +250,39 @@ export function ensureEdges(xml: string): string {
     if (!id || !b) continue;
     bounds.set(id, { x: +b.getAttribute("x")!, y: +b.getAttribute("y")!, w: +b.getAttribute("width")!, h: +b.getAttribute("height")! });
   }
+  // A boundary event's own bounds may be missing in a partial DI; fall back to its
+  // host's box so an edge into/out of it still resolves (today's orphan "↘" arrow
+  // is a flow whose end had no bounds, so the edge was silently dropped).
+  const attachedTo = new Map<string, string>();
+  for (const be of Array.from(doc.getElementsByTagNameNS(NS.bpmn, "boundaryEvent"))) {
+    const id = be.getAttribute("id");
+    const host = be.getAttribute("attachedToRef");
+    if (id && host) attachedTo.set(id, host);
+  }
+  const resolve = (id: string): Box | null =>
+    bounds.get(id) ?? (attachedTo.has(id) ? bounds.get(attachedTo.get(id)!) ?? null : null);
+
   const haveEdge = new Set<string>();
   for (const e of Array.from(doc.getElementsByTagNameNS(NS.di, "BPMNEdge"))) {
     const id = e.getAttribute("bpmnElement");
     if (id) haveEdge.add(id);
   }
-  let added = 0;
+  const addedSet = new Set<string>();
+  let missing = 0;
+  const flowIds: string[] = [];
   for (const f of Array.from(doc.getElementsByTagNameNS(NS.bpmn, "sequenceFlow"))) {
     const id = f.getAttribute("id");
+    if (id) flowIds.push(id);
     const s = f.getAttribute("sourceRef");
     const t = f.getAttribute("targetRef");
     if (!id || !s || !t || haveEdge.has(id)) continue;
-    const sb = bounds.get(s);
-    const tb = bounds.get(t);
-    if (!sb || !tb) continue;
+    const sb = resolve(s);
+    const tb = resolve(t);
+    if (!sb || !tb) {
+      missing++;
+      console.warn(`[living-diagram] no bounds to route sequenceFlow "${id}" (${s} → ${t}); skipping`);
+      continue;
+    }
     const e = doc.createElementNS(NS.di, "bpmndi:BPMNEdge");
     e.setAttribute("bpmnElement", id);
     for (const [x, y] of route(sb, tb)) {
@@ -251,9 +292,14 @@ export function ensureEdges(xml: string): string {
       e.appendChild(wp);
     }
     plane.appendChild(e);
-    added++;
+    addedSet.add(id);
   }
-  return added ? new XMLSerializer().serializeToString(doc) : xml;
+  // Parity: assert every sequenceFlow now has a rendered edge.
+  const covered = flowIds.filter((id) => haveEdge.has(id) || addedSet.has(id)).length;
+  if (covered !== flowIds.length) {
+    console.warn(`[living-diagram] edge parity mismatch: ${covered}/${flowIds.length} sequenceFlows routed (${missing} unroutable)`);
+  }
+  return addedSet.size ? new XMLSerializer().serializeToString(doc) : xml;
 }
 
 /** Orthogonal route between two boxes with one mid-bend (clean right angles). */

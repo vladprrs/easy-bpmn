@@ -75,3 +75,28 @@
   descent-override: 24%;
   line-gap-override: 0%;
 }
+
+/* Metric-tuned fallback for the DISPLAY face — Clash Display loads lazily, so the
+ * hero numerals (durations, throughput) and big headlines must not reflow when it
+ * swaps in. Arial is the closest widely-installed metric donor for a geometric sans
+ * display; the overrides approximate Clash Display's box so the swap is near-invisible. */
+@font-face {
+  font-family: "Clash Display Fallback";
+  src: local("Arial"), local("Helvetica Neue"), local("Helvetica");
+  size-adjust: 104%;
+  ascent-override: 94%;
+  descent-override: 23%;
+  line-gap-override: 0%;
+}
+
+/* Metric-tuned fallback for the MONO face — keeps data tables (ids, keys, timestamps,
+ * JSON) from shifting horizontally while Commit Mono loads. Menlo is the closest
+ * monospace donor (near-identical advance width); overrides approximate Commit Mono. */
+@font-face {
+  font-family: "Commit Mono Fallback";
+  src: local("Menlo"), local("Consolas"), local("DejaVu Sans Mono");
+  size-adjust: 100%;
+  ascent-override: 80%;
+  descent-override: 22%;
+  line-gap-override: 0%;
+}

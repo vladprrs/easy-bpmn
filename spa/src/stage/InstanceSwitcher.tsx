@@ -8,9 +8,10 @@ import { useNavigate } from "react-router-dom";
 import { ChevronDown, Play, Search } from "lucide-react";
 import { api } from "../api/client";
 import type { ElementIndex } from "../lib/elements";
-import { Popover } from "./primitives";
+import { Popover, useDebounced } from "./primitives";
 import { StatusBadge } from "../components/StatusBadge";
 import { relativeTime } from "../lib/format";
+import { humanize } from "../lib/humanize";
 
 const FILTERS = ["running", "waiting", "incident", "compensationFailed", "completed", "cancelled"];
 
@@ -30,15 +31,17 @@ export function InstanceSwitcher({
   const navigate = useNavigate();
   const [search, setSearch] = useState("");
   const [statuses, setStatuses] = useState<string[]>([]);
+  // Local typing stays instant; the network query only fires once typing settles.
+  const dSearch = useDebounced(search.trim(), 200);
 
   const q = useQuery({
-    queryKey: ["instances", workspaceId, sagaId, statuses, search],
+    queryKey: ["instances", workspaceId, sagaId, statuses, dSearch],
     queryFn: () =>
       api.instances({
         workspaceId,
         sagaId,
         status: statuses.length ? statuses.join(",") : undefined,
-        search: search || undefined,
+        search: dSearch || undefined,
         limit: 40,
       }),
     enabled: !!sagaId,
@@ -49,11 +52,12 @@ export function InstanceSwitcher({
   return (
     <Popover
       width={360}
+      ariaLabel="Choose a run to watch"
       trigger={({ toggle: t, ref, open }) => (
         <button
           ref={ref as any}
           onClick={t}
-          className="flex items-center gap-2 rounded-lg border border-line bg-surface-card/80 px-2.5 py-1.5 text-sm shadow-xs backdrop-blur transition hover:border-line-strong"
+          className="flex items-center gap-2 rounded-lg border border-line bg-surface-card px-2.5 py-1.5 text-sm shadow-xs transition hover:border-line-strong"
         >
           <Play className="h-3.5 w-3.5 text-accent" />
           <span className="max-w-[12rem] truncate font-data text-xs text-content">
@@ -64,15 +68,15 @@ export function InstanceSwitcher({
       )}
     >
       {(close) => (
-        <div className="w-[360px]">
+        <div className="w-[min(360px,calc(100vw_-_2rem))]">
           <div className="flex items-center gap-1.5 border-b border-line px-3 py-2">
             <Search className="h-3.5 w-3.5 text-content-muted" />
             <input
               autoFocus
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Find by business / correlation key"
-              className="w-full bg-transparent text-sm text-content outline-none placeholder:text-content-muted"
+              placeholder="Find by business or correlation key"
+              className="w-full bg-transparent text-sm text-content outline-none placeholder:text-content-secondary"
             />
           </div>
           <div className="flex flex-wrap gap-1 border-b border-line px-3 py-2">
@@ -80,42 +84,52 @@ export function InstanceSwitcher({
               <button
                 key={s}
                 onClick={() => toggle(s)}
-                className={`rounded-full border px-2 py-0.5 text-2xs transition ${
+                aria-pressed={statuses.includes(s)}
+                className={`rounded-full border px-2.5 py-1 text-xs transition ${
                   statuses.includes(s)
-                    ? "border-accent bg-accent-soft text-accent"
+                    ? "border-accent bg-accent-soft text-accent-press"
                     : "border-line text-content-secondary hover:border-line-strong"
                 }`}
               >
-                {s}
+                {humanize(s).title}
               </button>
             ))}
           </div>
           <ul className="max-h-[50vh] overflow-auto p-1.5">
-            {q.isLoading && <li className="px-3 py-6 text-center text-sm text-content-muted">Loading runs…</li>}
-            {q.data?.instances.map((i) => (
-              <li key={i.instanceId}>
-                <button
-                  onClick={() => {
-                    navigate(`/console/p/${encodeURIComponent(sagaId)}/i/${encodeURIComponent(i.instanceId)}`);
-                    close();
-                  }}
-                  className={`flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left transition hover:bg-surface-hover ${
-                    i.instanceId === currentInstanceId ? "bg-accent-soft" : ""
-                  }`}
-                >
-                  <StatusBadge status={i.status} />
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate font-data text-xs text-content">{i.businessKey || i.correlationKey}</div>
-                    <div className="truncate text-2xs text-content-muted">
-                      at {index.nameOf(i.currentElementId || "") || "—"}
-                    </div>
-                  </div>
-                  <span className="shrink-0 text-2xs text-content-muted">{relativeTime(i.updatedAt)}</span>
+            {q.isLoading && <li className="px-3 py-6 text-center text-sm text-content-secondary">Loading runs…</li>}
+            {q.isError && (
+              <li className="px-3 py-6 text-center text-sm text-content-secondary">
+                Couldn't load runs.{" "}
+                <button onClick={() => q.refetch()} className="font-medium text-accent-press hover:underline">
+                  Retry
                 </button>
               </li>
-            ))}
+            )}
+            {q.data?.instances.map((i) => {
+              const at = index.nameOf(i.currentElementId || "");
+              return (
+                <li key={i.instanceId}>
+                  <button
+                    onClick={() => {
+                      navigate(`/console/p/${encodeURIComponent(sagaId)}/i/${encodeURIComponent(i.instanceId)}`);
+                      close();
+                    }}
+                    className={`flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left transition hover:bg-surface-hover ${
+                      i.instanceId === currentInstanceId ? "bg-accent-soft" : ""
+                    }`}
+                  >
+                    <StatusBadge status={i.status} />
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate font-data text-xs text-content">{i.businessKey || i.correlationKey}</div>
+                      <div className="truncate text-xs text-content-secondary">{at ? `at ${at}` : "no active step"}</div>
+                    </div>
+                    <span className="shrink-0 text-xs text-content-secondary">{relativeTime(i.updatedAt)}</span>
+                  </button>
+                </li>
+              );
+            })}
             {q.data && q.data.instances.length === 0 && (
-              <li className="px-3 py-6 text-center text-sm text-content-muted">No runs match.</li>
+              <li className="px-3 py-6 text-center text-sm text-content-secondary">No runs match those filters.</li>
             )}
           </ul>
         </div>

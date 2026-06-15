@@ -3,9 +3,9 @@
 import type { Tone } from "./humanize";
 
 export function relativeTime(iso: string | null | undefined): string {
-  if (!iso) return "—";
+  if (!iso) return "n/a";
   const then = new Date(iso).getTime();
-  if (Number.isNaN(then)) return "—";
+  if (Number.isNaN(then)) return "n/a";
   const diff = Date.now() - then;
   const abs = Math.abs(diff);
   const s = Math.round(abs / 1000);
@@ -17,7 +17,7 @@ export function relativeTime(iso: string | null | undefined): string {
 }
 
 export function formatTime(iso: string | null | undefined): string {
-  if (!iso) return "—";
+  if (!iso) return "n/a";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return String(iso);
   return d.toLocaleString(undefined, { hour12: false });
@@ -46,7 +46,7 @@ export function statusTone(status: string): Tone {
 }
 
 export function shortId(id: string | null | undefined, keep = 8): string {
-  if (!id) return "—";
+  if (!id) return "n/a";
   const tail = id.includes("_") ? id.slice(id.lastIndexOf("_") + 1) : id;
   return tail.length > keep ? tail.slice(0, keep) : tail;
 }

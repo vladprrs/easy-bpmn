@@ -1,10 +1,12 @@
 // GlassRenderer — a high-priority bpmn-js BaseRenderer that redraws flow nodes as
-// luminous glass tiles and sequence flows as rounded connectors with a chevron
-// arrowhead that inherits the edge colour. Activities use a left-aligned "tile"
-// composition: a vivid filled category icon-chip + a bold name, with depth from a
-// glass rim + deep soft shadow rather than a heavy Camunda-style border. Runtime
-// state / flow / heat / selection still arrive as marker CSS classes; this renderer
-// owns the resting vocabulary.
+// SOLID, confident, legible cards and sequence flows as rounded connectors with a
+// chevron arrowhead that inherits the edge colour. Each node is one opaque white
+// card (--surface-card) carrying its category through a single full-opacity
+// category-coloured stroke + a vivid filled icon-chip, seated by one tight contact
+// shadow (no frost, no sheen, no rim — those were the glass tell). Runtime state /
+// flow / heat / selection still arrive as marker CSS classes that recolour the solid
+// body + stroke; this renderer owns the resting vocabulary. (Name kept for import
+// stability; the diagram is no longer glass.)
 
 import BaseRenderer from "diagram-js/lib/draw/BaseRenderer";
 import { is, isAny, getBusinessObject } from "bpmn-js/lib/util/ModelUtil";
@@ -60,17 +62,13 @@ export default class GlassRenderer extends BaseRenderer {
   private drawActivity(g: SVGElement, element: any) {
     const { width: w, height: h } = element;
     const R = TASK_RADIUS;
-    const clipId = `ebpmn-clip-${safeId(element.id)}`;
-    appendClip(g, clipId, el("rect", { x: 0, y: 0, width: w, height: h, rx: R }));
 
-    svgAppend(g, el("rect", { x: 0, y: 0, width: w, height: h, rx: R, fill: "url(#ebpmn-frost)", filter: "url(#ebpmn-elev)" }, "ebpmn-shape"));
-    const inner = el("g", { "clip-path": `url(#${clipId})` });
-    svgAppend(inner, el("rect", { x: 0, y: 0, width: w, height: h, rx: R }, "ebpmn-tint"));
-    svgAppend(inner, el("rect", { x: -3, y: -3, width: w + 6, height: h * 0.5, rx: R, fill: "url(#ebpmn-sheen)" }, "ebpmn-sheen"));
-    svgAppend(g, inner);
-    // Glass rim (bright inner edge) + the thin state stroke — no heavy border.
-    svgAppend(g, el("rect", { x: 1, y: 1, width: w - 2, height: h - 2, rx: R - 1, fill: "none" }, "ebpmn-rim"));
-    svgAppend(g, el("rect", { x: 0.6, y: 0.6, width: w - 1.2, height: h - 1.2, rx: R - 0.6, fill: "none" }, "ebpmn-stroke"));
+    // Solid white card (fill in CSS .ebpmn-shape) seated by one tight contact shadow.
+    svgAppend(g, el("rect", { x: 0, y: 0, width: w, height: h, rx: R, filter: "url(#ebpmn-elev)" }, "ebpmn-shape"));
+    // A very faint category wash over the white (≤8%) — subtlety, never a coloured box.
+    svgAppend(g, el("rect", { x: 0, y: 0, width: w, height: h, rx: R }, "ebpmn-tint"));
+    // ONE crisp category stroke (state recolours it; state border wins over category).
+    svgAppend(g, el("rect", { x: 0.75, y: 0.75, width: w - 1.5, height: h - 1.5, rx: R - 0.75, fill: "none" }, "ebpmn-stroke"));
 
     // Small vivid category chip in the TOP-LEFT corner — a colour accent, not a
     // column. Keeps the full tile width for the label (standard 100px authored tasks
@@ -93,10 +91,11 @@ export default class GlassRenderer extends BaseRenderer {
         box: { width: w - 16, height: Math.max(16, h - top - 6) },
         align: "center-middle",
         padding: 0,
-        style: { fontFamily: FONT, fontSize: 12, fontWeight: 600, fill: INK, lineHeight: 1.16 },
+        style: { fontFamily: FONT, fontSize: 13, fontWeight: 600, fill: INK, lineHeight: 1.3 },
       });
       svgAttr(text, { transform: `translate(8 ${top})` });
       svgClasses(text).add("ebpmn-label");
+      appendTitle(text, name); // full name always reachable (hover tooltip + a11y) if truncated
       svgAppend(g, text);
     }
 
@@ -112,7 +111,7 @@ export default class GlassRenderer extends BaseRenderer {
   private drawExpanded(g: SVGElement, element: any) {
     const { width: w, height: h } = element;
     const R = TASK_RADIUS + 3;
-    // A light translucent region so the nested children read on top of it.
+    // A solid pale region (sunken vs white child cards) so the nested children read on top.
     svgAppend(g, el("rect", { x: 0, y: 0, width: w, height: h, rx: R, filter: "url(#ebpmn-elev)" }, "ebpmn-region"));
     svgAppend(g, el("rect", { x: 0.6, y: 0.6, width: w - 1.2, height: h - 1.2, rx: R - 0.6, fill: "none" }, "ebpmn-stroke"));
     if (is(element, "bpmn:Transaction")) {
@@ -132,13 +131,14 @@ export default class GlassRenderer extends BaseRenderer {
     const name = getBusinessObject(element)?.name;
     if (name) {
       const text = this.textRenderer.createText(name, {
-        box: { width: w - hx - 10, height: 22 },
+        box: { width: w - hx - 10, height: 24 },
         align: "left-middle",
         padding: 0,
-        style: { fontFamily: FONT, fontSize: 12.5, fontWeight: 600, fill: INK, lineHeight: 1.1 },
+        style: { fontFamily: FONT, fontSize: 13, fontWeight: 600, fill: INK, lineHeight: 1.3 },
       });
-      svgAttr(text, { transform: `translate(${hx} 10)` });
+      svgAttr(text, { transform: `translate(${hx} 9)` });
       svgClasses(text).add("ebpmn-label");
+      appendTitle(text, name);
       svgAppend(g, text);
     }
   }
@@ -149,16 +149,11 @@ export default class GlassRenderer extends BaseRenderer {
     const r = Math.min(w, h) / 2;
     const cx = w / 2;
     const cy = h / 2;
-    const clipId = `ebpmn-clip-${safeId(element.id)}`;
-    appendClip(g, clipId, el("circle", { cx, cy, r }));
 
-    svgAppend(g, el("circle", { cx, cy, r, fill: "url(#ebpmn-disc-frost)", filter: "url(#ebpmn-elev)" }, "ebpmn-shape"));
-    const inner = el("g", { "clip-path": `url(#${clipId})` });
-    svgAppend(inner, el("circle", { cx, cy, r }, "ebpmn-tint"));
-    svgAppend(inner, el("ellipse", { cx, cy: cy - r * 0.3, rx: r * 0.92, ry: r * 0.6, fill: "url(#ebpmn-sheen)" }, "ebpmn-sheen"));
-    svgAppend(g, inner);
-    svgAppend(g, el("circle", { cx, cy, r: r - 1.5, fill: "none" }, "ebpmn-rim"));
-    svgAppend(g, el("circle", { cx, cy, r: r - 0.75, fill: "none" }, "ebpmn-stroke"));
+    // Solid white disc (fill in CSS) + faint category wash + one category ring.
+    svgAppend(g, el("circle", { cx, cy, r, filter: "url(#ebpmn-elev)" }, "ebpmn-shape"));
+    svgAppend(g, el("circle", { cx, cy, r }, "ebpmn-tint"));
+    svgAppend(g, el("circle", { cx, cy, r: r - 0.9, fill: "none" }, "ebpmn-stroke"));
     if (cat === "inter" || cat === "boundary") {
       svgAppend(g, el("circle", { cx, cy, r: r - 4, fill: "none" }, "ebpmn-stroke-inner"));
     }
@@ -171,14 +166,10 @@ export default class GlassRenderer extends BaseRenderer {
   private drawGateway(g: SVGElement, element: any) {
     const { width: w, height: h } = element;
     const d = diamondPath(w, h, 7);
-    const clipId = `ebpmn-clip-${safeId(element.id)}`;
-    appendClip(g, clipId, el("path", { d }));
 
-    svgAppend(g, el("path", { d, fill: "url(#ebpmn-frost)", filter: "url(#ebpmn-elev)" }, "ebpmn-shape"));
-    const inner = el("g", { "clip-path": `url(#${clipId})` });
-    svgAppend(inner, el("path", { d }, "ebpmn-tint"));
-    svgAppend(inner, el("rect", { x: 0, y: -2, width: w, height: h * 0.6, fill: "url(#ebpmn-sheen)" }, "ebpmn-sheen"));
-    svgAppend(g, inner);
+    // Solid white diamond (fill in CSS) + faint category wash + one category stroke.
+    svgAppend(g, el("path", { d, filter: "url(#ebpmn-elev)" }, "ebpmn-shape"));
+    svgAppend(g, el("path", { d }, "ebpmn-tint"));
     svgAppend(g, el("path", { d, fill: "none" }, "ebpmn-stroke"));
 
     drawGatewayGlyph(g, element, w, h);
@@ -202,11 +193,12 @@ function el(tag: string, attrs: Record<string, any>, cls?: string): SVGElement {
   return node;
 }
 
-function appendClip(g: SVGElement, id: string, shape: SVGElement) {
-  const clip = svgCreate("clipPath");
-  clip.id = id;
-  svgAppend(clip, shape);
-  svgAppend(g, clip);
+/** Attach the full name as a native SVG <title> so a truncated label stays readable
+ * on hover and to assistive tech (no information lost when a long name wraps/clips). */
+function appendTitle(textEl: SVGElement, name: string) {
+  const t = svgCreate("title");
+  t.textContent = name;
+  svgAppend(textEl, t);
 }
 
 function iconSvg(key: IconKey, filled: boolean, x: number, y: number, size: number): SVGElement {
@@ -332,8 +324,4 @@ function iconFor(element: any): { key: IconKey; filled: boolean } | null {
   if (is(element, "bpmn:CallActivity")) return { key: "call", filled: false };
   if (isAny(element, ["bpmn:SubProcess", "bpmn:Transaction"])) return { key: "subprocess", filled: false };
   return null;
-}
-
-function safeId(id: string): string {
-  return String(id).replace(/[^a-zA-Z0-9_-]/g, "");
 }

@@ -18,7 +18,7 @@ import type { DiagramOverlay, FlowPlan, HeatPlan } from "../lib/flow";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const XLINK = "http://www.w3.org/1999/xlink";
-const MAX_TOKENS = 12; // mirror a sane visual cap on the animated frontier
+const MAX_TOKENS = 4; // a few travelling tokens read as DIRECTION; more reads as confetti
 
 const MARKER = {
   traversed: "ebpmn-traversed",
@@ -35,6 +35,16 @@ function hasDi(xml: string): boolean {
 
 function prefersReducedMotion(): boolean {
   return typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+}
+
+/** Truncate to <= max chars on a WORD boundary with a trailing ellipsis. The full
+ *  string rides the badge's title attribute, so nothing is lost. */
+function truncateWords(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const cut = s.slice(0, max);
+  const sp = cut.lastIndexOf(" ");
+  const head = sp > max * 0.5 ? cut.slice(0, sp) : cut;
+  return head.replace(/[\s.,;:–-]+$/, "") + "…";
 }
 
 export default function LivingDiagram({
@@ -69,8 +79,16 @@ export default function LivingDiagram({
   const appliedMarkers = useRef<{ id: string; cls: string }[]>([]);
   const tokenNodes = useRef<SVGGElement[]>([]);
   const overlayIds = useRef<string[]>([]);
+  // The one-shot "circuit settles on success" beat: elements injected for it, plus an
+  // edge-trigger guard so it fires once on the false→true settle (never on a prop
+  // tick, a selection change, a re-fit, or a replay scrub).
+  const beatNodes = useRef<{ el: Element; anim: Animation }[]>([]);
+  const settledPlayed = useRef(false);
+  const lastBeatAt = useRef(0);
   const [failed, setFailed] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
+  // Bumped after a font-late re-import so the overlay effect re-applies markers/tokens.
+  const [refit, setRefit] = useState(0);
 
   // The aurora field owns its own WebGL canvas + RAF loop. It's created lazily in
   // the import effect (the canvas only exists on the non-fallback branch) and torn
@@ -87,6 +105,8 @@ export default function LivingDiagram({
     let disposed = false;
     setReady(false);
     setFailed(null);
+    // A new diagram: let an already-completed run play the settle beat on arrival.
+    settledPlayed.current = false;
     if (!bpmnXml || !hostRef.current) {
       setFailed(bpmnXml ? null : "No BPMN XML available.");
       return;
@@ -103,25 +123,33 @@ export default function LivingDiagram({
     const aurora = auroraRef.current;
 
     (async () => {
-      try {
-        // Load the label font BEFORE import so diagram-js measures (and therefore
-        // wraps) labels with the real General Sans metrics, not a fallback — else
-        // text is measured narrow, never wraps, and overflows the node.
-        if (typeof document !== "undefined" && document.fonts?.load) {
-          try {
-            await Promise.all([
-              document.fonts.load('600 13px "General Sans"'),
-              document.fonts.load('500 13px "General Sans"'),
-            ]);
-          } catch {
-            /* font API hiccup — proceed with fallback metrics */
-          }
+      // diagram-js measures (and wraps) labels at import time, so the real General
+      // Sans metrics MUST be resolved BEFORE importXML — otherwise text is measured
+      // with a narrow fallback and a 2-word label wraps one character per line.
+      // Preloading the two weights is not enough on its own: also block on
+      // document.fonts.ready (all in-flight font loads settled).
+      let fontsReady = false;
+      if (typeof document !== "undefined" && document.fonts) {
+        try {
+          await Promise.all([
+            document.fonts.load('600 13px "General Sans"'),
+            document.fonts.load('500 13px "General Sans"'),
+            document.fonts.ready,
+          ]);
+          fontsReady = true;
+        } catch {
+          /* font API hiccup — proceed with fallback metrics, re-measure below */
         }
+      }
+
+      try {
         const xml = hasDi(bpmnXml) ? bpmnXml : await layoutDiagram(bpmnXml);
         await viewer.importXML(xml);
         if (disposed) return;
         const canvas = viewer.get("canvas");
         canvas.zoom("fit-viewport", "auto");
+        // Click / hover handlers register on the persistent eventBus (they survive a
+        // re-import), so they're wired exactly once here.
         viewer.on("element.click", (e: any) => {
           const id = e?.element?.id;
           if (id) onSelectRef.current(id);
@@ -165,6 +193,26 @@ export default function LivingDiagram({
           ro.observe(hostRef.current);
         }
         setReady(true);
+
+        // Safety net: if we imported before the web fonts settled, re-import ONCE
+        // when they do — diagram-js only measures labels at import, so this re-wraps
+        // them with real metrics. The refit nonce re-applies overlays/tokens after.
+        if (!fontsReady && typeof document !== "undefined" && document.fonts?.ready) {
+          document.fonts.ready
+            .then(() => (disposed ? undefined : viewer.importXML(xml)))
+            .then(() => {
+              if (disposed) return;
+              try {
+                canvas.zoom("fit-viewport", "auto");
+              } catch {
+                /* ignore */
+              }
+              setRefit((n) => n + 1);
+            })
+            .catch(() => {
+              /* re-measure is best-effort */
+            });
+        }
       } catch (err) {
         if (!disposed) setFailed(err instanceof Error ? err.message : "Diagram render failed.");
       }
@@ -183,6 +231,7 @@ export default function LivingDiagram({
       appliedMarkers.current = [];
       tokenNodes.current = [];
       overlayIds.current = [];
+      clearBeat(beatNodes);
     };
     // `elements`/`onSelectElement` intentionally omitted: elements change with bpmnXml,
     // and the click handler reads the latest callback via onSelectRef — so a new parent
@@ -194,6 +243,7 @@ export default function LivingDiagram({
   useEffect(() => {
     const viewer = viewerRef.current;
     if (!viewer || !ready) return;
+    void refit; // re-apply trigger: bumped after a font-late re-import wipes the canvas
     let canvas: any, overlays: any, registry: any;
     try {
       canvas = viewer.get("canvas");
@@ -214,6 +264,7 @@ export default function LivingDiagram({
     appliedMarkers.current = [];
     for (const n of tokenNodes.current) n.remove();
     tokenNodes.current = [];
+    clearBeat(beatNodes); // cancel any in-flight settle beat before re-applying
     for (const id of overlayIds.current) {
       try {
         overlays.remove(id);
@@ -231,12 +282,15 @@ export default function LivingDiagram({
         /* not in this diagram */
       }
     };
-    const addBadge = (id: string, text: string, tone: string) => {
+    const addBadge = (id: string, text: string, tone: string, title?: string) => {
       try {
-        const oid = overlays.add(id, {
-          position: { top: -12, left: -6 },
-          html: `<div class="ebpmn-overlay-badge ${tone}">${text}</div>`,
-        });
+        // Build the badge node imperatively (textContent, never innerHTML) so a model
+        // name / failure reason can never inject markup.
+        const node = document.createElement("div");
+        node.className = `ebpmn-overlay-badge ${tone}`;
+        node.textContent = text;
+        if (title) node.title = title;
+        const oid = overlays.add(id, { position: { top: -12, left: -6 }, html: node });
         overlayIds.current.push(oid);
       } catch {
         /* skip */
@@ -269,28 +323,75 @@ export default function LivingDiagram({
       }
 
       // Badges: failure reasons, gateway decisions, timers.
-      overlay.failed.forEach((f) => addBadge(f.elementId, "✕ " + f.reason.slice(0, 28), "danger"));
+      overlay.failed.forEach((f) => addBadge(f.elementId, "✕ " + truncateWords(f.reason, 28), "danger", f.reason));
       overlay.badges.forEach((b) => addBadge(b.elementId, b.text, b.tone));
     }
 
-    // Selection highlight.
-    if (selectedElement) addMarker(selectedElement, MARKER.selected);
+    // Feed the aurora field the live light pools (it resolves geometry itself). A
+    // finished, successful circuit rests on a plain pale field — the pools breathe
+    // out in the settle beat below rather than holding a steady glow.
+    const reduced = prefersReducedMotion();
+    let spots: Hotspot[];
+    if (mode === "aggregate") {
+      spots = heat.nodes.map((n) => ({
+        id: n.elementId,
+        kind: n.hot ? "hot" : n.tier >= 2 ? "live" : "settle",
+        weight: n.hot ? 1 : 0.5 + n.tier * 0.25,
+      }));
+    } else if (flow.settled) {
+      spots = [];
+    } else {
+      spots = [
+        ...overlay.current.map((id) => ({ id, kind: "live" as const })),
+        ...overlay.failed.map((f) => ({ id: f.elementId, kind: "hot" as const })),
+        ...flow.settledNodes.map((id) => ({ id, kind: "settle" as const, weight: 0.8 })),
+      ];
+    }
 
-    // Feed the aurora field the live light pools (it resolves geometry itself).
-    const spots: Hotspot[] =
-      mode === "aggregate"
-        ? heat.nodes.map((n) => ({
-            id: n.elementId,
-            kind: n.hot ? "hot" : n.tier >= 2 ? "live" : "settle",
-            weight: n.hot ? 1 : 0.5 + n.tier * 0.25,
-          }))
-        : [
-            ...overlay.current.map((id) => ({ id, kind: "live" as const })),
-            ...overlay.failed.map((f) => ({ id: f.elementId, kind: "hot" as const })),
-            ...flow.settledNodes.map((id) => ({ id, kind: "settle" as const, weight: 0.8 })),
-          ];
+    // THE SIGNATURE — the circuit settles on success. Edge-triggered on the
+    // false→true settle so it plays ONCE: not on a prop tick, a selection, a
+    // re-fit, or a replay scrub. Under reduced motion it never plays — the static
+    // settled-green state below carries every bit of the information.
+    if (mode === "single" && !flow.settled) settledPlayed.current = false;
+    const playBeat =
+      mode === "single" && !!flow.settled && !settledPlayed.current && !reduced && Date.now() - lastBeatAt.current > 4000;
+    if (playBeat) {
+      settledPlayed.current = true;
+      lastBeatAt.current = Date.now();
+      auroraRef.current?.exhale(); // snapshot the live pools BEFORE they're cleared, then breathe out
+      playSettleBeat(registry, flow, beatNodes);
+    }
     auroraRef.current?.setHotspots(spots);
-  }, [overlay, flow, heat, mode, reverse, selectedElement, ready]);
+  }, [overlay, flow, heat, mode, reverse, ready, refit]);
+
+  // ---- Selection ring (its OWN effect) ------------------------------------
+  // Clicking a node must NOT tear down the marker/token reconciliation above or
+  // restart the live SMIL token march, so the selection highlight is applied and
+  // cleared in isolation. Keyed on the selection (plus `ready`/`refit`, since a
+  // font-late re-import wipes every canvas marker and the ring must re-land).
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    if (!viewer || !ready || !selectedElement) return;
+    void refit;
+    let canvas: any;
+    try {
+      canvas = viewer.get("canvas");
+    } catch {
+      return;
+    }
+    try {
+      canvas.addMarker(selectedElement, MARKER.selected);
+    } catch {
+      /* not in this diagram */
+    }
+    return () => {
+      try {
+        canvas.removeMarker(selectedElement, MARKER.selected);
+      } catch {
+        /* gone */
+      }
+    };
+  }, [selectedElement, ready, refit]);
 
   if (failed) {
     return <ElementListFallback elements={elements} overlay={overlay} reason={failed} onSelectElement={onSelectElement} />;
@@ -331,8 +432,10 @@ function injectTokens(registry: any, edgeIds: string[], reverse: boolean, store:
     core.setAttribute("class", "core");
     core.setAttribute("r", "3.6");
     if (reverse) {
+      // Compensation walks backward in amber; derive the halo from the warning token
+      // so the two stay in lockstep (no second hard-coded amber to drift).
       core.style.fill = "var(--state-warning)";
-      halo.style.fill = "rgba(207,138,24,0.45)";
+      halo.style.fill = "color-mix(in oklch, var(--state-warning) 45%, transparent)";
     }
     const motion = document.createElementNS(SVG_NS, "animateMotion");
     motion.setAttribute("dur", "2.6s");
@@ -353,6 +456,196 @@ function injectTokens(registry: any, edgeIds: string[], reverse: boolean, store:
     visual.appendChild(g);
     store.current.push(g);
   }
+}
+
+type BeatStore = { current: { el: Element; anim: Animation }[] };
+const EXPO = "cubic-bezier(0.16,1,0.3,1)"; // exponential ease-out — confident, no bounce
+
+/** THE SIGNATURE BEAT — "the circuit settles on success". One orchestrated ~1.5s
+ *  moment, played once (the overlay effect edge-triggers it on the settle):
+ *    1. the live teal current sprints the final edge into the End event;
+ *    2. the End event blooms — a soft green ring expands and eases out;
+ *    3. a wave of settle-light sweeps BACKWARD End→Start, nodes + edges catching
+ *       green in reverse, staggered with an exponential ease-out;
+ *    4. each element rests on the calm settled-green it ALREADY wears statically.
+ *  Everything injected is additive light over the resting markers, so the beat's end
+ *  frame IS the static settled state — the reduced-motion path simply skips it and
+ *  loses nothing. */
+function playSettleBeat(registry: any, flow: FlowPlan, store: BeatStore) {
+  if (!registry) return;
+  const order = flow.settleOrder ?? [];
+  // ms between elements. Clamp so the backward sweep lands in a fixed ~1.4-1.6s
+  // window even on a 30-40 node saga (a flat 58ms would stretch to ~2.6-3s and lose
+  // its punch). Small sagas keep the full 58ms legible spacing.
+  const STAGGER = Math.min(58, Math.round(1100 / Math.max(order.length, 1)));
+  const SPRINT = 340; // the current's final dash into the End event
+  const SWEEP_AT = SPRINT - 70; // bloom + sweep begin just as the dash lands
+
+  // (1) the current races the final edge into End (teal hands off to green).
+  const intoEnd = order.find((s) => s.kind === "edge");
+  if (intoEnd) sprintIntoEnd(registry, intoEnd.id, store);
+
+  // (2) the End event blooms.
+  for (const id of flow.settledNodes ?? []) bloomNode(registry, id, SWEEP_AT, store);
+
+  // (3) the wave sweeps backward End→Start.
+  order.forEach((step, i) => {
+    const delay = SWEEP_AT + i * STAGGER;
+    if (step.kind === "node") settleNode(registry, step.id, delay, store);
+    else settleEdge(registry, step.id, delay, store);
+  });
+}
+
+function trackBeat(store: BeatStore, el: Element, anim: Animation) {
+  store.current.push({ el, anim });
+  anim.onfinish = () => {
+    try {
+      el.remove();
+    } catch {
+      /* gone */
+    }
+  };
+}
+
+/** Cancel any in-flight settle beat and remove its injected light (called before a
+ *  re-apply and on teardown so a poll/scrub mid-beat never leaves stray elements). */
+function clearBeat(store: BeatStore) {
+  for (const { el, anim } of store.current) {
+    try {
+      anim.cancel();
+    } catch {
+      /* ignore */
+    }
+    try {
+      el.remove();
+    } catch {
+      /* ignore */
+    }
+  }
+  store.current = [];
+}
+
+function supportsOffsetPath(): boolean {
+  return typeof CSS !== "undefined" && !!CSS.supports?.("offset-path", 'path("M0 0")');
+}
+
+/** A connection's visible path + its `d` (absolute diagram coords, like the token). */
+function edgePath(registry: any, edgeId: string): { visual: SVGGElement; d: string } | null {
+  const gfx: SVGGElement | undefined = registry.getGraphics?.(edgeId);
+  const visual = gfx?.querySelector(".djs-visual") as SVGGElement | null;
+  const path = visual?.querySelector(":scope > path") as SVGPathElement | null;
+  const d = path?.getAttribute("d");
+  if (!visual || !d) return null;
+  return { visual, d };
+}
+
+/** (1) A bright teal token sprints the final edge and lands in the End event, via CSS
+ *  motion-path (a transform). Skipped where unsupported — the bloom + sweep carry on. */
+function sprintIntoEnd(registry: any, edgeId: string, store: BeatStore) {
+  const e = edgePath(registry, edgeId);
+  if (!e || !supportsOffsetPath()) return;
+  const g = document.createElementNS(SVG_NS, "g");
+  g.setAttribute("class", "ebpmn-settle-sprint");
+  const halo = document.createElementNS(SVG_NS, "circle");
+  halo.setAttribute("class", "halo");
+  halo.setAttribute("r", "9");
+  const core = document.createElementNS(SVG_NS, "circle");
+  core.setAttribute("class", "core");
+  core.setAttribute("r", "3.8");
+  g.appendChild(halo);
+  g.appendChild(core);
+  (g.style as any).offsetPath = `path('${e.d}')`;
+  (g.style as any).offsetRotate = "0deg";
+  e.visual.appendChild(g);
+  const anim = g.animate(
+    [
+      { offsetDistance: "0%", opacity: 0 },
+      { offsetDistance: "14%", opacity: 1, offset: 0.14 },
+      { offsetDistance: "92%", opacity: 1, offset: 0.86 },
+      { offsetDistance: "100%", opacity: 0 },
+    ] as any,
+    { duration: 360, easing: EXPO, fill: "both" },
+  );
+  trackBeat(store, g, anim);
+}
+
+/** (2) The End event blooms: a soft green ring expands and eases out (scale+opacity). */
+function bloomNode(registry: any, nodeId: string, delay: number, store: BeatStore) {
+  const el = registry.get?.(nodeId);
+  const gfx: SVGGElement | undefined = registry.getGraphics?.(nodeId);
+  const visual = gfx?.querySelector(".djs-visual") as SVGGElement | null;
+  if (!el || el.width == null || !visual) return;
+  const ring = document.createElementNS(SVG_NS, "circle");
+  ring.setAttribute("class", "ebpmn-settle-bloom");
+  ring.setAttribute("cx", String(el.width / 2));
+  ring.setAttribute("cy", String(el.height / 2));
+  ring.setAttribute("r", String(Math.max(el.width, el.height) / 2));
+  (ring.style as any).transformBox = "fill-box";
+  ring.style.transformOrigin = "center";
+  visual.appendChild(ring);
+  const anim = ring.animate(
+    [
+      { transform: "scale(0.5)", opacity: 0.7 },
+      { transform: "scale(2.5)", opacity: 0 },
+    ],
+    { duration: 780, delay, easing: EXPO, fill: "both" },
+  );
+  trackBeat(store, ring, anim);
+}
+
+/** (3) A node catches the settle-light: a soft green ring pulses around the resting
+ *  card and fades. Additive (a ring, never a fill) so the label stays legible and the
+ *  calm green marker remains underneath. */
+function settleNode(registry: any, nodeId: string, delay: number, store: BeatStore) {
+  const el = registry.get?.(nodeId);
+  const gfx: SVGGElement | undefined = registry.getGraphics?.(nodeId);
+  const node = gfx?.querySelector(".ebpmn-node") as SVGGElement | null;
+  if (!el || el.width == null || !node) return;
+  const pad = 5;
+  const round = Math.abs(el.width - el.height) < 6; // events / gateways read as round
+  const halo = document.createElementNS(SVG_NS, round ? "circle" : "rect");
+  halo.setAttribute("class", "ebpmn-settle-halo");
+  if (round) {
+    halo.setAttribute("cx", String(el.width / 2));
+    halo.setAttribute("cy", String(el.height / 2));
+    halo.setAttribute("r", String(Math.max(el.width, el.height) / 2 + pad));
+  } else {
+    halo.setAttribute("x", String(-pad));
+    halo.setAttribute("y", String(-pad));
+    halo.setAttribute("width", String(el.width + pad * 2));
+    halo.setAttribute("height", String(el.height + pad * 2));
+    halo.setAttribute("rx", "13");
+  }
+  (halo.style as any).transformBox = "fill-box";
+  halo.style.transformOrigin = "center";
+  node.appendChild(halo);
+  const anim = halo.animate(
+    [
+      { opacity: 0, transform: "scale(0.94)" },
+      { opacity: 0.7, transform: "scale(1.05)", offset: 0.4 },
+      { opacity: 0, transform: "scale(1)" },
+    ],
+    { duration: 560, delay, easing: EXPO, fill: "both" },
+  );
+  trackBeat(store, halo, anim);
+}
+
+/** (3) An edge catches the settle-light: a bright green flash flows over the resting
+ *  green path. The backward stagger across consecutive edges is the visible wave. */
+function settleEdge(registry: any, edgeId: string, delay: number, store: BeatStore) {
+  const e = edgePath(registry, edgeId);
+  if (!e) return;
+  const flash = document.createElementNS(SVG_NS, "path");
+  flash.setAttribute("class", "ebpmn-settle-flash");
+  flash.setAttribute("d", e.d);
+  e.visual.appendChild(flash);
+  const anim = flash.animate([{ opacity: 0 }, { opacity: 1, offset: 0.38 }, { opacity: 0 }], {
+    duration: 540,
+    delay,
+    easing: EXPO,
+    fill: "both",
+  });
+  trackBeat(store, flash, anim);
 }
 
 /** The diagram "powers up" on load: nodes ignite left→right with a soft scale-in,
@@ -409,15 +702,19 @@ function ElementListFallback({
   onSelectElement: (id: string | null) => void;
 }) {
   // The diagram IS the hero, so the textual element list is the resilient floor.
+  const shown = elements.filter((e) => !["sequenceFlow", "association"].includes(e.type));
   return (
     <div className="stage-field flex h-full w-full flex-col overflow-auto p-6">
       <div className="mb-3 text-sm text-content-secondary">
         Diagram unavailable ({reason}). Reading the process as an element list.
       </div>
       <ul className="grid grid-cols-2 gap-2 md:grid-cols-3 lg:grid-cols-4">
-        {elements
-          .filter((e) => !["sequenceFlow", "association"].includes(e.type))
-          .map((e) => {
+        {shown.length === 0 ? (
+          <li className="col-span-full rounded-md border border-line bg-surface-card px-3 py-6 text-center text-sm text-content-secondary">
+            No elements to show.
+          </li>
+        ) : (
+          shown.map((e) => {
             const isFailed = overlay.failed.some((f) => f.elementId === e.elementId);
             const isCurrent = overlay.current.includes(e.elementId);
             const isDone = overlay.traversed.includes(e.elementId);
@@ -426,22 +723,31 @@ function ElementListFallback({
                 <button
                   onClick={() => onSelectElement(e.elementId)}
                   title={e.elementId}
-                  className={`w-full truncate rounded-md border px-3 py-2 text-left text-sm transition ${
+                  className={`w-full truncate rounded-md border px-3 py-2 text-left text-sm text-content transition ${
                     isFailed
-                      ? "border-danger/40 bg-danger/10 text-danger"
+                      ? "border-danger/40 bg-danger/10"
                       : isCurrent
-                        ? "border-accent/40 bg-accent/10 text-accent"
+                        ? "border-accent/40 bg-accent/10"
                         : isDone
-                          ? "border-ok/30 bg-ok/5 text-content"
-                          : "border-line bg-surface-card text-content hover:border-line-strong"
+                          ? "border-ok/30 bg-ok/5"
+                          : "border-line bg-surface-card hover:border-line-strong"
                   }`}
                 >
                   <span className="font-data text-2xs text-content-muted">{e.type}</span>
-                  <span className="block truncate">{e.name || e.elementId}</span>
+                  {/* Name renders in body ink (AA); state tone lives on border+bg, and
+                      a long name carries an AA-safe tone (teal-700 / red-600) only. */}
+                  <span
+                    className={`block truncate ${
+                      isFailed ? "text-danger-hover" : isCurrent ? "text-accent-press" : "text-content"
+                    }`}
+                  >
+                    {e.name || e.elementId}
+                  </span>
                 </button>
               </li>
             );
-          })}
+          })
+        )}
       </ul>
     </div>
   );

@@ -5,11 +5,13 @@ import {
   NESTED_PAR_TX_BPMN,
   RE_ENTRY_TX_BPMN,
   authedPost,
+  createDraft,
   leaseAndComplete,
   leaseOne,
   mintWorkerToken,
   post,
   publishAndStart,
+  publishDraft,
 } from "../helpers";
 import { resumeInline, terminateUnleasableJob } from "../../src/runtime/engine";
 
@@ -166,6 +168,79 @@ describe("M5-L1 nested compensation (spec §3.4 / §4)", () => {
     rows = await ledgerByElementOcc(instanceId);
     expect(rows.get("A#0")).toBe("compensated");
     expect((await getInstanceRow(instanceId))!.status).toBe("compensated");
+  });
+
+  // Final-review C1 regression gate: the reviewer's corrupting adaptation of the
+  // gate-4 fixture — cancel fires on round 1 and the walk then loops back into T
+  // UNGUARDED (the loop-back into T made the gateway default) — must be
+  // UNPUBLISHABLE. The engine's cancelled-tx rewalk skip does not descend T's
+  // interior, so an unguarded re-entry would collide the interior occurrence
+  // counters with the cancelled occurrence's persisted rows (spurious re-cancel /
+  // stale outputs). The shipped RE_ENTRY_TX_BPMN itself stays publishable (its
+  // loop-back into T is condition-guarded) — asserted by gate 4 above.
+  it("rejects at publish the adapted re-entry fixture (cancel on round 1, unguarded loop back into T)", async () => {
+    const adapted = RE_ENTRY_TX_BPMN
+      // cancel fires on the FIRST round…
+      .replace("round = 2", "round = 1")
+      // …and the loop back into T becomes the UNGUARDED default route.
+      .replace('<bpmn:exclusiveGateway id="gw" default="og_trip"/>', '<bpmn:exclusiveGateway id="gw" default="og_T"/>')
+      .replace(
+        '<bpmn:sequenceFlow id="og_T" sourceRef="gw" targetRef="T"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">round &lt; 3</bpmn:conditionExpression></bpmn:sequenceFlow>',
+        '<bpmn:sequenceFlow id="og_T" sourceRef="gw" targetRef="T"/>',
+      )
+      .replace(
+        '<bpmn:sequenceFlow id="og_trip" sourceRef="gw" targetRef="trip"/>',
+        '<bpmn:sequenceFlow id="og_trip" sourceRef="gw" targetRef="trip"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">round &gt;= 3</bpmn:conditionExpression></bpmn:sequenceFlow>',
+      );
+    const draft = await createDraft(adapted, "reentry-after-cancel");
+    expect(draft.status).toBe(201);
+    expect(draft.body.status).toBe("invalid");
+    expect(
+      draft.body.validationIssues.some(
+        (i: { elementId: string | null; reason: string }) =>
+          i.elementId === "T" && /cancel boundary 'T_cancel'/.test(i.reason) && /re-entry after an interrupted occurrence is deferred \(M5-L1\)/.test(i.reason),
+      ),
+    ).toBe(true);
+    const pub = await publishDraft(draft.body.draftId);
+    expect(pub.status).toBe(409);
+  });
+
+  // Same gate for the subProcess-host timer skip: a scope-hosted timer boundary
+  // whose continuation loops back into the scope unguarded is unpublishable.
+  it("rejects at publish a subProcess whose timer-boundary path loops back into it unguarded", async () => {
+    const SUB_TIMER_LOOP = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="d_stl" targetNamespace="http://example.com">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="gwIn"/>
+    <bpmn:exclusiveGateway id="gwIn"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="gwIn" targetRef="Sub"/>
+    <bpmn:subProcess id="Sub">
+      <bpmn:startEvent id="SubS"/>
+      <bpmn:sequenceFlow id="t1" sourceRef="SubS" targetRef="A"/>
+      <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="a"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="t2" sourceRef="A" targetRef="SubE"/>
+      <bpmn:endEvent id="SubE"/>
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="tb" attachedToRef="Sub"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="onTimeout"/>
+    <bpmn:serviceTask id="onTimeout"><bpmn:extensionElements><easy-bpmn:taskDefinition type="timeout-handler"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="af" sourceRef="onTimeout" targetRef="gwIn"/>
+    <bpmn:sequenceFlow id="g2" sourceRef="Sub" targetRef="Done"/>
+    <bpmn:endEvent id="Done"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const draft = await createDraft(SUB_TIMER_LOOP, "subprocess-timer-loop");
+    expect(draft.status).toBe(201);
+    expect(draft.body.status).toBe("invalid");
+    expect(
+      draft.body.validationIssues.some(
+        (i: { elementId: string | null; reason: string }) =>
+          i.elementId === "Sub" && /timer boundary 'tb'/.test(i.reason) && /re-entry after an interrupted occurrence is deferred \(M5-L1\)/.test(i.reason),
+      ),
+    ).toBe(true);
+    const pub = await publishDraft(draft.body.draftId);
+    expect(pub.status).toBe(409);
   });
 
   // Operator /cancel = process root: retained committedLocal rows compensate; sealed never.

@@ -1389,6 +1389,105 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
   }
 
   // -------------------------------------------------------------------------
+  // M5-L1 re-entry after an abnormal scope skip (final-review C1 — fail-closed).
+  //
+  // The engine's two container-skipping rewalk fast-forwards — the fired-scope-
+  // timer skip and the cancelled-transaction skip (engine.ts driveLeaf) — jump
+  // from the container straight to the boundary target WITHOUT descending the
+  // interior, while the walk that performed the cancel/pre-fire DID descend. A
+  // later re-entry of that scope therefore restarts the interior occurrence
+  // counters and collides with the skipped occurrence's persisted rows (jobs,
+  // gateway decisions, markers): spurious re-cancel, stale-output application,
+  // loopLimit livelock. Error-catch exits are immune (they exit through the
+  // interior — parity holds) and commit exits are immune (the commit walk
+  // descends); only the two abnormal skips desync.
+  //
+  // Reject at publish when scope S is reachable from the continuation of one of
+  // its OWN abnormal-skip exits — (a) a timer boundary on S, or (b) the cancel
+  // boundary of a transaction S containing a cancel end (the cancel-end resume
+  // path). Reachability semantics (deliberate, documented): a forward traversal
+  // from the boundary's outgoing flows over UNGUARDED sequence flows only —
+  // flows WITHOUT a conditionExpression (plain + default flows) — plus boundary-
+  // attachment edges and a one-level scope-exit hop at interior end events.
+  // Condition-guarded loop-backs stay ACCEPTED: the shipped gate-4 re-entry saga
+  // shape (RE_ENTRY_TX_BPMN — commit-loop whose return edge into the nested tx
+  // carries a FEEL condition) is graph-isomorphic to a corrupting variant that
+  // differs only in a FEEL literal, so a purely structural gate cannot reject
+  // one without the other; the residual dynamic risk (a guarding condition that
+  // evaluates true after the abnormal skip) is deferred with true re-entry
+  // support to a later M5 layer.
+  // -------------------------------------------------------------------------
+  {
+    /** True when `scopeId` is `maybeAncestor` itself or nested anywhere inside it. */
+    const sameOrInside = (scopeId: string, maybeAncestor: string): boolean => {
+      for (let s: string | null | undefined = scopeId; s != null; s = scopeParent.get(s) ?? null) {
+        if (s === maybeAncestor) return true;
+      }
+      return false;
+    };
+    const boundariesByHost = new Map<string, NodeInfo[]>();
+    for (const n of nodes) {
+      if (n.type === "boundaryEvent" && n.attachedToRef) {
+        const arr = boundariesByHost.get(n.attachedToRef);
+        if (arr) arr.push(n);
+        else boundariesByHost.set(n.attachedToRef, [n]);
+      }
+    }
+    /** Unguarded (condition-less) forward successors of a node's outgoing flows. */
+    const unguardedTargets = (nodeId: string): string[] => {
+      const out: string[] = [];
+      for (const f of flowsBySource.get(nodeId) ?? []) {
+        if (f.conditionExpression != null) continue; // condition-guarded: not traversed
+        if (f.target) out.push(f.target);
+      }
+      return out;
+    };
+    /** Can the walk re-enter `scopeId` from boundary `boundaryId`'s continuation? */
+    const reEntersScope = (boundaryId: string, scopeId: string): boolean => {
+      const queue = unguardedTargets(boundaryId);
+      const visited = new Set<string>();
+      while (queue.length) {
+        const cur = queue.shift()!;
+        if (visited.has(cur)) continue;
+        visited.add(cur);
+        const node = nodeById.get(cur);
+        if (!node) continue;
+        // Re-entry: reached the scope itself, or a container the scope nests in
+        // (re-entering an ancestor re-enters every scope inside it).
+        if ((node.type === "transaction" || node.type === "subProcess" || cur === scopeId) && sameOrInside(scopeId, cur)) return true;
+        for (const t of unguardedTargets(cur)) queue.push(t);
+        // A path may continue via any boundary attached to the reached node.
+        for (const b of boundariesByHost.get(cur) ?? []) queue.push(b.id);
+        // An end event inside a scope P exits P: continue at P's outgoing flows
+        // and P's own boundaries (one-level hop; P itself is EXITED, not re-entered).
+        if (node.type === "endEvent" && node.scopeId !== processId) {
+          for (const t of unguardedTargets(node.scopeId)) queue.push(t);
+          for (const b of boundariesByHost.get(node.scopeId) ?? []) queue.push(b.id);
+        }
+      }
+      return false;
+    };
+    for (const n of nodes) {
+      if (n.type !== "transaction" && n.type !== "subProcess") continue;
+      for (const b of boundariesByHost.get(n.id) ?? []) {
+        const isTimerSkip = b.boundaryKind === "timer";
+        const isCancelSkip = b.boundaryKind === "cancel" && n.type === "transaction" && scopesWithCancelEnd.has(n.id);
+        if (!isTimerSkip && !isCancelSkip) continue;
+        if (reEntersScope(b.id, n.id)) {
+          const kindLabel = isTimerSkip ? `timer boundary '${b.id}'` : `cancel boundary '${b.id}'`;
+          err(
+            `Scope '${n.id}' is reachable from its own ${kindLabel} continuation along unguarded (unconditional/default) sequence flows. ` +
+              `The ${isTimerSkip ? "fired-timer" : "cancelled-transaction"} exit skips the scope's interior on rewalk, so ` +
+              "re-entry after an interrupted occurrence is deferred (M5-L1); route the boundary path forward, or guard the loop-back with a condition.",
+            n.id,
+            n.type,
+          );
+        }
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Intermediate timer catch degree (M3-L4, TASK-45, design §4.4): exactly ONE
   // incoming and ONE outgoing sequence flow. A timer catch is a single-token
   // delay, never a join. The per-scope linearity rules above already reject 0

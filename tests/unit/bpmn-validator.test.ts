@@ -33,6 +33,7 @@ import {
   sagaBpmn,
   TIMER_START_BPMN,
   TOLERANT_BPMN,
+  TX_TIMER_BPMN as TX_TIMER_HELPER_BPMN,
   USERTASK_BPMN,
   XOR_BPMN,
   XOR_IN_TX_BPMN,
@@ -2039,5 +2040,116 @@ describe("M5-L1 error end event acceptance (spec §5.2)", () => {
         (i) => i.elementId === "errEnd" && /Only a none end event, a cancel end event \(inside a transaction\), or an error end event is supported\./.test(i.reason),
       ),
     ).toBe(true);
+  });
+});
+
+describe("M5-L1 re-entry after an abnormal scope skip (final-review C1, fail-closed reject)", () => {
+  // The engine's cancelled-tx / fired-scope-timer rewalk fast-forwards skip the
+  // container WITHOUT descending its interior, so a later UNGUARDED re-entry of
+  // the same scope desyncs the walk-local interior occurrence counters against
+  // the skipped occurrence's persisted rows. The validator rejects at publish any
+  // scope reachable from its own abnormal-skip continuation along unguarded
+  // (unconditional/default) flows; a condition-guarded loop-back stays accepted
+  // (the shipped gate-4 re-entry saga shape — see RE_ENTRY_TX_BPMN).
+  const timerLoopBpmn = (container: "subProcess" | "transaction") => `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="d_tl" targetNamespace="http://example.com">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="gwIn"/>
+    <bpmn:exclusiveGateway id="gwIn"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="gwIn" targetRef="Sub"/>
+    <bpmn:${container} id="Sub">
+      <bpmn:startEvent id="SubS"/>
+      <bpmn:sequenceFlow id="t1" sourceRef="SubS" targetRef="A"/>
+      <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="a"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="t2" sourceRef="A" targetRef="SubE"/>
+      <bpmn:endEvent id="SubE"/>
+    </bpmn:${container}>
+    <bpmn:boundaryEvent id="tb" attachedToRef="Sub"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="onTimeout"/>
+    <bpmn:serviceTask id="onTimeout"><bpmn:extensionElements><easy-bpmn:taskDefinition type="timeout-handler"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="af" sourceRef="onTimeout" targetRef="gwIn"/>
+    <bpmn:sequenceFlow id="g2" sourceRef="Sub" targetRef="Done"/>
+    <bpmn:endEvent id="Done"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+  it("rejects a subProcess whose OWN timer-boundary path loops back into it unguarded", async () => {
+    const r = await parseAndValidate(timerLoopBpmn("subProcess"));
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some((i) => i.elementId === "Sub" && /timer boundary 'tb'/.test(i.reason) && /re-entry after an interrupted occurrence is deferred \(M5-L1\)/i.test(i.reason)),
+    ).toBe(true);
+  });
+
+  it("rejects a transaction whose OWN timer-boundary path loops back into it unguarded", async () => {
+    const r = await parseAndValidate(timerLoopBpmn("transaction"));
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some((i) => i.elementId === "Sub" && /timer boundary 'tb'/.test(i.reason) && /re-entry after an interrupted occurrence is deferred \(M5-L1\)/i.test(i.reason)),
+    ).toBe(true);
+  });
+
+  it("rejects a nested transaction whose cancel-boundary path loops back into it unguarded", async () => {
+    const CANCEL_LOOP = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="d_cl" targetNamespace="http://example.com">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="O"/>
+    <bpmn:transaction id="O">
+      <bpmn:startEvent id="o_start"/>
+      <bpmn:sequenceFlow id="of1" sourceRef="o_start" targetRef="gwm"/>
+      <bpmn:exclusiveGateway id="gwm"/>
+      <bpmn:sequenceFlow id="of2" sourceRef="gwm" targetRef="T"/>
+      <bpmn:transaction id="T">
+        <bpmn:startEvent id="t_start"/>
+        <bpmn:sequenceFlow id="tf1" sourceRef="t_start" targetRef="A"/>
+        <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="a"/></bpmn:extensionElements></bpmn:serviceTask>
+        <bpmn:sequenceFlow id="tf2" sourceRef="A" targetRef="tgw"/>
+        <bpmn:exclusiveGateway id="tgw" default="tg_ok"/>
+        <bpmn:sequenceFlow id="tg_cancel" sourceRef="tgw" targetRef="t_cancel"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">fail = true</bpmn:conditionExpression></bpmn:sequenceFlow>
+        <bpmn:endEvent id="t_cancel"><bpmn:cancelEventDefinition/></bpmn:endEvent>
+        <bpmn:sequenceFlow id="tg_ok" sourceRef="tgw" targetRef="t_end"/>
+        <bpmn:endEvent id="t_end"/>
+      </bpmn:transaction>
+      <bpmn:boundaryEvent id="T_cancel" attachedToRef="T"><bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:sequenceFlow id="of3" sourceRef="T_cancel" targetRef="gwm"/>
+      <bpmn:sequenceFlow id="of4" sourceRef="T" targetRef="o_end"/>
+      <bpmn:endEvent id="o_end"/>
+    </bpmn:transaction>
+    <bpmn:sequenceFlow id="f2" sourceRef="O" targetRef="Done"/>
+    <bpmn:endEvent id="Done"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const r = await parseAndValidate(CANCEL_LOOP);
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some((i) => i.elementId === "T" && /cancel boundary 'T_cancel'/.test(i.reason) && /re-entry after an interrupted occurrence is deferred \(M5-L1\)/i.test(i.reason)),
+    ).toBe(true);
+  });
+
+  it("still accepts the gate-4 re-entry saga fixture (loop-back into T is condition-guarded)", async () => {
+    const r = await parseAndValidate(RE_ENTRY_TX_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+  });
+
+  it("still accepts the Hazard-vs-Cancel tx-timer fixture (timer path continues forward)", async () => {
+    const r = await parseAndValidate(TX_TIMER_HELPER_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+  });
+
+  it("accepts a timer-boundary path whose only route back into the scope is condition-guarded", async () => {
+    const guarded = timerLoopBpmn("subProcess")
+      .replace('<bpmn:exclusiveGateway id="gwIn"/>', '<bpmn:exclusiveGateway id="gwIn" default="f_exit"/>')
+      .replace(
+        '<bpmn:sequenceFlow id="f2" sourceRef="gwIn" targetRef="Sub"/>',
+        `<bpmn:sequenceFlow id="f2" sourceRef="gwIn" targetRef="Sub"><bpmn:conditionExpression xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="bpmn:tFormalExpression">retries &lt; 3</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_exit" sourceRef="gwIn" targetRef="Done"/>`,
+      );
+    const r = await parseAndValidate(guarded);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
   });
 });

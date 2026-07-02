@@ -196,13 +196,13 @@ async function ledgerStragglers(env: Env, instanceId: string, graph: ExecutionGr
     if (job && job.status === "completed") {
       const stmts: D1PreparedStatement[] = [];
       if (!(await getSagaStep(env.DB, instanceId, t.position_element_id, job.occurrence))) {
-        const wiring = graph.transactions?.[scopeId]?.compensations?.[t.position_element_id];
+        const wiring = graph.compensations?.[t.position_element_id] ?? graph.transactions?.[scopeId]?.compensations?.[t.position_element_id];
         const handlerNode = wiring ? graph.nodes[wiring.handlerId] : undefined;
         stmts.push(
           insertSagaStepStmt(env.DB, {
             stepId: newId("step"),
             instanceId,
-            scopeId,
+            scopeId: graph.nodes[t.position_element_id]?.scopeId ?? scopeId,
             elementId: t.position_element_id,
             forwardJobId: job.job_id,
             capturedInput: parseJson<JsonObject>(job.input_variables, {}),

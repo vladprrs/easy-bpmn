@@ -48,7 +48,8 @@ import {
   variableSnapshotStmt,
 } from "../persistence/instances";
 import { insertSagaStepStmt } from "../persistence/saga";
-import { loadInst, isTransactionScope, type RunStep, type WaitForEvent } from "./engine-shared";
+import { loadInst, type RunStep, type WaitForEvent } from "./engine-shared";
+import { nearestEnclosingTx } from "../bpmn/scope-tree";
 import { createIncident, parkWaiting } from "./incidents";
 import { resolveScope } from "./frontier";
 import { branchHistoryTags, getToken, parseOverlay, readOverlay, rootTokenId, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
@@ -456,9 +457,11 @@ async function applyForwardCompletion(
     markJobOutputAppliedStmt(env.DB, job.job_id, now),
   ];
 
-  // Ledger write atomic with advance — only for completed compensatable steps in a transaction.
-  if (isTransactionScope(graph, node.scopeId)) {
-    const wiring = graph.transactions?.[node.scopeId!]?.compensations?.[elementId];
+  // Ledger write atomic with advance — for completed compensatable steps with a
+  // TRANSACTION ANCESTOR (M5-L1 spec §3.3: the gate is ancestry, not the immediate
+  // scope). scope_id stays the IMMEDIATE scope id — the subtree cursor depends on it.
+  if (nearestEnclosingTx(graph, node.scopeId ?? null) != null) {
+    const wiring = graph.compensations?.[elementId] ?? graph.transactions?.[node.scopeId!]?.compensations?.[elementId];
     const handlerNode = wiring ? graph.nodes[wiring.handlerId] : undefined;
     statements.push(
       insertSagaStepStmt(env.DB, {

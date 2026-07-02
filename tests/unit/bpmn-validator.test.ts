@@ -12,6 +12,7 @@ import {
   LOOP_XOR_BPMN,
   MALFORMED_XML,
   MULTI_INSTANCE_BPMN,
+  NESTED_TX_BPMN,
   NO_TASKTYPE_BPMN,
   PARALLEL_BPMN,
   INCLUSIVE_BPMN,
@@ -1852,5 +1853,29 @@ describe("M5-L1 embedded subProcess acceptance", () => {
     const r = await parseAndValidate(NESTED);
     expect(r.ok).toBe(true);
     expect(r.graph!.scopes!["tx"]).toMatchObject({ kind: "transaction", parentId: "sub", depth: 2 });
+  });
+
+  it("rejects a compensation handler inside a subProcess with no transaction ancestor", async () => {
+    const NO_TX = SUBPROC.replace(
+      '<bpmn:serviceTask id="s_task"><bpmn:extensionElements><easy-bpmn:taskDefinition type="doWork"/></bpmn:extensionElements></bpmn:serviceTask>',
+      `<bpmn:serviceTask id="s_task"><bpmn:extensionElements><easy-bpmn:taskDefinition type="doWork"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:boundaryEvent id="s_task_comp" attachedToRef="s_task"><bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="undoWork" isForCompensation="true"><bpmn:extensionElements><easy-bpmn:taskDefinition type="undoWork"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:association id="assocWork" sourceRef="s_task_comp" targetRef="undoWork"/>`,
+    );
+    const r = await parseAndValidate(NO_TX);
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some(
+        (i) => i.elementId === "undoWork" && /is isForCompensation but no enclosing scope is a <transaction>/.test(i.reason),
+      ),
+    ).toBe(true);
+  });
+
+  it("accepts a compensation handler inside a subProcess that IS nested in a transaction ancestor", async () => {
+    // NESTED_TX_BPMN: undoA's immediate scope is subProcess S; S's parent is transaction O.
+    const r = await parseAndValidate(NESTED_TX_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["undoA"]!.scopeId).toBe("S");
   });
 });

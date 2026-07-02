@@ -1488,11 +1488,18 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     }
   }
 
-  // Compensation handlers must live inside a transaction.
+  // Compensation handlers must live inside a transaction — ANY ancestor scope,
+  // not just the immediate one (M5-L1 spec §6, ancestry check): a handler may sit
+  // inside a subProcess that is itself nested in a transaction.
   for (const n of nodes) {
-    if (isHandler(n) && scopeKindOf.get(n.scopeId) !== "transaction") {
+    if (!isHandler(n)) continue;
+    let inTx = false;
+    for (let s: string | null | undefined = n.scopeId; s != null && s !== processId; s = scopeParent.get(s) ?? null) {
+      if (scopeKindOf.get(s) === "transaction") { inTx = true; break; }
+    }
+    if (!inTx) {
       err(
-        `Service task '${n.id}' is isForCompensation but is not inside a <transaction>. Compensation handlers belong to a transaction scope.`,
+        `Service task '${n.id}' is isForCompensation but no enclosing scope is a <transaction> — the handler has no trigger (no Cancel can reach it).`,
         n.id,
         "serviceTask",
       );

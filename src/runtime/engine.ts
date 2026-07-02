@@ -76,6 +76,7 @@ import { hasHistoryMarkerForOccurrence, historyStmt, latestCancelRootElement, la
 import {
   applyTransitionStmt,
   createSubscription,
+  createSubscriptionStmt,
   getSubscriptionForVisit,
   subscriptionConsumedStmt,
   variableSnapshotStmt,
@@ -1308,7 +1309,45 @@ async function registerReceive(env: Env, instanceId: string, graph: ExecutionGra
     await historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "invariantViolation", diagnostics: { reason: result.reason, messageName, correlationKey: inst.correlation_key } }).run();
     return { kind: "incident" };
   }
-  if (result.status === "correlated") return { kind: "correlated", event: result.event };
+  if (result.status === "correlated") {
+    // W-BUFFERED-STRAND-01 fix (design §7): record apply-from-D1 PROVENANCE for a
+    // broker-buffered message claimed at registration, ATOMICALLY with the claim.
+    // The broker has already deleted its buffer + marked the message consumed in
+    // the DO; previously the matched_subscription_id link was written only by the
+    // SEPARATE msg:tag applyMessage step, so a terminated-Workflow inline re-drive
+    // (no step cache) re-walking AFTER the buffer was consumed found no active
+    // subscription and an unlinked external_messages row -> getCorrelatedMessage-
+    // ForSubscription returns null -> the message strands until the wait cap.
+    // Persisting an ACTIVE subscription + the correlated link here closes that
+    // window: a re-drive finds the active subscription and recovers the payload via
+    // apply-from-D1. The caller's applyMessage (active path) then merges the payload
+    // and marks the subscription consumed exactly as before, so the steady-state
+    // end state (consumed subscription, correlated row, merged vars) is unchanged.
+    if (!active) {
+      await dbBatch(env.DB, [
+        createSubscriptionStmt(env.DB, {
+          subscriptionId,
+          workspaceId: inst.workspace_id,
+          instanceId,
+          elementId,
+          messageName,
+          correlationKey: inst.correlation_key,
+          brokerKey,
+          workflowEventType,
+          status: "active",
+          expiresAt,
+          occurrence: occ,
+          now,
+        }),
+        messageCorrelatedStmt(env.DB, { externalMessageId: result.event.externalMessageId, instanceId, subscriptionId, now }),
+      ]);
+    } else {
+      // A rewalk re-entered with the active subscription already persisted; just
+      // ensure the correlated link is recorded against it (idempotent UPDATE).
+      await messageCorrelatedStmt(env.DB, { externalMessageId: result.event.externalMessageId, instanceId, subscriptionId, now }).run();
+    }
+    return { kind: "correlated", event: result.event };
+  }
 
   if (!active) {
     await createSubscription(env.DB, { subscriptionId, workspaceId: inst.workspace_id, instanceId, elementId, messageName, correlationKey: inst.correlation_key, brokerKey, workflowEventType, status: "active", expiresAt, occurrence: occ, now });

@@ -47,4 +47,12 @@ export interface Env {
    */
   MAX_CONCURRENT_TOKENS_OVERRIDE?: string;
   STEP_BUDGET_SOFT_OVERRIDE?: string;
+  /**
+   * TEST-ONLY backstop override (ms). Workflow-mode (Layer B) self-heal tests
+   * inject a short MAX_WAKE_BACKSTOP via `wrangler dev --var
+   * MAX_WAKE_BACKSTOP_OVERRIDE:<ms>` so a genuinely lost wake self-heals inside a
+   * bounded poll window instead of the 1-hour production ceiling. Never set in
+   * production (wrangler.jsonc declares it nowhere).
+   */
+  MAX_WAKE_BACKSTOP_OVERRIDE?: string;
 }

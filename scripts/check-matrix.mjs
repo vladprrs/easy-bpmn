@@ -10,13 +10,18 @@
 // Workflow-mode gaps ABOVE the active phase are WARNINGS (Phases 2-3 flip them
 // to failures by raising MATRIX_PHASE).
 //
-// MATRIX_PHASE (env, default 1) = the highest phase whose coverage is enforced.
+// MATRIX_PHASE (env, default 3) = the highest phase whose coverage is enforced.
+// Phases 1-3 are all SHIPPED (Layer A direct + Layer B workflow-mode markers all
+// present), so the gate is raised to 3: a new construct must land with markers in
+// every declared mode/file or CI fails. (The Layer B *.wf.test.ts suites run via
+// `npm run test:wf` against a live Worker, NOT the default CI `npm test`; this
+// guard is a static marker check, so enforcing phase 3 in CI is safe.)
 
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
 const repoRoot = new URL("..", import.meta.url).pathname;
-const ACTIVE_PHASE = Number(process.env.MATRIX_PHASE ?? "1");
+const ACTIVE_PHASE = Number(process.env.MATRIX_PHASE ?? "3");
 const registryText = readFileSync(join(repoRoot, "tests/matrix/registry.ts"), "utf8");
 
 // Parse the one-object-per-line registry rows.

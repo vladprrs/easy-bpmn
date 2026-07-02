@@ -15,6 +15,7 @@
     "test:integration": "vitest run tests/integration",
     "check:matrix": "node scripts/check-matrix.mjs",
     "test:matrix": "vitest run tests/matrix tests/integration/matrix",
+    "test:wf": "vitest run --config tests/workflow-mode/run.config.ts",
     "dev:ui": "npm --prefix spa run dev",
     "build:ui": "npm --prefix spa run build",
     "typecheck:ui": "npm --prefix spa run typecheck",

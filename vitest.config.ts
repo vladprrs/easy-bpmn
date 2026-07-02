@@ -1,4 +1,4 @@
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-pool-workers";
 
 export default defineConfig(async () => {
@@ -36,6 +36,10 @@ export default defineConfig(async () => {
     ],
     test: {
       setupFiles: ["./tests/apply-migrations.ts"],
+      // Layer B (workflow-mode) suites are node-runner HTTP tests against a live
+      // `wrangler dev` (see tests/workflow-mode/run.config.ts + `npm run test:wf`).
+      // They must NOT run under vitest-pool-workers / the default CI `npm test`.
+      exclude: [...configDefaults.exclude, "tests/workflow-mode/**"],
     },
   };
 });

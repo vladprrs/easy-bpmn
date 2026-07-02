@@ -72,7 +72,7 @@ import {
 } from "../util";
 import { getVersionGraph } from "../persistence/definitions";
 import { dbBatch } from "../persistence/db";
-import { hasHistoryMarkerForOccurrence, historyStmt } from "../persistence/history";
+import { hasHistoryMarkerForOccurrence, historyStmt, latestCancelRootElement } from "../persistence/history";
 import {
   applyTransitionStmt,
   createSubscription,
@@ -110,7 +110,7 @@ import { completeInstanceGuarded } from "../persistence/instances";
 import { branchHistoryTags, listLiveTokens, setTokenStatusStmt, rootTokenId, getToken, parseOverlay, readOverlay, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
 import { withDriveLock } from "../persistence/drive-lock";
 import { driveForwardServiceTask, terminateUnleasableJob } from "./forward-task";
-import { beginCompensating, settleAfterCompensation } from "./compensation";
+import { beginCompensating, settleAfterCompensation, cancelBoundaryTarget } from "./compensation";
 import {
   armTimerDO,
   buildBoundaryArm,
@@ -237,11 +237,17 @@ async function runInstanceInner(env: Env, instanceId: string, opts: RunOptions):
   const inst = await loadInst(env, instanceId);
 
   // Resume into the reverse compensation pass (direct-mode resume / crash recovery):
-  // the cursor is re-derived from the ledger + the current (cancel-end) element.
+  // the compensation ROOT is derived from the latest transactionCancelled history row
+  // (durable + replay-safe, spec §4.3 refined). An operator cancel wrote it WITHOUT an
+  // element scope → the process root (null); an auto cancel-end wrote element_id = the
+  // cancelled transaction id. Persistence stays graph-free; the engine maps here.
   if (inst.status === "compensating") {
-    const scopeId = graph.nodes[inst.current_element_id ?? ""]?.scopeId ?? null;
-    if (!scopeId) return { status: "completed" };
-    return settleAfterCompensation(env, instanceId, graph, scopeId, opts.runStep, opts.waitFor);
+    const el = await latestCancelRootElement(env.DB, instanceId);
+    const root = el != null && graph.nodes[el]?.type === "transaction" ? el : null;
+    const settled = await settleAfterCompensation(env, instanceId, graph, root, opts.runStep, opts.waitFor);
+    if (settled.status !== "continue") return settled;
+    // Nested root settled non-terminally → fall through into the normal walk below
+    // (status is now running; the walk re-enters from start and fast-forwards).
   }
   if (isTerminalInstanceStatus(inst.status)) return { status: "completed" };
 
@@ -327,6 +333,14 @@ async function loop(
     return rawRunStep(name, fn);
   };
 
+  // Walk-local map of each transaction scope's CURRENT entry occurrence (M5-L1
+  // Task 8). A cancel end must stamp the cancelled TRANSACTION's occurrence into the
+  // transactionCancelled marker (not the cancel-end's own occurrence — under
+  // re-entry they diverge), so the rewalk fast-forward can skip exactly the
+  // cancelled occurrence. driveLeaf records it when it enters a transaction and reads
+  // it at the enclosed cancel end. Re-derived deterministically each rewalk.
+  const scopeEntryOcc = new Map<string, number>();
+
   // The per-node leaf dispatch (design §5.1: `driveLeaf`) — the SINGLE source of
   // node handling for BOTH the single-token scalar walk and the region DFS. It
   // returns a `LeafOutcome`; the existing per-kind drivers are reused verbatim,
@@ -345,12 +359,26 @@ async function loop(
       }
 
       if (node.type === "transaction" || node.type === "subProcess") {
+        // M5-L1 (Task 8): cancelled-tx rewalk fast-forward — a re-walk must NOT
+        // re-enter a nested tx whose occurrence already cancelled+settled (else the
+        // cancel end re-fires beginCompensating on a now-running instance). Keyed by
+        // the transaction's OWN occurrence (the marker stamped it), so an earlier
+        // COMMITTED occurrence of the same tx (no cancel marker at that occ) is
+        // re-entered and fast-forwarded normally.
+        if (node.type === "transaction" && (await visitApplied(env, instanceId, cur, occ, "transactionCancelled"))) {
+          const target = cancelBoundaryTarget(graph, cur);
+          if (target) return { kind: "next", next: target };
+          return { kind: "completed" }; // top-level cancelled tx: terminal settle owns the instance
+        }
         // M5-L1: a plain subProcess is a bookkeeping scope, driven by the SAME
         // enter/park-free pattern as a transaction — just no ledger commit on exit.
         const meta = scopesOf(graph)[cur];
         const innerStart = meta?.startId || graph.transactions?.[cur]?.startId;
         if (!innerStart) return { kind: "completed" }; // malformed (validator guards this)
         if (node.type === "transaction") {
+          // Record this entry's occurrence so an enclosed cancel end stamps the tx
+          // occurrence (Task 8), not the cancel-end's own occurrence.
+          scopeEntryOcc.set(cur, occ);
           return { kind: "next", next: await runStep(`tx:${tag}`, () => enterTransaction(env, instanceId, cur, occ, innerStart)) };
         }
         return { kind: "next", next: await runStep(`scope:${tag}`, () => enterScope(env, instanceId, cur, occ, innerStart)) };
@@ -420,7 +448,11 @@ async function loop(
 
       if (node.type === "endEvent") {
         if (node.endKind === "cancel" && isTransactionScope(graph, node.scopeId)) {
-          await runStep(`cancel:${tag}`, () => beginCompensating(env, instanceId, node.scopeId!, cur));
+          // Stamp the cancelled TRANSACTION's occurrence (Task 8): the tx's current
+          // entry occurrence recorded when driveLeaf entered it this walk (falls back
+          // to the cancel-end occ for a pre-entry resume, equal in the single-entry case).
+          const scopeOcc = scopeEntryOcc.get(node.scopeId!) ?? occ;
+          await runStep(`cancel:${tag}`, () => beginCompensating(env, instanceId, node.scopeId!, cur, scopeOcc));
           return { kind: "compensate", scopeId: node.scopeId!, elementId: cur };
         }
         if (isTransactionScope(graph, node.scopeId)) {
@@ -544,7 +576,13 @@ async function loop(
           break;
         }
         if (r.kind === "incident") return { status: "incident" };
-        if (r.kind === "compensate") return settleAfterCompensation(env, instanceId, graph, r.scopeId, runStep, waitFor);
+        if (r.kind === "compensate") {
+          const settled = await settleAfterCompensation(env, instanceId, graph, r.scopeId, runStep, waitFor);
+          // Nested cancel-end → the instance continues on the cancel boundary's
+          // failure target within THIS walk; otherwise the settle is terminal.
+          if (settled.status === "continue") { cur = settled.next; continue; }
+          return settled;
+        }
         return { status: "completed" }; // completed | consumed (consumed is unreachable without regions)
       }
       if (parked) {
@@ -563,7 +601,13 @@ async function loop(
   while (true) {
     const result = await driveFrontier(env, graph, instanceId, drivers, MAX_ELEMENT_OCCURRENCES, caps);
     if (result.incident) return { status: "incident" };
-    if (result.compensate) return settleAfterCompensation(env, instanceId, graph, result.compensate.scopeId, runStep, waitFor);
+    if (result.compensate) {
+      const settled = await settleAfterCompensation(env, instanceId, graph, result.compensate.scopeId, runStep, waitFor);
+      // Nested cancel-end → re-enter the frontier DFS (it re-walks and fast-forwards
+      // through the cancelled tx to the cancel boundary target); else terminal.
+      if (settled.status !== "continue") return settled;
+      continue;
+    }
     if (result.completed) return { status: "completed" };
     if (result.parked) {
       if (!(await issueWake())) return { status: "waiting" }; // direct mode parks; the next callback re-drives

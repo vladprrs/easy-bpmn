@@ -99,6 +99,24 @@ export async function hasHistoryMarkerForOccurrence(
   return row !== null;
 }
 
+/**
+ * The raw element_id of the most recent `transactionCancelled` history row (M5-L1
+ * Task 8) — the durable, replay-safe compensation-root marker. An operator /cancel
+ * writes this row WITHOUT an element scope (→ null → the process root); an
+ * auto cancel-end wrote element_id = the cancelled transaction id. Persistence stays
+ * graph-free: the ENGINE maps the returned element to a root (transaction id vs null).
+ */
+export async function latestCancelRootElement(db: D1Database, instanceId: string): Promise<string | null> {
+  const row = await stmt(
+    db,
+    `SELECT element_id FROM history_events
+      WHERE instance_id = ? AND type = 'transactionCancelled'
+      ORDER BY rowid DESC LIMIT 1`,
+    [instanceId],
+  ).first<{ element_id: string | null }>();
+  return row?.element_id ?? null;
+}
+
 /** Count history events of a given type for an instance element (e.g. poison strikes). */
 export async function countHistoryEventsOfType(
   db: D1Database,

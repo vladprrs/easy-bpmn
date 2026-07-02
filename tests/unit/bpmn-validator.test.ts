@@ -14,6 +14,7 @@ import {
   MULTI_INSTANCE_BPMN,
   NESTED_TX_BPMN,
   NO_TASKTYPE_BPMN,
+  RE_ENTRY_TX_BPMN,
   PARALLEL_BPMN,
   INCLUSIVE_BPMN,
   PARALLEL_DEADLOCK_BPMN,
@@ -250,6 +251,23 @@ describe("Canonical transaction-saga profile (SAGA design §3)", () => {
     const r = await parseAndValidate(SAGA_CROSS_SCOPE_ASSOC_BPMN);
     expect(r.ok).toBe(false);
     expect(r.issues.some((i) => i.elementId === "a1step_comp" && /different transaction scope/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a NESTED transaction with a cancel end but no cancel boundary (no failure path)", async () => {
+    // Strip T's cancel boundary + its continue flow from the (valid) re-entry fixture.
+    const noBoundary = RE_ENTRY_TX_BPMN.replace(
+      `<bpmn:boundaryEvent id="T_cancel" attachedToRef="T"><bpmn:cancelEventDefinition/></bpmn:boundaryEvent>`,
+      "",
+    ).replace(`<bpmn:sequenceFlow id="of3" sourceRef="T_cancel" targetRef="gwm"/>`, "");
+    const r = await parseAndValidate(noBoundary);
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "T" && /nested and contains a cancel end event but has no cancel boundary/.test(i.reason))).toBe(true);
+  });
+
+  it("accepts a NESTED transaction whose cancel end is matched by a cancel boundary", async () => {
+    const r = await parseAndValidate(RE_ENTRY_TX_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
   });
 
   it("rejects an error boundary whose errorRef does not resolve", async () => {

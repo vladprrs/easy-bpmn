@@ -1374,3 +1374,57 @@ export const NESTED_COMMIT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
     <bpmn:endEvent id="end"/>
   </bpmn:process>
 </bpmn:definitions>`;
+
+/**
+ * M5-L1 re-entry-shield fixture (gate 4): outer tx O loops through inner tx T.
+ * round=1: T commits (A → committedLocal). round=2: T's inner XOR routes to its
+ * cancel end → T's OWN reverse pass (occ1 only; occ0 shielded), instance continues
+ * via T_cancel → merge → bump. round=3: gw default → trip fails → O cancels →
+ * occ0's committedLocal row finally compensates (root O is a strict ancestor of T).
+ */
+export const RE_ENTRY_TX_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="def_reentry" targetNamespace="http://example.com">
+  <bpmn:process id="proc_reentry" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="O"/>
+    <bpmn:transaction id="O">
+      <bpmn:startEvent id="o_start"/>
+      <bpmn:sequenceFlow id="of1" sourceRef="o_start" targetRef="gw"/>
+      <bpmn:exclusiveGateway id="gw" default="og_trip"/>
+      <bpmn:sequenceFlow id="og_T" sourceRef="gw" targetRef="T"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">round &lt; 3</bpmn:conditionExpression></bpmn:sequenceFlow>
+      <bpmn:transaction id="T">
+        <bpmn:startEvent id="t_start"/>
+        <bpmn:sequenceFlow id="tf1" sourceRef="t_start" targetRef="A"/>
+        <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="stepA" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+        <bpmn:boundaryEvent id="A_comp" attachedToRef="A"><bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+        <bpmn:serviceTask id="undoA" isForCompensation="true"><bpmn:extensionElements><easy-bpmn:taskDefinition type="undoA" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+        <bpmn:association id="assocA" sourceRef="A_comp" targetRef="undoA"/>
+        <bpmn:sequenceFlow id="tf2" sourceRef="A" targetRef="tgw"/>
+        <bpmn:exclusiveGateway id="tgw" default="tg_ok"/>
+        <bpmn:sequenceFlow id="tg_cancel" sourceRef="tgw" targetRef="t_cancel"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">round = 2</bpmn:conditionExpression></bpmn:sequenceFlow>
+        <bpmn:endEvent id="t_cancel"><bpmn:cancelEventDefinition/></bpmn:endEvent>
+        <bpmn:sequenceFlow id="tg_ok" sourceRef="tgw" targetRef="t_end"/>
+        <bpmn:endEvent id="t_end"/>
+      </bpmn:transaction>
+      <bpmn:boundaryEvent id="T_cancel" attachedToRef="T"><bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:sequenceFlow id="of2" sourceRef="T" targetRef="gwm"/>
+      <bpmn:sequenceFlow id="of3" sourceRef="T_cancel" targetRef="gwm"/>
+      <bpmn:exclusiveGateway id="gwm" default="of4"/>
+      <bpmn:sequenceFlow id="of4" sourceRef="gwm" targetRef="bump"/>
+      <bpmn:serviceTask id="bump"><bpmn:extensionElements><easy-bpmn:taskDefinition type="bump" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="of5" sourceRef="bump" targetRef="gw"/>
+      <bpmn:sequenceFlow id="og_trip" sourceRef="gw" targetRef="trip"/>
+      <bpmn:serviceTask id="trip"><bpmn:extensionElements><easy-bpmn:taskDefinition type="trip" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:boundaryEvent id="trip_err" attachedToRef="trip"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:sequenceFlow id="of6" sourceRef="trip_err" targetRef="o_cancel"/>
+      <bpmn:endEvent id="o_cancel"><bpmn:cancelEventDefinition/></bpmn:endEvent>
+      <bpmn:sequenceFlow id="of7" sourceRef="trip" targetRef="o_end"/>
+      <bpmn:endEvent id="o_end"/>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="O_cancel" attachedToRef="O"><bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="f2" sourceRef="O_cancel" targetRef="failed_end"/>
+    <bpmn:endEvent id="failed_end"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="O" targetRef="end"/>
+    <bpmn:endEvent id="end"/>
+  </bpmn:process>
+</bpmn:definitions>`;

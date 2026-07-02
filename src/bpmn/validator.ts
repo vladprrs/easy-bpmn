@@ -1257,6 +1257,33 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
   }
 
   // -------------------------------------------------------------------------
+  // M5-L1 (spec §4.3, Task 8): a NESTED transaction (one enclosed by ANY scope,
+  // i.e. not directly at the process root) that contains a cancel end MUST carry a
+  // cancel boundary — otherwise its cancellation reverse pass has no failure path to
+  // continue the enclosing scope on. A top-level transaction needs none: its cancel
+  // end settles the instance terminally.
+  // -------------------------------------------------------------------------
+  const cancelBoundaryTx = new Set<string>();
+  for (const n of nodes) {
+    if (n.type === "boundaryEvent" && n.boundaryKind === "cancel" && n.attachedToRef) cancelBoundaryTx.add(n.attachedToRef);
+  }
+  const scopesWithCancelEnd = new Set<string>();
+  for (const n of nodes) {
+    if (n.type === "endEvent" && n.endKind === "cancel" && n.scopeId) scopesWithCancelEnd.add(n.scopeId);
+  }
+  for (const txId of scopesWithCancelEnd) {
+    const parent = scopeParent.get(txId) ?? null;
+    const isNested = parent != null && parent !== processId;
+    if (isNested && !cancelBoundaryTx.has(txId)) {
+      err(
+        `Transaction '${txId}' is nested and contains a cancel end event but has no cancel boundary — the instance would have no failure path to continue on.`,
+        txId,
+        "transaction",
+      );
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Per-activity error-boundary aggregation (M3-L2, TASK-42): on one activity
   // the coded boundaries must carry DISTINCT @errorCodes and there may be at
   // most ONE catch-all (errorEventDefinition with no errorRef). Grouped by

@@ -25,17 +25,23 @@ import {
   filterLineageQuiesced,
   getSagaStep,
   insertSagaStepStmt,
-  selectScopeStepsForCompensation,
+  selectSubtreeStepsForCompensation,
   updateCompensationStatusStmt,
   type SagaStepView,
 } from "../persistence/saga";
-import { listLiveTokens, setTokenStatusStmt } from "../persistence/tokens";
+import { abandonJobOnTimerFireStmt } from "../persistence/jobs";
+import { listLiveTokens, setTokenStatusStmt, type TokenRow } from "../persistence/tokens";
+import { eligibleCommittedLocalScopeIds, scopesOf, subtreeScopeIds } from "../bpmn/scope-tree";
 import { armCohortLeaseExpiryTerminators } from "./forward-task";
-import { loadInst, type RunStep, type WaitForEvent, type DriveResult } from "./engine-shared";
+import { loadInst, type RunStep, type WaitForEvent, type DriveResult, type SettleResult } from "./engine-shared";
 import { WAKE_TYPE, wakeBackstop } from "./wake";
 
-/** The failure-path target of the cancel boundary attached to transaction `scopeId`. */
-function cancelBoundaryTarget(graph: ExecutionGraph, scopeId: string): string | null {
+/**
+ * The failure-path target of the cancel boundary attached to transaction `scopeId`.
+ * Exported so the engine's cancelled-tx rewalk fast-forward reuses this scan
+ * instead of duplicating it (Task 8, engine driveLeaf).
+ */
+export function cancelBoundaryTarget(graph: ExecutionGraph, scopeId: string): string | null {
   for (const [, node] of Object.entries(graph.nodes)) {
     if (node.type === "boundaryEvent" && node.boundaryKind === "cancel" && node.attachedToRef === scopeId) {
       return node.next ?? null;
@@ -44,13 +50,18 @@ function cancelBoundaryTarget(graph: ExecutionGraph, scopeId: string): string | 
   return null;
 }
 
-export async function beginCompensating(env: Env, instanceId: string, scopeId: string, cancelEndId: string): Promise<void> {
+export async function beginCompensating(env: Env, instanceId: string, scopeId: string, cancelEndId: string, occ: number): Promise<void> {
   const inst = await loadInst(env, instanceId);
   // Idempotent re-run: once the cancel transition committed the reverse pass
   // owns the instance — never duplicate transactionCancelled or regress status.
   if (inst.status === "compensating" || isTerminalInstanceStatus(inst.status)) return;
   await dbBatch(env.DB, [
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: scopeId, type: "transactionCancelled", diagnostics: { transaction: scopeId, via: cancelEndId, traceId: traceIdFor(instanceId) } }),
+    // MARKER: `occurrence` is the CANCELLED TRANSACTION's occurrence (Task 8) — the
+    // engine's driveLeaf fast-forward reads (transaction id, its occurrence) to skip
+    // re-entering an occurrence that already cancelled+settled on a later rewalk. A
+    // re-entering (looped) tx cancels its LATEST entry, so occ != the cancel-end's
+    // own occurrence; the caller derives the tx occurrence and passes it here.
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: scopeId, type: "transactionCancelled", diagnostics: { transaction: scopeId, via: cancelEndId, traceId: traceIdFor(instanceId), occurrence: occ } }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: cancelEndId, status: "compensating", now: nowIso() }),
   ]);
   // M4-L5 (design §8.2): arm a per-token lease-expiry terminator for every in-flight
@@ -59,20 +70,30 @@ export async function beginCompensating(env: Env, instanceId: string, scopeId: s
   await armCohortLeaseExpiryTerminators(env, instanceId);
 }
 
-/** Run (or resume) the reverse pass for `scopeId`, then settle the saga-failed terminal. */
+/**
+ * Run (or resume) the reverse pass for compensation root `rootScopeId` (null = the
+ * process root / operator cancel), then settle. A NESTED root (the cancelled tx has
+ * a parent scope) settles NON-terminally — the instance continues on the cancel
+ * boundary's failure path (`{status:"continue"}`); a top-level / process root settles
+ * the saga-failed terminal.
+ */
 export async function settleAfterCompensation(
   env: Env,
   instanceId: string,
   graph: ExecutionGraph,
-  scopeId: string,
+  rootScopeId: string | null,
   runStep: RunStep,
   waitFor: WaitForEvent | null,
-): Promise<DriveResult> {
-  const result = await runCompensation(env, instanceId, graph, scopeId, runStep, waitFor);
+): Promise<SettleResult> {
+  const result = await runCompensation(env, instanceId, graph, rootScopeId, runStep, waitFor);
   if (result === "waiting") return { status: "waiting" };
   if (result === "failed") return { status: "incident" }; // compensationFailed terminal (operator-resumable)
-  await runStep(`settle:${scopeId}`, () => settleSagaCompensated(env, instanceId, scopeId, cancelBoundaryTarget(graph, scopeId)));
-  return { status: "completed" };
+  const target = rootScopeId != null ? cancelBoundaryTarget(graph, rootScopeId) : null;
+  // Nested root = the cancelled tx has ANY parent scope (spec §4.3 refined): after
+  // its own subtree settles the instance CONTINUES on the cancel boundary's target.
+  const isNestedRoot = rootScopeId != null && (scopesOf(graph)[rootScopeId]?.parentId ?? null) != null;
+  await runStep(`settle:${rootScopeId ?? "process"}`, () => settleSagaCompensated(env, instanceId, graph, rootScopeId, target, isNestedRoot));
+  return isNestedRoot && target ? { status: "continue", next: target } : { status: "completed" };
 }
 
 type CompResult = "compensated" | "waiting" | "failed";
@@ -81,7 +102,7 @@ async function runCompensation(
   env: Env,
   instanceId: string,
   graph: ExecutionGraph,
-  scopeId: string,
+  rootScopeId: string | null,
   runStep: RunStep,
   waitFor: WaitForEvent | null,
 ): Promise<CompResult> {
@@ -90,11 +111,19 @@ async function runCompensation(
   // reverse pass compensates every iteration separately with zero algorithm
   // change; compensation jobs + step names inherit the forward occurrence.
   //
-  // M4-L5: under in-instance concurrency a scope can have several live branch
-  // tokens at cancel. `isRegion` gates the cohort logic so M1–M3 single-token
-  // instances behave EXACTLY as before (no token rows of interest, the filter is a
-  // no-op, the barrier reduces to "ledger empty ⇒ compensated").
-  const isRegion = !!graph.regions;
+  // M5-L1 (spec §3.4 / §4): the cursor is ROOT-RELATIVE. `subtree` is every scope
+  // enclosed by the compensation root (inclusive; ALL scopes for the process root);
+  // `eligibleCommitted` is the subset whose committedLocal rows are still eligible
+  // (a nested tx committed strictly BELOW the root). The barrier + straggler scan
+  // are filtered to subtree MEMBERSHIP, not a single scope (§4.2). The straggler
+  // scan is ALWAYS on (spec §4.1 un-gates the old isRegion guard) — its no-op fast
+  // path is "zero live tokens in the cohort".
+  const subtree = subtreeScopeIds(graph, rootScopeId);
+  const eligibleCommitted = eligibleCommittedLocalScopeIds(graph, rootScopeId);
+  const inSubtree = (elementId: string): boolean => {
+    const s = graph.nodes[elementId]?.scopeId ?? null;
+    return s == null ? rootScopeId == null : subtree.includes(s);
+  };
   // Single-wake the reverse pass (TASK-54): `compWakeSeq` mirrors the forward loop's
   // `wakeSeq` and RESETS to 0 on each runCompensation invocation. Replay-safety does
   // NOT rest on the wake name selecting a step — the wake is a pure TICKLE (its return
@@ -111,16 +140,18 @@ async function runCompensation(
   let compWakeSeq = 0;
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    // M4-L5 (design §8.3): before the reverse pass, catch stragglers + drain
-    // terminal cohort tokens — a token whose forward job COMPLETED (possibly after
-    // cancel) is ledgered (INSERT OR IGNORE) + consumed; a FAILED one is discarded.
-    if (isRegion) await ledgerStragglers(env, instanceId, graph, scopeId);
+    // Straggler scan (design §8.3, spec §4.1/§4.2): before the reverse pass, catch
+    // stragglers + drain terminal cohort tokens across the SUBTREE cohort — a token
+    // whose forward job COMPLETED (possibly after cancel) is ledgered (INSERT OR
+    // IGNORE) + consumed; a FAILED one is discarded. Always on; a single-token
+    // instance simply has one (or zero) live token in the cohort.
+    await ledgerStragglers(env, instanceId, graph, rootScopeId, subtree);
 
-    const steps = await selectScopeStepsForCompensation(env.DB, instanceId, scopeId);
-    // Live cohort tokens (region only). filterLineageQuiesced is a no-op for the
-    // single-token path (token_id NULL steps are never blocked), so `live` is only
-    // needed for region instances.
-    const live = isRegion ? await listLiveTokens(env.DB, instanceId) : [];
+    const steps = await selectSubtreeStepsForCompensation(env.DB, instanceId, subtree, eligibleCommitted);
+    // Live cohort tokens, filtered to the compensation subtree (spec §4.2).
+    // filterLineageQuiesced is a no-op for the single-token path (token_id NULL
+    // steps are never blocked).
+    const live = (await listLiveTokens(env.DB, instanceId)).filter((t) => inSubtree(t.position_element_id));
 
     // Quiescence barrier (design §8.3): settle the terminal ONLY when no scope step
     // still needs compensation AND no cohort token is live. If the ledger is drained
@@ -187,44 +218,92 @@ async function runCompensation(
  * the SESE validator, so "positioned inside `scopeId`" (the position node's scopeId)
  * is the cohort; a token's region branch is a single-entry/single-exit sub-region.
  */
-async function ledgerStragglers(env: Env, instanceId: string, graph: ExecutionGraph, scopeId: string): Promise<void> {
+async function ledgerStragglers(env: Env, instanceId: string, graph: ExecutionGraph, rootScopeId: string | null, subtree: string[]): Promise<void> {
   const live = await listLiveTokens(env.DB, instanceId);
   for (const t of live) {
-    if (graph.nodes[t.position_element_id]?.scopeId !== scopeId) continue; // not in this cohort
+    const posScope = graph.nodes[t.position_element_id]?.scopeId ?? null;
+    if (posScope == null ? rootScopeId != null : !subtree.includes(posScope)) continue; // not in this cohort
     const now = nowIso();
     const job = await getForwardJobByElement(env.DB, instanceId, t.position_element_id);
     if (job && job.status === "completed") {
-      const stmts: D1PreparedStatement[] = [];
-      if (!(await getSagaStep(env.DB, instanceId, t.position_element_id, job.occurrence))) {
-        const wiring = graph.compensations?.[t.position_element_id] ?? graph.transactions?.[scopeId]?.compensations?.[t.position_element_id];
-        const handlerNode = wiring ? graph.nodes[wiring.handlerId] : undefined;
-        stmts.push(
-          insertSagaStepStmt(env.DB, {
-            stepId: newId("step"),
-            instanceId,
-            scopeId: graph.nodes[t.position_element_id]?.scopeId ?? scopeId,
-            elementId: t.position_element_id,
-            forwardJobId: job.job_id,
-            capturedInput: parseJson<JsonObject>(job.input_variables, {}),
-            capturedOutput: job.output_variables ? parseJson<JsonObject>(job.output_variables, {}) : null,
-            compensationElementId: wiring?.handlerId ?? null,
-            compensationTaskType: handlerNode?.taskType ?? null,
-            compensationStatus: wiring ? "pending" : "notRequired",
-            traceId: traceIdFor(instanceId),
-            occurrence: job.occurrence,
-            tokenId: t.token_id,
-            now,
-          }),
-        );
-      }
-      stmts.push(setTokenStatusStmt(env.DB, t.token_id, "consumed", now));
-      await dbBatch(env.DB, stmts);
+      await dbBatch(env.DB, await retainStragglerStmts(env, graph, instanceId, t, job, now));
     } else if (job && job.status === "failed") {
       await dbBatch(env.DB, [setTokenStatusStmt(env.DB, t.token_id, "discarded", now)]);
     } else if (!job) {
       await dbBatch(env.DB, [setTokenStatusStmt(env.DB, t.token_id, "discarded", now)]);
     }
     // else: job created/locked (in-flight) → leave live for the terminator.
+  }
+}
+
+/**
+ * The shared ledger-retain block (Task 8): a token whose forward job COMPLETED is
+ * ledgered (INSERT OR IGNORE, carrying the producing token + the job's occurrence /
+ * captured I/O — a no-op when the forward path already wrote the row) and CONSUMED.
+ * Used by BOTH the straggler scan (which then compensates it) and `drainScopeSubtree`
+ * (retention only). Kept in one place so the two callers never drift.
+ */
+async function retainStragglerStmts(
+  env: Env,
+  graph: ExecutionGraph,
+  instanceId: string,
+  t: TokenRow,
+  job: JobRow,
+  now: string,
+): Promise<D1PreparedStatement[]> {
+  const pos = t.position_element_id;
+  const scope = graph.nodes[pos]?.scopeId ?? "";
+  const stmts: D1PreparedStatement[] = [];
+  if (!(await getSagaStep(env.DB, instanceId, pos, job.occurrence))) {
+    const wiring = graph.compensations?.[pos] ?? graph.transactions?.[scope]?.compensations?.[pos];
+    const handlerNode = wiring ? graph.nodes[wiring.handlerId] : undefined;
+    stmts.push(
+      insertSagaStepStmt(env.DB, {
+        stepId: newId("step"),
+        instanceId,
+        scopeId: scope,
+        elementId: pos,
+        forwardJobId: job.job_id,
+        capturedInput: parseJson<JsonObject>(job.input_variables, {}),
+        capturedOutput: job.output_variables ? parseJson<JsonObject>(job.output_variables, {}) : null,
+        compensationElementId: wiring?.handlerId ?? null,
+        compensationTaskType: handlerNode?.taskType ?? null,
+        compensationStatus: wiring ? "pending" : "notRequired",
+        traceId: traceIdFor(instanceId),
+        occurrence: job.occurrence,
+        tokenId: t.token_id,
+        now,
+      }),
+    );
+  }
+  stmts.push(setTokenStatusStmt(env.DB, t.token_id, "consumed", now));
+  return stmts;
+}
+
+/**
+ * Phase-1 interrupt/drain of a scope subtree (spec §4.3.1 / §5.3.1): settle every
+ * live token positioned in the subtree — completed forward job → ledger (retained)
+ * + consume; created/locked → abandon the job (a late complete then no-ops) +
+ * discard; failed / no job → discard. Idempotent (INSERT OR IGNORE + status-guarded
+ * flips). Unlike the straggler scan this NEVER creates compensation work — it is
+ * retention only, used by Tasks 9/11 for non-cancel scope exits.
+ */
+export async function drainScopeSubtree(env: Env, graph: ExecutionGraph, instanceId: string, rootScopeId: string | null): Promise<void> {
+  const subtree = subtreeScopeIds(graph, rootScopeId);
+  const live = await listLiveTokens(env.DB, instanceId);
+  for (const t of live) {
+    const posScope = graph.nodes[t.position_element_id]?.scopeId ?? null;
+    if (posScope == null ? rootScopeId != null : !subtree.includes(posScope)) continue;
+    const now = nowIso();
+    const job = await getForwardJobByElement(env.DB, instanceId, t.position_element_id);
+    if (job && job.status === "completed") {
+      await dbBatch(env.DB, await retainStragglerStmts(env, graph, instanceId, t, job, now));
+    } else if (job && (job.status === "created" || job.status === "locked")) {
+      // abandonJobOnTimerFireStmt: created/locked → failed (a late worker callback no-ops).
+      await dbBatch(env.DB, [abandonJobOnTimerFireStmt(env.DB, job.job_id, now), setTokenStatusStmt(env.DB, t.token_id, "discarded", now)]);
+    } else {
+      await dbBatch(env.DB, [setTokenStatusStmt(env.DB, t.token_id, "discarded", now)]);
+    }
   }
 }
 
@@ -290,14 +369,30 @@ async function markStepCompensationFailed(env: Env, instanceId: string, step: Sa
   ]);
 }
 
-/** Settle the saga-failed terminal WITHOUT completeInstance (keep 'compensated'). */
-async function settleSagaCompensated(env: Env, instanceId: string, scopeId: string, failureTarget: string | null): Promise<void> {
+/**
+ * Settle a completed reverse pass. A NESTED cancel-end (spec §4.3 refined) settles
+ * NON-terminally — the instance CONTINUES on the cancel boundary's failure target,
+ * status back to running. A top-level / process root settles the saga-failed
+ * terminal WITHOUT completeInstance (keep 'compensated'). `rootScopeId` null (the
+ * operator/process root) folds its history element ids to the process id.
+ */
+async function settleSagaCompensated(env: Env, instanceId: string, graph: ExecutionGraph, rootScopeId: string | null, failureTarget: string | null, isNestedRoot: boolean): Promise<void> {
   const inst = await loadInst(env, instanceId);
   if (inst.status !== "compensating") return; // already settled / not in pass
   const now = nowIso();
-  const finalEl = failureTarget ?? scopeId;
+  const scopeEl = rootScopeId ?? graph.processId;
+  if (isNestedRoot && failureTarget) {
+    // Nested cancel-end (spec §4.3 as refined): the instance CONTINUES on the cancel
+    // boundary's failure path — non-terminal settle, status back to running.
+    await dbBatch(env.DB, [
+      historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: scopeEl, type: "compensationCompleted", diagnostics: { transaction: rootScopeId, outcome: "compensated", nested: true } }),
+      applyTransitionStmt(env.DB, { instanceId, currentElementId: failureTarget, status: "running", now }),
+    ]);
+    return;
+  }
+  const finalEl = failureTarget ?? scopeEl;
   await dbBatch(env.DB, [
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: scopeId, type: "compensationCompleted", diagnostics: { transaction: scopeId, outcome: "compensated" } }),
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: scopeEl, type: "compensationCompleted", diagnostics: { transaction: rootScopeId, outcome: "compensated" } }),
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: finalEl, type: "sagaFailed", diagnostics: { settledVia: finalEl } }),
     // Incident lifecycle (TASK-36 carry): an operator /cancel of a Hazard set
     // the incident resolution to 'compensating'; the settle is its natural

@@ -217,23 +217,6 @@ export async function countCompensableSteps(
   return (await selectSubtreeStepsForCompensation(db, instanceId, subtreeScopeIds, eligibleCommittedLocalScopeIds)).length;
 }
 
-/**
- * TEMPORARY single-scope compat shim (M5-L1 Task 4 → Task 8 removes this).
- * `src/runtime/compensation.ts` still drives one scope at a time; delegating to
- * the subtree cursor with `[scopeId]` + no committedLocal eligibility list is
- * byte-for-byte the old single-scope query (committedLocal never existed pre-M5,
- * so an empty eligibility list drops that OR-branch entirely). Task 8 rewrites
- * the compensation pass to call `selectSubtreeStepsForCompensation` directly with
- * the real scope-tree-derived lists and this wrapper goes away.
- */
-export async function selectScopeStepsForCompensation(
-  db: D1Database,
-  instanceId: string,
-  scopeId: string,
-): Promise<SagaStepView[]> {
-  return selectSubtreeStepsForCompensation(db, instanceId, [scopeId], []);
-}
-
 export async function getSagaStepsForInstance(
   db: D1Database,
   instanceId: string,
@@ -264,17 +247,6 @@ export async function getSagaStep(
     [instanceId, elementId, occurrence],
   );
   return row ? mapSagaStep(row) : null;
-}
-
-/** How many steps still need compensation (drives the cancel empty-ledger branch). */
-export async function countPendingSteps(db: D1Database, instanceId: string): Promise<number> {
-  const row = await dbFirst<{ n: number }>(
-    db,
-    `SELECT COUNT(*) AS n FROM saga_steps WHERE instance_id = ?
-       AND compensation_status IN ('pending', 'compensating', 'failed')`,
-    [instanceId],
-  );
-  return row?.n ?? 0;
 }
 
 /** The step whose compensator exhausted retries (operator-retry target). */

@@ -29,6 +29,14 @@ export interface DriveResult {
   status: DriveStatus;
 }
 
+// M5-L1 (Task 8): a nested cancel-end reverse pass settles NON-terminally — after
+// compensating its own subtree the instance CONTINUES on the cancel boundary's
+// failure path. `settleAfterCompensation` returns this extra `continue` shape so
+// the walk / frontier / resume sites route the cursor to `next` instead of
+// returning a terminal DriveResult. A top-level (process-root) settle is terminal
+// and still returns a plain DriveResult.
+export type SettleResult = DriveResult | { status: "continue"; next: string };
+
 export async function loadInst(env: Env, instanceId: string): Promise<InstanceRow> {
   const row = await getInstanceRow(env.DB, instanceId);
   if (!row) throw new Error(`Process instance ${instanceId} not found`);

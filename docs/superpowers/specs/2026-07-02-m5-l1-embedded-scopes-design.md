@@ -229,7 +229,12 @@ a **two-phase subtree operation** (decomposition §3.1.2(iii)):
    straggler scan above), failed/non-compensatable discarded, `created|locked` jobs drained via the
    existing lease-expiry terminators, now armed subtree-wide
    (`armCohortLeaseExpiryTerminators`, `src/runtime/forward-task.ts:257`). The barrier holds the
-   reverse pass until the subtree quiesces.
+   reverse pass until the subtree quiesces. Same drain, any ACTIVE message subscription owned by an
+   element inside `subtree(R)` (a parked `receiveTask`/message `intermediateCatchEvent`) is
+   superseded in D1 and its correlation-broker key released best-effort
+   (`releaseSubscriptionsInScopeSubtree`, `src/runtime/instance-release.ts`, TASK-72) — mirroring the
+   whole-instance `releaseActiveSubscriptionsForInstance` used by operator `/cancel` on a region — so a
+   drained wait never strands a broker key until the 1-hour buffered-message TTL.
 2. **Reverse pass bottom-up** — the §3.4 cursor; global `seq DESC` interleaves nested scopes
    correctly without any extra ordering machinery.
 

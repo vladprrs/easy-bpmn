@@ -128,4 +128,42 @@ describe("M5-L1 timer boundary on a transaction (spec §5.3-§5.4)", () => {
     expect((await getInstanceRow(instanceId))!.current_element_id).not.toBe("afterTimer");
     expect(await countJobs(instanceId, "afterTimer")).toBe(0);
   });
+
+  // TASK-72 (M5-L1 follow-up, PR #4 review finding #3): the timer-fired drain of
+  // TX must release waitMsg's still-active message subscription — both the D1 row
+  // (superseded, not left `active`) and the correlation-broker key (best-effort,
+  // freed rather than left to the 1-hour buffered-message TTL).
+  it("[TASK-72] timer-fired drain of TX releases waitMsg's active subscription and frees its broker key", async () => {
+    const token = await mintWorkerToken();
+    const correlationKey = `tx-timer-4-${crypto.randomUUID()}`;
+    const { instance } = await publishAndStart(TX_TIMER_BPMN, { correlationKey, variables: {} });
+    const instanceId = instance.body.instanceId as string;
+
+    await leaseAndComplete(token, "stepA", {});
+    expect((await getInstanceRow(instanceId))!.current_element_id).toBe("waitMsg");
+
+    const before = await env.DB.prepare(
+      `SELECT status FROM message_subscriptions WHERE instance_id = ? AND element_id = 'waitMsg' ORDER BY rowid DESC LIMIT 1`,
+    )
+      .bind(instanceId)
+      .first<{ status: string }>();
+    expect(before?.status).toBe("active");
+
+    await fireDueBoundaryTimer(instanceId);
+
+    // D1: the drain superseded waitMsg's subscription — it is no longer active.
+    const after = await env.DB.prepare(
+      `SELECT status FROM message_subscriptions WHERE instance_id = ? AND element_id = 'waitMsg' ORDER BY rowid DESC LIMIT 1`,
+    )
+      .bind(instanceId)
+      .first<{ status: string }>();
+    expect(after?.status).toBe("superseded");
+
+    // Broker: the key was freed, not left registered — a late publish no longer
+    // correlates to a live wait; it gets buffered (awaiting a NEW subscription
+    // within the TTL) rather than delivered to the (already-drained) instance.
+    const pub = await publishMessage({ messageName: "m1", correlationKey, messageId: `msg-${crypto.randomUUID()}`, payload: {} });
+    expect(pub.status).toBe(202);
+    expect(pub.body.outcome).toBe("buffered");
+  });
 });

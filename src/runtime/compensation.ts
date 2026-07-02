@@ -38,6 +38,7 @@ import { loadInst, type RunStep, type WaitForEvent, type DriveResult, type Settl
 import { WAKE_TYPE, wakeBackstop } from "./wake";
 import { buildBoundaryCancelSettle, convertOnFire, isUniqueConstraintViolation, settleDrainedScopeTimer } from "./boundary-timer";
 import { listTimersForInstance } from "../persistence/timers";
+import { releaseSubscriptionsInScopeSubtree } from "./instance-release";
 
 /**
  * The failure-path target of the cancel boundary attached to transaction `scopeId`.
@@ -353,6 +354,11 @@ async function retainStragglerStmts(
  * discard; failed / no job → discard. Idempotent (INSERT OR IGNORE + status-guarded
  * flips). Unlike the straggler scan this NEVER creates compensation work — it is
  * retention only, used by Tasks 9/11 for non-cancel scope exits.
+ *
+ * Also releases (TASK-72, M5-L1 follow-up, PR #4 review finding #3): any ACTIVE
+ * message subscription — and its correlation-broker key — held by a receiveTask
+ * (or message intermediateCatchEvent) wait positioned in the subtree, so a drained
+ * wait never strands a broker key until the 1-hour buffered-message TTL.
  */
 export async function drainScopeSubtree(env: Env, graph: ExecutionGraph, instanceId: string, rootScopeId: string | null): Promise<void> {
   const subtree = subtreeScopeIds(graph, rootScopeId);
@@ -371,6 +377,12 @@ export async function drainScopeSubtree(env: Env, graph: ExecutionGraph, instanc
       await dbBatch(env.DB, [setTokenStatusStmt(env.DB, t.token_id, "discarded", now)]);
     }
   }
+  // TASK-72: release any active receiveTask/message-catch subscription (+ broker
+  // key) still held anywhere in the drained subtree. A discarded token's own wait
+  // never resolves its subscription on the forward path, so without this the
+  // broker key would sit registered until the 1-hour TTL even though the instance
+  // has moved on. Best-effort per subscription (mirrors the whole-instance release).
+  await releaseSubscriptionsInScopeSubtree(env, graph, instanceId, rootScopeId, nowIso());
   // M5-L1 Task 11 review-fix: this drain tears down the WHOLE subtree — every
   // DESCENDANT scope (strictly inside `rootScopeId`) is gone too, so its OWN armed
   // boundary timer must be settled `cancelled`. The exiting root scope's own timer is

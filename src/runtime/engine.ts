@@ -677,7 +677,7 @@ async function commitTransaction(env: Env, instanceId: string, graph: ExecutionG
   const now = nowIso();
   await dbBatch(env.DB, [
     // Terminalize this scope's ledger so a later cancel can't re-compensate it.
-    markScopeStepsCommittedStmt(env.DB, { instanceId, scopeId: txId, now }),
+    markScopeStepsCommittedStmt(env.DB, { instanceId, scopeIds: [txId], seal: true, now }),
     // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: endElementId, type: "elementEntered", diagnostics: { elementType: "endEvent", endKind: "none", scope: txId, occurrence: occ } }),
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionCommitted", diagnostics: { transaction: txId } }),

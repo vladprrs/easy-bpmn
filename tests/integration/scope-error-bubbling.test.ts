@@ -68,7 +68,7 @@ async function historyTypes(instanceId: string): Promise<{ type: string; element
 }
 
 describe("M5-L1 hierarchical error bubbling (spec §5.1)", () => {
-  it("an uncaught task error climbs to the nearest enclosing scope boundary", async () => {
+  it("[S-ERR-BUBBLE-01] an uncaught task error climbs to the nearest enclosing scope boundary", async () => {
     const token = await mintWorkerToken();
     await flushStrayJobs(token, ["failing", "recover"]);
     const { instance } = await publishAndStart(SCOPE_ERR_BPMN, { correlationKey: `scope-err-${crypto.randomUUID()}`, variables: {} });
@@ -85,7 +85,7 @@ describe("M5-L1 hierarchical error bubbling (spec §5.1)", () => {
     expect(hist.filter((h) => h.type === "scopeExited" && h.element_id === "S1")).toHaveLength(1);
   });
 
-  it("no boundary anywhere → Hazard at root (serviceTaskFailure, no auto-compensation)", async () => {
+  it("[S-ERR-BUBBLE-01] no boundary anywhere → Hazard at root (serviceTaskFailure, no auto-compensation)", async () => {
     const token = await mintWorkerToken();
     await flushStrayJobs(token, ["failing", "recover"]);
     const { instance } = await publishAndStart(HAZARD_BUBBLE_BPMN, { correlationKey: `hazard-bubble-${crypto.randomUUID()}`, variables: {} });

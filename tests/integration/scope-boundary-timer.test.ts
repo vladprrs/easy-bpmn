@@ -58,7 +58,7 @@ async function countJobs(instanceId: string, taskType: string): Promise<number> 
 }
 
 describe("M5-L1 timer boundary on a transaction (spec §5.3-§5.4)", () => {
-  it("fire interrupts WITHOUT compensation; ledger retained; the timer path completes", async () => {
+  it("[S-TX-TIMER-01] fire interrupts WITHOUT compensation; ledger retained; the timer path completes", async () => {
     const token = await mintWorkerToken();
     const { instance } = await publishAndStart(TX_TIMER_BPMN, { correlationKey: `tx-timer-1-${crypto.randomUUID()}`, variables: {} });
     const instanceId = instance.body.instanceId as string;
@@ -85,7 +85,7 @@ describe("M5-L1 timer boundary on a transaction (spec §5.3-§5.4)", () => {
     // run (below) that never completes afterTimer.
   });
 
-  it("operator /cancel after the timer exit drives the retained rows through compensation", async () => {
+  it("[S-TX-TIMER-01] operator /cancel after the timer exit drives the retained rows through compensation", async () => {
     const token = await mintWorkerToken();
     const { instance } = await publishAndStart(TX_TIMER_BPMN, { correlationKey: `tx-timer-2-${crypto.randomUUID()}`, variables: {} });
     const instanceId = instance.body.instanceId as string;

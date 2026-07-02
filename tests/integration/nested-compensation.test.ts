@@ -125,7 +125,7 @@ async function expireLeaseAndRedrive(instanceId: string): Promise<void> {
 
 describe("M5-L1 nested compensation (spec §3.4 / §4)", () => {
   // GATE 1 (spec §10.1): outer cancel compensates a committed inner tx, reverse order.
-  it("outer-tx > subProcess > inner-tx-commits; outer cancel compensates A and B in reverse", async () => {
+  it("[C-COMP-NESTEDTX-BRANCH-01][S-COMP-NESTED-COMMIT-01] outer-tx > subProcess > inner-tx-commits; outer cancel compensates A and B in reverse", async () => {
     const token = await mintWorkerToken();
     await flushStrayJobs(token, ["stepA", "stepB", "trip", "undoA", "undoB"]);
     const { instance } = await publishAndStart(NESTED_COMMIT_BPMN, { correlationKey: `nc-g1-${crypto.randomUUID()}`, variables: {} });
@@ -147,7 +147,7 @@ describe("M5-L1 nested compensation (spec §3.4 / §4)", () => {
   });
 
   // GATE 4 (spec §10.4): self re-entry shield.
-  it("T committed at occ0 then cancelled at occ1: occ0 rows untouched; later outer cancel compensates both", async () => {
+  it("[S-COMP-REENTRY-SHIELD-01] T committed at occ0 then cancelled at occ1: occ0 rows untouched; later outer cancel compensates both", async () => {
     const token = await mintWorkerToken();
     await flushStrayJobs(token, ["stepA", "bump", "trip", "undoA"]);
     const { instance } = await publishAndStart(RE_ENTRY_TX_BPMN, { correlationKey: `nc-g4-${crypto.randomUUID()}`, variables: { round: 1 } });

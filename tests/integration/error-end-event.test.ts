@@ -41,7 +41,7 @@ async function getInstanceRow(instanceId: string) {
 }
 
 describe("M5-L1 error end event (spec §5.2)", () => {
-  it("an error end inside a subProcess routes to the scope's error boundary", async () => {
+  it("[S-ERR-END-01] an error end inside a subProcess routes to the scope's error boundary", async () => {
     const token = await mintWorkerToken();
     await flushStrayJobs(token, ["prep", "recover"]);
     const { instance } = await publishAndStart(ERROR_END_BPMN, {
@@ -54,7 +54,7 @@ describe("M5-L1 error end event (spec §5.2)", () => {
     expect((await getInstanceRow(instanceId))!.status).toBe("completed");
   });
 
-  it("an error end at process level settles an uncaughtError Hazard", async () => {
+  it("[S-ERR-END-01] an error end at process level settles an uncaughtError Hazard", async () => {
     const token = await mintWorkerToken();
     await flushStrayJobs(token, ["prep"]);
     const { instance } = await publishAndStart(ERROR_END_ROOT_BPMN, {

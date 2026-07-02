@@ -1258,3 +1258,25 @@ export const SAGA_CROSS_SCOPE_ASSOC_BPMN = `<?xml version="1.0" encoding="UTF-8"
     <bpmn:sequenceFlow id="g3" sourceRef="Tx2" targetRef="Done"/>
   </bpmn:process>
 </bpmn:definitions>`;
+
+// ---------------------------------------------------------------------------
+// M5-L1 fixtures (embedded scopes — subProcess walk, spec §2)
+// ---------------------------------------------------------------------------
+
+/** M5-L1: linear flow through a plain embedded subProcess (one service task inside). */
+export const SUBPROC_LINEAR_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="def_subproc" targetNamespace="http://example.com">
+  <bpmn:process id="proc_subproc" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="sub"/>
+    <bpmn:subProcess id="sub" name="Stage">
+      <bpmn:startEvent id="s_start"/>
+      <bpmn:sequenceFlow id="sf1" sourceRef="s_start" targetRef="s_task"/>
+      <bpmn:serviceTask id="s_task" name="Work"><bpmn:extensionElements><easy-bpmn:taskDefinition type="doWork" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="sf2" sourceRef="s_task" targetRef="s_end"/>
+      <bpmn:endEvent id="s_end"/>
+    </bpmn:subProcess>
+    <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="end"/>
+    <bpmn:endEvent id="end"/>
+  </bpmn:process>
+</bpmn:definitions>`;

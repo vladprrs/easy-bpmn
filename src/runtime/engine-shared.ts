@@ -9,6 +9,7 @@
 import type { Env } from "../env";
 import type { ExecutionGraph } from "../bpmn/graph";
 import { getInstanceRow, type InstanceRow } from "../persistence/instances";
+import { scopesOf } from "../bpmn/scope-tree";
 
 export type RunStep = <T>(name: string, fn: () => Promise<T>) => Promise<T>;
 // `parked` is a VESTIGIAL WaitOutcome member: it was the M4-L3 multi-wait sentinel
@@ -36,4 +37,11 @@ export async function loadInst(env: Env, instanceId: string): Promise<InstanceRo
 
 export function isTransactionScope(graph: ExecutionGraph, scopeId: string | null | undefined): scopeId is string {
   return !!scopeId && graph.nodes[scopeId]?.type === "transaction";
+}
+
+/** Kind of the given scope id, or null at process level. Legacy graphs resolve transactions only. */
+export function scopeKindOf(graph: ExecutionGraph, scopeId: string | null | undefined): "transaction" | "subProcess" | null {
+  if (!scopeId) return null;
+  const kind = scopesOf(graph)[scopeId]?.kind;
+  return kind === "transaction" || kind === "subProcess" ? kind : graph.nodes[scopeId]?.type === "transaction" ? "transaction" : null;
 }

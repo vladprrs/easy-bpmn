@@ -90,10 +90,12 @@ import {
 import {
   loadInst,
   isTransactionScope,
+  scopeKindOf,
   type RunStep,
   type WaitForEvent,
   type DriveResult,
 } from "./engine-shared";
+import { scopesOf } from "../bpmn/scope-tree";
 import { createIncident, completeInstance, recordTerminalIncident, raiseConcurrencyLimit as raiseConcurrencyLimitIncident, raiseStepBudget as raiseStepBudgetIncident } from "./incidents";
 import {
   reconstructFrontier,
@@ -342,10 +344,16 @@ async function loop(
         return { kind: "next", next: await runStep(`start:${tag}`, () => enterStart(env, instanceId, graph, cur, occ, node)) };
       }
 
-      if (node.type === "transaction") {
-        const innerStart = graph.transactions?.[cur]?.startId;
+      if (node.type === "transaction" || node.type === "subProcess") {
+        // M5-L1: a plain subProcess is a bookkeeping scope, driven by the SAME
+        // enter/park-free pattern as a transaction — just no ledger commit on exit.
+        const meta = scopesOf(graph)[cur];
+        const innerStart = meta?.startId || graph.transactions?.[cur]?.startId;
         if (!innerStart) return { kind: "completed" }; // malformed (validator guards this)
-        return { kind: "next", next: await runStep(`tx:${tag}`, () => enterTransaction(env, instanceId, cur, occ, innerStart)) };
+        if (node.type === "transaction") {
+          return { kind: "next", next: await runStep(`tx:${tag}`, () => enterTransaction(env, instanceId, cur, occ, innerStart)) };
+        }
+        return { kind: "next", next: await runStep(`scope:${tag}`, () => enterScope(env, instanceId, cur, occ, innerStart)) };
       }
 
       if (node.type === "serviceTask" && !node.isForCompensation) {
@@ -418,6 +426,10 @@ async function loop(
         if (isTransactionScope(graph, node.scopeId)) {
           // Inner none end → COMMIT the transaction → continue on its outer flow.
           return { kind: "next", next: await runStep(`commit:${tag}`, () => commitTransaction(env, instanceId, graph, node.scopeId!, cur, occ)) };
+        }
+        if (scopeKindOf(graph, node.scopeId) === "subProcess") {
+          // Inner none end of a subProcess → bookkeeping exit; NO ledger mutation (spec §2).
+          return { kind: "next", next: await runStep(`scope-end:${tag}`, () => exitScope(env, instanceId, graph, node.scopeId!, cur, occ)) };
         }
         // Process-level none end. A single-token (M0–M3) instance completes
         // DIRECTLY — byte-identical to the old loop. In a region graph, last-token-
@@ -640,8 +652,8 @@ async function enterStart(env: Env, instanceId: string, graph: ExecutionGraph, e
   if (await visitApplied(env, instanceId, elementId, occ, "elementEntered")) return next; // write-free rewalk
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
-  if (isTransactionScope(graph, node.scopeId)) {
-    // Inner transaction start — just advance (the transaction node already audited entry).
+  if (scopeKindOf(graph, node.scopeId) != null) {
+    // Inner transaction/subProcess start — just advance (the scope node already audited entry).
     await dbBatch(env.DB, [
       // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
       historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "elementEntered", diagnostics: { elementType: "startEvent", scope: node.scopeId, occurrence: occ } }),
@@ -681,6 +693,35 @@ async function commitTransaction(env: Env, instanceId: string, graph: ExecutionG
     // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: endElementId, type: "elementEntered", diagnostics: { elementType: "endEvent", endKind: "none", scope: txId, occurrence: occ } }),
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionCommitted", diagnostics: { transaction: txId } }),
+    applyTransitionStmt(env.DB, { instanceId, currentElementId: outer ?? endElementId, status: "running", now }),
+  ]);
+  return outer ?? endElementId;
+}
+
+// ---------------------------------------------------------------------------
+// M5-L1: plain subProcess enter / exit — bookkeeping scope, NO ledger mutation
+// ---------------------------------------------------------------------------
+
+async function enterScope(env: Env, instanceId: string, scopeId: string, occ: number, innerStart: string): Promise<string> {
+  if (await visitApplied(env, instanceId, scopeId, occ, "scopeEntered")) return innerStart; // write-free rewalk
+  const inst = await loadInst(env, instanceId);
+  await dbBatch(env.DB, [
+    // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: scopeId, type: "scopeEntered", diagnostics: { scope: scopeId, kind: "subProcess", occurrence: occ } }),
+    applyTransitionStmt(env.DB, { instanceId, currentElementId: innerStart, status: "running", now: nowIso() }),
+  ]);
+  return innerStart;
+}
+
+async function exitScope(env: Env, instanceId: string, graph: ExecutionGraph, scopeId: string, endElementId: string, occ: number): Promise<string> {
+  const outer = graph.nodes[scopeId]?.next ?? null;
+  if (await visitApplied(env, instanceId, endElementId, occ, "elementEntered")) return outer ?? endElementId; // write-free rewalk
+  const inst = await loadInst(env, instanceId);
+  const now = nowIso();
+  await dbBatch(env.DB, [
+    // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: endElementId, type: "elementEntered", diagnostics: { elementType: "endEvent", endKind: "none", scope: scopeId, occurrence: occ } }),
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: scopeId, type: "scopeExited", diagnostics: { scope: scopeId, occurrence: occ } }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: outer ?? endElementId, status: "running", now }),
   ]);
   return outer ?? endElementId;

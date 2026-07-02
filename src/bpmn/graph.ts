@@ -27,7 +27,9 @@ export type ElementType =
   // M4 concurrency — a split fans out concurrent tokens; `next` is null, the
   // engine reads `outgoing[]` (split) or the recorded join facts (join).
   | "parallelGateway"
-  | "inclusiveGateway";
+  | "inclusiveGateway"
+  // M5 composition:
+  | "subProcess";
 
 /** A node in the executable graph (excludes sequence flows, messages, associations, errors). */
 export type NodeType =
@@ -49,13 +51,30 @@ export type NodeType =
   // M4 concurrency — a split fans out concurrent tokens; `next` is null, the
   // engine reads `outgoing[]` (split) or the recorded join facts (join).
   | "parallelGateway"
-  | "inclusiveGateway";
+  | "inclusiveGateway"
+  // M5 composition:
+  | "subProcess";
 
-/** Discriminator for end events: a plain (commit) end vs a transaction Cancel end. */
-export type EndKind = "none" | "cancel";
+/** Discriminator for end events: a plain (commit) end vs a transaction Cancel end vs an error end. */
+export type EndKind = "none" | "cancel" | "error";
 
 /** Discriminator for a boundary event, by its single event definition. */
 export type BoundaryKind = "error" | "cancel" | "compensate" | "timer";
+
+/** M5 composition: static scope hierarchy kinds. */
+export type ScopeKind = "process" | "transaction" | "subProcess" | "callActivity" | "miBody";
+
+/** M5 composition: metadata for one scope in the compiled graph (spec §2). */
+export interface ScopeMeta {
+  id: string;
+  kind: ScopeKind;
+  /** null = the process root. */
+  parentId: string | null;
+  /** 1 for a scope directly in the process. */
+  depth: number;
+  /** The scope's inner none-start element id. */
+  startId: string;
+}
 
 /** A static ISO-8601 timer trigger (M3-L3): `timeDate` instant or `timeDuration` delay. */
 export interface TimerTriggerSpec {
@@ -216,6 +235,11 @@ export interface ExecutionGraph {
   errors?: ErrorDeclaration[];
   /** Concurrent regions keyed by split id (M4); absent on non-concurrent graphs. */
   regions?: Record<string, RegionInfo>;
+  // --- M5 composition additions ---
+  /** Static scope hierarchy — spec §2. */
+  scopes?: Record<string, ScopeMeta>;
+  /** Flat element-id-keyed compensation wiring; supersedes per-transaction `compensations` for scope-aware lookups (spec §3.3), which is retained for legacy graphs. */
+  compensations?: Record<string, { handlerId: string; boundaryId: string }>;
 }
 
 export interface ValidationIssueData {

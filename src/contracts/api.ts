@@ -147,7 +147,9 @@ export interface BpmnElement {
     | "eventBasedGateway"
     // M4 concurrency — block-structured AND/OR split/join gateways (M4-L1).
     | "parallelGateway"
-    | "inclusiveGateway";
+    | "inclusiveGateway"
+    // M5 composition:
+    | "subProcess";
   name?: string | null;
   taskType?: string | null;
   messageName?: string | null;

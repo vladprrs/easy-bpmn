@@ -35,7 +35,8 @@ import { eligibleCommittedLocalScopeIds, scopesOf, subtreeScopeIds } from "../bp
 import { armCohortLeaseExpiryTerminators } from "./forward-task";
 import { loadInst, type RunStep, type WaitForEvent, type DriveResult, type SettleResult } from "./engine-shared";
 import { WAKE_TYPE, wakeBackstop } from "./wake";
-import { buildBoundaryCancelSettle, convertOnFire, isUniqueConstraintViolation } from "./boundary-timer";
+import { buildBoundaryCancelSettle, convertOnFire, isUniqueConstraintViolation, settleDrainedScopeTimer } from "./boundary-timer";
+import { listTimersForInstance } from "../persistence/timers";
 
 /**
  * The failure-path target of the cancel boundary attached to transaction `scopeId`.
@@ -335,6 +336,22 @@ export async function drainScopeSubtree(env: Env, graph: ExecutionGraph, instanc
       await dbBatch(env.DB, [abandonJobOnTimerFireStmt(env.DB, job.job_id, now), setTokenStatusStmt(env.DB, t.token_id, "discarded", now)]);
     } else {
       await dbBatch(env.DB, [setTokenStatusStmt(env.DB, t.token_id, "discarded", now)]);
+    }
+  }
+  // M5-L1 Task 11 review-fix: this drain tears down the WHOLE subtree — every
+  // DESCENDANT scope (strictly inside `rootScopeId`) is gone too, so its OWN armed
+  // boundary timer must be settled `cancelled`. The exiting root scope's own timer is
+  // settled ATOMICALLY at its exit site (commit / exitScope / cancel / error-catch),
+  // so it is EXCLUDED here (a redundant settle would only PK-conflict). Idempotent:
+  // a re-run (Workflow step retry / self-heal) re-reads the now-settled timers and
+  // skips them; see `settleDrainedScopeTimer` for the fired-first race semantics.
+  const descendants = new Set(subtree.filter((id) => id !== rootScopeId));
+  if (descendants.size > 0) {
+    const inst = await loadInst(env, instanceId);
+    for (const timer of await listTimersForInstance(env.DB, instanceId)) {
+      if (timer.kind !== "boundary" || timer.status !== "armed") continue;
+      if (!timer.attachedToRef || !descendants.has(timer.attachedToRef)) continue;
+      await settleDrainedScopeTimer(env, instanceId, inst.workspace_id, timer);
     }
   }
 }

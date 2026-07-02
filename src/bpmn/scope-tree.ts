@@ -26,6 +26,14 @@ export function subtreeScopeIds(graph: ExecutionGraph, rootScopeId: string | nul
   return out;
 }
 
+/** Strict ancestor scope ids of scopeId (the parent chain, EXCLUDING scopeId), inner-to-outer. */
+export function ancestorScopeIds(graph: ExecutionGraph, scopeId: string): string[] {
+  const scopes = scopesOf(graph);
+  const out: string[] = [];
+  for (let s: string | null = scopes[scopeId]?.parentId ?? null; s != null; s = scopes[s]?.parentId ?? null) out.push(s);
+  return out;
+}
+
 /** Nearest transaction on the parent chain, INCLUSIVE of scopeId itself. */
 export function nearestEnclosingTx(graph: ExecutionGraph, scopeId: string | null): string | null {
   const scopes = scopesOf(graph);

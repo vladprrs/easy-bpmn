@@ -25,7 +25,8 @@ import type { Env } from "../env";
 import type { ExecutionGraph, GraphNode, TimerTriggerSpec } from "../bpmn/graph";
 import { isTerminalInstanceStatus, isoIsBefore, nowIso } from "../util";
 import { dbBatch } from "../persistence/db";
-import { hasHistoryMarkerForOccurrence, historyStmt } from "../persistence/history";
+import { ancestorScopeExitedAfterEntry, hasHistoryMarkerForOccurrence, historyStmt } from "../persistence/history";
+import { ancestorScopeIds } from "../bpmn/scope-tree";
 import {
   applyTransitionStmt,
   getForwardJob,
@@ -293,6 +294,52 @@ export async function cancelArmedTimersForInstance(env: Env, instanceId: string)
   }
 }
 
+/**
+ * Settle a still-armed DESCENDANT scope boundary timer torn down by an ANCESTOR
+ * scope's drain (M5-L1 Task 11 review-fix). Composed into `drainScopeSubtree`
+ * (compensation.ts): when an ancestor exit (normal commit / cancel / abnormal
+ * error-or-timer drain) tears down a subtree, every nested scope inside it is gone,
+ * so its OWN boundary timer must be settled `cancelled` in its OWN PK-decider batch —
+ * otherwise a later DO alarm would pass `fireTimer`'s status guard and reach
+ * `planBoundaryTimerFire`.
+ *
+ * Race semantics (deliberate): by drain time the ANCESTOR's exit transition has
+ * ALREADY committed. If the descendant timer FIRED first — its decider row exists →
+ * the plain `cancelled` INSERT violates the PK — we DO NOT convert to the
+ * descendant's boundary path: the ancestor already won the exit at a HIGHER level,
+ * so that boundary path is unreachable. The stray fire is made harmless at the
+ * source by `planBoundaryTimerFire`'s ancestor-exit guard (which no-ops the fire
+ * once an enclosing scope's exit marker post-dates this scope's entry); THIS settle
+ * is the belt-and-suspenders that flips the still-armed common case to a decided
+ * no-op (so a stray alarm short-circuits on the decider row, never re-planning).
+ */
+export async function settleDrainedScopeTimer(
+  env: Env,
+  instanceId: string,
+  workspaceId: string,
+  timer: TimerView,
+): Promise<void> {
+  const now = nowIso();
+  try {
+    await dbBatch(env.DB, [
+      insertTimerOutcomeStmt(env.DB, { timerId: timer.timerId, outcome: "cancelled", now }),
+      flipTimerCancelledStmt(env.DB, { timerId: timer.timerId, now }),
+      historyStmt(env.DB, {
+        workspaceId,
+        instanceId,
+        elementId: timer.elementId,
+        type: "timerCancelled",
+        diagnostics: { attachedToRef: timer.attachedToRef, occurrence: timer.occurrence, reason: "ancestor scope drained" },
+      }),
+    ]);
+  } catch (err) {
+    if (!isUniqueConstraintViolation(err)) throw err;
+    // The descendant timer fired in the window before this drain ran — leave its
+    // 'fired' outcome; its own ancestor-exit guard already no-oped the fire (no
+    // backward transition), so we DELIBERATELY do NOT convert to its boundary path.
+  }
+}
+
 /** True iff the guarding boundary timer's decider is `fired` (the true/timeout-path resolver). */
 export async function timerHasFired(env: Env, instanceId: string, tb: TimerBoundary, occ: number): Promise<boolean> {
   const outcome = await getTimerOutcome(env.DB, timerIdFor(instanceId, tb.boundaryId, occ));
@@ -412,6 +459,16 @@ export async function planBoundaryTimerFire(
       (await hasHistoryMarkerForOccurrence(env.DB, instanceId, hostId, "transactionCancelled", occ)) ||
       (host.type === "transaction" && (await hasHistoryMarkerForOccurrence(env.DB, instanceId, hostId, "scopeExited", occ)));
     if (exited) return { kind: "skip" };
+    // GUARD (M5-L1 Task 11 review-fix): the scope may carry no OWN exit marker yet
+    // still be gone because an ANCESTOR scope exited after this host entered — an
+    // enclosing error catch / cancel / timer that ran `drainScopeSubtree` over this
+    // subtree (which discards this scope's live tokens but writes no `scopeExited`
+    // for the passed-through descendant). Firing here would route a dead token
+    // BACKWARD into the already-drained ancestor; no-op instead. Replay-safe (pure
+    // append-only history read), same idiom as the own-marker check above.
+    if (await ancestorScopeExitedAfterEntry(env.DB, instanceId, hostId, occ, ancestorScopeIds(graph, hostId))) {
+      return { kind: "skip" };
+    }
     return {
       kind: "fire",
       next,

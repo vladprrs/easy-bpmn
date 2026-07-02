@@ -342,6 +342,19 @@ async function loop(
   // it at the enclosed cancel end. Re-derived deterministically each rewalk.
   const scopeEntryOcc = new Map<string, number>();
 
+  // Walk-local set of scope ids this rewalk FAST-FORWARDED past via an abnormal skip
+  // (M5-L1 follow-up, TASK-71) — a fired scope-timer boundary exit or a nested
+  // cancelled-transaction continuation. Those two skips jump from the container to
+  // its boundary target WITHOUT descending the interior, so a later re-descend (via a
+  // condition-guarded loop-back the static C1 validator cannot prove unreachable)
+  // would restart the interior occurrence namespace and collide with the skipped
+  // occurrence's persisted rows — a SILENT desync. Checked at scope descend below:
+  // a re-descend raises a deterministic `scopeReentry` incident instead. Populated on
+  // BOTH the live and fast-forward paths of each skip so a post-crash rewalk re-derives
+  // the identical set from the D1 deciders (timer_outcomes fired / transactionCancelled
+  // markers), never from surviving in-memory state — the replay-safety invariant.
+  const skippedScopes = new Set<string>();
+
   // The per-node leaf dispatch (design §5.1: `driveLeaf`) — the SINGLE source of
   // node handling for BOTH the single-token scalar walk and the region DFS. It
   // returns a `LeafOutcome`; the existing per-kind drivers are reused verbatim,
@@ -369,6 +382,7 @@ async function loop(
         const tb = timerBoundaryFor(graph, cur);
         if (tb && (await timerHasFired(env, instanceId, tb, occ))) {
           await runStep(`scope-timer-exit:${tag}`, () => drainScopeSubtree(env, graph, instanceId, cur));
+          skippedScopes.add(cur); // TASK-71: interior NOT descended — block a later re-descend
           return { kind: "next", next: tb.node.next! };
         }
         // M5-L1 (Task 8): cancelled-tx rewalk fast-forward — a re-walk must NOT
@@ -378,9 +392,31 @@ async function loop(
         // COMMITTED occurrence of the same tx (no cancel marker at that occ) is
         // re-entered and fast-forwarded normally.
         if (node.type === "transaction" && (await visitApplied(env, instanceId, cur, occ, "transactionCancelled"))) {
+          skippedScopes.add(cur); // TASK-71: interior NOT descended — block a later re-descend
           const target = cancelBoundaryTarget(graph, cur);
           if (target) return { kind: "next", next: target };
           return { kind: "completed" }; // top-level cancelled tx: terminal settle owns the instance
+        }
+        // TASK-71: re-entry backstop. Reached the descend for a GENUINELY new
+        // occurrence (the two fast-forward guards above already returned for a
+        // re-skip of the same occurrence). If an EARLIER occurrence of this scope was
+        // abnormally skipped this rewalk, descending now would restart the interior
+        // occurrence namespace and desync against the skipped occurrence's rows —
+        // raise a deterministic incident BEFORE assigning the occurrence / entering.
+        if (skippedScopes.has(cur)) {
+          await runStep(`scope-reentry:${tag}`, () =>
+            createIncident(
+              env,
+              instanceId,
+              cur,
+              0,
+              `Scope '${cur}' was re-entered after an earlier occurrence was abnormally skipped (fired scope timer / nested cancel); ` +
+                "re-entry after an interrupted occurrence is not supported (M5-L1) — route abnormal boundary paths forward or re-enter only after commit.",
+              { elementId: cur, occurrence: occ },
+              "scopeReentry",
+            ),
+          );
+          return { kind: "incident" };
         }
         // M5-L1: a plain subProcess is a bookkeeping scope, driven by the SAME
         // enter/park-free pattern as a transaction — just no ledger commit on exit.
@@ -688,7 +724,10 @@ async function loop(
           const settled = await settleAfterCompensation(env, instanceId, graph, r.scopeId, runStep, waitFor);
           // Nested cancel-end → the instance continues on the cancel boundary's
           // failure target within THIS walk; otherwise the settle is terminal.
-          if (settled.status === "continue") { cur = settled.next; continue; }
+          // TASK-71: this same-walk continuation skips the cancelled scope's interior
+          // (it descended it once, THEN cancelled), so flag it — a guarded loop-back
+          // re-descending it before the next rewalk must hit the backstop, not desync.
+          if (settled.status === "continue") { skippedScopes.add(r.scopeId); cur = settled.next; continue; }
           return settled;
         }
         return { status: "completed" }; // completed | consumed (consumed is unreachable without regions)
@@ -714,6 +753,10 @@ async function loop(
       // Nested cancel-end → re-enter the frontier DFS (it re-walks and fast-forwards
       // through the cancelled tx to the cancel boundary target); else terminal.
       if (settled.status !== "continue") return settled;
+      // TASK-71: flag the cancelled scope (defence-in-depth alongside the driveLeaf
+      // fast-forward, which the re-walk also re-derives) so a guarded loop-back
+      // re-descending it raises the backstop instead of desyncing.
+      skippedScopes.add(result.compensate.scopeId);
       continue;
     }
     if (result.completed) return { status: "completed" };

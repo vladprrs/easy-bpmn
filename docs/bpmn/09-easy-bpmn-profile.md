@@ -407,6 +407,12 @@ is the first layer's governance record.
   **continues running** on the cancel boundary's outgoing (failure) path in the parent scope. Only a
   **top-level** transaction's cancel end, or an operator `/cancel` (compensation root = the process),
   settles the instance terminally.
+- **Do not loop a boundary path back into its own scope.** A fired scope timer and a nested cancel both
+  *skip* the scope's interior on the rewalk, so **re-entering an abnormally-interrupted scope is not
+  supported in M5-L1**: route abnormal boundary paths **forward**, and let a guarded retry loop re-enter a
+  scope **only after it commits** (the shipped commit-loop shape). Publish statically rejects an *unguarded*
+  loop-back; a *condition-guarded* one still publishes but a runtime hit is caught by a deterministic
+  `scopeReentry` incident (the walk-local `skippedScopes` backstop, TASK-71) rather than silently desyncing.
 
 **M5-L2…L5 — accepted (v2.5.0), runtime not yet open — publish still rejects (interim):**
 

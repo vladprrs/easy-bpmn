@@ -224,8 +224,9 @@ export interface Incident {
    * (service/receive wait caps) | conditionFailure (hard FEEL error) + M4-L6
    * concurrency caps: concurrencyLimit (fan-out exceeded MAX_CONCURRENT_TOKENS) |
    * stepBudget (per-drive step counter crossed STEP_BUDGET_SOFT, below the
-   * platform step ceiling). `timeout` is LEGACY — retained for compatibility,
-   * never written by current code.
+   * platform step ceiling) + M5-L1 uncaughtError (error END reached the root) and
+   * scopeReentry (TASK-71 backstop: re-descend into an abnormally-skipped scope).
+   * `timeout` is LEGACY — retained for compatibility, never written by current code.
    */
   kind?: IncidentKind;
   resolution?: "open" | "compensating" | "compensated" | "operatorResolved";

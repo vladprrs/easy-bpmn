@@ -856,7 +856,13 @@ export type IncidentKind =
   | "stepBudget"
   // COMPOSITION (M5-L1 spec §5.1): an error END EVENT reached the process root
   // uncaught (worker-task uncaught errors keep serviceTaskFailure).
-  | "uncaughtError";
+  | "uncaughtError"
+  // COMPOSITION (M5-L1 follow-up, TASK-71) — the walk re-descended into a scope
+  // whose earlier occurrence was abnormally skipped (fired scope timer / nested
+  // cancel) — a deterministic backstop instead of a silent occurrence desync. The
+  // static C1 validator rejects UNGUARDED re-entry, this catches the residual
+  // CONDITION-GUARDED loop-back the static BFS cannot prove unreachable.
+  | "scopeReentry";
 /**
  * Incident remediation lifecycle (one-way):
  *

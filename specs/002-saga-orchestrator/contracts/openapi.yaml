@@ -1476,7 +1476,11 @@ components:
             STEP_BUDGET_SOFT — a graceful incident below the platform step ceiling).
             M5-L1 adds `uncaughtError` — an error END EVENT reached the process
             root uncaught (worker-task uncaught errors keep `serviceTaskFailure`).
-          enum: [serviceTaskFailure, compensationFailure, timeout, poison, loopLimit, noPath, jobActivationTimeout, waitTimeout, conditionFailure, concurrencyLimit, stepBudget, uncaughtError]
+            M5-L1 follow-up (TASK-71) adds `scopeReentry` — the walk re-descended a
+            scope whose earlier occurrence was abnormally skipped (fired scope timer /
+            nested cancel); a deterministic backstop for the residual condition-guarded
+            loop-back the static publish-time check cannot prove unreachable.
+          enum: [serviceTaskFailure, compensationFailure, timeout, poison, loopLimit, noPath, jobActivationTimeout, waitTimeout, conditionFailure, concurrencyLimit, stepBudget, uncaughtError, scopeReentry]
         resolution:
           type: string
           nullable: true

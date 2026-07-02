@@ -149,7 +149,8 @@ export interface BpmnElement {
     | "parallelGateway"
     | "inclusiveGateway"
     // M5 composition:
-    | "subProcess";
+    | "subProcess"
+    | "callActivity";
   name?: string | null;
   taskType?: string | null;
   messageName?: string | null;
@@ -182,7 +183,9 @@ export type InstanceStatusValue =
   | "compensating"
   | "compensated"
   | "compensationFailed"
-  | "cancelled";
+  | "cancelled"
+  // M5-L2 — child-only terminal: an uncaught error end event in a callActivity child.
+  | "errored";
 
 export interface ProcessInstance {
   instanceId: string;

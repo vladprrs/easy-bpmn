@@ -156,10 +156,13 @@ describe("BPMN-lite profile validator", () => {
     expect(r.issues[0]!.reason).toMatch(/well-formed|parseable/i);
   });
 
-  it("rejects a call activity (composition deferred)", async () => {
+  // M5-L2 opened callActivity acceptance (see tests/unit/validator-call-activity.test.ts
+  // for the dedicated accept/reject matrix); this fixture's calledElement does not
+  // resolve in THIS document, which is no longer a reject — see CALL_ACTIVITY_BPMN.
+  it("accepts a call activity (M5-L2) and emits its node", async () => {
     const r = await parseAndValidate(CALL_ACTIVITY_BPMN);
-    expect(r.ok).toBe(false);
-    expect(r.issues.some((i) => i.elementId === "CA" && /callActivity/.test(i.reason))).toBe(true);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["CA"]).toMatchObject({ type: "callActivity", calledElementId: "Sub" });
   });
 });
 

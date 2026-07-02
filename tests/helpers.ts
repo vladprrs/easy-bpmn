@@ -1022,7 +1022,12 @@ export const INTERMEDIATE_CATCH_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
   </bpmn:process>
 </bpmn:definitions>`;
 
-/** A call activity — composition is deferred to M5; must be rejected. */
+// M5-L2 widened the accept matrix: a callActivity is now a supported
+// construct (see "M5-L2 callActivity acceptance" below). This fixture's
+// calledElement ("Sub") does not resolve anywhere in the SAME document, but
+// document-local non-resolution is not a Task-2 reject — cross-document
+// resolution to a calledDefinitionVersionId happens at the CALLER's publish
+// (a later M5-L2 task), so this is now accepted.
 export const CALL_ACTIVITY_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D" targetNamespace="x">
   <bpmn:process id="P" isExecutable="true">

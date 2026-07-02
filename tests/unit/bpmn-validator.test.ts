@@ -2152,4 +2152,77 @@ describe("M5-L1 re-entry after an abnormal scope skip (final-review C1, fail-clo
     expect(r.ok).toBe(true);
     expect(r.issues).toHaveLength(0);
   });
+
+  // TASK-71 companion item 1: error-END-mediated exits of hopped-over containers.
+  // The ONLY route from S's fired-timer boundary back into S runs THROUGH container
+  // C's error end, which bubbles PAST C (C has no error boundary) to the error
+  // boundary on the enclosing subProcess W, whose continuation re-enters W (and so
+  // S). C's own normal outgoing dead-cycles (loopT⇄loopU), so the plain none-end
+  // hop never reaches W's boundary — the error-end hop is the load-bearing route.
+  const errorEndReentryBpmn = (reenterGuarded: boolean) => {
+    const guard = '<bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">retries &lt; 3</bpmn:conditionExpression>';
+    const reenterFlow = reenterGuarded
+      ? `<bpmn:sequenceFlow id="gb_reenter" sourceRef="gwb" targetRef="W">${guard}</bpmn:sequenceFlow>`
+      : '<bpmn:sequenceFlow id="gb_reenter" sourceRef="gwb" targetRef="W"/>';
+    const exitFlow = reenterGuarded
+      ? '<bpmn:sequenceFlow id="gb_exit" sourceRef="gwb" targetRef="deadEnd"/>'
+      : `<bpmn:sequenceFlow id="gb_exit" sourceRef="gwb" targetRef="deadEnd">${guard}</bpmn:sequenceFlow>`;
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="d_eer" targetNamespace="http://example.com">
+  <bpmn:error id="BizErr" name="Biz" errorCode="BOOM"/>
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="W"/>
+    <bpmn:subProcess id="W">
+      <bpmn:startEvent id="w_start"/>
+      <bpmn:sequenceFlow id="wf1" sourceRef="w_start" targetRef="S"/>
+      <bpmn:subProcess id="S">
+        <bpmn:startEvent id="s_start"/>
+        <bpmn:sequenceFlow id="sf1" sourceRef="s_start" targetRef="s_end"/>
+        <bpmn:endEvent id="s_end"/>
+      </bpmn:subProcess>
+      <bpmn:boundaryEvent id="sTimer" attachedToRef="S"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+      <bpmn:sequenceFlow id="tf" sourceRef="sTimer" targetRef="C"/>
+      <bpmn:sequenceFlow id="wf2" sourceRef="S" targetRef="w_end"/>
+      <bpmn:subProcess id="C">
+        <bpmn:startEvent id="c_start"/>
+        <bpmn:sequenceFlow id="cf1" sourceRef="c_start" targetRef="cgw"/>
+        <bpmn:exclusiveGateway id="cgw" default="cf_ok"/>
+        <bpmn:sequenceFlow id="cf_boom" sourceRef="cgw" targetRef="ce"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">retries &lt; 3</bpmn:conditionExpression></bpmn:sequenceFlow>
+        <bpmn:endEvent id="ce"><bpmn:errorEventDefinition errorRef="BizErr"/></bpmn:endEvent>
+        <bpmn:sequenceFlow id="cf_ok" sourceRef="cgw" targetRef="c_ok"/>
+        <bpmn:endEvent id="c_ok"/>
+      </bpmn:subProcess>
+      <bpmn:sequenceFlow id="wf3" sourceRef="C" targetRef="loopT"/>
+      <bpmn:serviceTask id="loopT"><bpmn:extensionElements><easy-bpmn:taskDefinition type="loopT"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="wf4" sourceRef="loopT" targetRef="loopU"/>
+      <bpmn:serviceTask id="loopU"><bpmn:extensionElements><easy-bpmn:taskDefinition type="loopU"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="wf5" sourceRef="loopU" targetRef="loopT"/>
+      <bpmn:endEvent id="w_end"/>
+    </bpmn:subProcess>
+    <bpmn:sequenceFlow id="f2" sourceRef="W" targetRef="p_end"/>
+    <bpmn:endEvent id="p_end"/>
+    <bpmn:boundaryEvent id="wErr" attachedToRef="W"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="ef1" sourceRef="wErr" targetRef="gwb"/>
+    <bpmn:exclusiveGateway id="gwb" default="${reenterGuarded ? "gb_exit" : "gb_reenter"}"/>
+    ${reenterFlow}
+    ${exitFlow}
+    <bpmn:endEvent id="deadEnd"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+  };
+
+  it("rejects when the only loop-back into a timer-skipped scope runs through an error-end→outer-boundary hop", async () => {
+    const r = await parseAndValidate(errorEndReentryBpmn(false));
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some((i) => i.elementId === "S" && /timer boundary 'sTimer'/.test(i.reason) && /re-entry after an interrupted occurrence is deferred \(M5-L1\)/i.test(i.reason)),
+    ).toBe(true);
+  });
+
+  it("still accepts the same error-end shape when the loop-back edge is condition-guarded (runtime backstop owns it)", async () => {
+    const r = await parseAndValidate(errorEndReentryBpmn(true));
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+  });
 });

@@ -407,6 +407,12 @@ is the first layer's governance record.
   **continues running** on the cancel boundary's outgoing (failure) path in the parent scope. Only a
   **top-level** transaction's cancel end, or an operator `/cancel` (compensation root = the process),
   settles the instance terminally.
+- **Do not loop a boundary path back into its own scope.** A fired scope timer and a nested cancel both
+  *skip* the scope's interior on the rewalk, so **re-entering an abnormally-interrupted scope is not
+  supported in M5-L1**: route abnormal boundary paths **forward**, and let a guarded retry loop re-enter a
+  scope **only after it commits** (the shipped commit-loop shape). Publish statically rejects an *unguarded*
+  loop-back; a *condition-guarded* one still publishes but a runtime hit is caught by a deterministic
+  `scopeReentry` incident (the walk-local `skippedScopes` backstop, TASK-71) rather than silently desyncing.
 
 **M5-L2…L5 — accepted (v2.5.0), runtime not yet open — publish still rejects (interim):**
 
@@ -525,6 +531,17 @@ A BPMN document is accepted for publish only if **all** hold:
     every completed step's ledger row is retained (`pending`/`committedLocal`), the drain deferred to the
     next engine rewalk (idempotent, retain-only) — see
     [`07-execution-semantics.md`](./07-execution-semantics.md).
+    **Timer fire while the instance is frozen (M5-L1, TASK-73):** if the deadline comes due while the
+    instance is not in the active-forward lane — i.e. it has been parked into `incident` (a sibling/inner
+    technical failure) or `compensating`/`compensationFailed` (an operator `/cancel` of a Hazard) — a
+    **scope-host** timer's fire is **recorded, not applied**. It is written to the same `timer_outcomes
+    'fired'` decider (with a `timerFired {suppressed:true}` audit) but drives **no** transition, drain, or
+    interrupt, so it **never unfreezes** the parked instance. When the operator resolves the incident and
+    `/retry`s, the recorded decision fast-forwards the resume walk onto the boundary path and the
+    interrupted scope is drained then — the modeled deadline is applied only **after** the freeze clears,
+    never violating it. A **task/receiveTask-host** timer on a frozen instance instead **re-arms with a
+    short backoff** (no decider claim, no transition), so the alarm re-fires after resume and the normal
+    fire — with its full host cleanup (job abandon / subscription supersede) — applies the deadline then.
 15. **Timer intermediate catch (M3-L4).** An `intermediateCatchEvent` + `timerEventDefinition` is a delay
     step on the token path, with exactly **one incoming** and **one outgoing** sequence flow (a join into
     it rejects with element id + reason). Allowed at process level **and inside a `transaction`**. Its

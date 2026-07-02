@@ -43,9 +43,21 @@ export class JobScheduler extends DurableObject<Env> {
     const jobId = await this.ctx.storage.get<string>(JOB_KEY);
     const timerId = await this.ctx.storage.get<string>(TIMER_KEY);
     if (jobId) await terminateUnleasableJob(this.env, jobId);
-    else if (timerId) await fireTimer(this.env, timerId);
-    // One-shot: drop our storage so the DO is inert after firing. Unconditional,
-    // as today — independent of which marker (or none) was dispatched.
+    else if (timerId) {
+      const rearm = await fireTimer(this.env, timerId);
+      if (rearm) {
+        // TASK-73: the fire was DEFERRED (frozen instance, a host without a resume
+        // heal — task/receive boundary hosts and EBG timers) — re-set our own alarm
+        // to the backoff instant and KEEP the marker instead of the one-shot
+        // teardown, so the deadline is re-evaluated after the operator resume. Done
+        // here, in the alarm handler, because the deleteAll below would wipe any
+        // marker a nested (self-RPC) re-arm wrote during the dispatch.
+        await this.ctx.storage.setAlarm(new Date(rearm.rearmAt).getTime());
+        return;
+      }
+    }
+    // One-shot: drop our storage so the DO is inert after firing. Unconditional
+    // otherwise, as today — independent of which marker (or none) was dispatched.
     await this.ctx.storage.deleteAll();
   }
 }

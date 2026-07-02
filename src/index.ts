@@ -75,11 +75,9 @@ import {
   getInstance,
   getInstanceRow,
   getOpenIncidentsForInstance,
-  listActiveSubscriptionsForInstance,
   mergeInstanceVariables,
   resolveAllOpenIncidents,
   resolveIncident,
-  subscriptionSupersededStmt,
   transitionStatusGuarded,
 } from "./persistence/instances";
 import { getExternalMessage, insertExternalMessage } from "./persistence/messages";
@@ -88,7 +86,8 @@ import { handleUiRoute } from "./ui/router";
 import { listInstanceSubscriptions, listInstancesFiltered } from "./persistence/ui-queries";
 import { getIdempotentResult, putIdempotentResult } from "./persistence/idempotency";
 import { loadGraphForInstance, resumeInline } from "./runtime/engine";
-import { cancelArmedTimersForInstance, supersedeBrokerSubscription } from "./runtime/boundary-timer";
+import { cancelArmedTimersForInstance } from "./runtime/boundary-timer";
+import { releaseActiveSubscriptionsForInstance } from "./runtime/instance-release";
 import { armCohortLeaseExpiryTerminators } from "./runtime/forward-task";
 import { listTimersForInstance } from "./persistence/timers";
 import { abandonActiveForwardJobs, resetJobForRetry } from "./persistence/jobs";
@@ -405,28 +404,6 @@ async function handleListInstances(env: Env, url: URL): Promise<Response> {
 // 'incident' (design §4.2/§4.5: operators may /cancel a Hazard to force the
 // reverse compensation of already-completed steps).
 const CANCELLABLE_FROM = ["running", "waiting", "incident"] as const;
-
-/**
- * Frontier-wide broker release (M4-L5, design §8.1): supersede every ACTIVE message
- * subscription of an instance on cancel — a best-effort broker supersede per key (so a
- * late publish gets the stable buffered/no-match outcome) + the `active → superseded`
- * D1 flip. Prevents a leaked broker key when a region cohort token parked at a message
- * catch is abandoned without eagerly failing its forward work.
- */
-async function releaseActiveSubscriptionsForInstance(env: Env, instanceId: string, now: string): Promise<void> {
-  for (const sub of await listActiveSubscriptionsForInstance(env.DB, instanceId)) {
-    // Per-subscription best-effort: one release failure (broker hiccup or D1 error)
-    // must NOT abort the cancel before the status transition + resumeInline, which
-    // would strand the instance. A leaked broker key is recoverable via its TTL;
-    // a stuck cancel is not.
-    try {
-      await supersedeBrokerSubscription(env, sub);
-      await subscriptionSupersededStmt(env.DB, sub.subscription_id, now).run();
-    } catch (err) {
-      console.error(JSON.stringify({ level: "warn", message: "releaseActiveSubscription failed", subscriptionId: sub.subscription_id, error: err instanceof Error ? err.message : String(err) }));
-    }
-  }
-}
 
 async function handleCancelInstance(env: Env, instanceId: string, request: Request): Promise<Response> {
   await parseBody(cancelInstanceRequestSchema, request).catch(() => ({}));

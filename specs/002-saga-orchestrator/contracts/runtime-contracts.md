@@ -424,6 +424,16 @@ Like other forward Hazards, neither auto-compensates: inside a transaction the l
 (generalised cohort capture, design §8.5) so a late `complete` ledgers-but-does-not-advance, and an operator
 `POST /instances/{id}/cancel` forces the reverse pass.
 
+- **`scopeReentry`** (M5-L1 follow-up, TASK-71) — the deterministic runtime backstop for a re-descend into a
+  scope whose earlier occurrence was **abnormally skipped** (a fired scope-hosted boundary timer, or a nested
+  cancelled transaction). Both skips fast-forward past the container **without descending its interior**, so
+  re-entering it would restart the interior occurrence namespace and collide with the skipped occurrence's
+  persisted rows (a silent desync). The publish-time C1 check rejects **unguarded** re-entry statically; a
+  **condition-guarded** loop-back it cannot prove unreachable is caught here. The engine carries a walk-local
+  `skippedScopes` set (rebuilt every rewalk from the D1 deciders — `timer_outcomes` fired / `transactionCancelled`
+  markers — so it is replay-stable, never derived from surviving in-memory state) and raises the incident at
+  scope descend. Terminal + view-only; true re-entry support is deferred to a later M5 layer.
+
 ### Variable overlays & the R2 offload
 
 - A token's `variables_overlay` (and the resolved scope chain) live in **D1** (`execution_tokens`), out of

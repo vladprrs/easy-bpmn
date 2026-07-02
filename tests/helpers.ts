@@ -1567,6 +1567,88 @@ export const ERROR_END_ROOT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
  * timer fires while waitMsg parks → exits TX WITHOUT compensation; A's row is
  * retained pending; POST /cancel afterwards forces the reverse pass.
  */
+/**
+ * TASK-71 (M5-L1 follow-up) runtime re-entry backstop fixture — the RESIDUAL
+ * dynamic gap the C1 validator cannot statically reject: a CONDITION-GUARDED
+ * loop-back into a scope whose earlier occurrence was abnormally skipped (here a
+ * fired scope-hosted boundary timer). The guard `reenter = true` publishes (the
+ * validator's BFS only traverses UNGUARDED flows), yet at runtime the timer-fired
+ * fast-forward skips HOST's interior without descending it; re-descending via the
+ * guarded loop-back would restart the interior occurrence namespace and desync.
+ * The engine's walk-local `skippedScopes` backstop must raise a deterministic
+ * `scopeReentry` incident instead. Parameterised over both host kinds — a scope
+ * boundary timer arms identically on a transaction and a plain subProcess.
+ */
+export const reentryTimerBpmn = (host: "transaction" | "subProcess") => `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="def_reentry_timer_${host}" targetNamespace="http://example.com">
+  <bpmn:process id="proc_reentry_timer_${host}" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="HOST"/>
+    <bpmn:${host} id="HOST">
+      <bpmn:startEvent id="h_start"/>
+      <bpmn:sequenceFlow id="hf1" sourceRef="h_start" targetRef="reWork"/>
+      <bpmn:serviceTask id="reWork"><bpmn:extensionElements><easy-bpmn:taskDefinition type="reWork" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="hf2" sourceRef="reWork" targetRef="h_end"/>
+      <bpmn:endEvent id="h_end"/>
+    </bpmn:${host}>
+    <bpmn:sequenceFlow id="h_out" sourceRef="HOST" targetRef="p_end"/>
+    <bpmn:boundaryEvent id="HOST_timer" attachedToRef="HOST"><bpmn:timerEventDefinition><bpmn:timeDuration>PT30S</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="tf" sourceRef="HOST_timer" targetRef="gw"/>
+    <bpmn:exclusiveGateway id="gw" default="g_fwd"/>
+    <bpmn:sequenceFlow id="g_back" sourceRef="gw" targetRef="HOST"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">reenter = true</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="g_fwd" sourceRef="gw" targetRef="p_end"/>
+    <bpmn:endEvent id="p_end"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
+ * TASK-71 companion fixture — the SAME residual gap reached via the OTHER abnormal
+ * skip: a NESTED cancelled transaction. Outer transaction O hosts inner transaction
+ * T (compensatable step A + a cancel end); T's cancel boundary continues to
+ * `afterCancel` and then a guarded loop-back (`reenter = true`) re-descends T. The
+ * nested cancel settles NON-terminally (continue), populating `skippedScopes` on
+ * the LIVE continuation; the `afterCancel` park then forces a rewalk that re-derives
+ * the same skip from the persisted `transactionCancelled` marker (the fast-forward
+ * path). Either way, re-descending T must raise `scopeReentry`, not desync.
+ */
+export const REENTRY_CANCEL_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="def_reentry_cancel" targetNamespace="http://example.com">
+  <bpmn:process id="proc_reentry_cancel" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="O"/>
+    <bpmn:transaction id="O">
+      <bpmn:startEvent id="o_start"/>
+      <bpmn:sequenceFlow id="of1" sourceRef="o_start" targetRef="T"/>
+      <bpmn:transaction id="T">
+        <bpmn:startEvent id="t_start"/>
+        <bpmn:sequenceFlow id="tf1" sourceRef="t_start" targetRef="A"/>
+        <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="rcStepA" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+        <bpmn:boundaryEvent id="A_comp" attachedToRef="A"><bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+        <bpmn:serviceTask id="undoA" isForCompensation="true"><bpmn:extensionElements><easy-bpmn:taskDefinition type="rcUndoA" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+        <bpmn:association id="assocA" sourceRef="A_comp" targetRef="undoA"/>
+        <bpmn:sequenceFlow id="tf2" sourceRef="A" targetRef="tgw"/>
+        <bpmn:exclusiveGateway id="tgw" default="tg_ok"/>
+        <bpmn:sequenceFlow id="tg_cancel" sourceRef="tgw" targetRef="t_cancel"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">doCancel = true</bpmn:conditionExpression></bpmn:sequenceFlow>
+        <bpmn:endEvent id="t_cancel"><bpmn:cancelEventDefinition/></bpmn:endEvent>
+        <bpmn:sequenceFlow id="tg_ok" sourceRef="tgw" targetRef="t_end"/>
+        <bpmn:endEvent id="t_end"/>
+      </bpmn:transaction>
+      <bpmn:boundaryEvent id="T_cancel" attachedToRef="T"><bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:sequenceFlow id="of2" sourceRef="T_cancel" targetRef="afterCancel"/>
+      <bpmn:serviceTask id="afterCancel"><bpmn:extensionElements><easy-bpmn:taskDefinition type="rcAfter" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="of3" sourceRef="afterCancel" targetRef="gw"/>
+      <bpmn:exclusiveGateway id="gw" default="g_fwd"/>
+      <bpmn:sequenceFlow id="g_back" sourceRef="gw" targetRef="T"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">reenter = true</bpmn:conditionExpression></bpmn:sequenceFlow>
+      <bpmn:sequenceFlow id="g_fwd" sourceRef="gw" targetRef="o_end"/>
+      <bpmn:endEvent id="o_end"/>
+      <bpmn:sequenceFlow id="of_commit" sourceRef="T" targetRef="o_commit_end"/>
+      <bpmn:endEvent id="o_commit_end"/>
+    </bpmn:transaction>
+    <bpmn:sequenceFlow id="f2" sourceRef="O" targetRef="p_end"/>
+    <bpmn:endEvent id="p_end"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
 export const TX_TIMER_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="def_tx_timer" targetNamespace="http://example.com">
   <bpmn:message id="m1" name="m1"/>

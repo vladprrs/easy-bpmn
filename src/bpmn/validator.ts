@@ -1442,6 +1442,41 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       }
       return out;
     };
+    /**
+     * The error boundary (id) that catches an error END event, walking the scope
+     * attachment chain outward from its enclosing scope (engine parity with
+     * `errorCatchTarget`): the nearest enclosing scope carrying an error boundary
+     * whose code is catch-all (no errorRef) or equals the end's code. null = uncaught.
+     */
+    const errorEndCatchBoundaryId = (endNode: NodeInfo): string | null => {
+      for (let s: string | null | undefined = endNode.scopeId; s != null && s !== processId; s = scopeParent.get(s) ?? null) {
+        for (const b of boundariesByHost.get(s) ?? []) {
+          if (b.boundaryKind !== "error") continue;
+          if (b.errorCode == null || b.errorCode === endNode.errorCode) return b.id;
+        }
+      }
+      return null;
+    };
+    /**
+     * TASK-71 companion: error-END-mediated exits of a hopped-over container. The
+     * skip continuation only reaches a container node (never descends its interior),
+     * so an error END thrown INSIDE the container that bubbles PAST it to an ANCESTOR
+     * scope's error boundary is a static exit route the plain unguarded walk misses.
+     * Returns those catching boundaries (a catch on the container itself is already
+     * covered by the container's own boundary edges in the BFS).
+     */
+    const errorEndExitBoundaries = (containerId: string): string[] => {
+      const out: string[] = [];
+      for (const e of nodes) {
+        if (e.type !== "endEvent" || e.endKind !== "error") continue;
+        if (!sameOrInside(e.scopeId, containerId)) continue; // error end inside the container subtree
+        const catchB = errorEndCatchBoundaryId(e);
+        if (!catchB) continue;
+        const host = nodeById.get(catchB)?.attachedToRef;
+        if (host && !sameOrInside(host, containerId)) out.push(catchB); // caught on a STRICT ancestor
+      }
+      return out;
+    };
     /** Can the walk re-enter `scopeId` from boundary `boundaryId`'s continuation? */
     const reEntersScope = (boundaryId: string, scopeId: string): boolean => {
       const queue = unguardedTargets(boundaryId);
@@ -1458,6 +1493,11 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         for (const t of unguardedTargets(cur)) queue.push(t);
         // A path may continue via any boundary attached to the reached node.
         for (const b of boundariesByHost.get(cur) ?? []) queue.push(b.id);
+        // TASK-71: a hopped-over container may throw an error END from inside that
+        // bubbles PAST it to an ancestor's error boundary — continue from there too.
+        if (node.type === "transaction" || node.type === "subProcess") {
+          for (const b of errorEndExitBoundaries(cur)) queue.push(b);
+        }
         // An end event inside a scope P exits P: continue at P's outgoing flows
         // and P's own boundaries (one-level hop; P itself is EXITED, not re-entered).
         if (node.type === "endEvent" && node.scopeId !== processId) {

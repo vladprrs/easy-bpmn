@@ -1324,3 +1324,53 @@ export const NESTED_TX_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
     <bpmn:endEvent id="end"/>
   </bpmn:process>
 </bpmn:definitions>`;
+
+/**
+ * M5-L1 commit-shield fixture: outer tx O > subProcess S > inner tx T (compensable
+ * task A/undoA; T always COMMITS) > then compensable task B in O > "trip" task with
+ * error boundary → O's cancel end. Cancel boundary on O → failed_end.
+ */
+export const NESTED_COMMIT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="def_nested_commit" targetNamespace="http://example.com">
+  <bpmn:process id="proc_nested_commit" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="O"/>
+    <bpmn:transaction id="O">
+      <bpmn:startEvent id="o_start"/>
+      <bpmn:sequenceFlow id="of1" sourceRef="o_start" targetRef="S"/>
+      <bpmn:subProcess id="S">
+        <bpmn:startEvent id="s_start"/>
+        <bpmn:sequenceFlow id="sf1" sourceRef="s_start" targetRef="T"/>
+        <bpmn:transaction id="T">
+          <bpmn:startEvent id="t_start"/>
+          <bpmn:sequenceFlow id="tf1" sourceRef="t_start" targetRef="A"/>
+          <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="stepA" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+          <bpmn:boundaryEvent id="A_comp" attachedToRef="A"><bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+          <bpmn:serviceTask id="undoA" isForCompensation="true"><bpmn:extensionElements><easy-bpmn:taskDefinition type="undoA" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+          <bpmn:association id="assocA" sourceRef="A_comp" targetRef="undoA"/>
+          <bpmn:sequenceFlow id="tf2" sourceRef="A" targetRef="t_end"/>
+          <bpmn:endEvent id="t_end"/>
+        </bpmn:transaction>
+        <bpmn:sequenceFlow id="sf2" sourceRef="T" targetRef="s_end"/>
+        <bpmn:endEvent id="s_end"/>
+      </bpmn:subProcess>
+      <bpmn:sequenceFlow id="of2" sourceRef="S" targetRef="B"/>
+      <bpmn:serviceTask id="B"><bpmn:extensionElements><easy-bpmn:taskDefinition type="stepB" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:boundaryEvent id="B_comp" attachedToRef="B"><bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="undoB" isForCompensation="true"><bpmn:extensionElements><easy-bpmn:taskDefinition type="undoB" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:association id="assocB" sourceRef="B_comp" targetRef="undoB"/>
+      <bpmn:sequenceFlow id="of3" sourceRef="B" targetRef="trip"/>
+      <bpmn:serviceTask id="trip"><bpmn:extensionElements><easy-bpmn:taskDefinition type="trip" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:boundaryEvent id="trip_err" attachedToRef="trip"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:sequenceFlow id="of4" sourceRef="trip_err" targetRef="o_cancel"/>
+      <bpmn:endEvent id="o_cancel"><bpmn:cancelEventDefinition/></bpmn:endEvent>
+      <bpmn:sequenceFlow id="of5" sourceRef="trip" targetRef="o_end"/>
+      <bpmn:endEvent id="o_end"/>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="O_cancel" attachedToRef="O"><bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="f2" sourceRef="O_cancel" targetRef="failed_end"/>
+    <bpmn:endEvent id="failed_end"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="O" targetRef="end"/>
+    <bpmn:endEvent id="end"/>
+  </bpmn:process>
+</bpmn:definitions>`;

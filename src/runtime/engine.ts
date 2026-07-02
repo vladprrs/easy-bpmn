@@ -95,7 +95,7 @@ import {
   type WaitForEvent,
   type DriveResult,
 } from "./engine-shared";
-import { scopesOf } from "../bpmn/scope-tree";
+import { nearestEnclosingTx, ownedScopeIds, scopesOf, subtreeScopeIds } from "../bpmn/scope-tree";
 import { createIncident, completeInstance, recordTerminalIncident, raiseConcurrencyLimit as raiseConcurrencyLimitIncident, raiseStepBudget as raiseStepBudgetIncident } from "./incidents";
 import {
   reconstructFrontier,
@@ -687,12 +687,19 @@ async function commitTransaction(env: Env, instanceId: string, graph: ExecutionG
   if (await visitApplied(env, instanceId, endElementId, occ, "elementEntered")) return outer ?? endElementId; // write-free rewalk
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
+  // M5-L1 commit shield (spec §3.2): a NESTED tx (some enclosing tx above it) flips
+  // only its OWNED scopes to non-terminal committedLocal; the OUTERMOST commit seals
+  // its whole subtree to terminal 'committed'.
+  const parentScope = scopesOf(graph)[txId]?.parentId ?? null;
+  const enclosingTx = nearestEnclosingTx(graph, parentScope);
+  const flip = enclosingTx != null
+    ? markScopeStepsCommittedStmt(env.DB, { instanceId, scopeIds: ownedScopeIds(graph, txId), seal: false, now })
+    : markScopeStepsCommittedStmt(env.DB, { instanceId, scopeIds: subtreeScopeIds(graph, txId), seal: true, now });
   await dbBatch(env.DB, [
-    // Terminalize this scope's ledger so a later cancel can't re-compensate it.
-    markScopeStepsCommittedStmt(env.DB, { instanceId, scopeIds: [txId], seal: true, now }),
+    flip,
     // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: endElementId, type: "elementEntered", diagnostics: { elementType: "endEvent", endKind: "none", scope: txId, occurrence: occ } }),
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionCommitted", diagnostics: { transaction: txId } }),
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionCommitted", diagnostics: { transaction: txId, sealed: enclosingTx == null } }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: outer ?? endElementId, status: "running", now }),
   ]);
   return outer ?? endElementId;

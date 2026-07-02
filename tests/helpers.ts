@@ -1518,3 +1518,37 @@ export const ERROR_END_ROOT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
     <bpmn:endEvent id="end"/>
   </bpmn:process>
 </bpmn:definitions>`;
+
+/**
+ * M5-L1 Hazard-vs-Cancel fixture (spec §5.3-§5.4): transaction TX with a timer
+ * boundary, containing compensable task A (undoA) then receiveTask waitMsg. The
+ * timer fires while waitMsg parks → exits TX WITHOUT compensation; A's row is
+ * retained pending; POST /cancel afterwards forces the reverse pass.
+ */
+export const TX_TIMER_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="def_tx_timer" targetNamespace="http://example.com">
+  <bpmn:message id="m1" name="m1"/>
+  <bpmn:process id="proc_tx_timer" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="TX"/>
+    <bpmn:transaction id="TX">
+      <bpmn:startEvent id="t_start"/>
+      <bpmn:sequenceFlow id="tf1" sourceRef="t_start" targetRef="A"/>
+      <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="stepA" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:boundaryEvent id="A_comp" attachedToRef="A"><bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="undoA" isForCompensation="true"><bpmn:extensionElements><easy-bpmn:taskDefinition type="undoA" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:association id="assocA" sourceRef="A_comp" targetRef="undoA"/>
+      <bpmn:sequenceFlow id="tf2" sourceRef="A" targetRef="waitMsg"/>
+      <bpmn:receiveTask id="waitMsg" messageRef="m1"/>
+      <bpmn:sequenceFlow id="tf3" sourceRef="waitMsg" targetRef="t_end"/>
+      <bpmn:endEvent id="t_end"/>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="TX_timer" attachedToRef="TX"><bpmn:timerEventDefinition><bpmn:timeDuration>PT1S</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="f2" sourceRef="TX_timer" targetRef="afterTimer"/>
+    <bpmn:serviceTask id="afterTimer"><bpmn:extensionElements><easy-bpmn:taskDefinition type="afterTimer" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f3" sourceRef="afterTimer" targetRef="after_end"/>
+    <bpmn:endEvent id="after_end"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="TX" targetRef="end"/>
+    <bpmn:endEvent id="end"/>
+  </bpmn:process>
+</bpmn:definitions>`;

@@ -100,6 +100,29 @@ export async function hasHistoryMarkerForOccurrence(
 }
 
 /**
+ * The occurrence of `scopeId`'s most recent entry marker (`transactionEntered` for
+ * a transaction, `scopeEntered` for a plain subProcess) — the scope's CURRENT
+ * (live) entry occurrence (M5-L1 Task 11). Used by callers that need to key a
+ * scope-hosted boundary timer's disarm/convert but sit outside engine.ts's
+ * walk-local `scopeEntryOcc` map (forward-task.ts's hostIsScope branches). The
+ * entry marker is written atomically with its transition and always precedes any
+ * later occurrence's own entry marker (a scope must fully exit — commit / exitScope
+ * / cancel / abnormal drain — before it can re-enter), so "most recent by rowid" is
+ * always the currently-live entry. Folds to 0 when no entry marker exists
+ * (unreachable when called on a live catch target; defensive default).
+ */
+export async function latestScopeEntryOccurrence(db: D1Database, instanceId: string, scopeId: string): Promise<number> {
+  const row = await stmt(
+    db,
+    `SELECT COALESCE(json_extract(diagnostics, '$.occurrence'), 0) AS occ FROM history_events
+      WHERE instance_id = ? AND element_id = ? AND type IN ('transactionEntered', 'scopeEntered')
+      ORDER BY rowid DESC LIMIT 1`,
+    [instanceId, scopeId],
+  ).first<{ occ: number }>();
+  return row?.occ ?? 0;
+}
+
+/**
  * The raw element_id of the most recent `transactionCancelled` history row (M5-L1
  * Task 8) — the durable, replay-safe compensation-root marker. An operator /cancel
  * writes this row WITHOUT an element scope (→ null → the process root); an

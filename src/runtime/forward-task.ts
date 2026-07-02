@@ -34,7 +34,7 @@ import {
 } from "./boundary-timer";
 import { getTimer, timerIdFor } from "../persistence/timers";
 import { dbBatch } from "../persistence/db";
-import { countHistoryEventsOfType, historyStmt } from "../persistence/history";
+import { countHistoryEventsOfType, historyStmt, latestScopeEntryOccurrence } from "../persistence/history";
 import {
   applyTransitionStmt,
   createJobStmt,
@@ -598,6 +598,10 @@ async function handleForwardFailure(
     const target = errorCatchTarget(graph, elementId, job.error_code);
     if (target) {
       const now = nowIso();
+      // M5-L1 (Task 11): the catching scope's OWN occurrence — needed only when the
+      // catch climbed to a scope (hostIsScope) to key that scope's boundary-timer
+      // disarm. `elementId`'s own occurrence (`occ`) is NOT the scope's occurrence.
+      const scopeOcc = target.hostIsScope ? await latestScopeEntryOccurrence(env.DB, instanceId, target.hostId) : 0;
       const stmts: D1PreparedStatement[] = [
         historyStmt(env.DB, {
           workspaceId: inst.workspace_id,
@@ -621,12 +625,22 @@ async function handleForwardFailure(
       // route; on a decider conflict the timer FIRED first → convert to its path.
       const cancelSettle = buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: elementId, occ, now });
       if (cancelSettle) stmts.push(...cancelSettle.stmts);
+      // M5-L1 (Task 11): the catching SCOPE may ALSO carry its own boundary timer —
+      // disarm it atomically with this abnormal exit too (Hazard-vs-Cancel, spec §5.3).
+      const scopeCancelSettle = target.hostIsScope
+        ? buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: target.hostId, occ: scopeOcc, now })
+        : null;
+      if (scopeCancelSettle) stmts.push(...scopeCancelSettle.stmts);
       try {
         await dbBatch(env.DB, stmts);
       } catch (err) {
         if (isUniqueConstraintViolation(err)) {
           const converted = await convertOnFire(env, graph, instanceId, elementId, occ);
           if (converted) return { kind: "next", next: converted };
+          if (target.hostIsScope) {
+            const scopeConverted = await convertOnFire(env, graph, instanceId, target.hostId, scopeOcc);
+            if (scopeConverted) return { kind: "next", next: scopeConverted };
+          }
         }
         throw err;
       }
@@ -646,7 +660,7 @@ async function handleForwardFailure(
           instanceId,
           elementId: target.hostId,
           type: "scopeExited",
-          diagnostics: { scope: target.hostId, via: target.boundaryId, abnormal: true },
+          diagnostics: { scope: target.hostId, via: target.boundaryId, abnormal: true, occurrence: scopeOcc },
         }).run();
       }
       return { kind: "next", next: target.next };

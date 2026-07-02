@@ -35,6 +35,7 @@ import { eligibleCommittedLocalScopeIds, scopesOf, subtreeScopeIds } from "../bp
 import { armCohortLeaseExpiryTerminators } from "./forward-task";
 import { loadInst, type RunStep, type WaitForEvent, type DriveResult, type SettleResult } from "./engine-shared";
 import { WAKE_TYPE, wakeBackstop } from "./wake";
+import { buildBoundaryCancelSettle, convertOnFire, isUniqueConstraintViolation } from "./boundary-timer";
 
 /**
  * The failure-path target of the cancel boundary attached to transaction `scopeId`.
@@ -50,24 +51,55 @@ export function cancelBoundaryTarget(graph: ExecutionGraph, scopeId: string): st
   return null;
 }
 
-export async function beginCompensating(env: Env, instanceId: string, scopeId: string, cancelEndId: string, occ: number): Promise<void> {
+/** Outcome of `beginCompensating` (M5-L1 Task 11): the normal case starts the
+ *  reverse pass; `convertedToTimer` means the transaction's OWN boundary timer
+ *  raced the cancel end and fired FIRST (Hazard beat Cancel) — the caller must
+ *  take the timer's boundary path instead of compensating. */
+export type BeginCompensatingOutcome = { kind: "compensating" } | { kind: "convertedToTimer"; next: string };
+
+export async function beginCompensating(
+  env: Env,
+  instanceId: string,
+  graph: ExecutionGraph,
+  scopeId: string,
+  cancelEndId: string,
+  occ: number,
+): Promise<BeginCompensatingOutcome> {
   const inst = await loadInst(env, instanceId);
   // Idempotent re-run: once the cancel transition committed the reverse pass
   // owns the instance — never duplicate transactionCancelled or regress status.
-  if (inst.status === "compensating" || isTerminalInstanceStatus(inst.status)) return;
-  await dbBatch(env.DB, [
+  if (inst.status === "compensating" || isTerminalInstanceStatus(inst.status)) return { kind: "compensating" };
+  const now = nowIso();
+  const stmts: D1PreparedStatement[] = [
     // MARKER: `occurrence` is the CANCELLED TRANSACTION's occurrence (Task 8) — the
     // engine's driveLeaf fast-forward reads (transaction id, its occurrence) to skip
     // re-entering an occurrence that already cancelled+settled on a later rewalk. A
     // re-entering (looped) tx cancels its LATEST entry, so occ != the cancel-end's
     // own occurrence; the caller derives the tx occurrence and passes it here.
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: scopeId, type: "transactionCancelled", diagnostics: { transaction: scopeId, via: cancelEndId, traceId: traceIdFor(instanceId), occurrence: occ } }),
-    applyTransitionStmt(env.DB, { instanceId, currentElementId: cancelEndId, status: "compensating", now: nowIso() }),
-  ]);
+    applyTransitionStmt(env.DB, { instanceId, currentElementId: cancelEndId, status: "compensating", now }),
+  ];
+  // M5-L1 (Task 11): disarm the transaction's own boundary timer (if any)
+  // ATOMICALLY with the cancel — this IS a scope exit (via the nested cancel end).
+  const cancelSettle = buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: scopeId, occ, now });
+  if (cancelSettle) stmts.push(...cancelSettle.stmts);
+  try {
+    await dbBatch(env.DB, stmts);
+  } catch (err) {
+    if (isUniqueConstraintViolation(err)) {
+      // The tx's own timer fired first (Hazard beat Cancel) — its fire batch
+      // already moved current_element_id to ITS boundary target; do NOT begin
+      // compensating (no transactionCancelled/compensating transition landed).
+      const converted = await convertOnFire(env, graph, instanceId, scopeId, occ);
+      if (converted) return { kind: "convertedToTimer", next: converted };
+    }
+    throw err;
+  }
   // M4-L5 (design §8.2): arm a per-token lease-expiry terminator for every in-flight
   // cohort forward job so the quiescence barrier drains without a future worker poll.
   // No-op for single-token instances (no locked forward job survives to a cancel-end).
   await armCohortLeaseExpiryTerminators(env, instanceId);
+  return { kind: "compensating" };
 }
 
 /**

@@ -25,7 +25,7 @@ import type { Env } from "../env";
 import type { ExecutionGraph, GraphNode, TimerTriggerSpec } from "../bpmn/graph";
 import { isTerminalInstanceStatus, isoIsBefore, nowIso } from "../util";
 import { dbBatch } from "../persistence/db";
-import { historyStmt } from "../persistence/history";
+import { hasHistoryMarkerForOccurrence, historyStmt } from "../persistence/history";
 import {
   applyTransitionStmt,
   getForwardJob,
@@ -388,6 +388,39 @@ export async function planBoundaryTimerFire(
         flipTimerFiredStmt(env.DB, { timerId: timer.timerId, firedAt: now, now }),
         subscriptionSupersededStmt(env.DB, sub.subscription_id, now), // active → superseded
         historyStmt(env.DB, { workspaceId, instanceId, elementId: timer.elementId, type: "timerFired", diagnostics: { attachedToRef: hostId, subscriptionId: sub.subscription_id, occurrence: occ, boundaryTarget: next } }),
+        applyTransitionStmt(env.DB, { instanceId, currentElementId: next, status: "running", now }),
+      ],
+    };
+  }
+
+  // M5-L1 (Task 11, spec §5.3-§5.4): a boundary timer on a scope (subProcess /
+  // transaction) INTERRUPTS WITHOUT COMPENSATION (Hazard-vs-Cancel) — completed
+  // ledger rows stay `pending`/`committedLocal` (retained), the token exits on the
+  // boundary path, and the subtree drain is deferred to the rewalk (engine.ts
+  // driveLeaf's scope branch) so THIS batch stays single/atomic (persist-before-
+  // advance) exactly like the serviceTask/receiveTask shapes above.
+  if (host?.type === "transaction" || host?.type === "subProcess") {
+    // GUARD: the scope's visit must still be open — a commit/exit/cancel marker for
+    // THIS occurrence means completion (or an abnormal exit via another boundary)
+    // already won the race. transactionCommitted is occurrence-stamped since Task 11
+    // (backward-compat: absent folds to 0); scopeExited covers both the subProcess
+    // normal exit AND any abnormal exit (error boundary / error end); transactionCancelled
+    // covers a cancel end / operator cancel that beat the timer.
+    const exitMarker = host.type === "transaction" ? "transactionCommitted" : "scopeExited";
+    const exited =
+      (await hasHistoryMarkerForOccurrence(env.DB, instanceId, hostId, exitMarker, occ)) ||
+      (await hasHistoryMarkerForOccurrence(env.DB, instanceId, hostId, "transactionCancelled", occ)) ||
+      (host.type === "transaction" && (await hasHistoryMarkerForOccurrence(env.DB, instanceId, hostId, "scopeExited", occ)));
+    if (exited) return { kind: "skip" };
+    return {
+      kind: "fire",
+      next,
+      wake: { instanceId, workflowEventType: WAKE_TYPE, timerId: timer.timerId },
+      stmts: [
+        insertTimerOutcomeStmt(env.DB, { timerId: timer.timerId, outcome: "fired", now }), // THE CLAIM
+        flipTimerFiredStmt(env.DB, { timerId: timer.timerId, firedAt: now, now }),
+        historyStmt(env.DB, { workspaceId, instanceId, elementId: timer.elementId, type: "timerFired", diagnostics: { attachedToRef: hostId, occurrence: occ, boundaryTarget: next, interruptsScope: true } }),
+        historyStmt(env.DB, { workspaceId, instanceId, elementId: hostId, type: "scopeExited", diagnostics: { scope: hostId, via: timer.elementId, abnormal: true, occurrence: occ } }),
         applyTransitionStmt(env.DB, { instanceId, currentElementId: next, status: "running", now }),
       ],
     };

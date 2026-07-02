@@ -72,7 +72,7 @@ import {
 } from "../util";
 import { getVersionGraph } from "../persistence/definitions";
 import { dbBatch } from "../persistence/db";
-import { hasHistoryMarkerForOccurrence, historyStmt, latestCancelRootElement } from "../persistence/history";
+import { hasHistoryMarkerForOccurrence, historyStmt, latestCancelRootElement, latestScopeEntryOccurrence } from "../persistence/history";
 import {
   applyTransitionStmt,
   createSubscription,
@@ -359,6 +359,17 @@ async function loop(
       }
 
       if (node.type === "transaction" || node.type === "subProcess") {
+        // M5-L1 (Task 11, spec §5.3-§5.4, Hazard-vs-Cancel): a fired scope-hosted
+        // boundary timer already interrupted THIS occurrence WITHOUT compensation —
+        // the fire batch (planBoundaryTimerFire) already moved current_element_id to
+        // the boundary target; the subtree drain is deferred here (atomicity: the
+        // fire batch stays single-batch) and is idempotent (retain-only) to re-run on
+        // every later rewalk that still lands on this node/occurrence.
+        const tb = timerBoundaryFor(graph, cur);
+        if (tb && (await timerHasFired(env, instanceId, tb, occ))) {
+          await runStep(`scope-timer-exit:${tag}`, () => drainScopeSubtree(env, graph, instanceId, cur));
+          return { kind: "next", next: tb.node.next! };
+        }
         // M5-L1 (Task 8): cancelled-tx rewalk fast-forward — a re-walk must NOT
         // re-enter a nested tx whose occurrence already cancelled+settled (else the
         // cancel end re-fires beginCompensating on a now-running instance). Keyed by
@@ -375,13 +386,14 @@ async function loop(
         const meta = scopesOf(graph)[cur];
         const innerStart = meta?.startId || graph.transactions?.[cur]?.startId;
         if (!innerStart) return { kind: "completed" }; // malformed (validator guards this)
+        // Record this entry's occurrence (Task 8's cancel-end lookup; Task 11's
+        // scope-timer disarm) for BOTH scope kinds — a nested subProcess boundary
+        // timer's disarm site also needs it (engine's Task 10 error-end branch).
+        scopeEntryOcc.set(cur, occ);
         if (node.type === "transaction") {
-          // Record this entry's occurrence so an enclosed cancel end stamps the tx
-          // occurrence (Task 8), not the cancel-end's own occurrence.
-          scopeEntryOcc.set(cur, occ);
-          return { kind: "next", next: await runStep(`tx:${tag}`, () => enterTransaction(env, instanceId, cur, occ, innerStart)) };
+          return { kind: "next", next: await runStep(`tx:${tag}`, () => enterTransaction(env, instanceId, graph, cur, occ, innerStart)) };
         }
-        return { kind: "next", next: await runStep(`scope:${tag}`, () => enterScope(env, instanceId, cur, occ, innerStart)) };
+        return { kind: "next", next: await runStep(`scope:${tag}`, () => enterScope(env, instanceId, graph, cur, occ, innerStart)) };
       }
 
       if (node.type === "serviceTask" && !node.isForCompensation) {
@@ -473,7 +485,15 @@ async function loop(
               // Idempotent retain-only (Task 8) — safe to re-run on a step retry.
               await drainScopeSubtree(env, graph, instanceId, catchT.hostId);
               const inst = await loadInst(env, instanceId);
-              await dbBatch(env.DB, [
+              const now = nowIso();
+              // M5-L1 (Task 11): the catching scope (`catchT.hostId` is always a
+              // scope for an error END — boundaries never attach to end events, so
+              // level 0 is always a no-op) may ALSO carry its own boundary timer —
+              // disarm it ATOMICALLY with this abnormal exit. Prefer the walk-local
+              // entry occurrence (scopeEntryOcc, recorded for every scope this SAME
+              // walk visited); fall back to the durable marker for a defensive resume.
+              const scopeOcc = scopeEntryOcc.get(catchT.hostId) ?? (await latestScopeEntryOccurrence(env.DB, instanceId, catchT.hostId));
+              const stmts: D1PreparedStatement[] = [
                 // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
                 historyStmt(env.DB, {
                   workspaceId: inst.workspace_id,
@@ -487,10 +507,23 @@ async function loop(
                   instanceId,
                   elementId: catchT.hostId,
                   type: "scopeExited",
-                  diagnostics: { scope: catchT.hostId, via: catchT.boundaryId, abnormal: true, occurrence: occ },
+                  diagnostics: { scope: catchT.hostId, via: catchT.boundaryId, abnormal: true, occurrence: scopeOcc },
                 }),
-                applyTransitionStmt(env.DB, { instanceId, currentElementId: catchT.next, status: "running", now: nowIso() }),
-              ]);
+                applyTransitionStmt(env.DB, { instanceId, currentElementId: catchT.next, status: "running", now }),
+              ];
+              const cancelSettle = buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: catchT.hostId, occ: scopeOcc, now });
+              if (cancelSettle) stmts.push(...cancelSettle.stmts);
+              try {
+                await dbBatch(env.DB, stmts);
+              } catch (err) {
+                if (isUniqueConstraintViolation(err)) {
+                  // The scope's OWN timer fired first — its fire batch already moved
+                  // current_element_id to ITS boundary target; convert to that instead.
+                  const converted = await convertOnFire(env, graph, instanceId, catchT.hostId, scopeOcc);
+                  if (converted) return converted;
+                }
+                throw err;
+              }
               return catchT.next;
             });
             return { kind: "next", next };
@@ -513,7 +546,12 @@ async function loop(
           // entry occurrence recorded when driveLeaf entered it this walk (falls back
           // to the cancel-end occ for a pre-entry resume, equal in the single-entry case).
           const scopeOcc = scopeEntryOcc.get(node.scopeId!) ?? occ;
-          await runStep(`cancel:${tag}`, () => beginCompensating(env, instanceId, node.scopeId!, cur, scopeOcc));
+          const beginOutcome = await runStep(`cancel:${tag}`, () => beginCompensating(env, instanceId, graph, node.scopeId!, cur, scopeOcc));
+          // M5-L1 (Task 11): the transaction's own boundary timer raced the cancel
+          // end and fired FIRST (Hazard beat Cancel) — its fire batch already moved
+          // current_element_id to its boundary target; take that path instead of
+          // starting the reverse pass.
+          if (beginOutcome.kind === "convertedToTimer") return { kind: "next", next: beginOutcome.next };
           return { kind: "compensate", scopeId: node.scopeId!, elementId: cur };
         }
         if (isTransactionScope(graph, node.scopeId)) {
@@ -775,14 +813,20 @@ async function enterStart(env: Env, instanceId: string, graph: ExecutionGraph, e
   return next;
 }
 
-async function enterTransaction(env: Env, instanceId: string, txId: string, occ: number, innerStart: string): Promise<string> {
+async function enterTransaction(env: Env, instanceId: string, graph: ExecutionGraph, txId: string, occ: number, innerStart: string): Promise<string> {
   if (await visitApplied(env, instanceId, txId, occ, "transactionEntered")) return innerStart; // write-free rewalk
   const inst = await loadInst(env, instanceId);
+  const now = nowIso();
+  // M5-L1 (Task 11, spec §5.4): arm the transaction's own boundary timer (if any)
+  // in the SAME entry batch — persist-before-advance; arm the DO after commit.
+  const arm = buildBoundaryArm(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: txId, occ, now });
   await dbBatch(env.DB, [
     // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionEntered", diagnostics: { transaction: txId, traceId: traceIdFor(instanceId), occurrence: occ } }),
-    applyTransitionStmt(env.DB, { instanceId, currentElementId: innerStart, status: "running", now: nowIso() }),
+    applyTransitionStmt(env.DB, { instanceId, currentElementId: innerStart, status: "running", now }),
+    ...(arm ? arm.stmts : []),
   ]);
+  if (arm) await armTimerDO(env, arm.timerId, arm.fireAt);
   return innerStart;
 }
 
@@ -800,13 +844,32 @@ async function commitTransaction(env: Env, instanceId: string, graph: ExecutionG
   const flip = enclosingTx != null
     ? markScopeStepsCommittedStmt(env.DB, { instanceId, scopeIds: ownedScopeIds(graph, txId), seal: false, now })
     : markScopeStepsCommittedStmt(env.DB, { instanceId, scopeIds: subtreeScopeIds(graph, txId), seal: true, now });
-  await dbBatch(env.DB, [
+  const stmts: D1PreparedStatement[] = [
     flip,
     // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: endElementId, type: "elementEntered", diagnostics: { elementType: "endEvent", endKind: "none", scope: txId, occurrence: occ } }),
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionCommitted", diagnostics: { transaction: txId, sealed: enclosingTx == null } }),
+    // `occurrence` (M5-L1 Task 11): planBoundaryTimerFire's scope-host GUARD reads
+    // this marker's occurrence to decide whether the tx's visit already exited —
+    // absent folds to 0 (backward-safe for pre-M5-L1 history rows).
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionCommitted", diagnostics: { transaction: txId, sealed: enclosingTx == null, occurrence: occ } }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: outer ?? endElementId, status: "running", now }),
-  ]);
+  ];
+  // M5-L1 (Task 11): disarm the tx's own boundary timer (if any) ATOMICALLY with
+  // the commit — a fired timer would otherwise be stranded 'armed' on a committed tx.
+  const cancelSettle = buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: txId, occ, now });
+  if (cancelSettle) stmts.push(...cancelSettle.stmts);
+  try {
+    await dbBatch(env.DB, stmts);
+  } catch (err) {
+    if (isUniqueConstraintViolation(err)) {
+      // The timer fired first (Hazard beat Cancel/commit) — its fire batch already
+      // moved current_element_id to the boundary target; convert instead of
+      // committing (the ledger stays retained, NOT sealed committed).
+      const converted = await convertOnFire(env, graph, instanceId, txId, occ);
+      if (converted) return converted;
+    }
+    throw err;
+  }
   return outer ?? endElementId;
 }
 
@@ -814,14 +877,20 @@ async function commitTransaction(env: Env, instanceId: string, graph: ExecutionG
 // M5-L1: plain subProcess enter / exit — bookkeeping scope, NO ledger mutation
 // ---------------------------------------------------------------------------
 
-async function enterScope(env: Env, instanceId: string, scopeId: string, occ: number, innerStart: string): Promise<string> {
+async function enterScope(env: Env, instanceId: string, graph: ExecutionGraph, scopeId: string, occ: number, innerStart: string): Promise<string> {
   if (await visitApplied(env, instanceId, scopeId, occ, "scopeEntered")) return innerStart; // write-free rewalk
   const inst = await loadInst(env, instanceId);
+  const now = nowIso();
+  // M5-L1 (Task 11, spec §5.4): arm the subProcess's own boundary timer (if any) in
+  // the SAME entry batch — persist-before-advance; arm the DO after commit.
+  const arm = buildBoundaryArm(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: scopeId, occ, now });
   await dbBatch(env.DB, [
     // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: scopeId, type: "scopeEntered", diagnostics: { scope: scopeId, kind: "subProcess", occurrence: occ } }),
-    applyTransitionStmt(env.DB, { instanceId, currentElementId: innerStart, status: "running", now: nowIso() }),
+    applyTransitionStmt(env.DB, { instanceId, currentElementId: innerStart, status: "running", now }),
+    ...(arm ? arm.stmts : []),
   ]);
+  if (arm) await armTimerDO(env, arm.timerId, arm.fireAt);
   return innerStart;
 }
 
@@ -830,12 +899,25 @@ async function exitScope(env: Env, instanceId: string, graph: ExecutionGraph, sc
   if (await visitApplied(env, instanceId, endElementId, occ, "elementEntered")) return outer ?? endElementId; // write-free rewalk
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
-  await dbBatch(env.DB, [
+  const stmts: D1PreparedStatement[] = [
     // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: endElementId, type: "elementEntered", diagnostics: { elementType: "endEvent", endKind: "none", scope: scopeId, occurrence: occ } }),
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: scopeId, type: "scopeExited", diagnostics: { scope: scopeId, occurrence: occ } }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: outer ?? endElementId, status: "running", now }),
-  ]);
+  ];
+  // M5-L1 (Task 11): disarm the subProcess's own boundary timer (if any) ATOMICALLY
+  // with this normal exit.
+  const cancelSettle = buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: scopeId, occ, now });
+  if (cancelSettle) stmts.push(...cancelSettle.stmts);
+  try {
+    await dbBatch(env.DB, stmts);
+  } catch (err) {
+    if (isUniqueConstraintViolation(err)) {
+      const converted = await convertOnFire(env, graph, instanceId, scopeId, occ);
+      if (converted) return converted;
+    }
+    throw err;
+  }
   return outer ?? endElementId;
 }
 

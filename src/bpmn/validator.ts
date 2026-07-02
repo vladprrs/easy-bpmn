@@ -1252,23 +1252,18 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         );
       }
     } else if (n.boundaryKind === "timer") {
-      // M3-L3 (TASK-44): an interrupting boundary timer attaches to a serviceTask
-      // or receiveTask (inside or outside a transaction) — NEVER to a transaction
-      // itself (it would terminate the scope WITHOUT compensation, the
-      // silent-rollback-loss trap, deferred to M5). Attachment to a gateway /
+      // M3-L3 (TASK-44) / M5-L1 (Task 11, spec §5.3-§5.4): an interrupting
+      // boundary timer attaches to a serviceTask or receiveTask, OR — since
+      // M5-L1 — a subProcess or transaction. Firing on a scope host INTERRUPTS
+      // WITHOUT COMPENSATION (Hazard-vs-Cancel): completed ledger rows are
+      // RETAINED pending, not reverse-compensated. Attachment to a gateway /
       // compensation handler is already rejected above (those `continue`). Exactly
       // one outgoing flow, to any token-path node in the same scope — the forbidden
       // targets are rejected by the per-flow endpoint rules (reused from M3-L2), so
       // only the single-outgoing degree is checked here.
-      if (attached.type === "transaction") {
+      if (attached.type !== "serviceTask" && attached.type !== "receiveTask" && attached.type !== "subProcess" && attached.type !== "transaction") {
         err(
-          `Boundary timer '${n.id}' is attached to transaction '${attached.id}'. A timer on a transaction would terminate the scope without compensation (deferred to M5) — attach it to a task INSIDE the transaction routing to a cancel end instead.`,
-          n.id,
-          "boundaryEvent",
-        );
-      } else if (attached.type !== "serviceTask" && attached.type !== "receiveTask") {
-        err(
-          `Boundary timer '${n.id}' must be attached to a service task or a receive task; '${attached.id}' is a ${attached.type}.`,
+          `Boundary timer '${n.id}' must be attached to a service task, a receive task, a subprocess, or a transaction; '${attached.id}' is a ${attached.type}.`,
           n.id,
           "boundaryEvent",
         );

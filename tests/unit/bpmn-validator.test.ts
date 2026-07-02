@@ -1235,7 +1235,7 @@ describe("Interrupting boundary timers (M3-L3, TASK-44)", () => {
     expect(r.graph!.nodes["tb"]?.attachedToRef).toBe("wait");
   });
 
-  it("rejects a boundary timer attached to a transaction (deferred to M5)", async () => {
+  it("accepts a boundary timer attached to a transaction (M5-L1 Task 11, Hazard-vs-Cancel spec §5.3-§5.4)", async () => {
     const TX_TIMER_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_txt" targetNamespace="x">
   <bpmn:process id="P" isExecutable="true">
@@ -1257,8 +1257,34 @@ describe("Interrupting boundary timers (M3-L3, TASK-44)", () => {
   </bpmn:process>
 </bpmn:definitions>`;
     const r = await parseAndValidate(TX_TIMER_BPMN);
-    expect(r.ok).toBe(false);
-    expect(r.issues.some((i) => i.elementId === "tb" && /attached to transaction/.test(i.reason) && /M5/.test(i.reason))).toBe(true);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["tb"]?.attachedToRef).toBe("Tx");
+  });
+
+  it("accepts a boundary timer attached to a plain subProcess (M5-L1 Task 11)", async () => {
+    const SUB_TIMER_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_subt" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:subProcess id="Sub">
+      <bpmn:startEvent id="SubS"/>
+      <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="a"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:endEvent id="SubE"/>
+      <bpmn:sequenceFlow id="t1" sourceRef="SubS" targetRef="A"/>
+      <bpmn:sequenceFlow id="t2" sourceRef="A" targetRef="SubE"/>
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="tb" attachedToRef="Sub"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+    <bpmn:serviceTask id="onTimeout"><bpmn:extensionElements><easy-bpmn:taskDefinition type="timeout-handler"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:endEvent id="Done"/>
+    <bpmn:sequenceFlow id="g1" sourceRef="S" targetRef="Sub"/>
+    <bpmn:sequenceFlow id="g2" sourceRef="Sub" targetRef="Done"/>
+    <bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="onTimeout"/>
+    <bpmn:sequenceFlow id="af" sourceRef="onTimeout" targetRef="Done"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const r = await parseAndValidate(SUB_TIMER_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["tb"]?.attachedToRef).toBe("Sub");
   });
 
   it("rejects a boundary timer attached to an isForCompensation handler", async () => {

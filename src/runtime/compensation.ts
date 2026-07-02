@@ -18,6 +18,7 @@ import {
   getCompensationJob,
   getForwardJobByElement,
   incidentStmt,
+  listForwardJobsForInstance,
   type JobRow,
 } from "../persistence/instances";
 import {
@@ -257,7 +258,7 @@ async function ledgerStragglers(env: Env, instanceId: string, graph: ExecutionGr
     const posScope = graph.nodes[t.position_element_id]?.scopeId ?? null;
     if (posScope == null ? rootScopeId != null : !subtree.includes(posScope)) continue; // not in this cohort
     const now = nowIso();
-    const job = await getForwardJobByElement(env.DB, instanceId, t.position_element_id);
+    const job = await resolveForwardJobForToken(env, graph, instanceId, t.position_element_id);
     if (job && job.status === "completed") {
       await dbBatch(env.DB, await retainStragglerStmts(env, graph, instanceId, t, job, now));
     } else if (job && job.status === "failed") {
@@ -270,11 +271,43 @@ async function ledgerStragglers(env: Env, instanceId: string, graph: ExecutionGr
 }
 
 /**
+ * Resolve the forward job "belonging to" a live token positioned at
+ * `positionElementId` (M5-L1 Task 12 fix, spec §10.5). A region branch token's
+ * `execution_tokens.position_element_id` is a ONE-TIME write at fan-out (the
+ * split's immediate flow target — `regions-runtime.ts`'s `fanOutSplit`); it is
+ * NEVER advanced as the branch descends through non-split/join hops, because a
+ * region graph's frontier read-model is owned by the split/join DFS, not by the
+ * per-step engine walk (`runInstanceInner` explicitly skips `syncFrontierReadModel`
+ * when `graph.regions` is set). A branch that enters a plain (non-transaction)
+ * subProcess before its first task/wait therefore leaves the token's recorded
+ * position on the subProcess CONTAINER, which never gets its own
+ * `service_task_jobs` row — an exact element_id match then finds nothing, and a
+ * naive caller would wrongly treat a still-in-flight branch as "owes no
+ * compensation". Fall back to a scope-subtree search when the position names a
+ * scope container (a subProcess/transaction): branch tokens are SESE-confined
+ * (the M4 region validator), so at most one non-compensation forward job is live
+ * anywhere under that container's subtree at a time.
+ */
+async function resolveForwardJobForToken(env: Env, graph: ExecutionGraph, instanceId: string, positionElementId: string): Promise<JobRow | null> {
+  const direct = await getForwardJobByElement(env.DB, instanceId, positionElementId);
+  if (direct) return direct;
+  if (!scopesOf(graph)[positionElementId]) return null; // not a scope container — genuinely no job here
+  const containerSubtree = new Set(subtreeScopeIds(graph, positionElementId));
+  const jobs = await listForwardJobsForInstance(env.DB, instanceId);
+  return jobs.find((j) => containerSubtree.has(graph.nodes[j.element_id]?.scopeId ?? "")) ?? null;
+}
+
+/**
  * The shared ledger-retain block (Task 8): a token whose forward job COMPLETED is
  * ledgered (INSERT OR IGNORE, carrying the producing token + the job's occurrence /
  * captured I/O — a no-op when the forward path already wrote the row) and CONSUMED.
  * Used by BOTH the straggler scan (which then compensates it) and `drainScopeSubtree`
  * (retention only). Kept in one place so the two callers never drift.
+ *
+ * `pos` is the JOB's own element id (Task 12 fix), not the token's recorded
+ * position — the two can diverge (see `resolveForwardJobForToken`) whenever the
+ * live token's position landed on a container several hops above the job that
+ * actually ran; the ledger row must describe what ran, so it always wins.
  */
 async function retainStragglerStmts(
   env: Env,
@@ -284,7 +317,7 @@ async function retainStragglerStmts(
   job: JobRow,
   now: string,
 ): Promise<D1PreparedStatement[]> {
-  const pos = t.position_element_id;
+  const pos = job.element_id;
   const scope = graph.nodes[pos]?.scopeId ?? "";
   const stmts: D1PreparedStatement[] = [];
   if (!(await getSagaStep(env.DB, instanceId, pos, job.occurrence))) {
@@ -328,7 +361,7 @@ export async function drainScopeSubtree(env: Env, graph: ExecutionGraph, instanc
     const posScope = graph.nodes[t.position_element_id]?.scopeId ?? null;
     if (posScope == null ? rootScopeId != null : !subtree.includes(posScope)) continue;
     const now = nowIso();
-    const job = await getForwardJobByElement(env.DB, instanceId, t.position_element_id);
+    const job = await resolveForwardJobForToken(env, graph, instanceId, t.position_element_id);
     if (job && job.status === "completed") {
       await dbBatch(env.DB, await retainStragglerStmts(env, graph, instanceId, t, job, now));
     } else if (job && (job.status === "created" || job.status === "locked")) {

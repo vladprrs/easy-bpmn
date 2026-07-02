@@ -2,6 +2,7 @@ import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import {
   NESTED_COMMIT_BPMN,
+  NESTED_PAR_TX_BPMN,
   RE_ENTRY_TX_BPMN,
   authedPost,
   leaseAndComplete,
@@ -10,7 +11,7 @@ import {
   post,
   publishAndStart,
 } from "../helpers";
-import { resumeInline } from "../../src/runtime/engine";
+import { resumeInline, terminateUnleasableJob } from "../../src/runtime/engine";
 
 // M5-L1 nested compensation (spec §3.4 / §4). The root-relative reverse pass:
 // an outer cancel compensates committed-inner-tx rows in global reverse order; a
@@ -98,6 +99,30 @@ async function historyTypes(instanceId: string): Promise<{ type: string; element
   return res.results ?? [];
 }
 
+/**
+ * Simulate the cohort's per-job DLQ / lease-expiry alarms firing (design §8.2) for
+ * EVERY still-open (non-compensation) forward job on the instance — mirrors
+ * saga-dlq-timeout.test.ts's `activation_expires_at` back-dating idiom, extended to
+ * the in-flight `locked` branch (`lock_expires_at`), then drives
+ * `terminateUnleasableJob` per job (the real cohort-lease-expiry / un-leasable-DLQ
+ * terminator, not a test-only shortcut) and finally re-drives the instance once so
+ * a straggler scan picks up every now-`failed` job in the same pass.
+ */
+async function expireLeaseAndRedrive(instanceId: string): Promise<void> {
+  const past = "2000-01-01T00:00:00Z";
+  const open = await env.DB.prepare(
+    `SELECT job_id FROM service_task_jobs WHERE instance_id = ? AND is_compensation = 0 AND status IN ('created', 'locked')`,
+  )
+    .bind(instanceId)
+    .all<{ job_id: string }>();
+  for (const { job_id } of open.results ?? []) {
+    await env.DB.prepare(`UPDATE service_task_jobs SET lock_expires_at = ? WHERE job_id = ? AND status = 'locked'`).bind(past, job_id).run();
+    await env.DB.prepare(`UPDATE service_task_jobs SET activation_expires_at = ? WHERE job_id = ? AND status = 'created'`).bind(past, job_id).run();
+    await terminateUnleasableJob(env, job_id);
+  }
+  await resumeInline(env, instanceId);
+}
+
 describe("M5-L1 nested compensation (spec §3.4 / §4)", () => {
   // GATE 1 (spec §10.1): outer cancel compensates a committed inner tx, reverse order.
   it("outer-tx > subProcess > inner-tx-commits; outer cancel compensates A and B in reverse", async () => {
@@ -156,5 +181,53 @@ describe("M5-L1 nested compensation (spec §3.4 / §4)", () => {
     await leaseAndComplete(token, "undoA", {});
     const rows = await ledgerByElement(instanceId);
     expect(rows["A"]).toBe("compensated");
+  });
+
+  // Task 12, gate 1 (spec §10.5): a live token in a DEEPER scope (branch A wrapped
+  // in subProcess S, nested inside the AND-region transaction) must hold the
+  // subtree quiescence barrier open — no wedge (the pass never busy-spins) and no
+  // early settle (the terminal must not fire while the deep-scope token is live).
+  it("a live token in a DEEPER scope holds the barrier (no wedge, no early settle)", async () => {
+    const token = await mintWorkerToken();
+    const { instance } = await publishAndStart(NESTED_PAR_TX_BPMN, { correlationKey: `np-bar-${crypto.randomUUID()}`, variables: {} });
+    const instanceId = instance.body.instanceId as string;
+    await leaseOne(token, "branch-a"); // branchA locked in the DEEP scope S — not completed
+    // Same cancel trigger as the copied M4 test (C-COMP-STRAGGLER-01): operator /cancel
+    // while a cohort token is still in flight.
+    const cancelled = await post(`/instances/${instanceId}/cancel`, {});
+    expect(cancelled.status).toBe(200);
+    await resumeInline(env, instanceId);
+    // Barrier: the deep-scope live token (and the untouched sibling branchB token)
+    // must hold the reverse pass open — no wedge, no early settle.
+    expect((await getInstanceRow(instanceId))!.status).toBe("compensating");
+    // The cohort's per-token lease-expiry / un-leasable-DLQ terminators fire (as they
+    // would off a real alarm): both forward jobs go `failed` — no compensatable side
+    // effect occurred — so their tokens discard and the drained ledger settles.
+    await expireLeaseAndRedrive(instanceId);
+    expect((await getInstanceRow(instanceId))!.status).toBe("compensated");
+  });
+
+  // Task 12, gate 2 (spec §10.5): a deeper-scope straggler — branch A's forward job
+  // completes AFTER cancel began — must be ledgered against its IMMEDIATE scope
+  // (subProcess S, not the enclosing transaction) and still compensated (no leak of
+  // the executed side effect).
+  it("a deeper-scope straggler completing AFTER cancel is ledgered and compensated (no leak)", async () => {
+    const token = await mintWorkerToken();
+    const { instance } = await publishAndStart(NESTED_PAR_TX_BPMN, { correlationKey: `np-strag-${crypto.randomUUID()}`, variables: {} });
+    const instanceId = instance.body.instanceId as string;
+    const job = await leaseOne(token, "branch-a"); // branchA in flight in S
+    const cancelled = await post(`/instances/${instanceId}/cancel`, {});
+    expect(cancelled.status).toBe(200);
+    const ack = await authedPost(`/jobs/${job.jobId}/complete`, token, { lockToken: job.lockToken, outputVariables: { late: true } });
+    expect(ack.status).toBe(200); // straggler lands AFTER cancel
+    await resumeInline(env, instanceId);
+    const row = await env.DB.prepare(
+      `SELECT scope_id, compensation_status s FROM saga_steps WHERE instance_id = ? AND element_id = 'branchA'`,
+    )
+      .bind(instanceId)
+      .first<{ scope_id: string; s: string }>();
+    expect(row!.scope_id).toBe("S"); // ledgered with the IMMEDIATE scope, not the transaction
+    await leaseAndComplete(token, "comp-a", {}); // ...and compensated (no leaked effect)
+    expect((await ledgerByElement(instanceId))["branchA"]).toBe("compensated");
   });
 });

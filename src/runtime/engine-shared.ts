@@ -9,6 +9,7 @@
 import type { Env } from "../env";
 import type { ExecutionGraph } from "../bpmn/graph";
 import { getInstanceRow, type InstanceRow } from "../persistence/instances";
+import { scopesOf } from "../bpmn/scope-tree";
 
 export type RunStep = <T>(name: string, fn: () => Promise<T>) => Promise<T>;
 // `parked` is a VESTIGIAL WaitOutcome member: it was the M4-L3 multi-wait sentinel
@@ -28,6 +29,14 @@ export interface DriveResult {
   status: DriveStatus;
 }
 
+// M5-L1 (Task 8): a nested cancel-end reverse pass settles NON-terminally — after
+// compensating its own subtree the instance CONTINUES on the cancel boundary's
+// failure path. `settleAfterCompensation` returns this extra `continue` shape so
+// the walk / frontier / resume sites route the cursor to `next` instead of
+// returning a terminal DriveResult. A top-level (process-root) settle is terminal
+// and still returns a plain DriveResult.
+export type SettleResult = DriveResult | { status: "continue"; next: string };
+
 export async function loadInst(env: Env, instanceId: string): Promise<InstanceRow> {
   const row = await getInstanceRow(env.DB, instanceId);
   if (!row) throw new Error(`Process instance ${instanceId} not found`);
@@ -36,4 +45,11 @@ export async function loadInst(env: Env, instanceId: string): Promise<InstanceRo
 
 export function isTransactionScope(graph: ExecutionGraph, scopeId: string | null | undefined): scopeId is string {
   return !!scopeId && graph.nodes[scopeId]?.type === "transaction";
+}
+
+/** Kind of the given scope id, or null at process level. Legacy graphs resolve transactions only. */
+export function scopeKindOf(graph: ExecutionGraph, scopeId: string | null | undefined): "transaction" | "subProcess" | null {
+  if (!scopeId) return null;
+  const kind = scopesOf(graph)[scopeId]?.kind;
+  return kind === "transaction" || kind === "subProcess" ? kind : graph.nodes[scopeId]?.type === "transaction" ? "transaction" : null;
 }

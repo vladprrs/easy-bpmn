@@ -14,8 +14,11 @@ export type CompensationStatus =
   | "compensating"
   | "compensated"
   | "failed"
-  // Terminal: the enclosing transaction committed, so the step is no longer
-  // compensatable (it drops out of the reverse-pass cursor + the pending count).
+  // Non-terminal local commit (M5-L1 spec §3.2): a NESTED transaction committed.
+  // Shielded from its own scope's re-compensation (incl. later occurrences), but
+  // still eligible for compensation roots STRICTLY ABOVE its committing tx.
+  | "committedLocal"
+  // Terminal/sealed: the OUTERMOST enclosing transaction committed.
   | "committed";
 
 export interface SagaStepRow {
@@ -111,11 +114,13 @@ export function filterLineageQuiesced(steps: SagaStepView[], liveTokens: TokenRo
 
 /**
  * INSERT OR IGNORE a completed forward step into the ledger. `seq` is computed
- * atomically as the next monotonic value within (instance_id, scope_id): a
- * deterministic serialized walk-order rank that EQUALS completion order within a
- * causal chain (a token lineage), NOT across concurrent branches (design §10 — the
- * per-instance drive serialization makes it a strict total order with no
- * collisions; cross-branch reverse order is unconstrained, §8.4). A duplicate
+ * atomically as the next monotonic value PER-INSTANCE (M5-L1 spec §3.4 — global,
+ * not per-scope, so the root-relative reverse cursor can order across nested
+ * scopes with a single `seq DESC`): a deterministic serialized walk-order rank
+ * that EQUALS completion order within a causal chain (a token lineage), NOT
+ * across concurrent branches (design §10 — the per-instance drive serialization
+ * makes it a strict total order with no collisions; cross-branch reverse order
+ * is unconstrained, §8.4). A duplicate
  * (instance_id, element_id, occurrence) is ignored — the replay/double-complete
  * no-op, held PER loop iteration (design M2 §8): each completed pass of a looped
  * step is its own ledger row and is compensated separately by the reverse pass.
@@ -150,14 +155,13 @@ export function insertSagaStepStmt(
        (step_id, instance_id, scope_id, seq, element_id, forward_job_id, captured_input, captured_output,
         compensation_element_id, compensation_task_type, compensation_job_id, compensation_status, trace_id, created_at, updated_at, occurrence, token_id)
      SELECT ?, ?, ?,
-            COALESCE((SELECT MAX(seq) FROM saga_steps WHERE instance_id = ? AND scope_id = ?), 0) + 1,
+            COALESCE((SELECT MAX(seq) FROM saga_steps WHERE instance_id = ?), 0) + 1,
             ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?`,
     [
       input.stepId,
       input.instanceId,
       input.scopeId,
       input.instanceId,
-      input.scopeId,
       input.elementId,
       input.forwardJobId,
       toJson(input.capturedInput),
@@ -174,25 +178,43 @@ export function insertSagaStepStmt(
   );
 }
 
+const placeholders = (n: number): string => Array.from({ length: n }, () => "?").join(", ");
+
 /**
- * The reverse-order compensation cursor: a scope's ledger rows still needing
- * compensation, in descending completion order. Drives the reverse pass and its
- * crash-recovery re-derivation (a `compensating` row re-attaches to its job).
+ * Root-relative reverse cursor (M5-L1 spec §3.4). Callers precompute the two
+ * scope-id lists from the compiled graph (scope-tree.ts); SQL never walks the
+ * hierarchy. Global per-instance `seq DESC` = reverse chronology across nested
+ * scopes (bottom-up falls out for free).
  */
-export async function selectScopeStepsForCompensation(
+export async function selectSubtreeStepsForCompensation(
   db: D1Database,
   instanceId: string,
-  scopeId: string,
+  subtreeScopeIds: string[],
+  eligibleCommittedLocalScopeIds: string[],
 ): Promise<SagaStepView[]> {
+  if (subtreeScopeIds.length === 0) return [];
+  const elig = eligibleCommittedLocalScopeIds;
   const rows = await dbAll<SagaStepRow>(
     db,
     `SELECT * FROM saga_steps
-       WHERE instance_id = ? AND scope_id = ?
-         AND compensation_status IN ('pending', 'compensating', 'failed')
+       WHERE instance_id = ?
+         AND scope_id IN (${placeholders(subtreeScopeIds.length)})
+         AND ( compensation_status IN ('pending', 'compensating', 'failed')
+            ${elig.length > 0 ? `OR (compensation_status = 'committedLocal' AND scope_id IN (${placeholders(elig.length)}))` : ""} )
        ORDER BY seq DESC`,
-    [instanceId, scopeId],
+    [instanceId, ...subtreeScopeIds, ...elig],
   );
   return rows.map(mapSagaStep);
+}
+
+/** Root-relative compensable count (drives the operator-cancel empty-ledger branch). */
+export async function countCompensableSteps(
+  db: D1Database,
+  instanceId: string,
+  subtreeScopeIds: string[],
+  eligibleCommittedLocalScopeIds: string[],
+): Promise<number> {
+  return (await selectSubtreeStepsForCompensation(db, instanceId, subtreeScopeIds, eligibleCommittedLocalScopeIds)).length;
 }
 
 export async function getSagaStepsForInstance(
@@ -225,17 +247,6 @@ export async function getSagaStep(
     [instanceId, elementId, occurrence],
   );
   return row ? mapSagaStep(row) : null;
-}
-
-/** How many steps still need compensation (drives the cancel empty-ledger branch). */
-export async function countPendingSteps(db: D1Database, instanceId: string): Promise<number> {
-  const row = await dbFirst<{ n: number }>(
-    db,
-    `SELECT COUNT(*) AS n FROM saga_steps WHERE instance_id = ?
-       AND compensation_status IN ('pending', 'compensating', 'failed')`,
-    [instanceId],
-  );
-  return row?.n ?? 0;
 }
 
 /** The step whose compensator exhausted retries (operator-retry target). */
@@ -275,18 +286,21 @@ export function updateCompensationStatusStmt(
 }
 
 /**
- * On transaction commit, terminalize the scope's still-pending steps → 'committed'
- * so a later operator /cancel of a DIFFERENT scope does not re-compensate them
- * (they drop out of countPendingSteps + selectScopeStepsForCompensation).
+ * Transaction-commit ledger flip (M5-L1 spec §3.2).
+ *   seal=false (NESTED commit): owned scopes' pending|compensating → 'committedLocal'.
+ *   seal=true  (OUTERMOST commit): subtree's pending|compensating|committedLocal → 'committed' (terminal).
+ * For a top-level single-scope transaction seal=true reduces byte-for-byte to the
+ * pre-M5 statement (the M1–M4 no-op fast path).
  */
 export function markScopeStepsCommittedStmt(
   db: D1Database,
-  input: { instanceId: string; scopeId: string; now: string },
+  input: { instanceId: string; scopeIds: string[]; seal: boolean; now: string },
 ): D1PreparedStatement {
+  const from = input.seal ? `('pending', 'compensating', 'committedLocal')` : `('pending', 'compensating')`;
   return stmt(
     db,
-    `UPDATE saga_steps SET compensation_status = 'committed', updated_at = ?
-       WHERE instance_id = ? AND scope_id = ? AND compensation_status IN ('pending', 'compensating')`,
-    [input.now, input.instanceId, input.scopeId],
+    `UPDATE saga_steps SET compensation_status = '${input.seal ? "committed" : "committedLocal"}', updated_at = ?
+       WHERE instance_id = ? AND scope_id IN (${placeholders(input.scopeIds.length)}) AND compensation_status IN ${from}`,
+    [input.now, input.instanceId, ...input.scopeIds],
   );
 }

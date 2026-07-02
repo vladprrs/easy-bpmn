@@ -178,6 +178,69 @@ mechanics (shipped across M4-L2…L6):
   platform `limits.steps = 25000` ceiling) settles a graceful `stepBudget` incident. See the profile and
   constants in [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
 
-Every arrow is an audited, replay-safe, idempotent transition. That constrained model — multi-token but
-**block-structured (SESE)** — is precisely what makes the engine *provably* durable. See
+**Since M5-L1** the engine composes scopes: a plain embedded `subProcess` nests with `transaction` in
+either order (subProcess-in-tx, tx-in-subProcess, tx-in-tx), up to `MAX_SCOPE_DEPTH = 8`. The runtime
+mechanics:
+
+- **Typed scope hierarchy.** The compiled graph carries a static `scopes` map — one entry per non-process
+  scope, keyed by its element id, recording `kind` (`"transaction" | "subProcess"`), `parentId` (`null` at
+  the process root), and `depth`. It is computed once at publish from the immutable definition version,
+  never recomputed from live state during a Workflow replay. All hierarchy questions — a scope's
+  **subtree** (itself + every descendant), its **nearest enclosing transaction** (walking the parent chain
+  inclusive), a transaction's **owned scopes** (itself + descendants not passing through another
+  transaction), and **strict-ancestor** tests — are pure functions over this map.
+- **`MAX_SCOPE_DEPTH = 8`** (in `src/runtime/engine.ts`) bounds scope nesting depth. Because M5-L1 scope
+  depth is fully static (no `callActivity`, no `multiInstance` yet), the cap is enforced **at publish** by
+  the validator (element id + reason) — a fail-closed, zero-runtime-surface check. A future dynamic-depth
+  layer (call chains) will need a runtime incident instead; M5-L1 does not.
+- **Bookkeeping scope entry/exit.** A `subProcess` node is a walk-local bookkeeping visit — entering it
+  writes a `scopeEntered` history event (mirroring `enterTransaction`), its inner none end writes
+  `scopeExited`, and neither touches the saga ledger. A `transaction` still opens a ledger scope exactly as
+  before; commit semantics generalize per the shield below.
+- **The two-tier commit shield.** A ledger row is sealed **terminal** (`committed`) only when the
+  **outermost** transaction enclosing its committing transaction commits. A **nested** transaction's commit
+  (one with an enclosing transaction) flips only its **owned** scopes' rows to a non-terminal
+  `committedLocal` — still eligible for compensation, but only under a compensation root that is a
+  **strict ancestor** of the committing transaction. This shields a `committedLocal` row from its **own**
+  transaction re-cancelling on a **later occurrence** (an M2 cycle re-entering the same nested
+  transaction), while remaining reachable to an **ancestor**'s cancel (or operator `/cancel`, root = the
+  process). For a top-level, single-scope transaction this collapses byte-for-byte to the pre-M5
+  `pending|compensating|committedLocal → committed` flip — the M1–M4 no-op fast path is unchanged.
+- **The root-relative reverse cursor.** Compensating root `R` (a nested cancel end, a top-level cancel end,
+  or operator `/cancel` with `R` = the process root) selects every `saga_steps` row whose scope is in
+  `subtree(R)` and whose status is `pending`/`compensating`/`failed`, **or** `committedLocal` **and**
+  eligible — i.e. its nearest enclosing transaction has `R` as a strict ancestor. `seq` is monotonic **per
+  instance** (not per scope, as before M5-L1), so `ORDER BY seq DESC` over this set yields true
+  bottom-up, reverse-chronological order across nested scopes with no extra ordering machinery — a single
+  compensation pass interleaves rows from different nested scopes correctly.
+- **Two-phase cancel.** Cancelling scope `R` is (1) an interrupt/drain phase over `subtree(R)` — a
+  completed forward job still in flight is ledgered (never lost), a `created`/`locked` job is drained via
+  the existing lease-expiry terminators armed subtree-wide, and the live-token barrier holds until the
+  subtree quiesces — then (2) the reverse pass over the cursor above. A **cancel end inside a nested
+  transaction** compensates only `subtree(T)`; the instance then **continues running** on the cancel
+  boundary's outgoing (failure) path in the parent scope — a **non-terminal** settle. Only a **top-level**
+  transaction's cancel end, or an operator `/cancel` (root = the process), settles the instance terminally
+  (`compensated`, or saga-failed on `compensationFailed`).
+- **Hierarchical error bubbling.** An uncaught error — from a service task, or from an **error end event**
+  (`endEvent` + `errorEventDefinition`, also new in M5-L1) — searches for a catching boundary by walking
+  the **attachment chain** outward: boundaries on the throwing element's own scope first, then boundaries
+  on each enclosing scope in turn, applying the existing exact-`@errorCode` → catch-all precedence at every
+  level. The walk exhausting at the process root with no catch is a Hazard: a terminal incident (worker
+  errors keep `serviceTaskFailure`; an uncaught error end event settles the new kind `uncaughtError`) —
+  no auto-compensation (Principle VI unchanged).
+- **Hazard-vs-Cancel on a scope catch.** A **non-cancel** interrupting catch on scope `B` — an error
+  boundary, or a scope-hosted boundary **timer** firing — runs phase 1 (drain `subtree(B)`, retaining
+  completed effects as `pending`/`committedLocal` rows) but runs **no reverse pass**: Principle VI reserves
+  compensation for a transaction Cancel, never an uncaught error or a non-cancel timer. A fired scope timer
+  defers its subtree drain to the **next engine rewalk** (idempotent, retain-only) rather than draining
+  inside the fire transition, so the fire batch stays a single atomic persist-before-advance write; a
+  plan-time guard (`ancestorScopeExitedAfterEntry`) makes a stray fire of an already-drained descendant
+  scope's timer a no-op. The retained effects remain reachable: a **later** cancel of an enclosing
+  transaction, or operator `/cancel`, walks the exited subtree via the reverse cursor above and compensates
+  them then. See [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md) for the modeling guidance (route a
+  rollback-intended timer to a cancel end **inside** the transaction — that is Cancel, not Hazard).
+
+Every arrow is an audited, replay-safe, idempotent transition. That constrained model — multi-token,
+**block-structured (SESE)** concurrency, and (since M5-L1) an arbitrarily nested but statically bounded
+scope tree — is precisely what makes the engine *provably* durable. See
 [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).

@@ -94,11 +94,12 @@ import { listTimersForInstance } from "./persistence/timers";
 import { abandonActiveForwardJobs, resetJobForRetry } from "./persistence/jobs";
 import { LIVE_TOKEN_STATUSES, listLiveTokens, listTokens, parseOverlay } from "./persistence/tokens";
 import {
-  countPendingSteps,
+  countCompensableSteps,
   getFailedStep,
   getSagaStepsForInstance,
   updateCompensationStatusStmt,
 } from "./persistence/saga";
+import { eligibleCommittedLocalScopeIds, subtreeScopeIds } from "./bpmn/scope-tree";
 import {
   cancelInstanceRequestSchema,
   retryInstanceRequestSchema,
@@ -463,10 +464,21 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
   await cancelArmedTimersForInstance(env, instanceId);
   await getExecutor(env).terminate(instanceId);
 
-  const pending = await countPendingSteps(env.DB, instanceId);
-  // M4-L5: a region instance with live cohort tokens must NOT take the empty-ledger
-  // terminal shortcut — a late straggler still owes a ledger row + compensation, so
-  // it enters `compensating` and the quiescence barrier holds until the cohort drains.
+  // M5-L1 (Task 8): operator /cancel is a PROCESS-ROOT cancel. The compensable count
+  // spans the whole scope tree (subtree(null)) including retained committedLocal rows
+  // (eligible for the process root), so a nested tx that already committed locally is
+  // still undone. Sealed 'committed' rows (the outermost tx committed) are never
+  // compensated — the ledger query excludes them.
+  const pending = await countCompensableSteps(env.DB, instanceId, subtreeScopeIds(graph, null), eligibleCommittedLocalScopeIds(graph, null));
+  // A live cohort token must NOT take the empty-ledger terminal shortcut — a late
+  // straggler still owes a ledger row + compensation, so it enters `compensating`
+  // and the barrier holds until it drains. Straggler risk is REGION-only: a
+  // non-region park has its in-flight forward job eagerly abandoned above (a late
+  // complete no-ops → no straggler), and a pure wait (receive/timer) has no job at
+  // all, so a single-token instance's own root-token park never owes compensation
+  // and must still cancel outright on an empty ledger (Task 8 divergence from the
+  // brief's "unfiltered" — that regressed the empty-ledger no-op; the process-root
+  // change lives in `pending`, which spans committedLocal rows across scopes).
   const liveCohort = isRegion ? (await listLiveTokens(env.DB, instanceId)).length : 0;
   if (pending === 0 && liveCohort === 0) {
     const changed = await transitionStatusGuarded(env.DB, instanceId, [...CANCELLABLE_FROM], "cancelled", now);
@@ -485,7 +497,9 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
   if (changed > 0) {
     // M4-L5 (design §8.2): arm a per-token lease-expiry terminator for every in-flight
     // cohort forward job so the quiescence barrier drains without a future worker poll.
-    if (isRegion) await armCohortLeaseExpiryTerminators(env, instanceId);
+    // M5-L1: always (process-root cancel spans every scope; single-token instances have
+    // no in-flight cohort job that survives, so this is a no-op there).
+    await armCohortLeaseExpiryTerminators(env, instanceId);
     if (inst.status === "incident") {
       // Target ONLY the current Hazard incident (M3-L1, TASK-39) so a sibling
       // incident is never collaterally moved into the compensation lifecycle. An

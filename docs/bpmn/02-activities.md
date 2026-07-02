@@ -107,11 +107,28 @@ Any activity (task or sub-process) can have **boundary events** attached to its 
 marker (a compensation boundary event wired to an `isForCompensation` handler), plus error/cancel boundary
 events.
 
+**In scope since M5-L1 (embedded scopes):** the plain embedded `subProcess` — one none-start, ≥1 none-end,
+sharing the **parent's variable space** (unlike a `transaction`, it opens no saga ledger commit of its
+own). It is a pure **bookkeeping scope**: entering it writes a `scopeEntered` history event, its inner none
+end writes `scopeExited`, and neither mutates the saga ledger — a completed step inside a `subProcess`
+remains a `pending` (or `committedLocal`) row of whichever **enclosing transaction** it belongs to, per the
+ancestry rule in [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md). Nesting is arbitrary —
+`subProcess`-in-`transaction`, `transaction`-in-`subProcess`, `transaction`-in-`transaction` — up to the
+publish-time `MAX_SCOPE_DEPTH = 8` cap (see
+[`07-execution-semantics.md`](./07-execution-semantics.md)). Error and (interrupting) timer boundary events
+may now attach to a `subProcess` (or a `transaction`) in addition to a task — see
+[`01-events.md`](./01-events.md) for the Hazard-vs-Cancel firing semantics. The `adHocSubProcess` and event
+sub-process (`triggeredByEvent="true"`) remain rejected; `callActivity` and
+`multiInstanceLoopCharacteristics` are constitution-accepted (v2.5.0) but stay interim-rejected until M5-L2
+/ M5-L3 open their runtime.
+
 **Out of scope (reject before publish):** the abstract `task`, `userTask`, `sendTask`, `manualTask`,
-`scriptTask`, `businessRuleTask`, the non-transaction sub-process types (`subProcess`, `adHocSubProcess`),
+`scriptTask`, `businessRuleTask`, the event sub-process (`triggeredByEvent="true"`) and `adHocSubProcess`,
 `callActivity`, the loop and multi-instance markers, and any task with `instantiate="true"` (instances start
-via the API).
+via the API). (The plain embedded `subProcess` is no longer in this list — see M5-L1 above.)
 
 The baseline activity vocabulary is *call a worker* (service task) and *wait for a message* (receive task);
 since M1 it also includes the `transaction` sub-process with compensation / error / cancel boundary events
-— the canonical saga scope. See [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
+— the canonical saga scope; since M5-L1 it also includes the plain embedded `subProcess` as a
+non-transactional bookkeeping scope, nestable with `transaction` in either order. See
+[`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).

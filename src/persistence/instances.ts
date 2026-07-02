@@ -348,6 +348,24 @@ export async function getForwardJobByElement(
 }
 
 /**
+ * Every FORWARD (non-compensation) job row for an instance, most-recent first
+ * (M5-L1 Task 12): used by the straggler scan's scope-subtree fallback (a region
+ * branch token's `execution_tokens.position_element_id` is a one-time write at
+ * fan-out — the flow target right after the split — never advanced as the branch
+ * descends through non-split/join hops, so a branch that enters a plain subProcess
+ * before its first task/wait leaves the position on the subProcess container,
+ * which never gets its own job row).
+ */
+export async function listForwardJobsForInstance(db: D1Database, instanceId: string): Promise<JobRow[]> {
+  const res = await dbAll<JobRow>(
+    db,
+    `SELECT * FROM service_task_jobs WHERE instance_id = ? AND is_compensation = 0 ORDER BY created_at DESC, rowid DESC`,
+    [instanceId],
+  );
+  return res;
+}
+
+/**
  * The FORWARD job for one specific iteration of an element (design M2 §5): the
  * occurrence-aware lookup the loop-capable rewalk uses. No row → the iteration
  * has not run; a row with un-applied output → the resume frontier.
@@ -835,7 +853,10 @@ export type IncidentKind =
   // count crossed STEP_BUDGET_SOFT (a graceful incident BELOW the platform step
   // ceiling, so a hot parallel×loop shape never becomes an opaque errored Workflow).
   | "concurrencyLimit"
-  | "stepBudget";
+  | "stepBudget"
+  // COMPOSITION (M5-L1 spec §5.1): an error END EVENT reached the process root
+  // uncaught (worker-task uncaught errors keep serviceTaskFailure).
+  | "uncaughtError";
 /**
  * Incident remediation lifecycle (one-way):
  *

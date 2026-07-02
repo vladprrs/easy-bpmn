@@ -7,12 +7,15 @@ import {
   DEMO_BPMN,
   deferredGatewayBpmn,
   EMPTY_MESSAGE_NAME_BPMN,
+  ERROR_END_BPMN,
   INSTANTIATE_RECEIVE_BPMN,
   INTERMEDIATE_CATCH_BPMN,
   LOOP_XOR_BPMN,
   MALFORMED_XML,
   MULTI_INSTANCE_BPMN,
+  NESTED_TX_BPMN,
   NO_TASKTYPE_BPMN,
+  RE_ENTRY_TX_BPMN,
   PARALLEL_BPMN,
   INCLUSIVE_BPMN,
   PARALLEL_DEADLOCK_BPMN,
@@ -30,6 +33,7 @@ import {
   sagaBpmn,
   TIMER_START_BPMN,
   TOLERANT_BPMN,
+  TX_TIMER_BPMN as TX_TIMER_HELPER_BPMN,
   USERTASK_BPMN,
   XOR_BPMN,
   XOR_IN_TX_BPMN,
@@ -118,10 +122,14 @@ describe("BPMN-lite profile validator", () => {
     expect(r.issues.some((i) => i.elementId === "R" && /no name|non-empty message name/i.test(i.reason))).toBe(true);
   });
 
-  it("rejects a subprocess", async () => {
+  // M5-L1 widened the accept matrix: an embedded subProcess is now a
+  // supported construct (see "M5-L1 embedded subProcess acceptance" below).
+  // SUBPROCESS_BPMN is an empty subprocess (no inner start/end event), so it
+  // is still rejected — now for structural reasons, not "unsupported construct".
+  it("rejects an embedded subprocess with no inner start event (structurally invalid)", async () => {
     const r = await parseAndValidate(SUBPROCESS_BPMN);
     expect(r.ok).toBe(false);
-    expect(r.issues.some((i) => i.elementId === "SP" && /subProcess/.test(i.reason))).toBe(true);
+    expect(r.issues.some((i) => i.elementId === "SP" && /none start event/.test(i.reason))).toBe(true);
   });
 
   it("rejects a send task", async () => {
@@ -245,6 +253,23 @@ describe("Canonical transaction-saga profile (SAGA design §3)", () => {
     const r = await parseAndValidate(SAGA_CROSS_SCOPE_ASSOC_BPMN);
     expect(r.ok).toBe(false);
     expect(r.issues.some((i) => i.elementId === "a1step_comp" && /different transaction scope/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects a NESTED transaction with a cancel end but no cancel boundary (no failure path)", async () => {
+    // Strip T's cancel boundary + its continue flow from the (valid) re-entry fixture.
+    const noBoundary = RE_ENTRY_TX_BPMN.replace(
+      `<bpmn:boundaryEvent id="T_cancel" attachedToRef="T"><bpmn:cancelEventDefinition/></bpmn:boundaryEvent>`,
+      "",
+    ).replace(`<bpmn:sequenceFlow id="of3" sourceRef="T_cancel" targetRef="gwm"/>`, "");
+    const r = await parseAndValidate(noBoundary);
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "T" && /nested and contains a cancel end event but has no cancel boundary/.test(i.reason))).toBe(true);
+  });
+
+  it("accepts a NESTED transaction whose cancel end is matched by a cancel boundary", async () => {
+    const r = await parseAndValidate(RE_ENTRY_TX_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
   });
 
   it("rejects an error boundary whose errorRef does not resolve", async () => {
@@ -1211,7 +1236,7 @@ describe("Interrupting boundary timers (M3-L3, TASK-44)", () => {
     expect(r.graph!.nodes["tb"]?.attachedToRef).toBe("wait");
   });
 
-  it("rejects a boundary timer attached to a transaction (deferred to M5)", async () => {
+  it("accepts a boundary timer attached to a transaction (M5-L1 Task 11, Hazard-vs-Cancel spec §5.3-§5.4)", async () => {
     const TX_TIMER_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_txt" targetNamespace="x">
   <bpmn:process id="P" isExecutable="true">
@@ -1233,8 +1258,34 @@ describe("Interrupting boundary timers (M3-L3, TASK-44)", () => {
   </bpmn:process>
 </bpmn:definitions>`;
     const r = await parseAndValidate(TX_TIMER_BPMN);
-    expect(r.ok).toBe(false);
-    expect(r.issues.some((i) => i.elementId === "tb" && /attached to transaction/.test(i.reason) && /M5/.test(i.reason))).toBe(true);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["tb"]?.attachedToRef).toBe("Tx");
+  });
+
+  it("accepts a boundary timer attached to a plain subProcess (M5-L1 Task 11)", async () => {
+    const SUB_TIMER_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_subt" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:subProcess id="Sub">
+      <bpmn:startEvent id="SubS"/>
+      <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="a"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:endEvent id="SubE"/>
+      <bpmn:sequenceFlow id="t1" sourceRef="SubS" targetRef="A"/>
+      <bpmn:sequenceFlow id="t2" sourceRef="A" targetRef="SubE"/>
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="tb" attachedToRef="Sub"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+    <bpmn:serviceTask id="onTimeout"><bpmn:extensionElements><easy-bpmn:taskDefinition type="timeout-handler"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:endEvent id="Done"/>
+    <bpmn:sequenceFlow id="g1" sourceRef="S" targetRef="Sub"/>
+    <bpmn:sequenceFlow id="g2" sourceRef="Sub" targetRef="Done"/>
+    <bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="onTimeout"/>
+    <bpmn:sequenceFlow id="af" sourceRef="onTimeout" targetRef="Done"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const r = await parseAndValidate(SUB_TIMER_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["tb"]?.attachedToRef).toBe("Sub");
   });
 
   it("rejects a boundary timer attached to an isForCompensation handler", async () => {
@@ -1769,5 +1820,336 @@ describe("M4 concurrency profile", () => {
     const r = await parseAndValidate(PARALLEL_SAME_MESSAGE_BPMN);
     expect(r.ok).toBe(false);
     expect(r.issues.some((i) => /same message|broker key|distinct message/i.test(i.reason))).toBe(true);
+  });
+});
+
+describe("M5-L1 embedded subProcess acceptance", () => {
+  const SUBPROC = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="d" targetNamespace="http://example.com">
+  <bpmn:process id="proc" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="sub"/>
+    <bpmn:subProcess id="sub">
+      <bpmn:startEvent id="s_start"/>
+      <bpmn:sequenceFlow id="sf1" sourceRef="s_start" targetRef="s_task"/>
+      <bpmn:serviceTask id="s_task"><bpmn:extensionElements><easy-bpmn:taskDefinition type="doWork"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="sf2" sourceRef="s_task" targetRef="s_end"/>
+      <bpmn:endEvent id="s_end"/>
+    </bpmn:subProcess>
+    <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="end"/>
+    <bpmn:endEvent id="end"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+  it("accepts a plain embedded subProcess and compiles its scope", async () => {
+    const r = await parseAndValidate(SUBPROC);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["sub"]!.type).toBe("subProcess");
+    expect(r.graph!.nodes["s_task"]!.scopeId).toBe("sub");
+    expect(r.graph!.scopes!["sub"]).toEqual({ id: "sub", kind: "subProcess", parentId: null, depth: 1, startId: "s_start" });
+  });
+
+  it("rejects an event subprocess (interim → M5-L4) with element id + reason", async () => {
+    const r = await parseAndValidate(SUBPROC.replace('<bpmn:subProcess id="sub">', '<bpmn:subProcess id="sub" triggeredByEvent="true">'));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "sub" && /M5-L4/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects an adHocSubProcess with element id + reason", async () => {
+    const r = await parseAndValidate(SUBPROC.replace(/bpmn:subProcess/g, "bpmn:adHocSubProcess"));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "sub")).toBe(true);
+  });
+
+  it("rejects multiInstanceLoopCharacteristics on a subProcess (interim → M5-L3)", async () => {
+    const withMi = SUBPROC.replace('<bpmn:startEvent id="s_start"/>', '<bpmn:multiInstanceLoopCharacteristics/><bpmn:startEvent id="s_start"/>');
+    const r = await parseAndValidate(withMi);
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "sub" && /M5-L3/.test(i.reason))).toBe(true);
+  });
+
+  it("enforces MAX_SCOPE_DEPTH: depth 8 accepted, depth 9 rejected", async () => {
+    const nest = (depth: number): string => {
+      let inner = `<bpmn:startEvent id="d${depth}_start"/><bpmn:sequenceFlow id="d${depth}_f" sourceRef="d${depth}_start" targetRef="d${depth}_end"/><bpmn:endEvent id="d${depth}_end"/>`;
+      for (let d = depth; d >= 1; d--) {
+        inner = `<bpmn:startEvent id="d${d - 1}_start"/><bpmn:sequenceFlow id="d${d - 1}_f1" sourceRef="d${d - 1}_start" targetRef="sub${d}"/><bpmn:subProcess id="sub${d}">${inner}</bpmn:subProcess><bpmn:sequenceFlow id="d${d - 1}_f2" sourceRef="sub${d}" targetRef="d${d - 1}_end"/><bpmn:endEvent id="d${d - 1}_end"/>`;
+      }
+      return `<?xml version="1.0" encoding="UTF-8"?><bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="d" targetNamespace="http://example.com"><bpmn:process id="proc" isExecutable="true">${inner}</bpmn:process></bpmn:definitions>`;
+    };
+    expect((await parseAndValidate(nest(8))).ok).toBe(true);
+    const r9 = await parseAndValidate(nest(9));
+    expect(r9.ok).toBe(false);
+    expect(r9.issues.some((i) => /MAX_SCOPE_DEPTH|depth/.test(i.reason))).toBe(true);
+  });
+
+  it("tolerates and ignores foreign-namespace extension content inside a subProcess", async () => {
+    // spec §10 unit bullet: ignorable extension content must not reject.
+    const withForeign = SUBPROC.replace(
+      '<bpmn:startEvent id="s_start"/>',
+      '<bpmn:extensionElements xmlns:camunda="http://camunda.org/schema/1.0/bpmn"><camunda:properties/></bpmn:extensionElements><bpmn:startEvent id="s_start"/>',
+    );
+    expect((await parseAndValidate(withForeign)).ok).toBe(true);
+  });
+
+  it("accepts a transaction nested inside a subProcess and records parentage", async () => {
+    const NESTED = SUBPROC.replace(
+      '<bpmn:serviceTask id="s_task"><bpmn:extensionElements><easy-bpmn:taskDefinition type="doWork"/></bpmn:extensionElements></bpmn:serviceTask>',
+      `<bpmn:transaction id="tx"><bpmn:startEvent id="t_start"/><bpmn:sequenceFlow id="tf1" sourceRef="t_start" targetRef="t_end"/><bpmn:endEvent id="t_end"/></bpmn:transaction>`,
+    ).replace(/s_task/g, "tx");
+    const r = await parseAndValidate(NESTED);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.scopes!["tx"]).toMatchObject({ kind: "transaction", parentId: "sub", depth: 2 });
+  });
+
+  it("rejects a compensation handler inside a subProcess with no transaction ancestor", async () => {
+    const NO_TX = SUBPROC.replace(
+      '<bpmn:serviceTask id="s_task"><bpmn:extensionElements><easy-bpmn:taskDefinition type="doWork"/></bpmn:extensionElements></bpmn:serviceTask>',
+      `<bpmn:serviceTask id="s_task"><bpmn:extensionElements><easy-bpmn:taskDefinition type="doWork"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:boundaryEvent id="s_task_comp" attachedToRef="s_task"><bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="undoWork" isForCompensation="true"><bpmn:extensionElements><easy-bpmn:taskDefinition type="undoWork"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:association id="assocWork" sourceRef="s_task_comp" targetRef="undoWork"/>`,
+    );
+    const r = await parseAndValidate(NO_TX);
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some(
+        (i) => i.elementId === "undoWork" && /is isForCompensation but no enclosing scope is a <transaction>/.test(i.reason),
+      ),
+    ).toBe(true);
+  });
+
+  it("accepts a compensation handler inside a subProcess that IS nested in a transaction ancestor", async () => {
+    // NESTED_TX_BPMN: undoA's immediate scope is subProcess S; S's parent is transaction O.
+    const r = await parseAndValidate(NESTED_TX_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["undoA"]!.scopeId).toBe("S");
+  });
+
+  // M5-L1 Task 9: error boundaries widen from serviceTask-only to also accept
+  // subProcess/transaction hosts (hierarchical error bubbling, spec §5.1).
+  it("accepts an error boundary attached to a subProcess", async () => {
+    const WITH_BOUNDARY = SUBPROC.replace(
+      '<bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="end"/>\n    <bpmn:endEvent id="end"/>',
+      `<bpmn:boundaryEvent id="sub_err" attachedToRef="sub"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="f_err" sourceRef="sub_err" targetRef="recover"/>
+    <bpmn:serviceTask id="recover"><bpmn:extensionElements><easy-bpmn:taskDefinition type="recover"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f_recover_end" sourceRef="recover" targetRef="recover_end"/>
+    <bpmn:endEvent id="recover_end"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="end"/>
+    <bpmn:endEvent id="end"/>`,
+    );
+    const r = await parseAndValidate(WITH_BOUNDARY);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["sub_err"]!.type).toBe("boundaryEvent");
+    expect(r.graph!.nodes["sub_err"]!.attachedToRef).toBe("sub");
+  });
+
+  it("accepts an error boundary attached to a transaction", async () => {
+    // The boundary event must share tx's IMMEDIATE scope ("sub"), so it is a
+    // sibling of tx inside the subProcess, not at the outer process scope.
+    const NESTED = SUBPROC.replace(
+      '<bpmn:serviceTask id="s_task"><bpmn:extensionElements><easy-bpmn:taskDefinition type="doWork"/></bpmn:extensionElements></bpmn:serviceTask>',
+      `<bpmn:transaction id="tx"><bpmn:startEvent id="t_start"/><bpmn:sequenceFlow id="tf1" sourceRef="t_start" targetRef="t_end"/><bpmn:endEvent id="t_end"/></bpmn:transaction>
+      <bpmn:boundaryEvent id="tx_err" attachedToRef="tx"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:sequenceFlow id="f_err" sourceRef="tx_err" targetRef="recover"/>
+      <bpmn:serviceTask id="recover"><bpmn:extensionElements><easy-bpmn:taskDefinition type="recover"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="f_recover_end" sourceRef="recover" targetRef="recover_end"/>
+      <bpmn:endEvent id="recover_end"/>`,
+    ).replace(/s_task/g, "tx");
+    const r = await parseAndValidate(NESTED);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["tx_err"]!.type).toBe("boundaryEvent");
+    expect(r.graph!.nodes["tx_err"]!.attachedToRef).toBe("tx");
+  });
+});
+
+// M5-L1 Task 10: an endEvent carrying an <errorEventDefinition> is now a
+// supported end kind ("error") — it THROWS from its enclosing scope (engine
+// side, error-end-event.test.ts) rather than settling the instance. Unlike an
+// error BOUNDARY (errorRef optional — absent means catch-all), an error END
+// event has no catch-all shape for a throw: errorRef must be PRESENT and
+// resolve to a <bpmn:error> with a non-empty @errorCode.
+describe("M5-L1 error end event acceptance (spec §5.2)", () => {
+  // A none end event (commit) is required somewhere in the process — the
+  // gateway split gives the model one, mirroring ERROR_END_ROOT_BPMN's shape.
+  const ERR_END = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="d" targetNamespace="http://example.com">
+  <bpmn:error id="E1" name="Fail" errorCode="E_FAIL"/>
+  <bpmn:error id="E_nocode" name="NoCode"/>
+  <bpmn:process id="proc" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="gw"/>
+    <bpmn:exclusiveGateway id="gw" default="f_ok"/>
+    <bpmn:sequenceFlow id="f_fail" sourceRef="gw" targetRef="errEnd"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">fail = true</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:endEvent id="errEnd"><bpmn:errorEventDefinition errorRef="E1"/></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f_ok" sourceRef="gw" targetRef="end"/>
+    <bpmn:endEvent id="end"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+  it("accepts an error end event with a resolvable, coded errorRef", async () => {
+    const r = await parseAndValidate(ERR_END);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    expect(r.graph!.nodes["errEnd"]!.endKind).toBe("error");
+    expect(r.graph!.nodes["errEnd"]!.errorRef).toBe("E1");
+    expect(r.graph!.nodes["errEnd"]!.errorCode).toBe("E_FAIL");
+  });
+
+  it("accepts the M5-L1 scoped error-end fixture (subProcess throw + catch-all boundary)", async () => {
+    const r = await parseAndValidate(ERROR_END_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    expect(r.graph!.nodes["errEnd"]!.endKind).toBe("error");
+    expect(r.graph!.nodes["errEnd"]!.errorCode).toBe("E_FAIL");
+  });
+
+  it("rejects an error end event with a dangling errorRef", async () => {
+    const r = await parseAndValidate(ERR_END.replace('errorRef="E1"', 'errorRef="Err_missing"'));
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some((i) => i.elementId === "errEnd" && /Error end event 'errEnd' has an errorRef 'Err_missing' that does not resolve to a declared/.test(i.reason)),
+    ).toBe(true);
+  });
+
+  it("rejects an error end event whose errorRef resolves to a code-less <bpmn:error>", async () => {
+    const r = await parseAndValidate(ERR_END.replace('errorRef="E1"', 'errorRef="E_nocode"'));
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some(
+        (i) => i.elementId === "errEnd" && /Error end event 'errEnd' must reference a declared <bpmn:error> with a non-empty @errorCode\./.test(i.reason),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects an error end event with NO errorRef at all (no catch-all shape for a throw)", async () => {
+    const r = await parseAndValidate(ERR_END.replace('<bpmn:errorEventDefinition errorRef="E1"/>', "<bpmn:errorEventDefinition/>"));
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some(
+        (i) => i.elementId === "errEnd" && /Error end event 'errEnd' must reference a declared <bpmn:error> with a non-empty @errorCode\./.test(i.reason),
+      ),
+    ).toBe(true);
+  });
+
+  it("still rejects an unsupported end-event definition (e.g. message) with the widened reject message", async () => {
+    const r = await parseAndValidate(ERR_END.replace("<bpmn:errorEventDefinition errorRef=\"E1\"/>", "<bpmn:terminateEventDefinition/>"));
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some(
+        (i) => i.elementId === "errEnd" && /Only a none end event, a cancel end event \(inside a transaction\), or an error end event is supported\./.test(i.reason),
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("M5-L1 re-entry after an abnormal scope skip (final-review C1, fail-closed reject)", () => {
+  // The engine's cancelled-tx / fired-scope-timer rewalk fast-forwards skip the
+  // container WITHOUT descending its interior, so a later UNGUARDED re-entry of
+  // the same scope desyncs the walk-local interior occurrence counters against
+  // the skipped occurrence's persisted rows. The validator rejects at publish any
+  // scope reachable from its own abnormal-skip continuation along unguarded
+  // (unconditional/default) flows; a condition-guarded loop-back stays accepted
+  // (the shipped gate-4 re-entry saga shape — see RE_ENTRY_TX_BPMN).
+  const timerLoopBpmn = (container: "subProcess" | "transaction") => `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="d_tl" targetNamespace="http://example.com">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="gwIn"/>
+    <bpmn:exclusiveGateway id="gwIn"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="gwIn" targetRef="Sub"/>
+    <bpmn:${container} id="Sub">
+      <bpmn:startEvent id="SubS"/>
+      <bpmn:sequenceFlow id="t1" sourceRef="SubS" targetRef="A"/>
+      <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="a"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="t2" sourceRef="A" targetRef="SubE"/>
+      <bpmn:endEvent id="SubE"/>
+    </bpmn:${container}>
+    <bpmn:boundaryEvent id="tb" attachedToRef="Sub"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="tf" sourceRef="tb" targetRef="onTimeout"/>
+    <bpmn:serviceTask id="onTimeout"><bpmn:extensionElements><easy-bpmn:taskDefinition type="timeout-handler"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="af" sourceRef="onTimeout" targetRef="gwIn"/>
+    <bpmn:sequenceFlow id="g2" sourceRef="Sub" targetRef="Done"/>
+    <bpmn:endEvent id="Done"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+  it("rejects a subProcess whose OWN timer-boundary path loops back into it unguarded", async () => {
+    const r = await parseAndValidate(timerLoopBpmn("subProcess"));
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some((i) => i.elementId === "Sub" && /timer boundary 'tb'/.test(i.reason) && /re-entry after an interrupted occurrence is deferred \(M5-L1\)/i.test(i.reason)),
+    ).toBe(true);
+  });
+
+  it("rejects a transaction whose OWN timer-boundary path loops back into it unguarded", async () => {
+    const r = await parseAndValidate(timerLoopBpmn("transaction"));
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some((i) => i.elementId === "Sub" && /timer boundary 'tb'/.test(i.reason) && /re-entry after an interrupted occurrence is deferred \(M5-L1\)/i.test(i.reason)),
+    ).toBe(true);
+  });
+
+  it("rejects a nested transaction whose cancel-boundary path loops back into it unguarded", async () => {
+    const CANCEL_LOOP = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="d_cl" targetNamespace="http://example.com">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="O"/>
+    <bpmn:transaction id="O">
+      <bpmn:startEvent id="o_start"/>
+      <bpmn:sequenceFlow id="of1" sourceRef="o_start" targetRef="gwm"/>
+      <bpmn:exclusiveGateway id="gwm"/>
+      <bpmn:sequenceFlow id="of2" sourceRef="gwm" targetRef="T"/>
+      <bpmn:transaction id="T">
+        <bpmn:startEvent id="t_start"/>
+        <bpmn:sequenceFlow id="tf1" sourceRef="t_start" targetRef="A"/>
+        <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="a"/></bpmn:extensionElements></bpmn:serviceTask>
+        <bpmn:sequenceFlow id="tf2" sourceRef="A" targetRef="tgw"/>
+        <bpmn:exclusiveGateway id="tgw" default="tg_ok"/>
+        <bpmn:sequenceFlow id="tg_cancel" sourceRef="tgw" targetRef="t_cancel"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">fail = true</bpmn:conditionExpression></bpmn:sequenceFlow>
+        <bpmn:endEvent id="t_cancel"><bpmn:cancelEventDefinition/></bpmn:endEvent>
+        <bpmn:sequenceFlow id="tg_ok" sourceRef="tgw" targetRef="t_end"/>
+        <bpmn:endEvent id="t_end"/>
+      </bpmn:transaction>
+      <bpmn:boundaryEvent id="T_cancel" attachedToRef="T"><bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:sequenceFlow id="of3" sourceRef="T_cancel" targetRef="gwm"/>
+      <bpmn:sequenceFlow id="of4" sourceRef="T" targetRef="o_end"/>
+      <bpmn:endEvent id="o_end"/>
+    </bpmn:transaction>
+    <bpmn:sequenceFlow id="f2" sourceRef="O" targetRef="Done"/>
+    <bpmn:endEvent id="Done"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const r = await parseAndValidate(CANCEL_LOOP);
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some((i) => i.elementId === "T" && /cancel boundary 'T_cancel'/.test(i.reason) && /re-entry after an interrupted occurrence is deferred \(M5-L1\)/i.test(i.reason)),
+    ).toBe(true);
+  });
+
+  it("still accepts the gate-4 re-entry saga fixture (loop-back into T is condition-guarded)", async () => {
+    const r = await parseAndValidate(RE_ENTRY_TX_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+  });
+
+  it("still accepts the Hazard-vs-Cancel tx-timer fixture (timer path continues forward)", async () => {
+    const r = await parseAndValidate(TX_TIMER_HELPER_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+  });
+
+  it("accepts a timer-boundary path whose only route back into the scope is condition-guarded", async () => {
+    const guarded = timerLoopBpmn("subProcess")
+      .replace('<bpmn:exclusiveGateway id="gwIn"/>', '<bpmn:exclusiveGateway id="gwIn" default="f_exit"/>')
+      .replace(
+        '<bpmn:sequenceFlow id="f2" sourceRef="gwIn" targetRef="Sub"/>',
+        `<bpmn:sequenceFlow id="f2" sourceRef="gwIn" targetRef="Sub"><bpmn:conditionExpression xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="bpmn:tFormalExpression">retries &lt; 3</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_exit" sourceRef="gwIn" targetRef="Done"/>`,
+      );
+    const r = await parseAndValidate(guarded);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
   });
 });

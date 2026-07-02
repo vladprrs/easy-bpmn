@@ -99,6 +99,91 @@ export async function hasHistoryMarkerForOccurrence(
   return row !== null;
 }
 
+/**
+ * The occurrence of `scopeId`'s most recent entry marker (`transactionEntered` for
+ * a transaction, `scopeEntered` for a plain subProcess) — the scope's CURRENT
+ * (live) entry occurrence (M5-L1 Task 11). Used by callers that need to key a
+ * scope-hosted boundary timer's disarm/convert but sit outside engine.ts's
+ * walk-local `scopeEntryOcc` map (forward-task.ts's hostIsScope branches). The
+ * entry marker is written atomically with its transition and always precedes any
+ * later occurrence's own entry marker (a scope must fully exit — commit / exitScope
+ * / cancel / abnormal drain — before it can re-enter), so "most recent by rowid" is
+ * always the currently-live entry. Folds to 0 when no entry marker exists
+ * (unreachable when called on a live catch target; defensive default).
+ */
+export async function latestScopeEntryOccurrence(db: D1Database, instanceId: string, scopeId: string): Promise<number> {
+  const row = await stmt(
+    db,
+    `SELECT COALESCE(json_extract(diagnostics, '$.occurrence'), 0) AS occ FROM history_events
+      WHERE instance_id = ? AND element_id = ? AND type IN ('transactionEntered', 'scopeEntered')
+      ORDER BY rowid DESC LIMIT 1`,
+    [instanceId, scopeId],
+  ).first<{ occ: number }>();
+  return row?.occ ?? 0;
+}
+
+/**
+ * True iff some ANCESTOR scope exited AFTER `hostId` entered its `occ`-th visit
+ * (M5-L1 Task 11 review-fix: nested scope-hosted timer disarm under ancestor drain).
+ * A scope-hosted boundary timer must NOT fire once an ENCLOSING scope has already
+ * exited — normal commit (`transactionCommitted`), cancel (`transactionCancelled`),
+ * or abnormal error/timer drain (`scopeExited`) — after this host entered: the
+ * enclosing exit tore down this scope's subtree, so firing would write a BACKWARD
+ * transition into an already-drained ancestor. Block-structured (SESE) scopes exit
+ * inside-out, so in a LEGITIMATE fire (host still live) NO ancestor has an exit
+ * marker after this host's entry; only an ancestor's abnormal drain produces one.
+ * `rowid` ordering is the durable, replay-safe clock (history is append-only). Folds
+ * to `false` (defer to the other guards) when the host has no entry marker for `occ`
+ * or the ancestor list is empty (a top-level scope / pre-M5 flat graph).
+ */
+export async function ancestorScopeExitedAfterEntry(
+  db: D1Database,
+  instanceId: string,
+  hostId: string,
+  occ: number,
+  ancestorScopeIds: string[],
+): Promise<boolean> {
+  if (ancestorScopeIds.length === 0) return false;
+  const entry = await stmt(
+    db,
+    `SELECT rowid AS r FROM history_events
+      WHERE instance_id = ? AND element_id = ? AND type IN ('transactionEntered', 'scopeEntered')
+        AND COALESCE(json_extract(diagnostics, '$.occurrence'), 0) = ?
+      ORDER BY rowid DESC LIMIT 1`,
+    [instanceId, hostId, occ],
+  ).first<{ r: number }>();
+  if (!entry) return false;
+  const placeholders = ancestorScopeIds.map(() => "?").join(", ");
+  const hit = await stmt(
+    db,
+    `SELECT 1 AS hit FROM history_events
+      WHERE instance_id = ? AND element_id IN (${placeholders})
+        AND type IN ('scopeExited', 'transactionCancelled', 'transactionCommitted')
+        AND rowid > ?
+      LIMIT 1`,
+    [instanceId, ...ancestorScopeIds, entry.r],
+  ).first<{ hit: number }>();
+  return hit !== null;
+}
+
+/**
+ * The raw element_id of the most recent `transactionCancelled` history row (M5-L1
+ * Task 8) — the durable, replay-safe compensation-root marker. An operator /cancel
+ * writes this row WITHOUT an element scope (→ null → the process root); an
+ * auto cancel-end wrote element_id = the cancelled transaction id. Persistence stays
+ * graph-free: the ENGINE maps the returned element to a root (transaction id vs null).
+ */
+export async function latestCancelRootElement(db: D1Database, instanceId: string): Promise<string | null> {
+  const row = await stmt(
+    db,
+    `SELECT element_id FROM history_events
+      WHERE instance_id = ? AND type = 'transactionCancelled'
+      ORDER BY rowid DESC LIMIT 1`,
+    [instanceId],
+  ).first<{ element_id: string | null }>();
+  return row?.element_id ?? null;
+}
+
 /** Count history events of a given type for an instance element (e.g. poison strikes). */
 export async function countHistoryEventsOfType(
   db: D1Database,

@@ -26,6 +26,18 @@ ordinal: 22000
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
 Optional epic placeholder for milestone M5 (design §8) — the remaining 'full BPMN' pieces, demand-driven: bpmn:callActivity (reusable sub-saga), nested non-transaction subProcess, multiInstance (parallel over a collection, each instance compensated), and signal/escalation events. Target semantics: docs/bpmn/02-activities.md. Sliced only if a concrete need appears after M4.
+
+**M5-L1 status (2026-07-02):** the demand appeared and M5 was sliced into 5 layers (L1 embedded scopes/
+exceptions · L2 callActivity risk-apex · L3 multiInstance · L4 escalation · L5 signal — decomposition on
+`docs/superpowers/specs/2026-06-20-m5-composition-design.md`). **L1 (embedded scopes + hierarchical
+exceptions) has SHIPPED** via PR #4 (branch `m5-l1-embedded-scopes`): plain `subProcess` scopes, scope-aware
+compensation (two-tier `committedLocal`/`committed` shield, root-relative reverse pass), hierarchical error
+bubbling + boundaries + error end event (`uncaughtError` incident), and Hazard-vs-Cancel timer boundaries
+on scopes. Constitution amended to **v2.5.0** to cover the full five-layer M5 set. Backlog: TASK-64..70
+(Done). Follow-ups from the final-review fix wave: TASK-71 (runtime re-entry backstop for a residual
+guarded-loop-back gap), TASK-72 (drain doesn't release message subscriptions/broker keys), TASK-73 (armed
+scope timer can fire on an incident/compensating instance), TASK-74 (polish sweep). **L2 (callActivity) is
+next.**
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria

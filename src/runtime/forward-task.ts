@@ -34,7 +34,7 @@ import {
 } from "./boundary-timer";
 import { getTimer, timerIdFor } from "../persistence/timers";
 import { dbBatch } from "../persistence/db";
-import { countHistoryEventsOfType, historyStmt } from "../persistence/history";
+import { countHistoryEventsOfType, historyStmt, latestScopeEntryOccurrence } from "../persistence/history";
 import {
   applyTransitionStmt,
   createJobStmt,
@@ -48,59 +48,125 @@ import {
   variableSnapshotStmt,
 } from "../persistence/instances";
 import { insertSagaStepStmt } from "../persistence/saga";
-import { loadInst, isTransactionScope, type RunStep, type WaitForEvent } from "./engine-shared";
+import { loadInst, type RunStep, type WaitForEvent } from "./engine-shared";
+import { nearestEnclosingTx, scopesOf } from "../bpmn/scope-tree";
 import { createIncident, parkWaiting } from "./incidents";
 import { resolveScope } from "./frontier";
 import { branchHistoryTags, getToken, parseOverlay, readOverlay, rootTokenId, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
+import { drainScopeSubtree } from "./compensation";
 
 /**
- * The token-path node an error boundary on `elementId` routes the failed token
- * to, by `errorCode`. Free error-boundary routing (M3-L2, TASK-42): an activity
- * may carry many DISTINCT-`@errorCode` interrupting boundaries plus at most one
- * catch-all (validator-enforced), each targeting ANY token-path node — no longer
- * cancel-end-only. The matching precedence is:
- *   exact `@errorCode` → catch-all (`errorCode == null`) → null (→ caller Hazard).
+ * The error boundary hosted directly ON `hostId` that matches `errorCode`, if
+ * any. Free error-boundary routing (M3-L2, TASK-42): an activity (or, since
+ * M5-L1 Task 9, a scope) may carry many DISTINCT-`@errorCode` interrupting
+ * boundaries plus at most one catch-all (validator-enforced), each targeting
+ * ANY token-path node — no longer cancel-end-only. The matching precedence is:
+ *   exact `@errorCode` → catch-all (`errorCode == null`) → null (→ caller climbs).
  * After validation a null `errorCode` UNAMBIGUOUSLY means catch-all (a coded
  * boundary with an empty/missing `@errorCode` is rejected at publish), so the
  * catch-all matches ANY business code including ones not declared as a
  * `<bpmn:error>`. Deterministic regardless of node-iteration order: an exact
  * match returns immediately; otherwise the (single) catch-all is the fallback.
  */
-function errorBoundaryTarget(graph: ExecutionGraph, elementId: string, errorCode: string | null): string | null {
-  // The catch-all's target (its `next`, or null if it routes nowhere) doubles as
-  // the "no catch-all found" sentinel: both yield null, which the caller treats
-  // as an uncaught business error (→ Hazard). No separate presence flag needed.
-  let catchAll: string | null = null;
-  for (const [, node] of Object.entries(graph.nodes)) {
-    if (node.type !== "boundaryEvent" || node.boundaryKind !== "error" || node.attachedToRef !== elementId) continue;
-    if (node.errorCode != null && node.errorCode === errorCode) return node.next ?? null; // exact wins
-    if (node.errorCode == null) catchAll = node.next ?? null;
+function matchErrorBoundaryOn(
+  graph: ExecutionGraph,
+  hostId: string,
+  errorCode: string | null,
+): { boundaryId: string; next: string } | null {
+  let catchAll: { boundaryId: string; next: string } | null = null;
+  for (const [bid, node] of Object.entries(graph.nodes)) {
+    if (node.type !== "boundaryEvent" || node.boundaryKind !== "error" || node.attachedToRef !== hostId) continue;
+    if (node.errorCode != null && node.errorCode === errorCode && node.next) return { boundaryId: bid, next: node.next };
+    if (node.errorCode == null && node.next) catchAll = { boundaryId: bid, next: node.next };
   }
   return catchAll;
+}
+
+export interface ErrorCatchTarget {
+  boundaryId: string;
+  hostId: string;
+  hostIsScope: boolean;
+  next: string;
+}
+
+/**
+ * Hierarchical error catch (M5-L1 spec §5.1): the attachment-chain walk — the
+ * throwing element's own boundaries first, then each enclosing scope bottom-up;
+ * per level exact `@errorCode` beats catch-all; the first level with a match
+ * wins. Null → the caller Hazards (uncaught business error, no matching
+ * boundary anywhere on the chain). Level-0 (own boundary on `elementId`) is
+ * byte-identical to the pre-M5 `errorBoundaryTarget` behavior.
+ */
+export function errorCatchTarget(graph: ExecutionGraph, elementId: string, errorCode: string | null): ErrorCatchTarget | null {
+  const own = matchErrorBoundaryOn(graph, elementId, errorCode);
+  if (own) return { ...own, hostId: elementId, hostIsScope: false };
+  const scopes = scopesOf(graph);
+  for (let s = graph.nodes[elementId]?.scopeId ?? null; s != null; s = scopes[s]?.parentId ?? null) {
+    const m = matchErrorBoundaryOn(graph, s, errorCode);
+    if (m) return { ...m, hostId: s, hostIsScope: true };
+  }
+  return null;
 }
 
 export type ForwardOutcome = { kind: "next"; next: string } | { kind: "waiting" } | { kind: "incident" };
 
 /**
- * Write-free fast-forward predicate for a forward Service Task visit
- * (design M2 §5): once a job's terminal outcome has been APPLIED to the
- * instance (output_applied=1, set in the same dbBatch as the advance), the
- * rewalk derives the successor purely from graph + persisted job state —
- * a completed job advances on `node.next`; a business failure re-derives the
- * SAME deterministic boundary target from the persisted error_code. Returns
- * null when the visit still needs driving (the frontier).
+ * Fast-forward predicate for a forward Service Task visit (design M2 §5): once
+ * a job's terminal outcome has been APPLIED to the instance (output_applied=1,
+ * set in the same dbBatch as the advance), the rewalk derives the successor
+ * purely from graph + persisted job state — a completed job advances on
+ * `node.next`; a business failure re-derives the SAME deterministic catch
+ * target from the persisted error_code. Returns null when the visit still
+ * needs driving (the frontier). Write-free EXCEPT the one self-healing case
+ * inside: a scope-caught business failure whose post-batch drain/audit was
+ * crashed away is re-drained here (idempotent, existence-guarded — see the
+ * inline block).
  */
-function appliedForwardOutcome(
+async function appliedForwardOutcome(
+  env: Env,
+  instanceId: string,
   graph: ExecutionGraph,
   elementId: string,
   node: GraphNode,
   job: JobRow | null,
-): ForwardOutcome | null {
+): Promise<ForwardOutcome | null> {
   if (!job || job.output_applied !== 1) return null;
   if (job.status === "completed") return { kind: "next", next: node.next! };
   if (job.status === "failed" && job.error_code) {
-    const target = errorBoundaryTarget(graph, elementId, job.error_code);
-    if (target) return { kind: "next", next: target };
+    // Re-derivation (M5-L1 spec §5.1): deterministic because the graph is
+    // immutable — the same attachment-chain walk always yields the same target.
+    const target = errorCatchTarget(graph, elementId, job.error_code);
+    if (target) {
+      // Self-healing backstop for the scope-caught case: the applying path runs
+      // the subtree drain + `scopeExited` audit AFTER its dbBatch commits (which
+      // already flipped output_applied=1) — a crash in that window would
+      // otherwise skip them FOREVER, since every later drive fast-forwards
+      // through here, and unlike the beginCompensating precedent no future
+      // worker poll would revisit (stranding live subtree tokens and wedging the
+      // frontier barrier). The `scopeExited` row is the completion marker: both
+      // writers order drain-then-audit, so row-exists ⇒ the drain finished. On
+      // the steady state this costs ONE history read per rewalk of this visit.
+      // Narrowest existence predicate available here: (instance, scope,
+      // 'scopeExited') — this path has no reliable scope-exit occurrence (the
+      // JOB's occurrence is the task's, not the scope's), so a LOOPED scope
+      // that already exited abnormally once is not re-healed for a later
+      // crashed exit; its first-exit drain semantics still hold.
+      if (target.hostIsScope) {
+        const audited = await countHistoryEventsOfType(env.DB, instanceId, target.hostId, "scopeExited");
+        if (audited === 0) {
+          await drainScopeSubtree(env, graph, instanceId, target.hostId); // idempotent retain-only
+          const inst = await loadInst(env, instanceId);
+          await historyStmt(env.DB, {
+            workspaceId: inst.workspace_id,
+            instanceId,
+            elementId: target.hostId,
+            type: "scopeExited",
+            diagnostics: { scope: target.hostId, via: target.boundaryId, abnormal: true },
+          }).run();
+        }
+      }
+      return { kind: "next", next: target.next };
+    }
   }
   // Defensive — unreachable by construction: output_applied=1 is only ever set
   // on a completed apply or a business-routed failure (whose boundary target is
@@ -139,8 +205,9 @@ export async function driveForwardServiceTask(
 
   let job = await getForwardJob(env.DB, instanceId, elementId, occ);
 
-  // Already applied → pure in-memory cursor move, NO writes, NO step.
-  const applied = appliedForwardOutcome(graph, elementId, node, job);
+  // Already applied → pure cursor move (no step; write-free except the guarded
+  // self-healing re-drain of a crashed scope exit — see appliedForwardOutcome).
+  const applied = await appliedForwardOutcome(env, instanceId, graph, elementId, node, job);
   if (applied) return applied;
 
   if (job?.status === "completed") {
@@ -353,7 +420,7 @@ async function applyForwardCompletion(
   // Apply-once guard (idempotent step body): a Workflow step retry after the
   // batch below committed must not re-merge the output over newer variables.
   const live = await getForwardJob(env.DB, instanceId, elementId, occ);
-  const appliedAlready = appliedForwardOutcome(graph, elementId, node, live);
+  const appliedAlready = await appliedForwardOutcome(env, instanceId, graph, elementId, node, live);
   if (appliedAlready) return appliedAlready;
 
   const inst = await loadInst(env, instanceId);
@@ -456,9 +523,11 @@ async function applyForwardCompletion(
     markJobOutputAppliedStmt(env.DB, job.job_id, now),
   ];
 
-  // Ledger write atomic with advance — only for completed compensatable steps in a transaction.
-  if (isTransactionScope(graph, node.scopeId)) {
-    const wiring = graph.transactions?.[node.scopeId!]?.compensations?.[elementId];
+  // Ledger write atomic with advance — for completed compensatable steps with a
+  // TRANSACTION ANCESTOR (M5-L1 spec §3.3: the gate is ancestry, not the immediate
+  // scope). scope_id stays the IMMEDIATE scope id — the subtree cursor depends on it.
+  if (nearestEnclosingTx(graph, node.scopeId ?? null) != null) {
+    const wiring = graph.compensations?.[elementId] ?? graph.transactions?.[node.scopeId!]?.compensations?.[elementId];
     const handlerNode = wiring ? graph.nodes[wiring.handlerId] : undefined;
     statements.push(
       insertSagaStepStmt(env.DB, {
@@ -512,29 +581,42 @@ async function handleForwardFailure(
 ): Promise<ForwardOutcome> {
   // Route-once guard (idempotent step body): a re-run after the business-error
   // batch committed fast-forwards to the recorded boundary target instead of
-  // duplicating businessErrorCaught + rewriting the cursor.
+  // duplicating businessErrorCaught + rewriting the cursor (and self-heals a
+  // crashed-away scope drain/audit — see appliedForwardOutcome).
   const live = await getForwardJob(env.DB, instanceId, elementId, occ);
-  const appliedAlready = appliedForwardOutcome(graph, elementId, node, live);
+  const appliedAlready = await appliedForwardOutcome(env, instanceId, graph, elementId, node, live);
   if (appliedAlready) return appliedAlready;
 
   const inst = await loadInst(env, instanceId);
   if (job.error_code) {
-    // Business error → route to the matching error boundary's target (any
-    // token-path node; exact @errorCode → catch-all). The token then walks
-    // forward like any other: it triggers compensation only if it REACHES a
-    // cancel end, otherwise the saga continues with the ledger intact.
-    const target = errorBoundaryTarget(graph, elementId, job.error_code);
+    // Business error → route to the matching error boundary's target via the
+    // hierarchical attachment-chain walk (M5-L1 spec §5.1): the throwing
+    // element's own boundaries first, then each enclosing scope bottom-up (any
+    // token-path node; exact @errorCode → catch-all per level). The token then
+    // walks forward like any other: it triggers compensation only if it REACHES
+    // a cancel end, otherwise the saga continues with the ledger intact.
+    const target = errorCatchTarget(graph, elementId, job.error_code);
     if (target) {
       const now = nowIso();
+      // M5-L1 (Task 11): the catching scope's OWN occurrence — needed only when the
+      // catch climbed to a scope (hostIsScope) to key that scope's boundary-timer
+      // disarm. `elementId`'s own occurrence (`occ`) is NOT the scope's occurrence.
+      const scopeOcc = target.hostIsScope ? await latestScopeEntryOccurrence(env.DB, instanceId, target.hostId) : 0;
       const stmts: D1PreparedStatement[] = [
         historyStmt(env.DB, {
           workspaceId: inst.workspace_id,
           instanceId,
           elementId,
           type: "businessErrorCaught",
-          diagnostics: { jobId: job.job_id, errorCode: job.error_code, boundaryTarget: target, occurrence: occ, ...branchHistoryTags(activeTokenId) },
+          diagnostics: {
+            jobId: job.job_id,
+            errorCode: job.error_code,
+            boundaryTarget: target.next,
+            occurrence: occ,
+            ...branchHistoryTags(activeTokenId),
+          },
         }),
-        applyTransitionStmt(env.DB, { instanceId, currentElementId: target, status: "running", now }),
+        applyTransitionStmt(env.DB, { instanceId, currentElementId: target.next, status: "running", now }),
         // Atomic with the route: the rewalk fast-forwards this visit by
         // re-deriving the same deterministic target from the persisted error_code.
         markFailedJobHandledStmt(env.DB, job.job_id, now),
@@ -543,16 +625,45 @@ async function handleForwardFailure(
       // route; on a decider conflict the timer FIRED first → convert to its path.
       const cancelSettle = buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: elementId, occ, now });
       if (cancelSettle) stmts.push(...cancelSettle.stmts);
+      // M5-L1 (Task 11): the catching SCOPE may ALSO carry its own boundary timer —
+      // disarm it atomically with this abnormal exit too (Hazard-vs-Cancel, spec §5.3).
+      const scopeCancelSettle = target.hostIsScope
+        ? buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: target.hostId, occ: scopeOcc, now })
+        : null;
+      if (scopeCancelSettle) stmts.push(...scopeCancelSettle.stmts);
       try {
         await dbBatch(env.DB, stmts);
       } catch (err) {
         if (isUniqueConstraintViolation(err)) {
           const converted = await convertOnFire(env, graph, instanceId, elementId, occ);
           if (converted) return { kind: "next", next: converted };
+          if (target.hostIsScope) {
+            const scopeConverted = await convertOnFire(env, graph, instanceId, target.hostId, scopeOcc);
+            if (scopeConverted) return { kind: "next", next: scopeConverted };
+          }
         }
         throw err;
       }
-      return { kind: "next", next: target };
+      // M5-L1 Task 9: the catch host IS a scope (climbed past `elementId`'s own
+      // boundaries) → the abnormal exit drains every live token in that scope's
+      // subtree (idempotent retain-only, Task 8) and is audited. Not folded into
+      // the batch above — `drainScopeSubtree` issues its own dbBatch(es) per live
+      // token, and is safe to re-run on a step retry (retain-only, INSERT OR
+      // IGNORE + status-guarded flips). Post-batch drain+audit: a crash landing
+      // between the batch commit and here is healed by appliedForwardOutcome's
+      // idempotent, existence-guarded re-drain on the next drive (the batch set
+      // output_applied=1, so every later drive re-derives through that path).
+      if (target.hostIsScope) {
+        await drainScopeSubtree(env, graph, instanceId, target.hostId);
+        await historyStmt(env.DB, {
+          workspaceId: inst.workspace_id,
+          instanceId,
+          elementId: target.hostId,
+          type: "scopeExited",
+          diagnostics: { scope: target.hostId, via: target.boundaryId, abnormal: true, occurrence: scopeOcc },
+        }).run();
+      }
+      return { kind: "next", next: target.next };
     }
     // Uncaught business error → Hazard. Settle the guarding timer first (its own
     // batch — the Hazard terminal is a separate createIncident batch); if the timer

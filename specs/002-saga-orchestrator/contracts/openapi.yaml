@@ -941,8 +941,8 @@ components:
         endKind:
           type: string
           nullable: true
-          enum: [none, cancel, compensate]
-          description: Event-definition kind for an endEvent.
+          enum: [none, cancel, error]
+          description: Event-definition kind for an endEvent (error end events ship with M5-L1).
         scopeId:
           type: string
           nullable: true
@@ -1062,7 +1062,12 @@ components:
           description: Monotonic completion order within the transaction scope.
         compensationStatus:
           type: string
-          enum: [pending, notRequired, compensating, compensated, failed]
+          description: >-
+            `committed` is the terminal/sealed status (the outermost enclosing
+            transaction committed). M5-L1 adds `committedLocal` — a non-terminal
+            local commit of a NESTED transaction, still compensable by an
+            ancestor's cancel (design §3.2/§3.4).
+          enum: [pending, notRequired, compensating, compensated, failed, committed, committedLocal]
         compensationElementId:
           type: string
           nullable: true
@@ -1469,7 +1474,9 @@ components:
             `concurrencyLimit` (a split fan-out exceeded MAX_CONCURRENT_TOKENS live
             tokens) and `stepBudget` (the per-drive step counter crossed
             STEP_BUDGET_SOFT — a graceful incident below the platform step ceiling).
-          enum: [serviceTaskFailure, compensationFailure, timeout, poison, loopLimit, noPath, jobActivationTimeout, waitTimeout, conditionFailure, concurrencyLimit, stepBudget]
+            M5-L1 adds `uncaughtError` — an error END EVENT reached the process
+            root uncaught (worker-task uncaught errors keep `serviceTaskFailure`).
+          enum: [serviceTaskFailure, compensationFailure, timeout, poison, loopLimit, noPath, jobActivationTimeout, waitTimeout, conditionFailure, concurrencyLimit, stepBudget, uncaughtError]
         resolution:
           type: string
           nullable: true

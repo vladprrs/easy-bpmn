@@ -2,10 +2,10 @@ import { describe, it, expect } from "vitest";
 import { SCENARIOS } from "./registry";
 
 describe("matrix registry well-formedness", () => {
-  it("has exactly 60 scenarios with unique ids", () => {
-    expect(SCENARIOS).toHaveLength(60);
+  it("has exactly 71 scenarios with unique ids", () => {
+    expect(SCENARIOS).toHaveLength(71);
     const ids = SCENARIOS.map((s) => s.id);
-    expect(new Set(ids).size).toBe(60);
+    expect(new Set(ids).size).toBe(71);
   });
 
   it("every scenario has valid enums and at least one declared mode", () => {
@@ -20,9 +20,9 @@ describe("matrix registry well-formedness", () => {
     }
   });
 
-  it("registers exactly the 11 reject scenarios and they are direct-only", () => {
+  it("registers exactly the 16 reject scenarios and they are direct-only", () => {
     const rejects = SCENARIOS.filter((s) => s.legality === "reject");
-    expect(rejects).toHaveLength(11);
+    expect(rejects).toHaveLength(16);
     for (const s of rejects) expect(s.modes).toEqual(["direct"]);
   });
 });

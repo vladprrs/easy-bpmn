@@ -25,6 +25,10 @@ import { parseBpmnXml } from "./parser";
 import { TASK_DEFINITION_TYPE } from "./moddle-extension";
 import { parseCondition } from "../runtime/expressions";
 import { isValidIso8601DateTime, parseIso8601DurationMs } from "../runtime/iso8601";
+// M5-L1: the scope-nesting depth cap, enforced here at publish (spec §7). No
+// import cycle — engine.ts imports only `bpmn/graph` (type-only), never this
+// validator module; verified by grep before wiring this import.
+import { MAX_SCOPE_DEPTH } from "../runtime/engine";
 import { validateRegions, type RegionInput, type RegionInfoOut } from "./regions";
 import {
   ASSOCIATION_TYPE,
@@ -50,6 +54,7 @@ import type {
   GraphElement,
   GraphNode,
   NodeType,
+  ScopeMeta,
   TimerTriggerSpec,
   TransactionScope,
   ValidationIssueData,
@@ -180,7 +185,7 @@ interface AssocInfo {
 
 interface ScopeInfo {
   id: string;
-  kind: "process" | "transaction";
+  kind: "process" | "transaction" | "subProcess";
 }
 
 const SUPPORTED_HINT =
@@ -245,17 +250,19 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
 
   // An `errorRef` on an <errorEventDefinition> that names a non-existent <error>
   // is DROPPED by bpmn-moddle (exactly like an unresolved `default`), leaving the
-  // parsed boundary indistinguishable from a genuine catch-all (no errorRef).
-  // Recover those dangling refs from the parser warnings — keyed by the OWNING
-  // boundary event id (the warning's element is the errorEventDefinition; its
-  // $parent is the boundary) — so the error-boundary rules can reject them with
-  // an element id instead of silently accepting a hidden catch-all (M3-L2).
+  // parsed boundary/end event indistinguishable from a genuine catch-all (no
+  // errorRef). Recover those dangling refs from the parser warnings — keyed by
+  // the OWNING event id (the warning's element is the errorEventDefinition; its
+  // $parent is the boundary event OR, since M5-L1 TASK-10, the end event) — so
+  // the error-boundary/error-end rules can reject them with an element id
+  // instead of silently accepting a hidden catch-all (M3-L2; widened M5-L1).
   //
   // CAUTION: like the `bpmn:default` block above, the warning shape
-  // (`property: "bpmn:errorRef"`, the `$parent` boundary id) is moddle-INTERNAL
+  // (`property: "bpmn:errorRef"`, the `$parent` owner id) is moddle-INTERNAL
   // and version-coupled, not a public contract — it is pinned by the "rejects an
-  // error boundary whose errorRef does not resolve" unit test, which must break
-  // loudly on a bpmn-moddle upgrade that reshapes it.
+  // error boundary whose errorRef does not resolve" / "rejects an error end
+  // event with a dangling errorRef" unit tests, which must break loudly on a
+  // bpmn-moddle upgrade that reshapes it.
   const danglingErrorRef = new Map<string, string>();
   for (const w of parsed.warnings as Array<{
     message?: string;
@@ -265,7 +272,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
   }>) {
     if (w?.property === "bpmn:errorRef" && typeof w.message === "string" && /unresolved reference/i.test(w.message)) {
       const owner = w.element?.$parent;
-      if (owner?.$type === "bpmn:BoundaryEvent" && typeof owner.id === "string") {
+      if ((owner?.$type === "bpmn:BoundaryEvent" || owner?.$type === "bpmn:EndEvent") && typeof owner.id === "string") {
         danglingErrorRef.set(owner.id, String(w.value));
       }
     }
@@ -378,12 +385,80 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     return msgName;
   };
 
+  // Shared errorRef → errorCode resolution (M3-L2 TASK-42, widened M5-L1
+  // TASK-10) — used by BOTH an error boundary event and an error end event:
+  //  - PRESENT-but-unresolved (moddle dropped it; recovered via the dangling
+  //    map) → reject. It is NOT a catch-all — a typo must not silently widen
+  //    to "match any code".
+  //  - PRESENT-and-resolved → its <bpmn:error> @errorCode must be NON-EMPTY.
+  //    An empty/absent code would silently act as a catch-all (the engine
+  //    matches errorCode==null to any code), so it is rejected.
+  //  - ABSENT: a BOUNDARY treats this as the catch-all (leave n.errorCode
+  //    undefined so the graph carries errorCode:null, the unambiguous "match
+  //    any code" marker) — `requireCode=false`. An END event THROWS and has no
+  //    catch-all shape: `requireCode=true` rejects an absent errorRef with the
+  //    same "must reference ... non-empty @errorCode" message as a code-less one.
+  const resolveErrorCode = (
+    n: { id: string; errorRef?: string; errorCode?: string },
+    label: string,
+    requireCode: boolean,
+  ): void => {
+    const elementKind = requireCode ? "endEvent" : "boundaryEvent";
+    const danglingRef = danglingErrorRef.get(n.id);
+    if (danglingRef !== undefined) {
+      err(`${label} '${n.id}' has an errorRef '${danglingRef}' that does not resolve to a declared <bpmn:error>.`, n.id, elementKind);
+      return;
+    }
+    if (n.errorRef == null) {
+      if (requireCode) {
+        err(`${label} '${n.id}' must reference a declared <bpmn:error> with a non-empty @errorCode.`, n.id, elementKind);
+      }
+      return;
+    }
+    if (!errorsById.has(n.errorRef)) {
+      err(`${label} '${n.id}' has an errorRef that does not resolve to a declared <bpmn:error>.`, n.id, elementKind);
+      return;
+    }
+    const code = errorsById.get(n.errorRef)!.errorCode;
+    if (code == null || code.trim() === "") {
+      if (requireCode) {
+        err(`${label} '${n.id}' must reference a declared <bpmn:error> with a non-empty @errorCode.`, n.id, elementKind);
+      } else {
+        err(
+          `${label} '${n.id}' references error '${n.errorRef}', which has no (or an empty) @errorCode. ` +
+            "A coded error boundary needs a non-empty @errorCode; omit the errorRef to make this a catch-all boundary.",
+          n.id,
+          elementKind,
+        );
+      }
+      return;
+    }
+    n.errorCode = code;
+  };
+
+  // M5-L1: the static scope-hierarchy map (spec §2) — a scope's parent scope id
+  // (null at the process root) and its nesting depth (1 = directly in the
+  // process). Populated alongside `scopes` by every classifyContainer call.
+  const scopeParent = new Map<string, string | null>();
+  const scopeDepth = new Map<string, number>();
+
   const classifyContainer = (
     container: ModdleElement,
     scopeId: string,
-    scopeKind: "process" | "transaction",
+    scopeKind: "process" | "transaction" | "subProcess",
+    parentScopeId: string | null,
+    depth: number,
   ): void => {
     scopes.push({ id: scopeId, kind: scopeKind });
+    scopeParent.set(scopeId, parentScopeId);
+    scopeDepth.set(scopeId, depth);
+    if (depth > MAX_SCOPE_DEPTH) {
+      err(
+        `Scope '${scopeId}' exceeds MAX_SCOPE_DEPTH = ${MAX_SCOPE_DEPTH} (nesting depth ${depth}).`,
+        scopeId,
+        scopeKind === "transaction" ? "transaction" : "subProcess",
+      );
+    }
 
     // Associations live in `artifacts`, not `flowElements`. Other artifacts
     // (text annotations, groups) are ignorable like DI — tolerated, not parsed.
@@ -456,7 +531,41 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
           );
         }
         nodes.push({ id: id ?? "", type: "transaction", name: (el.name as string) ?? undefined, scopeId });
-        classifyContainer(el, id ?? "", "transaction");
+        classifyContainer(el, id ?? "", "transaction", scopeId, depth + 1);
+        continue;
+      }
+
+      // M5-L1: plain embedded subProcess — a bookkeeping scope on the token path.
+      // An event subprocess (triggeredByEvent) and ad-hoc subprocesses are out of
+      // profile (interim rejects with roadmap pointers, spec §6); MI-on-subProcess
+      // is deferred to M5-L3.
+      if ($type === "bpmn:SubProcess") {
+        if (el.triggeredByEvent === true) {
+          err(
+            `Event subprocess '${id ?? "(no id)"}' (triggeredByEvent="true") is not yet supported — planned for milestone M5-L4.`,
+            id,
+            "subProcess",
+          );
+          continue;
+        }
+        if (el.loopCharacteristics != null) {
+          err(
+            `Subprocess '${id ?? "(no id)"}' has loop or multi-instance characteristics — multiInstance is planned for milestone M5-L3.`,
+            id,
+            "subProcess",
+          );
+          continue;
+        }
+        nodes.push({ id: id ?? "", type: "subProcess", name: (el.name as string) ?? undefined, scopeId });
+        classifyContainer(el, id ?? "", "subProcess", scopeId, depth + 1);
+        continue;
+      }
+      if ($type === "bpmn:AdHocSubProcess") {
+        err(
+          `Ad-hoc subprocess '${id ?? "(no id)"}' is not supported in this profile (no planned support).`,
+          id,
+          "subProcess",
+        );
         continue;
       }
 
@@ -689,10 +798,18 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
           info.endKind = "none";
         } else if (only === CANCEL_EVENT_DEFINITION) {
           info.endKind = "cancel"; // validated against scope below
+        } else if (only === ERROR_EVENT_DEFINITION) {
+          // M5-L1 (Task 10, spec §5.2): an error end event THROWS from its
+          // enclosing scope via the same hierarchical attachment-chain walk as a
+          // worker-task business error. errorRef/errorCode resolution (PRESENT +
+          // coded, unlike the optional/catch-all boundary shape) happens in the
+          // shared `resolveErrorCode` pass below, alongside the boundary pass.
+          info.endKind = "error";
+          info.errorRef = refId((defs[0] as ModdleElement).errorRef) ?? undefined;
         } else {
           err(
             `End event '${id ?? ""}' has a ${defs.length === 1 ? localTypeName(defs[0]!.$type) : "event definition"}. ` +
-              "Only a none end event or a cancel end event (inside a transaction) is supported.",
+              "Only a none end event, a cancel end event (inside a transaction), or an error end event is supported.",
             id,
             "endEvent",
           );
@@ -742,7 +859,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     }
   };
 
-  classifyContainer(proc, processId, "process");
+  classifyContainer(proc, processId, "process", null, 0);
 
   const nodeById = new Map(nodes.map((n) => [n.id, n]));
 
@@ -852,7 +969,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     const starts = scopeNodes.filter((n) => n.type === "startEvent");
     const ends = scopeNodes.filter((n) => n.type === "endEvent");
     const noneEnds = ends.filter((e) => e.endKind === "none");
-    const where = kind === "transaction" ? `transaction '${sid}'` : "the process";
+    const where = kind === "transaction" ? `transaction '${sid}'` : kind === "subProcess" ? `subprocess '${sid}'` : "the process";
 
     if (starts.length !== 1) {
       err(`Exactly one none start event is required in ${where}; found ${starts.length}.`, sid, "startEvent");
@@ -1099,46 +1216,12 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         }
       }
     } else if (n.boundaryKind === "error") {
-      if (attached.type !== "serviceTask") {
-        err(`Error boundary event '${n.id}' must be attached to a service task.`, n.id, "boundaryEvent");
+      if (attached.type !== "serviceTask" && attached.type !== "subProcess" && attached.type !== "transaction") {
+        err(`Error boundary event '${n.id}' must be attached to a service task, a subprocess, or a transaction.`, n.id, "boundaryEvent");
       }
-      // errorRef handling (M3-L2, TASK-42):
-      //  - PRESENT-but-unresolved (moddle dropped it; recovered via the dangling
-      //    map) → reject. It is NOT a catch-all — a typo must not silently widen
-      //    to "match any code".
-      //  - PRESENT-and-resolved → its <bpmn:error> @errorCode must be NON-EMPTY.
-      //    An empty/absent code would silently act as a catch-all (the engine
-      //    matches errorCode==null to any code), so it is rejected.
-      //  - ABSENT → this IS the catch-all: leave n.errorCode undefined so the
-      //    graph carries errorCode:null, the unambiguous "match any code" marker.
-      const danglingRef = danglingErrorRef.get(n.id);
-      if (danglingRef !== undefined) {
-        err(
-          `Error boundary event '${n.id}' has an errorRef '${danglingRef}' that does not resolve to a declared <bpmn:error>.`,
-          n.id,
-          "boundaryEvent",
-        );
-      } else if (n.errorRef != null) {
-        if (!errorsById.has(n.errorRef)) {
-          err(
-            `Error boundary event '${n.id}' has an errorRef that does not resolve to a declared <bpmn:error>.`,
-            n.id,
-            "boundaryEvent",
-          );
-        } else {
-          const code = errorsById.get(n.errorRef)!.errorCode;
-          if (code == null || code.trim() === "") {
-            err(
-              `Error boundary event '${n.id}' references error '${n.errorRef}', which has no (or an empty) @errorCode. ` +
-                "A coded error boundary needs a non-empty @errorCode; omit the errorRef to make this a catch-all boundary.",
-              n.id,
-              "boundaryEvent",
-            );
-          } else {
-            n.errorCode = code;
-          }
-        }
-      }
+      // errorRef handling (M3-L2, TASK-42) — the shared resolveErrorCode pass
+      // (requireCode=false: absent errorRef IS the catch-all, left unrejected).
+      resolveErrorCode(n, "Error boundary event", false);
       // Lifted target rule (M3-L2): exactly ONE outgoing flow, to any token-path
       // node in the SAME scope (no longer "a cancel end event"). The forbidden
       // targets are already rejected by the per-flow endpoint rules above — a
@@ -1169,23 +1252,18 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         );
       }
     } else if (n.boundaryKind === "timer") {
-      // M3-L3 (TASK-44): an interrupting boundary timer attaches to a serviceTask
-      // or receiveTask (inside or outside a transaction) — NEVER to a transaction
-      // itself (it would terminate the scope WITHOUT compensation, the
-      // silent-rollback-loss trap, deferred to M5). Attachment to a gateway /
+      // M3-L3 (TASK-44) / M5-L1 (Task 11, spec §5.3-§5.4): an interrupting
+      // boundary timer attaches to a serviceTask or receiveTask, OR — since
+      // M5-L1 — a subProcess or transaction. Firing on a scope host INTERRUPTS
+      // WITHOUT COMPENSATION (Hazard-vs-Cancel): completed ledger rows are
+      // RETAINED pending, not reverse-compensated. Attachment to a gateway /
       // compensation handler is already rejected above (those `continue`). Exactly
       // one outgoing flow, to any token-path node in the same scope — the forbidden
       // targets are rejected by the per-flow endpoint rules (reused from M3-L2), so
       // only the single-outgoing degree is checked here.
-      if (attached.type === "transaction") {
+      if (attached.type !== "serviceTask" && attached.type !== "receiveTask" && attached.type !== "subProcess" && attached.type !== "transaction") {
         err(
-          `Boundary timer '${n.id}' is attached to transaction '${attached.id}'. A timer on a transaction would terminate the scope without compensation (deferred to M5) — attach it to a task INSIDE the transaction routing to a cancel end instead.`,
-          n.id,
-          "boundaryEvent",
-        );
-      } else if (attached.type !== "serviceTask" && attached.type !== "receiveTask") {
-        err(
-          `Boundary timer '${n.id}' must be attached to a service task or a receive task; '${attached.id}' is a ${attached.type}.`,
+          `Boundary timer '${n.id}' must be attached to a service task, a receive task, a subprocess, or a transaction; '${attached.id}' is a ${attached.type}.`,
           n.id,
           "boundaryEvent",
         );
@@ -1197,6 +1275,42 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
           "boundaryEvent",
         );
       }
+    }
+  }
+
+  // M5-L1 (Task 10, spec §5.2): error END events — the shared resolveErrorCode
+  // pass (requireCode=true: a throw has no catch-all shape, so an absent OR
+  // code-less errorRef both reject with the same "must reference ... non-empty
+  // @errorCode" message).
+  for (const n of nodes) {
+    if (n.type !== "endEvent" || n.endKind !== "error") continue;
+    resolveErrorCode(n, "Error end event", true);
+  }
+
+  // -------------------------------------------------------------------------
+  // M5-L1 (spec §4.3, Task 8): a NESTED transaction (one enclosed by ANY scope,
+  // i.e. not directly at the process root) that contains a cancel end MUST carry a
+  // cancel boundary — otherwise its cancellation reverse pass has no failure path to
+  // continue the enclosing scope on. A top-level transaction needs none: its cancel
+  // end settles the instance terminally.
+  // -------------------------------------------------------------------------
+  const cancelBoundaryTx = new Set<string>();
+  for (const n of nodes) {
+    if (n.type === "boundaryEvent" && n.boundaryKind === "cancel" && n.attachedToRef) cancelBoundaryTx.add(n.attachedToRef);
+  }
+  const scopesWithCancelEnd = new Set<string>();
+  for (const n of nodes) {
+    if (n.type === "endEvent" && n.endKind === "cancel" && n.scopeId) scopesWithCancelEnd.add(n.scopeId);
+  }
+  for (const txId of scopesWithCancelEnd) {
+    const parent = scopeParent.get(txId) ?? null;
+    const isNested = parent != null && parent !== processId;
+    if (isNested && !cancelBoundaryTx.has(txId)) {
+      err(
+        `Transaction '${txId}' is nested and contains a cancel end event but has no cancel boundary — the instance would have no failure path to continue on.`,
+        txId,
+        "transaction",
+      );
     }
   }
 
@@ -1271,6 +1385,105 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         b.id,
         "boundaryEvent",
       );
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // M5-L1 re-entry after an abnormal scope skip (final-review C1 — fail-closed).
+  //
+  // The engine's two container-skipping rewalk fast-forwards — the fired-scope-
+  // timer skip and the cancelled-transaction skip (engine.ts driveLeaf) — jump
+  // from the container straight to the boundary target WITHOUT descending the
+  // interior, while the walk that performed the cancel/pre-fire DID descend. A
+  // later re-entry of that scope therefore restarts the interior occurrence
+  // counters and collides with the skipped occurrence's persisted rows (jobs,
+  // gateway decisions, markers): spurious re-cancel, stale-output application,
+  // loopLimit livelock. Error-catch exits are immune (they exit through the
+  // interior — parity holds) and commit exits are immune (the commit walk
+  // descends); only the two abnormal skips desync.
+  //
+  // Reject at publish when scope S is reachable from the continuation of one of
+  // its OWN abnormal-skip exits — (a) a timer boundary on S, or (b) the cancel
+  // boundary of a transaction S containing a cancel end (the cancel-end resume
+  // path). Reachability semantics (deliberate, documented): a forward traversal
+  // from the boundary's outgoing flows over UNGUARDED sequence flows only —
+  // flows WITHOUT a conditionExpression (plain + default flows) — plus boundary-
+  // attachment edges and a one-level scope-exit hop at interior end events.
+  // Condition-guarded loop-backs stay ACCEPTED: the shipped gate-4 re-entry saga
+  // shape (RE_ENTRY_TX_BPMN — commit-loop whose return edge into the nested tx
+  // carries a FEEL condition) is graph-isomorphic to a corrupting variant that
+  // differs only in a FEEL literal, so a purely structural gate cannot reject
+  // one without the other; the residual dynamic risk (a guarding condition that
+  // evaluates true after the abnormal skip) is deferred with true re-entry
+  // support to a later M5 layer.
+  // -------------------------------------------------------------------------
+  {
+    /** True when `scopeId` is `maybeAncestor` itself or nested anywhere inside it. */
+    const sameOrInside = (scopeId: string, maybeAncestor: string): boolean => {
+      for (let s: string | null | undefined = scopeId; s != null; s = scopeParent.get(s) ?? null) {
+        if (s === maybeAncestor) return true;
+      }
+      return false;
+    };
+    const boundariesByHost = new Map<string, NodeInfo[]>();
+    for (const n of nodes) {
+      if (n.type === "boundaryEvent" && n.attachedToRef) {
+        const arr = boundariesByHost.get(n.attachedToRef);
+        if (arr) arr.push(n);
+        else boundariesByHost.set(n.attachedToRef, [n]);
+      }
+    }
+    /** Unguarded (condition-less) forward successors of a node's outgoing flows. */
+    const unguardedTargets = (nodeId: string): string[] => {
+      const out: string[] = [];
+      for (const f of flowsBySource.get(nodeId) ?? []) {
+        if (f.conditionExpression != null) continue; // condition-guarded: not traversed
+        if (f.target) out.push(f.target);
+      }
+      return out;
+    };
+    /** Can the walk re-enter `scopeId` from boundary `boundaryId`'s continuation? */
+    const reEntersScope = (boundaryId: string, scopeId: string): boolean => {
+      const queue = unguardedTargets(boundaryId);
+      const visited = new Set<string>();
+      while (queue.length) {
+        const cur = queue.shift()!;
+        if (visited.has(cur)) continue;
+        visited.add(cur);
+        const node = nodeById.get(cur);
+        if (!node) continue;
+        // Re-entry: reached the scope itself, or a container the scope nests in
+        // (re-entering an ancestor re-enters every scope inside it).
+        if ((node.type === "transaction" || node.type === "subProcess" || cur === scopeId) && sameOrInside(scopeId, cur)) return true;
+        for (const t of unguardedTargets(cur)) queue.push(t);
+        // A path may continue via any boundary attached to the reached node.
+        for (const b of boundariesByHost.get(cur) ?? []) queue.push(b.id);
+        // An end event inside a scope P exits P: continue at P's outgoing flows
+        // and P's own boundaries (one-level hop; P itself is EXITED, not re-entered).
+        if (node.type === "endEvent" && node.scopeId !== processId) {
+          for (const t of unguardedTargets(node.scopeId)) queue.push(t);
+          for (const b of boundariesByHost.get(node.scopeId) ?? []) queue.push(b.id);
+        }
+      }
+      return false;
+    };
+    for (const n of nodes) {
+      if (n.type !== "transaction" && n.type !== "subProcess") continue;
+      for (const b of boundariesByHost.get(n.id) ?? []) {
+        const isTimerSkip = b.boundaryKind === "timer";
+        const isCancelSkip = b.boundaryKind === "cancel" && n.type === "transaction" && scopesWithCancelEnd.has(n.id);
+        if (!isTimerSkip && !isCancelSkip) continue;
+        if (reEntersScope(b.id, n.id)) {
+          const kindLabel = isTimerSkip ? `timer boundary '${b.id}'` : `cancel boundary '${b.id}'`;
+          err(
+            `Scope '${n.id}' is reachable from its own ${kindLabel} continuation along unguarded (unconditional/default) sequence flows. ` +
+              `The ${isTimerSkip ? "fired-timer" : "cancelled-transaction"} exit skips the scope's interior on rewalk, so ` +
+              "re-entry after an interrupted occurrence is deferred (M5-L1); route the boundary path forward, or guard the loop-back with a condition.",
+            n.id,
+            n.type,
+          );
+        }
+      }
     }
   }
 
@@ -1379,7 +1592,11 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     const flowsForRegion = flows.filter((f) => f.scopeId === sid);
     const input: RegionInput = {
       scopeId: sid,
-      scopeKind: scopeKindOf.get(sid)!,
+      // RegionInput["scopeKind"] predates M5-L1 and is unused inside regions.ts
+      // (declared but never read) — cast rather than widen that file's type for
+      // one inert field; a subProcess scope's SESE region validation is
+      // otherwise identical to a transaction's.
+      scopeKind: scopeKindOf.get(sid)! as unknown as RegionInput["scopeKind"],
       scopeNodes: scopeNodesForRegion as unknown as RegionInput["scopeNodes"],
       flows: flowsForRegion as unknown as RegionInput["flows"],
       outgoing,
@@ -1428,11 +1645,18 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     }
   }
 
-  // Compensation handlers must live inside a transaction.
+  // Compensation handlers must live inside a transaction — ANY ancestor scope,
+  // not just the immediate one (M5-L1 spec §6, ancestry check): a handler may sit
+  // inside a subProcess that is itself nested in a transaction.
   for (const n of nodes) {
-    if (isHandler(n) && scopeKindOf.get(n.scopeId) !== "transaction") {
+    if (!isHandler(n)) continue;
+    let inTx = false;
+    for (let s: string | null | undefined = n.scopeId; s != null && s !== processId; s = scopeParent.get(s) ?? null) {
+      if (scopeKindOf.get(s) === "transaction") { inTx = true; break; }
+    }
+    if (!inTx) {
       err(
-        `Service task '${n.id}' is isForCompensation but is not inside a <transaction>. Compensation handlers belong to a transaction scope.`,
+        `Service task '${n.id}' is isForCompensation but no enclosing scope is a <transaction> — the handler has no trigger (no Cancel can reach it).`,
         n.id,
         "serviceTask",
       );
@@ -1470,7 +1694,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       }
       for (const n of scopeNodes) {
         if (!visited.has(n.id)) {
-          err(`Element '${n.id}' is not reachable in ${sid === processId ? "the process" : `transaction '${sid}'`}.`, n.id, n.type);
+          err(`Element '${n.id}' is not reachable in ${sid === processId ? "the process" : `scope '${sid}'`}.`, n.id, n.type);
         }
       }
     }
@@ -1549,7 +1773,13 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       };
       if (n.type === "serviceTask") node.isForCompensation = n.isForCompensation === true;
       if (n.type === "intermediateCatchEvent") node.timerTrigger = n.timerTrigger ?? null; // M3-L4: the static ISO-8601 delay
-      if (n.type === "endEvent") node.endKind = n.endKind ?? "none";
+      if (n.type === "endEvent") {
+        node.endKind = n.endKind ?? "none";
+        if (n.endKind === "error") {
+          node.errorRef = n.errorRef ?? null;
+          node.errorCode = n.errorCode ?? null;
+        }
+      }
       if (n.type === "boundaryEvent") {
         node.boundaryKind = n.boundaryKind ?? null;
         node.attachedToRef = n.attachedToRef ?? null;
@@ -1585,6 +1815,25 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         childIds: members.map((m) => m.id),
         endIds: innerEnds.map((e) => e.id),
         compensations,
+      };
+    }
+
+    // M5-L1: the static scope map (spec §2) + the flat compensation wiring
+    // (spec §3.3) — element-id-keyed, superseding the per-transaction
+    // `compensations` above for scope-aware lookups (that field is retained for
+    // legacy graphs). Process-level "scope" is not itself a scope entry — only
+    // transaction and subProcess scopes are meaningful nesting boundaries.
+    const scopeMetas: Record<string, ScopeMeta> = {};
+    for (const s of scopes) {
+      if (s.kind === "process") continue;
+      const inner = nodes.find((n) => n.scopeId === s.id && n.type === "startEvent");
+      const parent = scopeParent.get(s.id) ?? null;
+      scopeMetas[s.id] = {
+        id: s.id,
+        kind: s.kind,
+        parentId: parent === processId ? null : parent,
+        depth: scopeDepth.get(s.id) ?? 1,
+        startId: inner?.id ?? "",
       };
     }
 
@@ -1637,6 +1886,8 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       ...(associationLinks.length > 0 ? { associations: associationLinks } : {}),
       ...(errorDecls.length > 0 ? { errors: errorDecls } : {}),
       ...(Object.keys(regionsByScope).length > 0 ? { regions: regionsByScope } : {}),
+      ...(Object.keys(scopeMetas).length > 0 ? { scopes: scopeMetas } : {}),
+      ...(compensationOf.size > 0 ? { compensations: Object.fromEntries(compensationOf) } : {}),
     };
   };
 

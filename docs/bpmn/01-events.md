@@ -127,16 +127,52 @@ The profile grows one milestone at a time, each gated by a constitution amendmen
 Measured against the events in this file:
 
 **Start / end events.** The **None Start Event** (instances start via the API) and the **None End Event**
-(ordinary completion / transaction commit) are the only start and terminal events. Inside a
-`transaction`, a **Cancel End Event** is also accepted — reaching it triggers reverse-order compensation
-(M1). Every other start/end trigger — message/timer/signal/conditional **start** events, and
-error/escalation/signal/message/compensation/**terminate** **end** events — is **out of scope** and
+(ordinary completion / transaction commit / subprocess exit) are the only start and terminal events. Inside
+a `transaction`, a **Cancel End Event** is also accepted — reaching it triggers reverse-order compensation
+of that transaction's owned subtree (M1; generalized to the scope-subtree model by M5-L1, see below). Since
+**M5-L1** an **Error End Event** is also accepted, at process level or inside any scope. Every other
+start/end trigger — message/timer/signal/conditional **start** events, and
+escalation/signal/message/compensation/**terminate** **end** events — remains **out of scope** and
 rejected before publish with a user-visible reason.
 
 **Boundary events.** The **compensation**, **error**, and **cancel** boundary events are in scope since
 **M1** as the canonical transaction-saga shape (a compensation marker wired to an `isForCompensation`
 handler, an error boundary, and a cancel boundary on the `transaction`). The blanket "boundary events are
-out of scope" claim held only for the original linear MVP.
+out of scope" claim held only for the original linear MVP. Since **M5-L1** the **error** and **timer**
+boundary events additionally host on a `subProcess`/`transaction` **scope**, not just a task — see below.
+
+**M5-L1 — embedded scopes + hierarchical exceptions (shipped).** Three additions, all scope-generalizing:
+
+- **Error end event** (`endEvent` + `errorEventDefinition`). Reaching it throws the error **from the scope
+  containing the end event**: the engine walks the **attachment chain** upward — boundaries on that scope
+  node first, then boundaries on each enclosing scope in turn — matching exact `@errorCode` before a
+  catch-all at each level (the same precedence an error *boundary* uses). The first match wins and catches
+  interruptingly. If the walk exhausts the chain at the process root, the error is **uncaught**: a terminal
+  incident of kind `uncaughtError` (a Hazard — no auto-compensation, Principle VI). A worker (service task)
+  uncaught error keeps the existing `serviceTaskFailure` incident kind; `uncaughtError` is specifically an
+  error **end event** reaching the root uncaught.
+- **Error and timer boundary events on a `subProcess`/`transaction`.** The same attachment-chain walk
+  applies to an error *thrown* inside a scope (not just an explicit end event) — a service task's uncaught
+  error bubbles past its own scope's boundaries to the next enclosing scope's, and so on. A **timer**
+  boundary on a scope fires exactly like a boundary timer on a task (armed at scope entry, disarmed on any
+  scope exit — normal or abnormal).
+- **Hazard-vs-Cancel on a scope catch.** When a **non-cancel** interrupting boundary on scope B catches
+  (an error boundary, or a scope timer firing), the engine **interrupts B's entire subtree without
+  compensation**: every completed step's ledger row is **retained** (`pending`/`committedLocal`), in-flight
+  work is drained (a straggler's completed job is still ledgered, never lost), and the token exits on the
+  boundary's single outgoing flow — but **no reverse pass runs** (Principle VI: only a transaction Cancel
+  triggers compensation, never an uncaught error or a non-cancel timer). The subtree's retained effects stay
+  reachable for remediation: a **later** cancel of an enclosing transaction, or an operator `/cancel`
+  (root = the whole process), walks the exited subtree via the root-relative reverse cursor (see
+  [`07-execution-semantics.md`](./07-execution-semantics.md)) and compensates them then. **Modeling
+  guidance:** if a timer boundary is meant to trigger *rollback*, route its outgoing flow to a **cancel end
+  event inside** the transaction — that is Cancel, and it does compensate. A timer routed anywhere else is
+  deliberately Hazard-class (interrupt only, ledger retained for later remediation).
+- A **cancel end inside a nested transaction** (one enclosed by another scope, not the process root) is
+  **not** instance-terminal: it compensates only its own transaction's subtree and the instance then
+  **continues running** on the cancel boundary's outgoing (failure) path in the parent scope. Only a
+  top-level transaction's cancel end, or an operator `/cancel` (compensation root = the process), settles
+  the instance terminally (`compensated` / saga-failed).
 
 **M3 — time & failure taxonomy (accepted in constitution v2.2.0, opened per validator layer — now
 shipped).** The M3 amendment adds, as drawn standard BPMN: an **interrupting boundary

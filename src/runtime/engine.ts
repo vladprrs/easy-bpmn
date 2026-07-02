@@ -72,7 +72,7 @@ import {
 } from "../util";
 import { getVersionGraph } from "../persistence/definitions";
 import { dbBatch } from "../persistence/db";
-import { hasHistoryMarkerForOccurrence, historyStmt } from "../persistence/history";
+import { hasHistoryMarkerForOccurrence, historyStmt, latestCancelRootElement, latestScopeEntryOccurrence } from "../persistence/history";
 import {
   applyTransitionStmt,
   createSubscription,
@@ -90,10 +90,12 @@ import {
 import {
   loadInst,
   isTransactionScope,
+  scopeKindOf,
   type RunStep,
   type WaitForEvent,
   type DriveResult,
 } from "./engine-shared";
+import { nearestEnclosingTx, ownedScopeIds, scopesOf, subtreeScopeIds } from "../bpmn/scope-tree";
 import { createIncident, completeInstance, recordTerminalIncident, raiseConcurrencyLimit as raiseConcurrencyLimitIncident, raiseStepBudget as raiseStepBudgetIncident } from "./incidents";
 import {
   reconstructFrontier,
@@ -107,8 +109,8 @@ import {
 import { completeInstanceGuarded } from "../persistence/instances";
 import { branchHistoryTags, listLiveTokens, setTokenStatusStmt, rootTokenId, getToken, parseOverlay, readOverlay, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
 import { withDriveLock } from "../persistence/drive-lock";
-import { driveForwardServiceTask, terminateUnleasableJob } from "./forward-task";
-import { beginCompensating, settleAfterCompensation } from "./compensation";
+import { driveForwardServiceTask, terminateUnleasableJob, errorCatchTarget } from "./forward-task";
+import { beginCompensating, settleAfterCompensation, cancelBoundaryTarget, drainScopeSubtree } from "./compensation";
 import {
   armTimerDO,
   buildBoundaryArm,
@@ -175,6 +177,14 @@ export const MAX_CONCURRENT_TOKENS = 256;
 export const STEP_BUDGET_SOFT = 20000;
 
 /**
+ * Scope-nesting depth cap (M5-L1, spec §7). Depth is fully STATIC in L1 (no
+ * callActivity / MI), so this is enforced by the VALIDATOR at publish — a
+ * fail-closed reject with element id + reason, zero runtime surface. The
+ * `scopeDepth` runtime incident becomes reachable only with M5-L2 call chains.
+ */
+export const MAX_SCOPE_DEPTH = 8;
+
+/**
  * TEST-ONLY cap overrides (design §9 / L6.1). Integration tests lower a cap via an
  * env var so a bomb fixture trips it without 256 real branches / 20000 real steps;
  * production never sets these (the `Env` fields are optional + test-only). A
@@ -227,11 +237,17 @@ async function runInstanceInner(env: Env, instanceId: string, opts: RunOptions):
   const inst = await loadInst(env, instanceId);
 
   // Resume into the reverse compensation pass (direct-mode resume / crash recovery):
-  // the cursor is re-derived from the ledger + the current (cancel-end) element.
+  // the compensation ROOT is derived from the latest transactionCancelled history row
+  // (durable + replay-safe, spec §4.3 refined). An operator cancel wrote it WITHOUT an
+  // element scope → the process root (null); an auto cancel-end wrote element_id = the
+  // cancelled transaction id. Persistence stays graph-free; the engine maps here.
   if (inst.status === "compensating") {
-    const scopeId = graph.nodes[inst.current_element_id ?? ""]?.scopeId ?? null;
-    if (!scopeId) return { status: "completed" };
-    return settleAfterCompensation(env, instanceId, graph, scopeId, opts.runStep, opts.waitFor);
+    const el = await latestCancelRootElement(env.DB, instanceId);
+    const root = el != null && graph.nodes[el]?.type === "transaction" ? el : null;
+    const settled = await settleAfterCompensation(env, instanceId, graph, root, opts.runStep, opts.waitFor);
+    if (settled.status !== "continue") return settled;
+    // Nested root settled non-terminally → fall through into the normal walk below
+    // (status is now running; the walk re-enters from start and fast-forwards).
   }
   if (isTerminalInstanceStatus(inst.status)) return { status: "completed" };
 
@@ -317,6 +333,14 @@ async function loop(
     return rawRunStep(name, fn);
   };
 
+  // Walk-local map of each transaction scope's CURRENT entry occurrence (M5-L1
+  // Task 8). A cancel end must stamp the cancelled TRANSACTION's occurrence into the
+  // transactionCancelled marker (not the cancel-end's own occurrence — under
+  // re-entry they diverge), so the rewalk fast-forward can skip exactly the
+  // cancelled occurrence. driveLeaf records it when it enters a transaction and reads
+  // it at the enclosed cancel end. Re-derived deterministically each rewalk.
+  const scopeEntryOcc = new Map<string, number>();
+
   // The per-node leaf dispatch (design §5.1: `driveLeaf`) — the SINGLE source of
   // node handling for BOTH the single-token scalar walk and the region DFS. It
   // returns a `LeafOutcome`; the existing per-kind drivers are reused verbatim,
@@ -334,10 +358,42 @@ async function loop(
         return { kind: "next", next: await runStep(`start:${tag}`, () => enterStart(env, instanceId, graph, cur, occ, node)) };
       }
 
-      if (node.type === "transaction") {
-        const innerStart = graph.transactions?.[cur]?.startId;
+      if (node.type === "transaction" || node.type === "subProcess") {
+        // M5-L1 (Task 11, spec §5.3-§5.4, Hazard-vs-Cancel): a fired scope-hosted
+        // boundary timer already interrupted THIS occurrence WITHOUT compensation —
+        // the fire batch (planBoundaryTimerFire) already moved current_element_id to
+        // the boundary target; the subtree drain is deferred here (atomicity: the
+        // fire batch stays single-batch) and is idempotent (retain-only) to re-run on
+        // every later rewalk that still lands on this node/occurrence.
+        const tb = timerBoundaryFor(graph, cur);
+        if (tb && (await timerHasFired(env, instanceId, tb, occ))) {
+          await runStep(`scope-timer-exit:${tag}`, () => drainScopeSubtree(env, graph, instanceId, cur));
+          return { kind: "next", next: tb.node.next! };
+        }
+        // M5-L1 (Task 8): cancelled-tx rewalk fast-forward — a re-walk must NOT
+        // re-enter a nested tx whose occurrence already cancelled+settled (else the
+        // cancel end re-fires beginCompensating on a now-running instance). Keyed by
+        // the transaction's OWN occurrence (the marker stamped it), so an earlier
+        // COMMITTED occurrence of the same tx (no cancel marker at that occ) is
+        // re-entered and fast-forwarded normally.
+        if (node.type === "transaction" && (await visitApplied(env, instanceId, cur, occ, "transactionCancelled"))) {
+          const target = cancelBoundaryTarget(graph, cur);
+          if (target) return { kind: "next", next: target };
+          return { kind: "completed" }; // top-level cancelled tx: terminal settle owns the instance
+        }
+        // M5-L1: a plain subProcess is a bookkeeping scope, driven by the SAME
+        // enter/park-free pattern as a transaction — just no ledger commit on exit.
+        const meta = scopesOf(graph)[cur];
+        const innerStart = meta?.startId || graph.transactions?.[cur]?.startId;
         if (!innerStart) return { kind: "completed" }; // malformed (validator guards this)
-        return { kind: "next", next: await runStep(`tx:${tag}`, () => enterTransaction(env, instanceId, cur, occ, innerStart)) };
+        // Record this entry's occurrence (Task 8's cancel-end lookup; Task 11's
+        // scope-timer disarm) for BOTH scope kinds — a nested subProcess boundary
+        // timer's disarm site also needs it (engine's Task 10 error-end branch).
+        scopeEntryOcc.set(cur, occ);
+        if (node.type === "transaction") {
+          return { kind: "next", next: await runStep(`tx:${tag}`, () => enterTransaction(env, instanceId, graph, cur, occ, innerStart)) };
+        }
+        return { kind: "next", next: await runStep(`scope:${tag}`, () => enterScope(env, instanceId, graph, cur, occ, innerStart)) };
       }
 
       if (node.type === "serviceTask" && !node.isForCompensation) {
@@ -403,13 +459,116 @@ async function loop(
       }
 
       if (node.type === "endEvent") {
+        if (node.endKind === "error") {
+          // M5-L1 (Task 10, spec §5.2): an error END event THROWS from its
+          // enclosing scope via the SAME hierarchical attachment-chain walk as a
+          // worker-task business error (errorCatchTarget, Task 9) — level 0 is a
+          // no-op (boundaries never attach to end events), so the chain
+          // effectively starts at the enclosing scope. Caught → drain the catch
+          // host's subtree, write the abnormal-exit audit, and continue on the
+          // boundary's target — like a cancel end, this NEVER settles the
+          // instance itself. Uncaught at the process root → a NEW `uncaughtError`
+          // incident kind (worker-task uncaught errors keep `serviceTaskFailure`).
+          //
+          // Fast-forward (idempotency): `errorCatchTarget` is a pure function of
+          // the immutable graph + the persisted errorCode — deterministic
+          // regardless of when it is recomputed. Once the caught branch's batch
+          // below has committed (the `errorEndThrown` marker exists), a rewalk
+          // re-derives the SAME target write-free instead of re-draining.
+          if (await visitApplied(env, instanceId, cur, occ, "errorEndThrown")) {
+            const target = errorCatchTarget(graph, cur, node.errorCode ?? null);
+            return { kind: "next", next: target!.next };
+          }
+          const catchT = errorCatchTarget(graph, cur, node.errorCode ?? null);
+          if (catchT) {
+            const next = await runStep(`err-end:${tag}`, async () => {
+              // Idempotent retain-only (Task 8) — safe to re-run on a step retry.
+              await drainScopeSubtree(env, graph, instanceId, catchT.hostId);
+              const inst = await loadInst(env, instanceId);
+              const now = nowIso();
+              // M5-L1 (Task 11): the catching scope (`catchT.hostId` is always a
+              // scope for an error END — boundaries never attach to end events, so
+              // level 0 is always a no-op) may ALSO carry its own boundary timer —
+              // disarm it ATOMICALLY with this abnormal exit. Prefer the walk-local
+              // entry occurrence (scopeEntryOcc, recorded for every scope this SAME
+              // walk visited); fall back to the durable marker for a defensive resume.
+              const scopeOcc = scopeEntryOcc.get(catchT.hostId) ?? (await latestScopeEntryOccurrence(env.DB, instanceId, catchT.hostId));
+              const stmts: D1PreparedStatement[] = [
+                // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
+                historyStmt(env.DB, {
+                  workspaceId: inst.workspace_id,
+                  instanceId,
+                  elementId: cur,
+                  type: "errorEndThrown",
+                  diagnostics: { errorCode: node.errorCode, caughtBy: catchT.boundaryId, occurrence: occ },
+                }),
+                historyStmt(env.DB, {
+                  workspaceId: inst.workspace_id,
+                  instanceId,
+                  elementId: catchT.hostId,
+                  type: "scopeExited",
+                  diagnostics: { scope: catchT.hostId, via: catchT.boundaryId, abnormal: true, occurrence: scopeOcc },
+                }),
+                applyTransitionStmt(env.DB, { instanceId, currentElementId: catchT.next, status: "running", now }),
+              ];
+              const cancelSettle = buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: catchT.hostId, occ: scopeOcc, now });
+              if (cancelSettle) stmts.push(...cancelSettle.stmts);
+              try {
+                await dbBatch(env.DB, stmts);
+              } catch (err) {
+                if (isUniqueConstraintViolation(err)) {
+                  // The scope's OWN timer fired first — its fire batch already moved
+                  // current_element_id to ITS boundary target; convert to that instead.
+                  const converted = await convertOnFire(env, graph, instanceId, catchT.hostId, scopeOcc);
+                  if (converted) return converted;
+                }
+                throw err;
+              }
+              return catchT.next;
+            });
+            return { kind: "next", next };
+          }
+          await runStep(`err-end:${tag}`, () =>
+            createIncident(
+              env,
+              instanceId,
+              cur,
+              0,
+              `Uncaught error end event ('${node.errorCode}') reached the process root.`,
+              { errorCode: node.errorCode },
+              "uncaughtError",
+            ),
+          );
+          return { kind: "incident" };
+        }
         if (node.endKind === "cancel" && isTransactionScope(graph, node.scopeId)) {
-          await runStep(`cancel:${tag}`, () => beginCompensating(env, instanceId, node.scopeId!, cur));
+          // Stamp the cancelled TRANSACTION's occurrence (Task 8): the tx's current
+          // entry occurrence recorded when driveLeaf entered it this walk (falls back
+          // to the cancel-end occ for a pre-entry resume, equal in the single-entry case).
+          const scopeOcc = scopeEntryOcc.get(node.scopeId!) ?? occ;
+          const beginOutcome = await runStep(`cancel:${tag}`, () => beginCompensating(env, instanceId, graph, node.scopeId!, cur, scopeOcc));
+          // M5-L1 (Task 11): the transaction's own boundary timer raced the cancel
+          // end and fired FIRST (Hazard beat Cancel) — its fire batch already moved
+          // current_element_id to its boundary target; take that path instead of
+          // starting the reverse pass.
+          if (beginOutcome.kind === "convertedToTimer") return { kind: "next", next: beginOutcome.next };
           return { kind: "compensate", scopeId: node.scopeId!, elementId: cur };
         }
         if (isTransactionScope(graph, node.scopeId)) {
           // Inner none end → COMMIT the transaction → continue on its outer flow.
-          return { kind: "next", next: await runStep(`commit:${tag}`, () => commitTransaction(env, instanceId, graph, node.scopeId!, cur, occ)) };
+          // The SCOPE's entry occurrence (walk-local, same rule as the cancel-end
+          // branch above): the tx's boundary timer was armed at the TX's occurrence,
+          // and planBoundaryTimerFire's own-exit guard reads the transactionCommitted
+          // marker at that same occurrence — the end element's occ diverges under
+          // re-entry, so the disarm/marker stamp must use the scope's occ.
+          const scopeOcc = scopeEntryOcc.get(node.scopeId!) ?? occ;
+          return { kind: "next", next: await runStep(`commit:${tag}`, () => commitTransaction(env, instanceId, graph, node.scopeId!, cur, occ, scopeOcc)) };
+        }
+        if (scopeKindOf(graph, node.scopeId) === "subProcess") {
+          // Inner none end of a subProcess → bookkeeping exit; NO ledger mutation (spec §2).
+          // Same scope-entry-occurrence rule as the commit branch above.
+          const scopeOcc = scopeEntryOcc.get(node.scopeId!) ?? occ;
+          return { kind: "next", next: await runStep(`scope-end:${tag}`, () => exitScope(env, instanceId, graph, node.scopeId!, cur, occ, scopeOcc)) };
         }
         // Process-level none end. A single-token (M0–M3) instance completes
         // DIRECTLY — byte-identical to the old loop. In a region graph, last-token-
@@ -524,7 +683,13 @@ async function loop(
           break;
         }
         if (r.kind === "incident") return { status: "incident" };
-        if (r.kind === "compensate") return settleAfterCompensation(env, instanceId, graph, r.scopeId, runStep, waitFor);
+        if (r.kind === "compensate") {
+          const settled = await settleAfterCompensation(env, instanceId, graph, r.scopeId, runStep, waitFor);
+          // Nested cancel-end → the instance continues on the cancel boundary's
+          // failure target within THIS walk; otherwise the settle is terminal.
+          if (settled.status === "continue") { cur = settled.next; continue; }
+          return settled;
+        }
         return { status: "completed" }; // completed | consumed (consumed is unreachable without regions)
       }
       if (parked) {
@@ -543,7 +708,13 @@ async function loop(
   while (true) {
     const result = await driveFrontier(env, graph, instanceId, drivers, MAX_ELEMENT_OCCURRENCES, caps);
     if (result.incident) return { status: "incident" };
-    if (result.compensate) return settleAfterCompensation(env, instanceId, graph, result.compensate.scopeId, runStep, waitFor);
+    if (result.compensate) {
+      const settled = await settleAfterCompensation(env, instanceId, graph, result.compensate.scopeId, runStep, waitFor);
+      // Nested cancel-end → re-enter the frontier DFS (it re-walks and fast-forwards
+      // through the cancelled tx to the cancel boundary target); else terminal.
+      if (settled.status !== "continue") return settled;
+      continue;
+    }
     if (result.completed) return { status: "completed" };
     if (result.parked) {
       if (!(await issueWake())) return { status: "waiting" }; // direct mode parks; the next callback re-drives
@@ -632,8 +803,8 @@ async function enterStart(env: Env, instanceId: string, graph: ExecutionGraph, e
   if (await visitApplied(env, instanceId, elementId, occ, "elementEntered")) return next; // write-free rewalk
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
-  if (isTransactionScope(graph, node.scopeId)) {
-    // Inner transaction start — just advance (the transaction node already audited entry).
+  if (scopeKindOf(graph, node.scopeId) != null) {
+    // Inner transaction/subProcess start — just advance (the scope node already audited entry).
     await dbBatch(env.DB, [
       // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
       historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "elementEntered", diagnostics: { elementType: "startEvent", scope: node.scopeId, occurrence: occ } }),
@@ -650,31 +821,117 @@ async function enterStart(env: Env, instanceId: string, graph: ExecutionGraph, e
   return next;
 }
 
-async function enterTransaction(env: Env, instanceId: string, txId: string, occ: number, innerStart: string): Promise<string> {
+async function enterTransaction(env: Env, instanceId: string, graph: ExecutionGraph, txId: string, occ: number, innerStart: string): Promise<string> {
   if (await visitApplied(env, instanceId, txId, occ, "transactionEntered")) return innerStart; // write-free rewalk
   const inst = await loadInst(env, instanceId);
+  const now = nowIso();
+  // M5-L1 (Task 11, spec §5.4): arm the transaction's own boundary timer (if any)
+  // in the SAME entry batch — persist-before-advance; arm the DO after commit.
+  const arm = buildBoundaryArm(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: txId, occ, now });
   await dbBatch(env.DB, [
     // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionEntered", diagnostics: { transaction: txId, traceId: traceIdFor(instanceId), occurrence: occ } }),
-    applyTransitionStmt(env.DB, { instanceId, currentElementId: innerStart, status: "running", now: nowIso() }),
+    applyTransitionStmt(env.DB, { instanceId, currentElementId: innerStart, status: "running", now }),
+    ...(arm ? arm.stmts : []),
   ]);
+  if (arm) await armTimerDO(env, arm.timerId, arm.fireAt);
   return innerStart;
 }
 
-async function commitTransaction(env: Env, instanceId: string, graph: ExecutionGraph, txId: string, endElementId: string, occ: number): Promise<string> {
+async function commitTransaction(env: Env, instanceId: string, graph: ExecutionGraph, txId: string, endElementId: string, occ: number, scopeOcc: number): Promise<string> {
   const txNode = graph.nodes[txId];
   const outer = txNode?.next ?? null;
   if (await visitApplied(env, instanceId, endElementId, occ, "elementEntered")) return outer ?? endElementId; // write-free rewalk
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
-  await dbBatch(env.DB, [
-    // Terminalize this scope's ledger so a later cancel can't re-compensate it.
-    markScopeStepsCommittedStmt(env.DB, { instanceId, scopeId: txId, now }),
+  // M5-L1 commit shield (spec §3.2): a NESTED tx (some enclosing tx above it) flips
+  // only its OWNED scopes to non-terminal committedLocal; the OUTERMOST commit seals
+  // its whole subtree to terminal 'committed'.
+  const parentScope = scopesOf(graph)[txId]?.parentId ?? null;
+  const enclosingTx = nearestEnclosingTx(graph, parentScope);
+  const flip = enclosingTx != null
+    ? markScopeStepsCommittedStmt(env.DB, { instanceId, scopeIds: ownedScopeIds(graph, txId), seal: false, now })
+    : markScopeStepsCommittedStmt(env.DB, { instanceId, scopeIds: subtreeScopeIds(graph, txId), seal: true, now });
+  const stmts: D1PreparedStatement[] = [
+    flip,
     // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: endElementId, type: "elementEntered", diagnostics: { elementType: "endEvent", endKind: "none", scope: txId, occurrence: occ } }),
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionCommitted", diagnostics: { transaction: txId } }),
+    // `occurrence` (M5-L1 Task 11): planBoundaryTimerFire's scope-host GUARD reads
+    // this marker's occurrence to decide whether the tx's visit already exited —
+    // absent folds to 0 (backward-safe for pre-M5-L1 history rows). It MUST be the
+    // TX's entry occurrence (`scopeOcc`, the occurrence the timer was armed at),
+    // NOT the end element's walk occurrence — the two diverge under re-entry.
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionCommitted", diagnostics: { transaction: txId, sealed: enclosingTx == null, occurrence: scopeOcc } }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: outer ?? endElementId, status: "running", now }),
+  ];
+  // M5-L1 (Task 11): disarm the tx's own boundary timer (if any) ATOMICALLY with
+  // the commit — a fired timer would otherwise be stranded 'armed' on a committed tx.
+  // Keyed by the TX's entry occurrence (the arm site), not the end element's occ.
+  const cancelSettle = buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: txId, occ: scopeOcc, now });
+  if (cancelSettle) stmts.push(...cancelSettle.stmts);
+  try {
+    await dbBatch(env.DB, stmts);
+  } catch (err) {
+    if (isUniqueConstraintViolation(err)) {
+      // The timer fired first (Hazard beat Cancel/commit) — its fire batch already
+      // moved current_element_id to the boundary target; convert instead of
+      // committing (the ledger stays retained, NOT sealed committed).
+      const converted = await convertOnFire(env, graph, instanceId, txId, scopeOcc);
+      if (converted) return converted;
+    }
+    throw err;
+  }
+  return outer ?? endElementId;
+}
+
+// ---------------------------------------------------------------------------
+// M5-L1: plain subProcess enter / exit — bookkeeping scope, NO ledger mutation
+// ---------------------------------------------------------------------------
+
+async function enterScope(env: Env, instanceId: string, graph: ExecutionGraph, scopeId: string, occ: number, innerStart: string): Promise<string> {
+  if (await visitApplied(env, instanceId, scopeId, occ, "scopeEntered")) return innerStart; // write-free rewalk
+  const inst = await loadInst(env, instanceId);
+  const now = nowIso();
+  // M5-L1 (Task 11, spec §5.4): arm the subProcess's own boundary timer (if any) in
+  // the SAME entry batch — persist-before-advance; arm the DO after commit.
+  const arm = buildBoundaryArm(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: scopeId, occ, now });
+  await dbBatch(env.DB, [
+    // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: scopeId, type: "scopeEntered", diagnostics: { scope: scopeId, kind: "subProcess", occurrence: occ } }),
+    applyTransitionStmt(env.DB, { instanceId, currentElementId: innerStart, status: "running", now }),
+    ...(arm ? arm.stmts : []),
   ]);
+  if (arm) await armTimerDO(env, arm.timerId, arm.fireAt);
+  return innerStart;
+}
+
+async function exitScope(env: Env, instanceId: string, graph: ExecutionGraph, scopeId: string, endElementId: string, occ: number, scopeOcc: number): Promise<string> {
+  const outer = graph.nodes[scopeId]?.next ?? null;
+  if (await visitApplied(env, instanceId, endElementId, occ, "elementEntered")) return outer ?? endElementId; // write-free rewalk
+  const inst = await loadInst(env, instanceId);
+  const now = nowIso();
+  const stmts: D1PreparedStatement[] = [
+    // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: endElementId, type: "elementEntered", diagnostics: { elementType: "endEvent", endKind: "none", scope: scopeId, occurrence: occ } }),
+    // `occurrence` = the SCOPE's entry occurrence (`scopeOcc` — the occurrence its
+    // boundary timer was armed at, read by planBoundaryTimerFire's own-exit guard),
+    // NOT the end element's walk occurrence: the two diverge under re-entry.
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: scopeId, type: "scopeExited", diagnostics: { scope: scopeId, occurrence: scopeOcc } }),
+    applyTransitionStmt(env.DB, { instanceId, currentElementId: outer ?? endElementId, status: "running", now }),
+  ];
+  // M5-L1 (Task 11): disarm the subProcess's own boundary timer (if any) ATOMICALLY
+  // with this normal exit. Keyed by the SCOPE's entry occurrence (the arm site).
+  const cancelSettle = buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: scopeId, occ: scopeOcc, now });
+  if (cancelSettle) stmts.push(...cancelSettle.stmts);
+  try {
+    await dbBatch(env.DB, stmts);
+  } catch (err) {
+    if (isUniqueConstraintViolation(err)) {
+      const converted = await convertOnFire(env, graph, instanceId, scopeId, scopeOcc);
+      if (converted) return converted;
+    }
+    throw err;
+  }
   return outer ?? endElementId;
 }
 

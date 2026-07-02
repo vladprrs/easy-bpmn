@@ -1,20 +1,27 @@
 # 09 — The `easy-bpmn` BPMN Profile
 
 This is the **contract** between the BPMN standard and what `easy-bpmn` actually executes. It is the
-operational reading of the [constitution](../../.specify/memory/constitution.md) (now **v2.3.1**, with
+operational reading of the [constitution](../../.specify/memory/constitution.md) (now **v2.5.0**, with
 the widened **Principle I — "Standard BPMN Profile Only"** covering the M2 conditional set, **the M3
 time-&-failure-taxonomy set** — interrupting boundary timers, timer/message intermediate catch events,
-the `eventBasedGateway`, and free error-boundary routing — **and the M4 in-instance concurrency set**
-(block-structured `parallelGateway` (AND) / `inclusiveGateway` (OR), SESE-only) — and **Principle VI —
-"SAGA / Compensation Integrity"**, redefined per causal chain with a multi-token completion rule). The M3
+the `eventBasedGateway`, and free error-boundary routing — **the M4 in-instance concurrency set**
+(block-structured `parallelGateway` (AND) / `inclusiveGateway` (OR), SESE-only) — **and the M5 composition
+set** (embedded `subProcess`, scope-hosted error/timer boundaries, the error end event, `callActivity`,
+`multiInstance`, escalation, signal, and the first non-interrupting signal/escalation boundaries) — and
+**Principle VI — "SAGA / Compensation Integrity"**, redefined per causal chain with a multi-token
+completion rule, and generalized to a scope subtree by M5). The M3
 set was **accepted in v2.2.0 and opened per validator layer**, and the whole set has now **shipped
 (M3-L2/L3/L4)**: free error-boundary routing, interrupting boundary timers, **both** the **timer** and the
 **message** intermediate catch, and the `eventBasedGateway` (the timer/message race). The M4 concurrency
 set was **accepted in v2.3.0** and has now **shipped**: block-structured `parallelGateway` (AND) regions
 (token frontier + AND-join) through **M4-L3**, `inclusiveGateway` (OR) regions through **M4-L4**,
 parallel-branch compensation through **M4-L5**, and the concurrency caps, R2 overlay offload, per-token
-observability, and the `tokens` inspection array through **M4-L6**. When in doubt, the constitution wins. The
-authoritative designs are
+observability, and the `tokens` inspection array through **M4-L6**. The **whole M5 composition set was
+accepted, up front, in v2.5.0** and its runtime is now **opening per layer**: **M5-L1 (embedded scopes +
+hierarchical exceptions) is opening** — see the interim markers below; M5-L2 (`callActivity`), M5-L3
+(`multiInstance`), M5-L4 (escalation + event subprocess), and M5-L5 (signal) remain **accepted-in-
+governance, interim-rejected at publish** until their own layers open. When in doubt, the constitution
+wins. The authoritative designs are
 [`2026-06-08-saga-orchestrator-design.md`](../superpowers/specs/2026-06-08-saga-orchestrator-design.md)
 (M1) and
 [`2026-06-09-m2-conditional-sagas-design.md`](../superpowers/specs/2026-06-09-m2-conditional-sagas-design.md)
@@ -59,8 +66,12 @@ The profile grows one milestone at a time, each guarded by a constitution amendm
   parallel-branch (straggler-catching) compensation. Execution semantics in
   [`07-execution-semantics.md`](./07-execution-semantics.md); gateway routing in
   [`03-gateways.md`](./03-gateways.md).
-- **M5 → composition** (`callActivity`, non-transaction `subProcess`, `multiInstance`,
-  `signal`/`escalation`): [`02-activities.md`](./02-activities.md).
+- **M5 → composition — ACCEPTED IN FULL v2.5.0, opening per layer** — the whole composition set (embedded
+  `subProcess`, scope-hosted error/timer boundaries, an error end event, `callActivity`,
+  `multiInstanceLoopCharacteristics`, `escalation`, `signal`, and the first non-interrupting
+  signal/escalation boundaries) was accepted by the single M5 amendment; the runtime opens **per layer**,
+  M5-L1 through M5-L5. **M5-L1 (embedded scopes + hierarchical exceptions) is opening now** — see the
+  interim markers below. [`02-activities.md`](./02-activities.md).
 
 ## What "no custom notation" means (precisely)
 
@@ -337,19 +348,69 @@ duplicate publishes. See the supported element set above and **rule 16**.
 Every M3 construct's row has moved into the supported element set above and the validator
 accepts-and-validates it. No construct remains in the interim (rejected-until-its-layer-ships) state.
 
+### Accepted in v2.5.0 (M5) — composition, opening per layer
+
+The **whole** M5 composition set — non-transaction `subProcess`, error/timer boundaries on a
+`subProcess`/`transaction`, an error end event, `callActivity`, `multiInstanceLoopCharacteristics`
+(parallel and sequential), `escalation` throw/boundary + event subprocess, `signal` throw/catch, and the
+first non-interrupting boundary events (signal/escalation only) — was **accepted by the constitution
+(Principle I, v2.5.0) up front**, per the single-amendment governance lane (decomposition doc §5). Unlike
+M3/M4, where each amendment accepted a set that then opened across a run of layers within the *same*
+milestone, M5 is decomposed into **five ordered runtime layers under one milestone** (M5-L1…L5); v2.5.0
+accepts the entire five-layer set in one MINOR bump, and the runtime opens **one layer at a time**, each
+layer recording its own Constitution Check (`specs/002-saga-orchestrator/m5-L{N}-constitution-check.md`)
+and flipping its own construct rows here from "accepted-in-governance, interim-rejected-at-publish" to
+"runtime open" — exactly the discipline the M3 (L2–L4) and M4 (L1–L6) amendments established. The
+[decomposition design](../superpowers/specs/2026-06-20-m5-composition-design.md) (the 5-layer split,
+adversarially hardened) and the [M5-L1 layer design](../superpowers/specs/2026-07-02-m5-l1-embedded-scopes-design.md)
+are the source artifacts; the recorded [M5-L1 Constitution Check](../../specs/002-saga-orchestrator/m5-L1-constitution-check.md)
+is the first layer's governance record.
+
+**M5-L1 (embedded scopes + hierarchical exceptions) — runtime opening in this layer:**
+
+- Plain embedded `bpmn:subProcess` (one none-start, ≥1 end, sharing the parent variable scope; arbitrary
+  nesting of `subProcess`/`transaction`) — **runtime opening in this layer**.
+- Error and timer `boundaryEvent`s hosted on a `subProcess`/`transaction` (a non-cancel interrupting
+  boundary interrupts **without** auto-compensation, ledger retained) — **runtime opening in this layer**.
+- The error **end** event (`endEvent` + `errorEventDefinition`) — **runtime opening in this layer**.
+- Hierarchical (up-scope) error bubbling and the generalized scope-subtree compensation model (commit
+  shield, straggler cohort, live-token barrier, compensation-reachability ancestry check) —
+  **runtime opening in this layer**.
+- `MAX_SCOPE_DEPTH` (publish-time cap on scope nesting depth) — **runtime opening in this layer**.
+
+**M5-L2…L5 — accepted (v2.5.0), runtime not yet open — publish still rejects (interim):**
+
+- `bpmn:callActivity` (M5-L2) — **accepted (v2.5.0), runtime not yet open — publish still rejects
+  (interim)**; stays in the whitelist reject with an M5-L2 roadmap pointer until that layer opens it.
+- `multiInstanceLoopCharacteristics` (parallel and sequential, M5-L3) — **accepted (v2.5.0), runtime not
+  yet open — publish still rejects (interim)**.
+- `escalation` throw/boundary and the event subprocess (`triggeredByEvent="true"`, M5-L4) — **accepted
+  (v2.5.0), runtime not yet open — publish still rejects (interim)**.
+- `signal` throw/catch, workspace-scoped 1:N broadcast (M5-L5) — **accepted (v2.5.0), runtime not yet
+  open — publish still rejects (interim)**.
+- The first non-interrupting boundary events, accepted only for signal/escalation (M5-L4/L5) — **accepted
+  (v2.5.0), runtime not yet open — publish still rejects (interim)** until their hosting construct's layer
+  opens.
+
+**Deferred beyond M5 (not opened by any M5 layer):** the `compensateEventDefinition` boundary on a
+subProcess (compensate-as-unit) stays deferred **post-M5** (decomposition §6 M5-L1 decision 6) — in M5-L1 a
+subProcess's completed steps are simply rows in the enclosing transaction's ledger, not a separately
+compensatable unit.
+
 ### Still deferred (need a future constitution amendment)
 
-These remain out of scope; each requires its own later-milestone amendment first (v2.3.0 opens only the
-block-structured parallel/inclusive concurrency set noted above):
+These remain out of scope; each requires its own later-milestone amendment first (v2.5.0 opens the whole
+M5 composition set noted above — up front, per layer — plus the M2/M4 sets noted earlier; nothing below is
+opened by it):
 
 | Category | Rejected elements |
 |----------|-------------------|
 | Tasks | abstract `task`, `userTask`, `sendTask`, `manualTask`, `scriptTask`, `businessRuleTask` |
-| Events | timer **start** events, `signal` / `escalation` / `conditional` / `link` event definitions; **non-interrupting** boundary timers and `timeCycle` triggers (M4); `intermediateThrowEvent`; **non-catch** message events (message throw/end); terminate end; a non-cancel end-event definition. (Interrupting boundary timers **and both the timer and the message intermediate catch** are shipped — see the supported set above; not here.) |
+| Events | timer **start** events, `conditional` / `link` event definitions; a **top-level (process-level)** `signal` start event; **non-interrupting** *timer or conditional* boundary events and `timeCycle` triggers; `intermediateThrowEvent` other than `escalation`/`signal` (M5-L4/L5); **non-catch** message events (message throw/end); `compensateEventDefinition` on a throw/end; terminate end; a non-cancel end-event definition. (Interrupting boundary timers **and both the timer and the message intermediate catch** are shipped — see the supported set above; not here. `signal`/`escalation` throw/boundary/event-subprocess-start and **non-interrupting** signal/escalation boundaries are **M5-accepted (v2.5.0)** — see the M5 interim markers above; not here. An error **end** event is **M5-L1-accepted and opening now** — see above; not here.) |
 | Gateways | `complexGateway` (not on the roadmap), and any **implicit split (>1 outgoing sequence flow on a non-gateway node)** — pointers in lockstep with `DEFERRED_GATEWAY_REASONS` (`src/bpmn/profile.ts`). (`eventBasedGateway` is M3-accepted and **shipped at L4**; `parallelGateway`/`inclusiveGateway` are **M4-accepted and SESE-validated at publish since M4-L1** — all see the supported set above.) |
-| Flow | `conditionExpression` on any flow **not leaving an `exclusiveGateway`**, a `default` attribute on a non-gateway node, `messageFlow`, a sequence flow crossing a transaction boundary |
-| Structure | non-transaction `subProcess`, `adHocSubProcess`, `callActivity`, `collaboration`, `participant` (pools), `laneSet`/`lane`, `choreography` |
-| Loops/data | `multiInstanceLoopCharacteristics`, `standardLoopCharacteristics` (the activity **markers** — distinct from the accepted M2 cycles drawn as sequence flows through a gateway), `dataObject`/`dataStore`/`dataInput`/`dataOutput` |
+| Flow | `conditionExpression` on any flow **not leaving an `exclusiveGateway`**, a `default` attribute on a non-gateway node, `messageFlow`, a sequence flow crossing a transaction boundary (a scope boundary, generalized by M5-L1 — see above) |
+| Structure | `adHocSubProcess`, `collaboration`, `participant` (pools), `laneSet`/`lane`, `choreography`, a non-process `calledElement` (GlobalTask). (Non-transaction `subProcess` is **M5-L1-accepted and opening now**; `callActivity` is **M5-accepted (v2.5.0), runtime not yet open until M5-L2** — see the M5 interim markers above; neither is here.) |
+| Loops/data | `standardLoopCharacteristics` (the activity **marker** — distinct from the accepted M2 cycles drawn as sequence flows through a gateway and from `multiInstanceLoopCharacteristics`), MI's standard ItemAwareElement data bindings (`loopDataInputRef`/`loopDataOutputRef`/`inputDataItem`/`outputDataItem`), an MI with no recognized cardinality source, `dataObject`/`dataStore`/`dataInput`/`dataOutput`. (`multiInstanceLoopCharacteristics` itself is **M5-accepted (v2.5.0), runtime not yet open until M5-L3** — see the M5 interim markers above; not here.) |
 | Model instantiation | `receiveTask instantiate="true"` (or any non-none instantiation path) |
 | Platform | built-in tasklist, forms/assignment, process migration, full Zeebe/Camunda compatibility, visual modeler, advanced Operate-style UI |
 
@@ -527,7 +588,12 @@ expression — each with the offending element id.
   completion, and parallel-branch (straggler-catching) compensation; plus the concurrency caps, R2 overlay
   offload, per-token observability, and the `tokens` inspection array.
   [`07-execution-semantics.md`](./07-execution-semantics.md), [`03-gateways.md`](./03-gateways.md).
-- **M5 — composition:** `callActivity`, non-transaction `subProcess`, `multiInstance`, `signal`/`escalation`.
+- **M5 — composition: ACCEPTED IN FULL (constitution v2.5.0), opening per layer** — non-transaction
+  `subProcess`, scope-hosted error/timer boundaries, an error end event, `callActivity`,
+  `multiInstanceLoopCharacteristics`, `escalation`, `signal`, and the first non-interrupting
+  signal/escalation boundaries. **M5-L1 (embedded scopes + hierarchical exceptions) is opening now** — see
+  [Accepted in v2.5.0 (M5)](#accepted-in-v250-m5--composition-opening-per-layer) above; M5-L2
+  (`callActivity`) through M5-L5 (`signal`) remain interim-rejected until their own layers open.
   [`02-activities.md`](./02-activities.md).
 
 > Any expansion of this profile requires amending the constitution first (Governance & scope). This file
@@ -536,4 +602,9 @@ expression — each with the offending element id.
 > validator runtime ships in a later layer — that gap is **named explicitly** in the
 > [Accepted in v2.2.0, opened per validator layer](#explicitly-out-of-scope-must-be-rejected-before-publish)
 > section, so a constitution-allowed construct rejected until its layer ships is documented behavior, not
-> drift. The full M3 **and M4** sets have now shipped, so no such gap currently exists.
+> drift. The full M3 **and M4** sets have shipped. **M5 currently has such a gap by design**: the whole
+> composition set is constitution-accepted (v2.5.0) up front, but only the M5-L1 subset is runtime-open —
+> M5-L2 through M5-L5 are named, individually, in the
+> [Accepted in v2.5.0 (M5)](#accepted-in-v250-m5--composition-opening-per-layer) section above as
+> "accepted, runtime not yet open — publish still rejects (interim)", so each remains documented behavior,
+> not drift, until its own layer lands.

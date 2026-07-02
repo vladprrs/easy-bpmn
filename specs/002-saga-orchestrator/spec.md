@@ -17,7 +17,10 @@ This specification covers **Milestone M1 — Canonical transaction-saga
 (multi-microservice)**, which alone satisfies the literal "SAGA orchestrator for
 multiple microservices" ask. M2 (conditional sagas), M3 (time/failure taxonomy),
 and M4 (concurrency) have since shipped — the M4 concurrency section is appended
-below; **M5 (composition)** is the next milestone, tracked in the roadmap.
+below; **M5 (composition)** is the current (and last) roadmap milestone, opened by
+the constitution v2.5.0 amendment and decomposed into five runtime layers
+(M5-L1…L5) — the **M5-L1 (embedded scopes + hierarchical exceptions)** section is
+appended below.
 
 ## Constitution Alignment *(mandatory)*
 
@@ -811,3 +814,325 @@ within their lineage.
    (`tests/integration/parallel-gateway.test.ts`).
 4. **parallel-branch-compensation** — straggler ledger, quiescence barrier, lineage-ordered
    reverse, quiesced settle (`tests/integration/parallel-compensation.test.ts`).
+
+## M5-L1: Embedded Scopes + Hierarchical Exceptions
+
+**Constitution**: v2.5.0 (MINOR — the single M5 amendment, accepted whole; this layer opens the M5-L1
+runtime subset)
+**Design source**: `docs/superpowers/specs/2026-07-02-m5-l1-embedded-scopes-design.md` (normative for
+M5-L1; wins where more specific than the decomposition doc), `docs/superpowers/specs/2026-06-20-m5-composition-design.md`
+§6 M5-L1 (decomposition), `specs/002-saga-orchestrator/m5-L1-constitution-check.md` (recorded Constitution
+Check)
+**Status**: Governance opened (this section, Task 1 of the M5-L1 plan); implementation not yet started.
+Plan: `docs/superpowers/plans/2026-07-02-m5-l1-embedded-scopes.md` (15 tasks, TDD, governance-first).
+
+### Constitution Alignment
+
+**BPMN Profile Impact** (Principle I, widened to v2.5.0, this layer's runtime subset): M5-L1 opens the
+validator/runtime for plain embedded `bpmn:subProcess` (one none-start, ≥1 end, shares the parent variable
+scope, arbitrary nesting of subProcess/transaction), error and timer `boundaryEvent`s hosted on a
+`subProcess`/`transaction`, and the error **end** event (`endEvent` + `errorEventDefinition`). The
+`triggeredByEvent="true"` event subprocess, `multiInstanceLoopCharacteristics`, and `callActivity` stay
+**interim-rejected** with an M5-L4/L3/L2 roadmap pointer respectively; `adHocSubProcess` and
+`standardLoopCharacteristics` stay permanently rejected. The no-custom-notation clause, XSD-validity, and
+modeler round-trippability are unchanged.
+
+**SAGA / Compensation Impact** (Principle VI, generalized to a scope subtree — see §3.1/§3.4 below): a
+transaction may now nest inside another scope; commit is non-terminal (`committedLocal`) until the
+outermost enclosing transaction commits; the straggler cohort and live-token barrier become
+scope-subtree-aware; compensation wiring is legal iff some ancestor scope is a transaction. The
+Cancel-only-trigger / Hazard-does-not-compensate / idempotent / at-least-once / `compensationFailed`
+clauses are **unchanged**.
+
+**Hierarchical Exception Impact** (Principle VI, thread B — see §5 below): an uncaught error climbs the
+scope stack to the nearest enclosing error boundary; unhandled at the process root it is a **Hazard**
+(terminate, no auto-compensation — Principle VI verbatim). A non-cancel interrupting boundary on a scope
+interrupts **without** compensation; its subtree's completed compensatable effects are **retained**, not
+dropped.
+
+**Immutable Version Binding** (Principle II): Unchanged this layer. The scope hierarchy (kind, parent,
+depth) is a static property of the immutable definition version, computed at publish and persisted in
+`parsed_profile` — later drives never recompute it from a live graph.
+
+**Durable Idempotency** (Principle III): Unchanged this layer (M5-L1 adds no cross-instance execution).
+Scope entry/exit are ordinary `runStep`-memoized bookkeeping steps (fast-forward write-free from a landed
+history event, exactly like `enterTransaction`); the commit-shield transition and the widened reverse-cursor
+CAS keep the existing claim discipline (`INSERT OR IGNORE` / plain `UPDATE` / CAS).
+
+**Receive Task Correlation** (Principle IV): Unchanged — M5-L1 introduces no message or signal construct.
+
+**Audit and Operator Visibility** (Principle V): New history event types `scopeEntered`/`scopeExited`; an
+uncaught error end event settles the new incident kind `uncaughtError`. Every rejection states the
+offending element id and reason. No SPA change this layer (history-only delta); the read-only/D1-only
+invariant is re-affirmed.
+
+### Scope of this layer
+
+**In** (design §1):
+
+- Plain embedded **non-transaction `subProcess`** (one none-start, ≥1 end, shares the parent variable
+  space; arbitrary nesting: subProcess-in-tx, tx-in-subProcess, tx-in-tx).
+- The **complete generalized-scope model** (decomposition thread A): a typed scope hierarchy in the
+  compiled graph, with scope-subtree-aware commit/compensation/straggler/barrier semantics — the three
+  §3.1 invariants (below) land here, designed-complete.
+- **Hierarchical error propagation** (thread B): an uncaught error climbs the scope stack; Hazard at
+  root (Principle VI verbatim — no auto-compensation).
+- **Error end event** (`endEvent` + `errorEventDefinition`) — accepted (decomposition §6 M5-L1 decision 4,
+  recommended lane taken).
+- **Error and timer boundaries on a `subProcess`/`transaction`**, with the Hazard-vs-Cancel semantics: a
+  non-cancel interrupting boundary interrupts **without** compensation, ledger retained.
+- **`MAX_SCOPE_DEPTH`** cap (publish-time in L1; the numeric value is fixed and `check:docs`-synced when
+  the validator lands, not by this governance-opening section).
+
+**Out** (explicit, with interim validator rejects where applicable):
+
+- Event subprocess (`triggeredByEvent="true"`) → M5-L4 (interim reject with roadmap pointer).
+- `multiInstanceLoopCharacteristics` on any activity → M5-L3 (interim reject).
+- `callActivity` → M5-L2 (stays in the whitelist reject).
+- `compensateEventDefinition` boundary on a subProcess (compensate-as-unit) → post-M5 (decomposition §6
+  M5-L1 decision 6): in L1 a subProcess's completed steps are simply rows in the enclosing transaction's
+  ledger.
+- Escalation, signal, non-interrupting boundaries → M5-L4/L5.
+- Console UI changes → thread G deltas start at M5-L2; L1 ships only the new history events.
+
+### The ledger invariant
+
+> A ledger row is **sealed forever only when the outermost transaction enclosing its committing
+> transaction commits**. Until then, a locally-committed row remains eligible for exactly the
+> compensation roots that are **strict ancestors of its committing transaction** — and for no other
+> root, including later occurrences of the same static scope.
+
+`CompensationStatus` gains one non-terminal value, **`committedLocal`**; `committed` keeps its current
+meaning (terminal, sealed). A nested transaction's commit flips only its **owned** scopes to
+`committedLocal`; only the **outermost** commit (no enclosing transaction) flips a subtree to `committed`
+— for a top-level single-scope transaction this reduces byte-for-byte to today's (pre-M5) commit
+behavior, the M1–M4 no-op fast path.
+
+### Cursor semantics
+
+The reverse cursor generalizes to a **root-relative subtree cursor**. For compensation root R, a row is
+selected iff its `scope_id ∈ subtree(R)` and either its status is `pending|compensating|failed`, or it is
+`committedLocal` with `scope_id ∈ eligibleCommittedScopes(R)` (every scope `s ∈ subtree(R)` whose nearest
+enclosing transaction is a **strict ancestor** of R), ordered `seq DESC` (global, per-instance-monotonic —
+not per-scope, so cross-scope reverse order is well-defined).
+
+| Case | Root R | Row | Outcome |
+|---|---|---|---|
+| Outer cancel over committed inner tx | outer tx O | `committedLocal`, scope ∈ owned(T), T inside O | `strictAncestor(O, T)` ✓ → compensates, reverse order |
+| Self re-entry: T#occ1 cancels after T#occ0 committed | T | `committedLocal`, nearestTx = T | `strictAncestor(T, T)` ✗ → shielded |
+| Same, rows in S inside T | T | `committedLocal`, scope = S, nearestTx(S) = T | shielded (the §3.1 counterexample, fixed) |
+| Operator `/cancel` | process root | any `committedLocal` | process is a strict ancestor of every tx → eligible |
+| Operator `/cancel` vs a committed **top-level** tx | process root | `committed` (sealed at outermost commit) | never selected — current `/cancel` semantics preserved |
+| Loop of inner tx inside outer, all iterations committed, outer cancels | O | `committedLocal` occ0..k | all eligible, `seq DESC` runs them newest-first |
+
+The straggler cohort and live-token barrier, previously gated on `isRegion` and skipped entirely outside
+the M4 concurrency world, are **un-gated** and run for every graph with subtree-membership filters — for a
+single-scope graph `subtree(R) = {R}` and behavior is unchanged. Cancel of scope R is a **two-phase
+subtree operation**: (1) interrupt/drain in-flight tokens in `subtree(R)` (completed jobs ledgered,
+failed/non-compensatable discarded, `created|locked` jobs drained), the barrier holding until quiesced;
+(2) the reverse pass bottom-up via the cursor above.
+
+### Exception semantics
+
+An uncaught error climbs the scope stack: candidates are evaluated bottom-up, first boundaries on the
+throwing element, then boundaries attached to each enclosing scope node in turn; exact `@errorCode` match
+wins over a catch-all, first match wins. Exhausting the chain at the process root is a **Hazard**: incident,
+no auto-compensation. An error **end event** consumes its token and throws from the scope containing the
+end event; an uncaught error end at process level settles the new incident kind `uncaughtError`.
+
+When an error is caught by a boundary on scope B (or a scope timer fires — same shape): (1) phase-1 drain
+of `subtree(B)` — completed effects **retained** (ledgered, not compensated), in-flight work drained;
+(2) **no reverse pass** — a non-cancel boundary interrupts without compensation (Principle VI: no Cancel ⇒
+no compensation); (3) the token exits on the boundary's single outgoing flow in B's parent scope.
+Remediation needs no new operator surface: a later cancel of an enclosing transaction, or operator
+`/cancel` (root = process), reaches retained rows through the subtree cursor above — the concrete
+realization of "operator `/cancel` walks exited scopes." Modeling guidance: for timer-triggered *rollback*,
+route the boundary's outgoing flow to a **cancel-end inside** the transaction; a timer routed elsewhere is
+deliberately Hazard-class.
+
+A **cancel-end inside a nested transaction** T compensates only `subtree(T)`; the instance then
+**continues** on T's cancel-boundary failure-path target (a non-terminal settle back to `running`) — see
+`m5-L1-constitution-check.md` Complexity Tracking (b) for this refinement of the decomposition doc. Only a
+**root-level** cancel (a top-level transaction's cancel-end, or an operator `/cancel`) settles the instance
+terminally, as in M1–M4.
+
+### Validator delta
+
+| Rule | Change |
+|---|---|
+| `bpmn:SubProcess` (plain, embedded) | **Accept**: recurse `classifyContainer` with `scopeKind="subProcess"`; today it falls to the generic whitelist reject |
+| `triggeredByEvent="true"` | **Interim reject** with M5-L4 roadmap pointer (element id + reason) |
+| `adHocSubProcess` | **Reject** (permanent, element id + reason) |
+| `multiInstanceLoopCharacteristics` / `standardLoopCharacteristics` on any activity | **Interim reject** → M5-L3 / permanent reject respectively |
+| Error end event | **Accept** (replaces the prior reject); `errorRef` → `bpmn:error/@errorCode` resolution required, dangling/empty rejected |
+| Cancel end event | Immediate scope MUST be a transaction (explicit about *immediate* under nesting) |
+| Error boundary hosts | serviceTask (existing) **+ subProcess + transaction** |
+| Timer boundary hosts | serviceTask/receiveTask (existing) **+ subProcess + transaction** — the M5-deferral reject is removed |
+| Cancel boundary hosts | transaction only (**unchanged**) |
+| Compensate boundary hosts | serviceTask only (**unchanged**; compensate-subProcess-as-unit deferred post-M5) |
+| Compensation association guard | **Unchanged** — boundary and handler must share an immediate scope |
+| Handler-in-transaction guard | Becomes the **ancestry check**: legal iff **some ancestor scope is a transaction**; a chain reaching the process root without one is rejected (element id + reason: the handler has no trigger) |
+| Boundary count per activity, non-interrupting reject | Unchanged, now also covering scope hosts |
+| Flow crossing a scope boundary | Unchanged mechanism, now exercised by nested scopes |
+| Per-scope structure (exactly one none-start, ≥1 end, SESE regions per scope) | Unchanged mechanism, applies to subProcess scopes |
+| `MAX_SCOPE_DEPTH` | **New publish-time reject** (see Caps below) |
+| Nested transaction with a cancel end | **New reject**: MUST carry a cancel boundary, else the failure path has no target |
+
+### Caps
+
+`MAX_SCOPE_DEPTH` — nesting depth of scopes (subProcess-in-subProcess), a **new engine cap**, joining the
+three existing caps (`MAX_ELEMENT_OCCURRENCES`, `MAX_CONCURRENT_TOKENS`, `STEP_BUDGET_SOFT`). Deliberate
+refinement of decomposition §4 (recorded in `m5-L1-constitution-check.md` Complexity Tracking (a)): in L1
+scope depth is **fully static** (no `callActivity`, no `multiInstance`), so the cap is enforced by the
+**validator at publish** (element id + reason) — fail-closed, zero runtime surface. The `scopeDepth`
+*runtime incident* named by the decomposition doc becomes reachable only once M5-L2 introduces dynamic
+depth (call chains), and is deferred to that layer. This governance-opening section fixes no numeric
+value; the value is defined in `src/runtime/engine.ts` and `check:docs`-synced when the validator task
+lands.
+
+### User Scenarios & Testing
+
+#### User Story 11 — Nest a Transaction Inside a SubProcess and Compensate on Outer Cancel (Priority: P1)
+
+A `bpmn:transaction` sits inside a plain `subProcess`, itself inside an outer `bpmn:transaction`. The
+inner transaction commits normally; when the outer transaction later cancels, the inner transaction's
+(and its subProcess sibling's) completed steps compensate in reverse.
+
+**Acceptance Scenarios**:
+
+1. **Given** `outer-tx > subProcess > inner-tx` where the inner transaction has committed, **When** the
+   outer transaction cancels, **Then** the inner transaction's steps compensate in global-`seq` reverse
+   order, and the previously `committedLocal` rows are used, not skipped.
+2. **Given** a single-scope (non-nested) transaction — the M1–M4 shape — **When** it commits, **Then** its
+   rows are marked terminal `committed` exactly as before (byte-for-byte no-op fast path).
+
+#### User Story 12 — Bubble an Uncaught Error to a Scope Boundary or Hazard (Priority: P1)
+
+An error thrown by a service task (or an error end event) inside a `subProcess` climbs the scope stack to
+the nearest enclosing error boundary; with no boundary anywhere in the chain, the instance settles a
+Hazard incident at the process root.
+
+**Acceptance Scenarios**:
+
+1. **Given** a service task inside a `subProcess` fails with a business error code, **When** no boundary
+   is attached to the task itself but one is attached to the enclosing `subProcess`, **Then** the token
+   routes to that boundary's target.
+2. **Given** no boundary exists anywhere in the scope chain, **When** the error is thrown, **Then** the
+   instance settles a Hazard incident (`serviceTaskFailure` for a worker error, `uncaughtError` for an
+   error end event) with no auto-compensation.
+3. **Given** an error **end event** inside a `subProcess` on a non-service control path, **When** it is
+   reached, **Then** it throws exactly as a worker error would, subject to the same bubbling.
+
+#### User Story 13 — Interrupt (Not Compensate) via a Non-Cancel Boundary on a Transaction (Priority: P1)
+
+A timer or error boundary on a `transaction` fires without routing to a cancel end. The transaction is
+interrupted, but its completed compensatable effects are retained (not auto-compensated), and an operator
+can later force the reverse pass.
+
+**Acceptance Scenarios**:
+
+1. **Given** a timer boundary on a transaction fires (or an error boundary catches a non-cancel-routed
+   error), **When** the boundary's target is outside the transaction, **Then** the transaction's completed
+   steps stay `pending` (retained), and the token exits without compensation.
+2. **Given** the transaction was exited via such a boundary, **When** an operator issues `/cancel`, **Then**
+   the retained steps are located (via the root-relative subtree cursor at the process root) and
+   compensated in reverse order.
+
+#### User Story 14 — Shield a Committed Nested Transaction from Its Own Re-Entry (Priority: P2)
+
+A nested transaction inside an M2 cycle commits at occurrence 0, then re-enters and cancels at occurrence
+1. The occurrence-0 rows (including rows in a child `subProcess`) are shielded from this self-cancel, but
+remain eligible for a later ancestor cancel.
+
+**Acceptance Scenarios**:
+
+1. **Given** transaction T commits at occurrence 0 (nested inside an outer scope), re-enters via a cycle,
+   and cancels at occurrence 1, **When** the occurrence-1 reverse pass runs, **Then** occurrence-0 rows
+   (including rows in T's child subProcess) are untouched.
+2. **Given** the same instance, **When** an ancestor of T later cancels, **Then** both occurrences'
+   `committedLocal` rows compensate.
+
+#### User Story 15 — Resume the Instance After a Nested Cancel-End Compensates (Priority: P2)
+
+A cancel end inside a **nested** transaction (not the top-level saga) drives the reverse pass over only
+that transaction's subtree, then the instance continues running on the cancel boundary's failure-path
+target — it does not terminate.
+
+**Acceptance Scenarios**:
+
+1. **Given** a cancel end is reached inside a nested transaction T with a cancel boundary attached,
+   **When** T's subtree finishes compensating, **Then** the instance status returns to `running` at the
+   cancel boundary's target element (a non-terminal settle), not a terminal `compensated`/`sagaFailed`.
+2. **Given** a cancel end is reached inside a **top-level** transaction (or an operator issues `/cancel`
+   at the process root), **When** compensation completes, **Then** the instance settles terminally, exactly
+   as M1–M4 today.
+3. **Given** a nested transaction contains a cancel end but has **no** cancel boundary attached, **When**
+   the model is published, **Then** publish is rejected (element id + reason: no failure-path target).
+
+### Key Entities (M5-L1)
+
+- **Scope (`ExecutionGraph.scopes`)**: A static property of the compiled graph — `{ id, kind, parentId,
+  depth }`, one entry per non-process scope (`kind ∈ { process, transaction, subProcess }` in L1; the
+  `ScopeKind` type carries the full M5 union `process | transaction | subProcess | callActivity | miBody`
+  so L2/L3 extend without churn). `GraphNode.scopeId` keeps its existing meaning — the immediate enclosing
+  scope, `null` at process level.
+- **`committedLocal` (`CompensationStatus`)**: A new non-terminal ledger status — a nested transaction's
+  commit shield. `committed` remains the terminal, sealed status. No D1 migration (TEXT column).
+- **Compensation root (R)**: The scope a cancel (cancel-end or operator `/cancel`) is rooted at. Drives the
+  root-relative subtree cursor, the straggler cohort, and the live-token barrier.
+- **`subtree(R)`**: Every scope whose parent chain contains R, including R. For R = process root: every
+  scope plus the `null` process level.
+- **`nearestEnclosingTx(s)`**: Walking s's parent chain inclusive, the first scope of kind `transaction`;
+  `null` if the chain reaches the root without one.
+- **`MAX_SCOPE_DEPTH`**: A new publish-time cap on scope nesting depth (see Caps above); joins
+  `MAX_ELEMENT_OCCURRENCES`, `MAX_CONCURRENT_TOKENS`, `STEP_BUDGET_SOFT`.
+- **`uncaughtError` (`IncidentKind`)**: The new terminal incident kind for an uncaught error **end event**
+  reaching the process root (distinct from `serviceTaskFailure`, which stays the kind for an uncaught
+  worker error).
+
+### Success Criteria (M5-L1)
+
+- **SC-014**: `outer-tx > subProcess > inner-tx-commits`, then outer cancel compensates the inner steps in
+  reverse (global-`seq` order); a single-scope M1–M4 instance is byte-for-byte unaffected (no-op fast
+  path).
+- **SC-015**: An error thrown by a service task or an error end event inside a `subProcess` bubbles to the
+  nearest enclosing scope boundary; with none anywhere, the instance settles a Hazard at root
+  (`serviceTaskFailure` or `uncaughtError`).
+- **SC-016**: A timer (or non-cancel-routed error) boundary on a transaction interrupts **without**
+  compensation, retaining the transaction's completed steps; a later operator `/cancel` drives the reverse
+  pass over the retained, exited scope.
+- **SC-017**: A committed nested transaction is shielded from its own re-entrant self-cancel
+  (`committedLocal` not re-selected by `strictAncestor(T, T)`), but compensates under any strict-ancestor
+  cancel.
+- **SC-018**: A cancel end inside a **nested** transaction resumes the instance on the cancel boundary's
+  failure-path target after its subtree compensates (non-terminal settle); a **root-level** cancel still
+  settles the instance terminally, exactly as M1–M4.
+
+### M5-L1 constitution-critical test gates
+
+Planned (this governance-opening section precedes implementation; file paths per the implementation plan,
+`docs/superpowers/plans/2026-07-02-m5-l1-embedded-scopes.md`):
+
+1. **scope-tree-compilation** — kinds, parents, depths, `ownedScopes`, `nearestEnclosingTx`, subtree
+   closure; `MAX_SCOPE_DEPTH` boundary (`tests/unit/scope-tree.test.ts`).
+2. **subprocess-validator-accept-reject** — every §6 validator-delta row, accept/reject pairs, including
+   tolerate-and-ignore of foreign-namespace extension content inside a subProcess
+   (`tests/unit/bpmn-validator.test.ts`).
+3. **subtree-cursor-eligibility** — table-driven over the Cursor semantics case table above, seeded
+   directly via `saga_steps` (`tests/integration/saga-subtree-cursor.test.ts`).
+4. **nested-commit-shield** — `outer-tx > subProcess > inner-tx-commits` then outer cancel (SC-014); the
+   re-entry shield (SC-017) (`tests/integration/nested-compensation.test.ts`).
+5. **subprocess-walk** — plain embedded subProcess enter/exit bookkeeping + occurrence fast-forward
+   (`tests/integration/subprocess-walk.test.ts`).
+6. **scope-error-bubbling** — uncaught task error climbs the scope chain to a subProcess boundary; none
+   anywhere → Hazard (SC-015) (`tests/integration/scope-error-bubbling.test.ts`).
+7. **error-end-event** — error end throws from a subProcess to the scope boundary; uncaught at root →
+   `uncaughtError` incident (`tests/integration/error-end-event.test.ts`).
+8. **scope-boundary-timer** — timer boundary on a transaction interrupts without compensation, retained
+   ledger, `/cancel` forces the reverse pass (SC-016) (`tests/integration/scope-boundary-timer.test.ts`).
+9. **nested-cancel-end-resume** — a cancel end inside a nested transaction resumes the instance
+   non-terminally (SC-018); a nested transaction with a cancel end but no cancel boundary rejects at
+   publish (`tests/integration/nested-compensation.test.ts`).
+10. **no-op regression gate** — the entire existing M1–M4 suite green with zero test edits (single-scope
+    fast path byte-compatible), except the deliberately rewritten matrix scenario
+    `C-COMP-NESTEDTX-BRANCH-01` (`npm run test:integration && npm run test:unit`).

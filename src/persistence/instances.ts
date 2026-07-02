@@ -27,6 +27,12 @@ export interface InstanceRow {
   updated_at: string;
   completed_at: string | null;
   last_synced_at: string | null;
+  // M5-L2 (0008) — parent linkage (NULL for root instances) + the child-only
+  // errored terminal's business error code (spec §4).
+  parent_instance_id: string | null;
+  parent_element_id: string | null;
+  parent_occurrence: number | null;
+  error_code: string | null;
 }
 
 export type InstanceStatus = ProcessInstance["status"];
@@ -44,6 +50,8 @@ export function mapInstance(row: InstanceRow): ProcessInstance {
     variables: parseJson<JsonObject>(row.variables, {}),
     startedAt: row.started_at,
     completedAt: row.completed_at,
+    parentInstanceId: row.parent_instance_id ?? null,
+    errorCode: row.error_code ?? null,
   };
 }
 
@@ -80,6 +88,25 @@ export async function createInstance(
       input.now,
     ],
   );
+}
+
+/** Batchable child-instance INSERT (M5-L2): same shape as createInstance but a
+ *  statement (it must commit in the SAME batch as the child_instances provenance
+ *  row — persist-before-advance), with the parent linkage columns. */
+export function createChildInstanceStmt(db: D1Database, input: {
+  instanceId: string; workspaceId: string; definitionVersionId: string;
+  correlationKey: string; startElementId: string; variables: JsonObject;
+  parentInstanceId: string; parentElementId: string; parentOccurrence: number; now: string;
+}): D1PreparedStatement {
+  return stmt(db,
+    `INSERT INTO process_instances
+       (instance_id, workspace_id, definition_version_id, workflow_instance_id, workflow_status,
+        business_key, correlation_key, status, current_element_id, variables, started_at, updated_at,
+        completed_at, last_synced_at, parent_instance_id, parent_element_id, parent_occurrence)
+     VALUES (?, ?, ?, ?, NULL, NULL, ?, 'starting', ?, ?, ?, ?, NULL, NULL, ?, ?, ?)`,
+    [input.instanceId, input.workspaceId, input.definitionVersionId, input.instanceId,
+     input.correlationKey, input.startElementId, toJson(input.variables), input.now, input.now,
+     input.parentInstanceId, input.parentElementId, input.parentOccurrence]);
 }
 
 export async function getInstanceRow(

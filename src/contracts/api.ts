@@ -199,6 +199,11 @@ export interface ProcessInstance {
   variables: Record<string, unknown>;
   startedAt: string;
   completedAt?: string | null;
+  /** M5-L2 (callActivity) — the parent instance's id when this instance was
+   *  spawned by a callActivity; null/absent for root instances. */
+  parentInstanceId?: string | null;
+  /** M5-L2 — the child-only errored terminal's business error code (spec §4). */
+  errorCode?: string | null;
 }
 
 export interface HistoryEvent {

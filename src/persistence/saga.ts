@@ -43,6 +43,10 @@ export interface SagaStepRow {
   // token (M1–M3 / root) path. The lineage-quiescence-ordered reverse pass uses it
   // to compensate a step only once its branch lineage has no live token (§8.4).
   token_id: string | null;
+  // M5-L2 (0008) — step-kind dispatch for the reverse pass (spec §5): NULL = a
+  // worker-task step; non-NULL = compensate by driving this child instance's
+  // own reverse pass instead of a compensation job.
+  child_instance_id: string | null;
 }
 
 export interface SagaStepView {
@@ -62,6 +66,8 @@ export interface SagaStepView {
   traceId: string | null;
   /** M4-L5: the branch token that produced this row; NULL on the root/single-token path. */
   tokenId: string | null;
+  /** M5-L2: non-NULL ⇒ compensate via this child instance's own reverse pass. */
+  childInstanceId: string | null;
 }
 
 export function mapSagaStep(row: SagaStepRow): SagaStepView {
@@ -80,6 +86,7 @@ export function mapSagaStep(row: SagaStepRow): SagaStepView {
     compensationStatus: row.compensation_status as CompensationStatus,
     traceId: row.trace_id,
     tokenId: row.token_id,
+    childInstanceId: row.child_instance_id,
   };
 }
 
@@ -146,6 +153,9 @@ export function insertSagaStepStmt(
     occurrence?: number;
     /** M4-L5 (0007) — producing branch token; NULL on the root/single-token path. */
     tokenId?: string | null;
+    /** M5-L2 (0008) — non-NULL ⇒ this step compensates via a child instance's
+     *  own reverse pass rather than a compensation job; defaults to NULL. */
+    childInstanceId?: string | null;
     now: string;
   },
 ): D1PreparedStatement {
@@ -153,10 +163,10 @@ export function insertSagaStepStmt(
     db,
     `INSERT OR IGNORE INTO saga_steps
        (step_id, instance_id, scope_id, seq, element_id, forward_job_id, captured_input, captured_output,
-        compensation_element_id, compensation_task_type, compensation_job_id, compensation_status, trace_id, created_at, updated_at, occurrence, token_id)
+        compensation_element_id, compensation_task_type, compensation_job_id, compensation_status, trace_id, created_at, updated_at, occurrence, token_id, child_instance_id)
      SELECT ?, ?, ?,
             COALESCE((SELECT MAX(seq) FROM saga_steps WHERE instance_id = ?), 0) + 1,
-            ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?`,
+            ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?`,
     [
       input.stepId,
       input.instanceId,
@@ -174,6 +184,7 @@ export function insertSagaStepStmt(
       input.now,
       input.occurrence ?? 0,
       input.tokenId ?? null,
+      input.childInstanceId ?? null,
     ],
   );
 }

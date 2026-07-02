@@ -66,6 +66,25 @@ than dropped._
 - **T11:** protective comment explaining why `drainScopeSubtree` deliberately excludes task-hosted
   descendant timers (pre-existing-safe M3 behavior) — without the comment a future pass may "fix" this
   incorrectly.
+
+**Added 2026-07-02 from the TASK-71..73 follow-up wave final review (merge cd3d59c) — all triaged backlog:**
+
+- **T73:** frozen-instance re-arm backoff (task/receiveTask hosts, EBG, unresolvable hosts) has no ceiling —
+  a never-resumed frozen instance re-arms its DO alarm every 60s indefinitely; add a ceiling or stop
+  re-arming on `compensationFailed`.
+- **T73 (operator docs):** `/retry` after a suppressed scope-timer fire takes the BOUNDARY path and abandons
+  the failed inner task (owner-decided policy) — surface in operator-facing docs.
+- **T73:** no receiveTask-host frozen-fire fixture (subscription/broker-key variant of the DLQ task-host
+  test in scope-timer-frozen.test.ts); code path is shared with the tested serviceTask host.
+- **T73 (cosmetic):** `FROZEN_REARM_BACKOFF_MS` declared between two import statements in timers.ts —
+  fold into the post-import constants block.
+- **T72:** error-bubbling drain trigger has no dedicated subscription-release test (timer-fire trigger
+  covers the shared drainScopeSubtree path).
+- **T71:** `scopeReentry` incident diagnostics record the re-descend occurrence, not the skipped one —
+  observability polish.
+- **T71:** M4-regions live-continue skippedScopes population is defence-in-depth without a dedicated
+  concurrent-region fixture.
+
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria

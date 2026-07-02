@@ -1,10 +1,10 @@
 ---
 id: TASK-72
 title: 'M5-L1 follow-up: drainScopeSubtree does not release active message subscriptions/broker keys'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-07-02 00:00'
-updated_date: '2026-07-02 00:00'
+updated_date: '2026-07-02 18:40'
 labels:
   - saga
   - engine
@@ -43,9 +43,9 @@ contract, not an afterthought.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 `drainScopeSubtree`'s per-token settle releases (supersedes) any active message subscription held by a receiveTask wait inside the drained subtree
-- [ ] #2 The correlation-broker key for a released subscription is freed (best-effort, matching the `releaseActiveSubscriptionsForInstance` pattern), not left to expire via the 1-hour TTL
-- [ ] #3 Integration test: a receiveTask wait inside a nested scope that gets abnormally drained (timer fire or error bubbling) no longer has an active subscription afterward
-- [ ] #4 `docs/superpowers/specs/2026-07-02-m5-l1-embedded-scopes-design.md` drain-semantics section amended to document subscription/broker-key release as part of the drain contract
-- [ ] #5 Full suite stays green; no regression to the M3/M4 whole-instance release paths
+- [x] #1 `drainScopeSubtree`'s per-token settle releases (supersedes) any active message subscription held by a receiveTask wait inside the drained subtree
+- [x] #2 The correlation-broker key for a released subscription is freed (best-effort, matching the `releaseActiveSubscriptionsForInstance` pattern), not left to expire via the 1-hour TTL
+- [x] #3 Integration test: a receiveTask wait inside a nested scope that gets abnormally drained (timer fire or error bubbling) no longer has an active subscription afterward
+- [x] #4 `docs/superpowers/specs/2026-07-02-m5-l1-embedded-scopes-design.md` drain-semantics section amended to document subscription/broker-key release as part of the drain contract
+- [x] #5 Full suite stays green; no regression to the M3/M4 whole-instance release paths
 <!-- AC:END -->

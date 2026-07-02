@@ -1,10 +1,10 @@
 ---
 id: TASK-73
 title: 'M5-L1 follow-up: armed scope timer fires on an incident/compensating instance, silently unfreezing it'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-07-02 00:00'
-updated_date: '2026-07-02 00:00'
+updated_date: '2026-07-02 18:40'
 labels:
   - saga
   - engine
@@ -48,10 +48,10 @@ implement + test both host kinds (transaction + subProcess) with a concurrent-in
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Policy decided (Option A skip vs Option B atomic Hazard-escape, or a documented alternative) and recorded in the design doc
-- [ ] #2 `docs/bpmn/09-easy-bpmn-profile.md` documents the chosen timer-vs-frozen-instance policy
-- [ ] #3 The scope-timer fire handler checks instance status before acting, per the chosen policy
-- [ ] #4 Integration test: a scope timer armed on a branch fires while the instance is already `incident` (sibling technical failure) — behavior matches the documented policy, no silent unfreeze
-- [ ] #5 Integration test: a scope timer fires concurrently with an operator `/cancel` — no race/double-transition
-- [ ] #6 Full suite stays green
+- [x] #1 Policy decided (Option A skip vs Option B atomic Hazard-escape, or a documented alternative) and recorded in the design doc
+- [x] #2 `docs/bpmn/09-easy-bpmn-profile.md` documents the chosen timer-vs-frozen-instance policy
+- [x] #3 The scope-timer fire handler checks instance status before acting, per the chosen policy
+- [x] #4 Integration test: a scope timer armed on a branch fires while the instance is already `incident` (sibling technical failure) — behavior matches the documented policy, no silent unfreeze
+- [x] #5 Integration test: a scope timer fires concurrently with an operator `/cancel` — no race/double-transition
+- [x] #6 Full suite stays green
 <!-- AC:END -->

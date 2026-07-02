@@ -1,10 +1,10 @@
 ---
 id: TASK-71
 title: 'M5-L1 follow-up: runtime re-entry backstop + validator error-end traversal edge + 09-profile modeling caveat'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-07-02 00:00'
-updated_date: '2026-07-02 00:00'
+updated_date: '2026-07-02 18:40'
 labels:
   - saga
   - engine
@@ -54,10 +54,10 @@ that used to be accepted — this was sanctioned in the PR discussion and does n
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Decide and document the incident kind raised when the walk descends into a walk-local `skippedScopes`-flagged scope
-- [ ] #2 Implement the `skippedScopes` set check at scope descend, alongside `scopeEntryOcc`
-- [ ] #3 A condition-guarded loop-back into an abnormally-skipped scope raises the deterministic incident instead of desyncing the occurrence namespace, with an integration test for both host kinds (transaction + subProcess)
-- [ ] #4 Extend the C1 validator BFS to model error-END-mediated exits of hopped-over containers (the second static reachability hole)
-- [ ] #5 `docs/bpmn/09-easy-bpmn-profile.md` gains the modeling caveat on abnormal boundary paths and guarded retry loops
-- [ ] #6 openapi + `runtime-contracts.md` updated in lockstep with the new incident kind (if a new kind is chosen)
+- [x] #1 Decide and document the incident kind raised when the walk descends into a walk-local `skippedScopes`-flagged scope
+- [x] #2 Implement the `skippedScopes` set check at scope descend, alongside `scopeEntryOcc`
+- [x] #3 A condition-guarded loop-back into an abnormally-skipped scope raises the deterministic incident instead of desyncing the occurrence namespace, with an integration test for both host kinds (transaction + subProcess)
+- [x] #4 Extend the C1 validator BFS to model error-END-mediated exits of hopped-over containers (the second static reachability hole)
+- [x] #5 `docs/bpmn/09-easy-bpmn-profile.md` gains the modeling caveat on abnormal boundary paths and guarded retry loops
+- [x] #6 openapi + `runtime-contracts.md` updated in lockstep with the new incident kind (if a new kind is chosen)
 <!-- AC:END -->

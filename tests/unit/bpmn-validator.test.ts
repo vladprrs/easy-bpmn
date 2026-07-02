@@ -7,6 +7,7 @@ import {
   DEMO_BPMN,
   deferredGatewayBpmn,
   EMPTY_MESSAGE_NAME_BPMN,
+  ERROR_END_BPMN,
   INSTANTIATE_RECEIVE_BPMN,
   INTERMEDIATE_CATCH_BPMN,
   LOOP_XOR_BPMN,
@@ -1932,5 +1933,85 @@ describe("M5-L1 embedded subProcess acceptance", () => {
     expect(r.ok).toBe(true);
     expect(r.graph!.nodes["tx_err"]!.type).toBe("boundaryEvent");
     expect(r.graph!.nodes["tx_err"]!.attachedToRef).toBe("tx");
+  });
+});
+
+// M5-L1 Task 10: an endEvent carrying an <errorEventDefinition> is now a
+// supported end kind ("error") — it THROWS from its enclosing scope (engine
+// side, error-end-event.test.ts) rather than settling the instance. Unlike an
+// error BOUNDARY (errorRef optional — absent means catch-all), an error END
+// event has no catch-all shape for a throw: errorRef must be PRESENT and
+// resolve to a <bpmn:error> with a non-empty @errorCode.
+describe("M5-L1 error end event acceptance (spec §5.2)", () => {
+  // A none end event (commit) is required somewhere in the process — the
+  // gateway split gives the model one, mirroring ERROR_END_ROOT_BPMN's shape.
+  const ERR_END = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="d" targetNamespace="http://example.com">
+  <bpmn:error id="E1" name="Fail" errorCode="E_FAIL"/>
+  <bpmn:error id="E_nocode" name="NoCode"/>
+  <bpmn:process id="proc" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="gw"/>
+    <bpmn:exclusiveGateway id="gw" default="f_ok"/>
+    <bpmn:sequenceFlow id="f_fail" sourceRef="gw" targetRef="errEnd"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">fail = true</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:endEvent id="errEnd"><bpmn:errorEventDefinition errorRef="E1"/></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f_ok" sourceRef="gw" targetRef="end"/>
+    <bpmn:endEvent id="end"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+  it("accepts an error end event with a resolvable, coded errorRef", async () => {
+    const r = await parseAndValidate(ERR_END);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    expect(r.graph!.nodes["errEnd"]!.endKind).toBe("error");
+    expect(r.graph!.nodes["errEnd"]!.errorRef).toBe("E1");
+    expect(r.graph!.nodes["errEnd"]!.errorCode).toBe("E_FAIL");
+  });
+
+  it("accepts the M5-L1 scoped error-end fixture (subProcess throw + catch-all boundary)", async () => {
+    const r = await parseAndValidate(ERROR_END_BPMN);
+    expect(r.ok).toBe(true);
+    expect(r.issues).toHaveLength(0);
+    expect(r.graph!.nodes["errEnd"]!.endKind).toBe("error");
+    expect(r.graph!.nodes["errEnd"]!.errorCode).toBe("E_FAIL");
+  });
+
+  it("rejects an error end event with a dangling errorRef", async () => {
+    const r = await parseAndValidate(ERR_END.replace('errorRef="E1"', 'errorRef="Err_missing"'));
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some((i) => i.elementId === "errEnd" && /Error end event 'errEnd' has an errorRef 'Err_missing' that does not resolve to a declared/.test(i.reason)),
+    ).toBe(true);
+  });
+
+  it("rejects an error end event whose errorRef resolves to a code-less <bpmn:error>", async () => {
+    const r = await parseAndValidate(ERR_END.replace('errorRef="E1"', 'errorRef="E_nocode"'));
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some(
+        (i) => i.elementId === "errEnd" && /Error end event 'errEnd' must reference a declared <bpmn:error> with a non-empty @errorCode\./.test(i.reason),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects an error end event with NO errorRef at all (no catch-all shape for a throw)", async () => {
+    const r = await parseAndValidate(ERR_END.replace('<bpmn:errorEventDefinition errorRef="E1"/>', "<bpmn:errorEventDefinition/>"));
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some(
+        (i) => i.elementId === "errEnd" && /Error end event 'errEnd' must reference a declared <bpmn:error> with a non-empty @errorCode\./.test(i.reason),
+      ),
+    ).toBe(true);
+  });
+
+  it("still rejects an unsupported end-event definition (e.g. message) with the widened reject message", async () => {
+    const r = await parseAndValidate(ERR_END.replace("<bpmn:errorEventDefinition errorRef=\"E1\"/>", "<bpmn:terminateEventDefinition/>"));
+    expect(r.ok).toBe(false);
+    expect(
+      r.issues.some(
+        (i) => i.elementId === "errEnd" && /Only a none end event, a cancel end event \(inside a transaction\), or an error end event is supported\./.test(i.reason),
+      ),
+    ).toBe(true);
   });
 });

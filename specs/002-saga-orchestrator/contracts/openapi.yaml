@@ -1469,7 +1469,9 @@ components:
             `concurrencyLimit` (a split fan-out exceeded MAX_CONCURRENT_TOKENS live
             tokens) and `stepBudget` (the per-drive step counter crossed
             STEP_BUDGET_SOFT — a graceful incident below the platform step ceiling).
-          enum: [serviceTaskFailure, compensationFailure, timeout, poison, loopLimit, noPath, jobActivationTimeout, waitTimeout, conditionFailure, concurrencyLimit, stepBudget]
+            M5-L1 adds `uncaughtError` — an error END EVENT reached the process
+            root uncaught (worker-task uncaught errors keep `serviceTaskFailure`).
+          enum: [serviceTaskFailure, compensationFailure, timeout, poison, loopLimit, noPath, jobActivationTimeout, waitTimeout, conditionFailure, concurrencyLimit, stepBudget, uncaughtError]
         resolution:
           type: string
           nullable: true

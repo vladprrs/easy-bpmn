@@ -1468,3 +1468,53 @@ export const HAZARD_BUBBLE_BPMN = SCOPE_ERR_BPMN
   .replace(/<bpmn:boundaryEvent id="S1_err"[\s\S]*?<bpmn:endEvent id="r_end"\/>\n?/, "")
   .replace('id="def_scope_err"', 'id="def_hazard_bubble"')
   .replace('id="proc_scope_err"', 'id="proc_hazard_bubble"');
+
+/**
+ * M5-L1 error-end fixture (TASK-10): process > subProcess S (error boundary
+ * catch-all → recover) > prep task then XOR: fail=true → errEnd (errorRef
+ * E1/E_FAIL); default → s_end. ERROR_END_ROOT_BPMN is the same throw at
+ * PROCESS level (no boundary) → uncaughtError.
+ */
+export const ERROR_END_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="def_err_end" targetNamespace="http://example.com">
+  <bpmn:error id="E1" name="Fail" errorCode="E_FAIL"/>
+  <bpmn:process id="proc_err_end" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="S"/>
+    <bpmn:subProcess id="S">
+      <bpmn:startEvent id="s_start"/>
+      <bpmn:sequenceFlow id="sf1" sourceRef="s_start" targetRef="prep"/>
+      <bpmn:serviceTask id="prep"><bpmn:extensionElements><easy-bpmn:taskDefinition type="prep" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="sf2" sourceRef="prep" targetRef="gw"/>
+      <bpmn:exclusiveGateway id="gw" default="sf_ok"/>
+      <bpmn:sequenceFlow id="sf_fail" sourceRef="gw" targetRef="errEnd"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">fail = true</bpmn:conditionExpression></bpmn:sequenceFlow>
+      <bpmn:endEvent id="errEnd"><bpmn:errorEventDefinition errorRef="E1"/></bpmn:endEvent>
+      <bpmn:sequenceFlow id="sf_ok" sourceRef="gw" targetRef="s_end"/>
+      <bpmn:endEvent id="s_end"/>
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="S_err" attachedToRef="S"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="f2" sourceRef="S_err" targetRef="recover"/>
+    <bpmn:serviceTask id="recover"><bpmn:extensionElements><easy-bpmn:taskDefinition type="recover" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f3" sourceRef="recover" targetRef="r_end"/>
+    <bpmn:endEvent id="r_end"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="S" targetRef="end"/>
+    <bpmn:endEvent id="end"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/** Same throw shape at PROCESS level — no boundary anywhere → uncaughtError incident. */
+export const ERROR_END_ROOT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="def_err_end_root" targetNamespace="http://example.com">
+  <bpmn:error id="E1" name="Fail" errorCode="E_FAIL"/>
+  <bpmn:process id="proc_err_end_root" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="prep"/>
+    <bpmn:serviceTask id="prep"><bpmn:extensionElements><easy-bpmn:taskDefinition type="prep" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="prep" targetRef="gw"/>
+    <bpmn:exclusiveGateway id="gw" default="f_ok"/>
+    <bpmn:sequenceFlow id="f_fail" sourceRef="gw" targetRef="errEnd"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">fail = true</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:endEvent id="errEnd"><bpmn:errorEventDefinition errorRef="E1"/></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f_ok" sourceRef="gw" targetRef="end"/>
+    <bpmn:endEvent id="end"/>
+  </bpmn:process>
+</bpmn:definitions>`;

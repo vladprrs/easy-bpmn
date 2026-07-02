@@ -109,8 +109,8 @@ import {
 import { completeInstanceGuarded } from "../persistence/instances";
 import { branchHistoryTags, listLiveTokens, setTokenStatusStmt, rootTokenId, getToken, parseOverlay, readOverlay, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
 import { withDriveLock } from "../persistence/drive-lock";
-import { driveForwardServiceTask, terminateUnleasableJob } from "./forward-task";
-import { beginCompensating, settleAfterCompensation, cancelBoundaryTarget } from "./compensation";
+import { driveForwardServiceTask, terminateUnleasableJob, errorCatchTarget } from "./forward-task";
+import { beginCompensating, settleAfterCompensation, cancelBoundaryTarget, drainScopeSubtree } from "./compensation";
 import {
   armTimerDO,
   buildBoundaryArm,
@@ -447,6 +447,67 @@ async function loop(
       }
 
       if (node.type === "endEvent") {
+        if (node.endKind === "error") {
+          // M5-L1 (Task 10, spec §5.2): an error END event THROWS from its
+          // enclosing scope via the SAME hierarchical attachment-chain walk as a
+          // worker-task business error (errorCatchTarget, Task 9) — level 0 is a
+          // no-op (boundaries never attach to end events), so the chain
+          // effectively starts at the enclosing scope. Caught → drain the catch
+          // host's subtree, write the abnormal-exit audit, and continue on the
+          // boundary's target — like a cancel end, this NEVER settles the
+          // instance itself. Uncaught at the process root → a NEW `uncaughtError`
+          // incident kind (worker-task uncaught errors keep `serviceTaskFailure`).
+          //
+          // Fast-forward (idempotency): `errorCatchTarget` is a pure function of
+          // the immutable graph + the persisted errorCode — deterministic
+          // regardless of when it is recomputed. Once the caught branch's batch
+          // below has committed (the `errorEndThrown` marker exists), a rewalk
+          // re-derives the SAME target write-free instead of re-draining.
+          if (await visitApplied(env, instanceId, cur, occ, "errorEndThrown")) {
+            const target = errorCatchTarget(graph, cur, node.errorCode ?? null);
+            return { kind: "next", next: target!.next };
+          }
+          const catchT = errorCatchTarget(graph, cur, node.errorCode ?? null);
+          if (catchT) {
+            const next = await runStep(`err-end:${tag}`, async () => {
+              // Idempotent retain-only (Task 8) — safe to re-run on a step retry.
+              await drainScopeSubtree(env, graph, instanceId, catchT.hostId);
+              const inst = await loadInst(env, instanceId);
+              await dbBatch(env.DB, [
+                // MARKER: visitApplied(...) fast-forwards on the EXISTENCE of this occurrence's marker — exactly one per visit, atomic with the transition; do not add/remove/conditionalize.
+                historyStmt(env.DB, {
+                  workspaceId: inst.workspace_id,
+                  instanceId,
+                  elementId: cur,
+                  type: "errorEndThrown",
+                  diagnostics: { errorCode: node.errorCode, caughtBy: catchT.boundaryId, occurrence: occ },
+                }),
+                historyStmt(env.DB, {
+                  workspaceId: inst.workspace_id,
+                  instanceId,
+                  elementId: catchT.hostId,
+                  type: "scopeExited",
+                  diagnostics: { scope: catchT.hostId, via: catchT.boundaryId, abnormal: true, occurrence: occ },
+                }),
+                applyTransitionStmt(env.DB, { instanceId, currentElementId: catchT.next, status: "running", now: nowIso() }),
+              ]);
+              return catchT.next;
+            });
+            return { kind: "next", next };
+          }
+          await runStep(`err-end:${tag}`, () =>
+            createIncident(
+              env,
+              instanceId,
+              cur,
+              0,
+              `Uncaught error end event ('${node.errorCode}') reached the process root.`,
+              { errorCode: node.errorCode },
+              "uncaughtError",
+            ),
+          );
+          return { kind: "incident" };
+        }
         if (node.endKind === "cancel" && isTransactionScope(graph, node.scopeId)) {
           // Stamp the cancelled TRANSACTION's occurrence (Task 8): the tx's current
           // entry occurrence recorded when driveLeaf entered it this walk (falls back

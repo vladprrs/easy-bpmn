@@ -250,17 +250,19 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
 
   // An `errorRef` on an <errorEventDefinition> that names a non-existent <error>
   // is DROPPED by bpmn-moddle (exactly like an unresolved `default`), leaving the
-  // parsed boundary indistinguishable from a genuine catch-all (no errorRef).
-  // Recover those dangling refs from the parser warnings — keyed by the OWNING
-  // boundary event id (the warning's element is the errorEventDefinition; its
-  // $parent is the boundary) — so the error-boundary rules can reject them with
-  // an element id instead of silently accepting a hidden catch-all (M3-L2).
+  // parsed boundary/end event indistinguishable from a genuine catch-all (no
+  // errorRef). Recover those dangling refs from the parser warnings — keyed by
+  // the OWNING event id (the warning's element is the errorEventDefinition; its
+  // $parent is the boundary event OR, since M5-L1 TASK-10, the end event) — so
+  // the error-boundary/error-end rules can reject them with an element id
+  // instead of silently accepting a hidden catch-all (M3-L2; widened M5-L1).
   //
   // CAUTION: like the `bpmn:default` block above, the warning shape
-  // (`property: "bpmn:errorRef"`, the `$parent` boundary id) is moddle-INTERNAL
+  // (`property: "bpmn:errorRef"`, the `$parent` owner id) is moddle-INTERNAL
   // and version-coupled, not a public contract — it is pinned by the "rejects an
-  // error boundary whose errorRef does not resolve" unit test, which must break
-  // loudly on a bpmn-moddle upgrade that reshapes it.
+  // error boundary whose errorRef does not resolve" / "rejects an error end
+  // event with a dangling errorRef" unit tests, which must break loudly on a
+  // bpmn-moddle upgrade that reshapes it.
   const danglingErrorRef = new Map<string, string>();
   for (const w of parsed.warnings as Array<{
     message?: string;
@@ -270,7 +272,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
   }>) {
     if (w?.property === "bpmn:errorRef" && typeof w.message === "string" && /unresolved reference/i.test(w.message)) {
       const owner = w.element?.$parent;
-      if (owner?.$type === "bpmn:BoundaryEvent" && typeof owner.id === "string") {
+      if ((owner?.$type === "bpmn:BoundaryEvent" || owner?.$type === "bpmn:EndEvent") && typeof owner.id === "string") {
         danglingErrorRef.set(owner.id, String(w.value));
       }
     }
@@ -381,6 +383,57 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       return undefined;
     }
     return msgName;
+  };
+
+  // Shared errorRef → errorCode resolution (M3-L2 TASK-42, widened M5-L1
+  // TASK-10) — used by BOTH an error boundary event and an error end event:
+  //  - PRESENT-but-unresolved (moddle dropped it; recovered via the dangling
+  //    map) → reject. It is NOT a catch-all — a typo must not silently widen
+  //    to "match any code".
+  //  - PRESENT-and-resolved → its <bpmn:error> @errorCode must be NON-EMPTY.
+  //    An empty/absent code would silently act as a catch-all (the engine
+  //    matches errorCode==null to any code), so it is rejected.
+  //  - ABSENT: a BOUNDARY treats this as the catch-all (leave n.errorCode
+  //    undefined so the graph carries errorCode:null, the unambiguous "match
+  //    any code" marker) — `requireCode=false`. An END event THROWS and has no
+  //    catch-all shape: `requireCode=true` rejects an absent errorRef with the
+  //    same "must reference ... non-empty @errorCode" message as a code-less one.
+  const resolveErrorCode = (
+    n: { id: string; errorRef?: string; errorCode?: string },
+    label: string,
+    requireCode: boolean,
+  ): void => {
+    const elementKind = requireCode ? "endEvent" : "boundaryEvent";
+    const danglingRef = danglingErrorRef.get(n.id);
+    if (danglingRef !== undefined) {
+      err(`${label} '${n.id}' has an errorRef '${danglingRef}' that does not resolve to a declared <bpmn:error>.`, n.id, elementKind);
+      return;
+    }
+    if (n.errorRef == null) {
+      if (requireCode) {
+        err(`${label} '${n.id}' must reference a declared <bpmn:error> with a non-empty @errorCode.`, n.id, elementKind);
+      }
+      return;
+    }
+    if (!errorsById.has(n.errorRef)) {
+      err(`${label} '${n.id}' has an errorRef that does not resolve to a declared <bpmn:error>.`, n.id, elementKind);
+      return;
+    }
+    const code = errorsById.get(n.errorRef)!.errorCode;
+    if (code == null || code.trim() === "") {
+      if (requireCode) {
+        err(`${label} '${n.id}' must reference a declared <bpmn:error> with a non-empty @errorCode.`, n.id, elementKind);
+      } else {
+        err(
+          `${label} '${n.id}' references error '${n.errorRef}', which has no (or an empty) @errorCode. ` +
+            "A coded error boundary needs a non-empty @errorCode; omit the errorRef to make this a catch-all boundary.",
+          n.id,
+          elementKind,
+        );
+      }
+      return;
+    }
+    n.errorCode = code;
   };
 
   // M5-L1: the static scope-hierarchy map (spec §2) — a scope's parent scope id
@@ -745,10 +798,18 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
           info.endKind = "none";
         } else if (only === CANCEL_EVENT_DEFINITION) {
           info.endKind = "cancel"; // validated against scope below
+        } else if (only === ERROR_EVENT_DEFINITION) {
+          // M5-L1 (Task 10, spec §5.2): an error end event THROWS from its
+          // enclosing scope via the same hierarchical attachment-chain walk as a
+          // worker-task business error. errorRef/errorCode resolution (PRESENT +
+          // coded, unlike the optional/catch-all boundary shape) happens in the
+          // shared `resolveErrorCode` pass below, alongside the boundary pass.
+          info.endKind = "error";
+          info.errorRef = refId((defs[0] as ModdleElement).errorRef) ?? undefined;
         } else {
           err(
             `End event '${id ?? ""}' has a ${defs.length === 1 ? localTypeName(defs[0]!.$type) : "event definition"}. ` +
-              "Only a none end event or a cancel end event (inside a transaction) is supported.",
+              "Only a none end event, a cancel end event (inside a transaction), or an error end event is supported.",
             id,
             "endEvent",
           );
@@ -1158,43 +1219,9 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       if (attached.type !== "serviceTask" && attached.type !== "subProcess" && attached.type !== "transaction") {
         err(`Error boundary event '${n.id}' must be attached to a service task, a subprocess, or a transaction.`, n.id, "boundaryEvent");
       }
-      // errorRef handling (M3-L2, TASK-42):
-      //  - PRESENT-but-unresolved (moddle dropped it; recovered via the dangling
-      //    map) → reject. It is NOT a catch-all — a typo must not silently widen
-      //    to "match any code".
-      //  - PRESENT-and-resolved → its <bpmn:error> @errorCode must be NON-EMPTY.
-      //    An empty/absent code would silently act as a catch-all (the engine
-      //    matches errorCode==null to any code), so it is rejected.
-      //  - ABSENT → this IS the catch-all: leave n.errorCode undefined so the
-      //    graph carries errorCode:null, the unambiguous "match any code" marker.
-      const danglingRef = danglingErrorRef.get(n.id);
-      if (danglingRef !== undefined) {
-        err(
-          `Error boundary event '${n.id}' has an errorRef '${danglingRef}' that does not resolve to a declared <bpmn:error>.`,
-          n.id,
-          "boundaryEvent",
-        );
-      } else if (n.errorRef != null) {
-        if (!errorsById.has(n.errorRef)) {
-          err(
-            `Error boundary event '${n.id}' has an errorRef that does not resolve to a declared <bpmn:error>.`,
-            n.id,
-            "boundaryEvent",
-          );
-        } else {
-          const code = errorsById.get(n.errorRef)!.errorCode;
-          if (code == null || code.trim() === "") {
-            err(
-              `Error boundary event '${n.id}' references error '${n.errorRef}', which has no (or an empty) @errorCode. ` +
-                "A coded error boundary needs a non-empty @errorCode; omit the errorRef to make this a catch-all boundary.",
-              n.id,
-              "boundaryEvent",
-            );
-          } else {
-            n.errorCode = code;
-          }
-        }
-      }
+      // errorRef handling (M3-L2, TASK-42) — the shared resolveErrorCode pass
+      // (requireCode=false: absent errorRef IS the catch-all, left unrejected).
+      resolveErrorCode(n, "Error boundary event", false);
       // Lifted target rule (M3-L2): exactly ONE outgoing flow, to any token-path
       // node in the SAME scope (no longer "a cancel end event"). The forbidden
       // targets are already rejected by the per-flow endpoint rules above — a
@@ -1254,6 +1281,15 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         );
       }
     }
+  }
+
+  // M5-L1 (Task 10, spec §5.2): error END events — the shared resolveErrorCode
+  // pass (requireCode=true: a throw has no catch-all shape, so an absent OR
+  // code-less errorRef both reject with the same "must reference ... non-empty
+  // @errorCode" message).
+  for (const n of nodes) {
+    if (n.type !== "endEvent" || n.endKind !== "error") continue;
+    resolveErrorCode(n, "Error end event", true);
   }
 
   // -------------------------------------------------------------------------
@@ -1643,7 +1679,13 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       };
       if (n.type === "serviceTask") node.isForCompensation = n.isForCompensation === true;
       if (n.type === "intermediateCatchEvent") node.timerTrigger = n.timerTrigger ?? null; // M3-L4: the static ISO-8601 delay
-      if (n.type === "endEvent") node.endKind = n.endKind ?? "none";
+      if (n.type === "endEvent") {
+        node.endKind = n.endKind ?? "none";
+        if (n.endKind === "error") {
+          node.errorRef = n.errorRef ?? null;
+          node.errorCode = n.errorCode ?? null;
+        }
+      }
       if (n.type === "boundaryEvent") {
         node.boundaryKind = n.boundaryKind ?? null;
         node.attachedToRef = n.attachedToRef ?? null;

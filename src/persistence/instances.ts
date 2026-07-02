@@ -835,7 +835,10 @@ export type IncidentKind =
   // count crossed STEP_BUDGET_SOFT (a graceful incident BELOW the platform step
   // ceiling, so a hot parallel×loop shape never becomes an opaque errored Workflow).
   | "concurrencyLimit"
-  | "stepBudget";
+  | "stepBudget"
+  // COMPOSITION (M5-L1 spec §5.1): an error END EVENT reached the process root
+  // uncaught (worker-task uncaught errors keep serviceTaskFailure).
+  | "uncaughtError";
 /**
  * Incident remediation lifecycle (one-way):
  *

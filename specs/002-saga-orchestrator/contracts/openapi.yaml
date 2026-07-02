@@ -1062,7 +1062,12 @@ components:
           description: Monotonic completion order within the transaction scope.
         compensationStatus:
           type: string
-          enum: [pending, notRequired, compensating, compensated, failed]
+          description: >-
+            `committed` is the terminal/sealed status (the outermost enclosing
+            transaction committed). M5-L1 adds `committedLocal` — a non-terminal
+            local commit of a NESTED transaction, still compensable by an
+            ancestor's cancel (design §3.2/§3.4).
+          enum: [pending, notRequired, compensating, compensated, failed, committed, committedLocal]
         compensationElementId:
           type: string
           nullable: true

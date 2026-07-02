@@ -161,9 +161,9 @@ export interface GraphNode {
   boundaryKind?: BoundaryKind | null;
   /** boundaryEvent only — the activity (or transaction) it is attached to. */
   attachedToRef?: string | null;
-  /** error boundaryEvent only — the referenced <bpmn:error> id. */
+  /** error boundaryEvent or error endEvent (M5-L1) — the referenced <bpmn:error> id. */
   errorRef?: string | null;
-  /** error boundaryEvent only — the resolved error code (the wire value workers send). */
+  /** error boundaryEvent or error endEvent (M5-L1) — the resolved error code (the wire value workers send). */
   errorCode?: string | null;
   /** compensate boundaryEvent only — the isForCompensation handler it associates to. */
   compensationHandlerId?: string | null;

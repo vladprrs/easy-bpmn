@@ -17,8 +17,8 @@ set was **accepted in v2.3.0** and has now **shipped**: block-structured `parall
 (token frontier + AND-join) through **M4-L3**, `inclusiveGateway` (OR) regions through **M4-L4**,
 parallel-branch compensation through **M4-L5**, and the concurrency caps, R2 overlay offload, per-token
 observability, and the `tokens` inspection array through **M4-L6**. The **whole M5 composition set was
-accepted, up front, in v2.5.0** and its runtime is now **opening per layer**: **M5-L1 (embedded scopes +
-hierarchical exceptions) is opening** — see the interim markers below; M5-L2 (`callActivity`), M5-L3
+accepted, up front, in v2.5.0** and its runtime opens **per layer**: **M5-L1 (embedded scopes +
+hierarchical exceptions) has shipped** — see the interim markers below; M5-L2 (`callActivity`), M5-L3
 (`multiInstance`), M5-L4 (escalation + event subprocess), and M5-L5 (signal) remain **accepted-in-
 governance, interim-rejected at publish** until their own layers open. When in doubt, the constitution
 wins. The authoritative designs are
@@ -70,8 +70,10 @@ The profile grows one milestone at a time, each guarded by a constitution amendm
   `subProcess`, scope-hosted error/timer boundaries, an error end event, `callActivity`,
   `multiInstanceLoopCharacteristics`, `escalation`, `signal`, and the first non-interrupting
   signal/escalation boundaries) was accepted by the single M5 amendment; the runtime opens **per layer**,
-  M5-L1 through M5-L5. **M5-L1 (embedded scopes + hierarchical exceptions) is opening now** — see the
-  interim markers below. [`02-activities.md`](./02-activities.md).
+  M5-L1 through M5-L5. **M5-L1 (embedded scopes + hierarchical exceptions) has SHIPPED** — the plain
+  embedded `subProcess`, error/timer boundaries on a scope, the error end event, hierarchical error
+  bubbling, the two-tier commit shield, and the root-relative reverse pass are all runtime-open — see below.
+  [`02-activities.md`](./02-activities.md).
 
 ## What "no custom notation" means (precisely)
 
@@ -247,17 +249,19 @@ The forward path may branch through an **`exclusiveGateway`** (XOR) and **loop b
 | **Exclusive Gateway** | `exclusiveGateway` | XOR **split** (1 in, N out): non-default outgoing flows carry FEEL conditions (`tFormalExpression`; parsed at publish via `feelin`), evaluated in document order, first `true` wins, else the `default` flow, else terminal `noPath`. XOR **join** (N in, 1 out): pass-through, no waiting. No boundary events may attach to a gateway. |
 | **Message** | `message` (root) | Declares the message **name** a Receive Task waits for. Correlation key is supplied via the **API** at start. |
 | **Transaction** | `transaction` | The **saga scope**: a none start event, supported children, a none end (commit), and optionally a cancel end. Compensation of its completed activities runs in reverse order on cancel. |
-| **Compensation Boundary Event** | `boundaryEvent` + `compensateEventDefinition` | A **compensation marker**: it is **neither interrupting nor non-interrupting** (the `cancelActivity` axis does not apply). MUST have **zero outgoing `sequenceFlow`** and **exactly one** outgoing `<association>` to an `isForCompensation` activity **in the same transaction scope**. |
-| **Error Boundary Event** | `boundaryEvent` + `errorEventDefinition` | **Interrupting**; attached to a `serviceTask` (never a compensation handler). Routes its single outgoing flow to **any token-path node in the same scope** (M3-L2) — no longer cancel-end-only. An activity may carry **any number of boundaries with distinct, non-empty `@errorCode`s** plus **at most one catch-all** (`errorEventDefinition` with **no** `errorRef`). A coded boundary's `errorRef` MUST resolve to a declared root `<bpmn:error>` with a non-empty `@errorCode`. Matching on a worker `fail.errorCode`: **exact `@errorCode` → catch-all → uncaught Hazard** (the catch-all catches any business code, even undeclared ones). |
+| **Compensation Boundary Event** | `boundaryEvent` + `compensateEventDefinition` | A **compensation marker**: it is **neither interrupting nor non-interrupting** (the `cancelActivity` axis does not apply). MUST have **zero outgoing `sequenceFlow`** and **exactly one** outgoing `<association>` to an `isForCompensation` activity **in the same immediate scope** (the handler's own enclosing scope need not itself be a `transaction` — see the ancestry rule on the Compensation Handler row and rule 10). |
+| **Error Boundary Event** | `boundaryEvent` + `errorEventDefinition` | **Interrupting**; attached to a `serviceTask`, a `subProcess`, **or** a `transaction` (M5-L1 — never a compensation handler). Routes its single outgoing flow to **any token-path node in the same scope** (M3-L2) — no longer cancel-end-only. An activity/scope may carry **any number of boundaries with distinct, non-empty `@errorCode`s** plus **at most one catch-all** (`errorEventDefinition` with **no** `errorRef`). A coded boundary's `errorRef` MUST resolve to a declared root `<bpmn:error>` with a non-empty `@errorCode`. Matching on a thrown error's code (a worker `fail.errorCode`, or an **error end event**'s `errorRef`): **exact `@errorCode` → catch-all → the attachment-chain walk continues to the next enclosing scope → uncaught Hazard at the process root** (the catch-all catches any business code, even undeclared ones). On a scope host, catching **interrupts the whole subtree without compensation** (Hazard-vs-Cancel, M5-L1 — see [`07-execution-semantics.md`](./07-execution-semantics.md)); on a `serviceTask` host it behaves exactly as before M5-L1. |
 | **Cancel Boundary Event** | `boundaryEvent` + `cancelEventDefinition` | **Interrupting**; attached **only to the `transaction`**; its single outgoing flow is the "saga failed" path. |
-| **Boundary Timer (M3-L3)** | `boundaryEvent` + `timerEventDefinition` | **Interrupting** (`cancelActivity` absent/`true`); attached to a `serviceTask` **or** `receiveTask` (inside or outside a transaction) — never a `transaction` (M5) or a compensation handler. **At most one** per activity. Exactly **one** static ISO-8601 trigger (`timeDate`\|`timeDuration`; `timeCycle`/FEEL/non-parsing reject). One outgoing flow to any token-path node in the same scope. On fire (a per-timer `JobScheduler` DO alarm; D1 `timers`/`timer_outcomes` are canonical) the token takes that path; the host's in-flight job is abandoned / its message subscription superseded, and a late worker callback / publish gets the stable no-op / buffered outcome. See **rule 14**. |
+| **Boundary Timer (M3-L3; scope hosts M5-L1)** | `boundaryEvent` + `timerEventDefinition` | **Interrupting** (`cancelActivity` absent/`true`); attached to a `serviceTask`, a `receiveTask` (inside or outside a transaction), **or** — since **M5-L1** — a `subProcess`/`transaction` (never a compensation handler). **At most one** per activity/scope. Exactly **one** static ISO-8601 trigger (`timeDate`\|`timeDuration`; `timeCycle`/FEEL/non-parsing reject). One outgoing flow to any token-path node in the same scope. On fire (a per-timer `JobScheduler` DO alarm; D1 `timers`/`timer_outcomes` are canonical) the token takes that path; on a **task** host the in-flight job is abandoned / its message subscription superseded (a late worker callback / publish gets the stable no-op / buffered outcome); on a **scope** host (M5-L1) the whole subtree is interrupted **without compensation** — completed effects retained as `pending`/`committedLocal` rows, the drain deferred to the next engine rewalk (idempotent, retain-only) so the fire transition stays a single atomic batch. See **rule 14**. |
 | **Timer Intermediate Catch (M3-L4)** | `intermediateCatchEvent` + `timerEventDefinition` | A **delay step on the token path** — the catch IS the wait. Exactly **one incoming** and **one outgoing** sequence flow (a single-token delay, not a join). Allowed at process level **and inside a `transaction`** (the saga scope stays open across the delay). Exactly **one** static ISO-8601 trigger (`timeDate`\|`timeDuration`; `timeCycle`/FEEL/non-parsing reject — same well-formedness as a boundary timer). On fire (a per-timer `JobScheduler` DO alarm; D1 `timers`/`timer_outcomes` canonical) the token advances down the single outgoing flow; there is **no** host job/subscription to abandon. See **rule 15**. |
 | **Message Intermediate Catch (M3-L4)** | `intermediateCatchEvent` + `messageEventDefinition` | A **correlation wait on the token path** with **identical** wait/correlation/resume semantics to a `receiveTask` (the **same** subscription/broker machinery; the `<message>` carries only its name; the correlation key is supplied via the **API** at instance start). Exactly **one incoming** and **one outgoing** sequence flow (a single-token wait, not a join). Allowed at process level **and inside a `transaction`** (the saga scope stays open across the wait). It is an **event, not an activity**: **no** `easy-bpmn:taskDefinition`, and **no** boundary events attach. Early/buffered messages are claimed at registration; a correlated message's payload is applied **atomically** with the transition out of the wait; a duplicate publish returns the stable prior outcome (never double-advances). See **rule 16**. |
 | **Event-Based Gateway (M3-L4)** | `eventBasedGateway` | A **deterministic race** over its branch catches. **≥2 outgoing flows**, every target an `intermediateCatchEvent` (timer or message) whose **only** incoming flow is from this gateway; **≤1 timer branch**; message branches reference **distinct** messages; `instantiate="true"` and `eventGatewayType="Parallel"` reject. Token arrival registers every message branch + arms the timer branch, then parks; whichever event resolves **first wins** (early/buffered messages win at registration, document-order tie-break). The race decides on a **single `gateway_decisions` row** claimed by a plain INSERT in the same batch as the transition — two concurrent writers (broker message-apply vs `fireTimer`), so the loser converts. The winner advances straight to the catch's single outgoing flow (the catch is never re-dispatched). See **rule 17**. |
 | **Parallel Gateway (M4-L1)** | `parallelGateway` | **Block-structured (SESE) AND**: split (1 in, N out — fork) paired with exactly one matching `parallelGateway` join (N in, 1 out — synchronise), validated at publish via post-dominators (no matching join, a branch escaping the region, an uncontrolled merge inside it, a mismatched join type, non-laminar nesting, or two concurrent branches awaiting the same message name reject with element ids). No conditions on its outgoing flows; `instantiate="true"` rejects. The join is satisfied once a token from every activated branch (origin-branch keyed) has arrived. **Multi-token runtime shipped (M4-L3):** the frontier fans a branch token out per out-flow (all leasable at once), the AND-join barrier waits for every activated branch, and branch-local variable overlays merge in split out-flow document order at the join. |
 | **Inclusive Gateway (M4-L1)** | `inclusiveGateway` | **Block-structured (SESE) OR**: split takes every outgoing flow whose FEEL condition is true (≥1; else the gateway-owned `default`) and is paired with a matching `inclusiveGateway` join that waits for a token from every **activated branch** (the recorded subset). Same SESE validation as the parallel gateway and the **same** condition/`default` rules as the `exclusiveGateway` split. `instantiate="true"` rejects. **OR runtime shipped (M4-L4):** the split's activated subset is recorded in `gateway_decisions.activated_flow_ids` (document order) and the OR-join waits for exactly that recorded subset; zero activation with no `default` raises terminal `noPath`. |
-| **Compensation Handler** | `serviceTask isForCompensation="true"` | A handler off the token path, reached **only** via compensation (the association from a compensation boundary). Bound by its own `easy-bpmn:taskDefinition type`. Must live inside a transaction. |
-| **Cancel End Event** | `endEvent` + `cancelEventDefinition` | Allowed **only inside a `transaction`**. Reaching it cancels the transaction → reverse-order compensation. |
+| **Compensation Handler** | `serviceTask isForCompensation="true"` | A handler off the token path, reached **only** via compensation (the association from a compensation boundary). Bound by its own `easy-bpmn:taskDefinition type`. Must live inside a transaction — since **M5-L1** this is an **ancestry** check: *some* enclosing scope (not necessarily the immediate one) must be a `transaction`, so a handler may sit inside a `subProcess` that is itself nested in a `transaction`. See **rule 10**. |
+| **Embedded Sub-process (M5-L1)** | `subProcess` (plain — not `triggeredByEvent`, not `adHocSubProcess`, no loop characteristics) | A **bookkeeping scope**: one none-start, ≥1 none-end, **shares the parent's variable space**, opens no saga ledger commit of its own. Nests with `transaction` in either order; error/timer boundary events may attach to it (see above). Its completed steps are ledgered against whichever **enclosing transaction** they belong to (the ledger-write gate is "some ancestor is a transaction", not "immediate scope is a transaction"). Bounded by `MAX_SCOPE_DEPTH = 8` (see [`07-execution-semantics.md`](./07-execution-semantics.md)). |
+| **Cancel End Event** | `endEvent` + `cancelEventDefinition` | Allowed **only inside a `transaction`** — the cancel end's **immediate** enclosing scope must be the transaction (a cancel end directly inside a plain `subProcess` rejects, even if an ancestor is a transaction). Reaching it cancels that transaction's **subtree** → root-relative reverse-order compensation (M5-L1 generalizes this from a single scope to the scope subtree). A **nested** transaction's cancel end is **non-terminal**: the instance continues on the cancel boundary's outgoing path; only a **top-level** transaction's cancel end (or operator `/cancel`) settles the instance terminally. A nested transaction containing a cancel end MUST carry a cancel boundary (else there is no failure path to continue on) — see **rule 12**. |
+| **Error End Event (M5-L1)** | `endEvent` + `errorEventDefinition` | Legal at process level or inside any scope. Reaching it consumes the token and throws the error **from the scope containing the end event** — the attachment-chain walk (exact `@errorCode` → catch-all → next enclosing scope) finds the nearest catching boundary; uncaught at the process root it settles a terminal incident `kind=uncaughtError`. `errorRef` MUST resolve to a declared `<bpmn:error>` with a non-empty `@errorCode` (the same publish-time resolution an error boundary uses). See **rule 18**. |
 | **Association** | `association` | Compensation wiring only: a compensation boundary → its `isForCompensation` handler. |
 | **Error** | `error` (root) | Declares a business error (`@id`, `@name`, `@errorCode`) referenced by an error boundary's `errorRef`. |
 
@@ -366,17 +370,43 @@ adversarially hardened) and the [M5-L1 layer design](../superpowers/specs/2026-0
 are the source artifacts; the recorded [M5-L1 Constitution Check](../../specs/002-saga-orchestrator/m5-L1-constitution-check.md)
 is the first layer's governance record.
 
-**M5-L1 (embedded scopes + hierarchical exceptions) — runtime opening in this layer:**
+**M5-L1 (embedded scopes + hierarchical exceptions) — SHIPPED, runtime open:**
 
 - Plain embedded `bpmn:subProcess` (one none-start, ≥1 end, sharing the parent variable scope; arbitrary
-  nesting of `subProcess`/`transaction`) — **runtime opening in this layer**.
-- Error and timer `boundaryEvent`s hosted on a `subProcess`/`transaction` (a non-cancel interrupting
-  boundary interrupts **without** auto-compensation, ledger retained) — **runtime opening in this layer**.
-- The error **end** event (`endEvent` + `errorEventDefinition`) — **runtime opening in this layer**.
-- Hierarchical (up-scope) error bubbling and the generalized scope-subtree compensation model (commit
-  shield, straggler cohort, live-token barrier, compensation-reachability ancestry check) —
-  **runtime opening in this layer**.
-- `MAX_SCOPE_DEPTH` (publish-time cap on scope nesting depth) — **runtime opening in this layer**.
+  nesting of `subProcess`/`transaction` in either order) — **shipped**: a pure bookkeeping scope (no ledger
+  commit of its own), whitelisted by the validator, walked by the engine as `scopeEntered`/`scopeExited`
+  history bookkeeping. See the supported set + rule 6 (structural sanity now applies per scope, including
+  `subProcess` scopes) below.
+- Error and timer `boundaryEvent`s hosted on a `subProcess`/`transaction` — **shipped**. A non-cancel
+  interrupting boundary (an error catch, or a scope timer firing) interrupts its subtree **without**
+  auto-compensation — completed effects stay `pending`/`committedLocal`, retained for a later ancestor
+  cancel or operator `/cancel` (Hazard-vs-Cancel; Principle VI). See rules 11 and 14.
+- The error **end** event (`endEvent` + `errorEventDefinition`) — **shipped**: throws from the scope
+  containing the end event, walks the attachment chain outward (same exact-`@errorCode` → catch-all
+  precedence an error boundary uses), and settles a new terminal incident kind `uncaughtError` if the walk
+  reaches the process root uncaught (worker/service-task errors keep `serviceTaskFailure`). See the
+  supported set + rule 18.
+- Hierarchical (up-scope) error bubbling and the generalized scope-subtree compensation model — **shipped**:
+  the **two-tier commit shield** (`committedLocal` non-terminal on a nested transaction's own commit,
+  sealed `committed` only at the outermost commit), the **root-relative reverse cursor** (a global
+  per-instance `seq`, subtree-filtered, ancestry-eligible `committedLocal` rows included), the **straggler
+  cohort** and **live-token barrier** un-gated to run for every graph (subtree-filtered, not just M4
+  region graphs), and the **compensation-reachability ancestry check** (a handler is legal iff *some*
+  ancestor scope is a transaction, not just the immediate one). See
+  [`07-execution-semantics.md`](./07-execution-semantics.md) for the runtime mechanics and rule 10 below
+  for the validator rule.
+- `MAX_SCOPE_DEPTH = 8` (publish-time cap on scope nesting depth, `src/runtime/engine.ts`) — **shipped**:
+  enforced by the validator at publish (element id + reason), because in L1 scope depth is fully static (no
+  `callActivity`, no `multiInstance` yet). See rule 19.
+- **Modeling guidance.** For a **timer-triggered rollback**, route the timer boundary's outgoing flow to a
+  **cancel end event inside** the transaction — that *is* Cancel, and it does compensate. A timer boundary
+  routed anywhere else is deliberately Hazard-class: it interrupts the scope but does **not** compensate,
+  and its retained ledger rows wait for a later ancestor cancel or operator `/cancel`.
+- **Nested cancel is non-terminal.** A cancel end **inside a nested transaction** (one enclosed by another
+  scope, not the process root) compensates only its own transaction's subtree, then the instance
+  **continues running** on the cancel boundary's outgoing (failure) path in the parent scope. Only a
+  **top-level** transaction's cancel end, or an operator `/cancel` (compensation root = the process),
+  settles the instance terminally.
 
 **M5-L2…L5 — accepted (v2.5.0), runtime not yet open — publish still rejects (interim):**
 
@@ -431,46 +461,70 @@ A BPMN document is accepted for publish only if **all** hold:
 2. **Single executable process.** Exactly one `<process isExecutable="true">`; no `<collaboration>`,
    pools, lanes, or choreography.
 3. **Whitelist only (flow nodes), recursively.** Every flow node — at the process level **and inside each
-   `transaction`** — is one of the supported nodes above. Any other standard-namespace flow node ⇒ reject
-   with the offending element id + reason (deferred gateways carry their roadmap pointer). No implicit
-   split: >1 outgoing sequence flow is allowed **only on an `exclusiveGateway`, `eventBasedGateway`,
-   `parallelGateway`, or `inclusiveGateway`**.
-4. **Event definitions.** Start events carry **no** event definition. End events are **none** (commit) or
-   a **cancel** end **only inside a `transaction`**. Boundary events carry exactly one of
-   `compensate`/`error`/`cancel`/`timer` and never attach to a gateway.
+   scope (`transaction` or, since M5-L1, `subProcess`), recursively to `MAX_SCOPE_DEPTH = 8`** — is one of
+   the supported nodes above. Any other standard-namespace flow node ⇒ reject with the offending element id
+   + reason (deferred gateways/constructs carry their roadmap pointer). No implicit split: >1 outgoing
+   sequence flow is allowed **only on an `exclusiveGateway`, `eventBasedGateway`, `parallelGateway`, or
+   `inclusiveGateway`**.
+4. **Event definitions.** Start events carry **no** event definition. End events are **none** (commit /
+   scope exit), a **cancel** end **only inside a `transaction`** (its **immediate** enclosing scope, not
+   merely an ancestor — rule 12), or — since **M5-L1** — an **error** end (rule 18). Boundary events carry
+   exactly one of `compensate`/`error`/`cancel`/`timer` and never attach to a gateway.
 5. **Conditions only on gateway splits, flows scoped.** A `conditionExpression` is allowed **only** on a
    flow leaving a multi-out `exclusiveGateway`; there, every **non-default** outgoing flow MUST carry one
    (FEEL; parse-checked at publish — a parse failure rejects with element id + reason), the `default`
    flow MUST NOT, and the `default` attribute MUST reference one of the gateway's own outgoing flows.
    All other flows are plain. Flows connect supported nodes **in the same scope** (a flow may not cross a
-   transaction boundary). Cycles on the token path are legal; reachability is BFS-based.
-6. **Structural sanity, per scope.** Each scope (the process and each transaction) has exactly one none
-   start event, ≥1 none end event, every `*Ref` resolves, and every node is reachable (via sequence flow,
-   boundary attachment, or compensation association).
+   scope boundary — `transaction` or `subProcess`). Cycles on the token path are legal; reachability is
+   BFS-based.
+6. **Structural sanity, per scope.** Each scope (the process, each `transaction`, and — since M5-L1 — each
+   `subProcess`) has exactly one none start event, ≥1 none end event, every `*Ref` resolves, and every node
+   is reachable (via sequence flow, boundary attachment, or compensation association).
 7. **No model-based instantiation.** No `receiveTask instantiate="true"`.
 8. **Service task is bound.** Each `serviceTask` (forward or `isForCompensation`) declares a non-empty
    `easy-bpmn:taskDefinition` `type`.
 9. **Receive task is well-formed.** Has a `messageRef` resolving to a named `<message>`.
-10. **Compensation wiring.** A compensation boundary event has **zero outgoing sequence flow** and
-    **exactly one** `<association>` to an `isForCompensation` service task **in the same transaction**.
-11. **Error boundary routing (M3-L2).** An error boundary event is attached to a `serviceTask` (never an
-    `isForCompensation` handler) and has exactly one outgoing flow to **any token-path node in the same
-    scope** (not a start event, a boundary event, or a handler). Per activity: **distinct, non-empty
-    `@errorCode`s** on the coded boundaries (each `errorRef` resolving to a declared `<bpmn:error>`) plus
-    **at most one catch-all** (no `errorRef`). A worker `fail.errorCode` matches **exact `@errorCode` →
-    catch-all → uncaught Hazard**.
-12. **Cancel placement.** A cancel **end event** appears only inside a `transaction`; a cancel **boundary
-    event** is attached only to the `transaction`.
+10. **Compensation wiring and reachability (ancestry generalized, M5-L1).** A compensation boundary event
+    has **zero outgoing sequence flow** and **exactly one** `<association>` to an `isForCompensation`
+    service task **in the same immediate scope** (unchanged mechanism — the boundary and its handler must
+    share a scope). Separately, an `isForCompensation` handler must be **reachable by a Cancel trigger**:
+    *some* scope on its ancestor chain — not necessarily the immediate one — must be a `transaction`; a
+    handler whose chain reaches the process root with no enclosing transaction is rejected (element id +
+    reason: "the handler has no trigger"). This lets a handler live inside a `subProcess` that is itself
+    nested in a `transaction`, while still catching every case the pre-M5-L1 immediate-parent check caught.
+11. **Error boundary routing (M3-L2; scope hosts M5-L1).** An error boundary event is attached to a
+    `serviceTask`, a `subProcess`, **or** a `transaction` (since M5-L1 — never an `isForCompensation`
+    handler) and has exactly one outgoing flow to **any token-path node in the same scope** (not a start
+    event, a boundary event, or a handler). Per activity/scope: **distinct, non-empty `@errorCode`s** on
+    the coded boundaries (each `errorRef` resolving to a declared `<bpmn:error>`) plus **at most one
+    catch-all** (no `errorRef`). A thrown error's code (a worker `fail.errorCode`, or an error end event's
+    `errorRef`) matches **exact `@errorCode` → catch-all → the attachment-chain walk continues to the next
+    enclosing scope → uncaught Hazard** at the process root. Catching on a scope host **interrupts the
+    whole subtree without compensation** (Hazard-vs-Cancel — see rule 14 and
+    [`07-execution-semantics.md`](./07-execution-semantics.md)).
+12. **Cancel placement.** A cancel **end event**'s **immediate** enclosing scope MUST be a `transaction`
+    (an ancestor transaction further up the chain does not satisfy this — a cancel end directly inside a
+    plain `subProcess` rejects even when that `subProcess` is nested in a transaction); a cancel **boundary
+    event** is attached only to a `transaction`. Since **M5-L1**: a **nested** transaction (enclosed by any
+    scope, not the process root) that contains a cancel end MUST itself carry a cancel boundary — otherwise
+    its cancellation's reverse pass would have no failure path to continue the enclosing scope on (element
+    id + reason). A top-level transaction needs no cancel boundary: its cancel end settles the instance
+    terminally.
 13. **Extensions tolerated, not required.** Foreign-namespace `<extensionElements>`, DI, `documentation`,
     and text annotations are accepted and ignored; the only binding `easy-bpmn` reads is its own.
-14. **Interrupting boundary timer (M3-L3).** A `boundaryEvent` + `timerEventDefinition` is **interrupting**
-    (`cancelActivity` absent or `true`; `cancelActivity="false"` rejects — M4) and attaches to a
-    `serviceTask` **or** `receiveTask` (inside or outside a transaction) — **never a `transaction`** (M5)
-    nor an `isForCompensation` handler. **At most one** timer boundary per activity. Exactly **one outgoing
-    flow** to any token-path node in the same scope (the rule 11 endpoint rules apply). The
-    `timerEventDefinition` carries exactly **one** of `timeDate`|`timeDuration` as a **static ISO-8601
-    literal that parses** — `timeCycle`, a FEEL expression, a non-parsing literal, or zero/two time
-    children each reject with element id + reason.
+14. **Interrupting boundary timer (M3-L3; scope hosts M5-L1).** A `boundaryEvent` + `timerEventDefinition`
+    is **interrupting** (`cancelActivity` absent or `true`; `cancelActivity="false"` rejects — M4) and
+    attaches to a `serviceTask` **or** `receiveTask` (inside or outside a transaction), **or** — since
+    **M5-L1** — a `subProcess`/`transaction` (never an `isForCompensation` handler). **At most one** timer
+    boundary per activity/scope. Exactly **one outgoing flow** to any token-path node in the same scope
+    (the rule 11 endpoint rules apply). The `timerEventDefinition` carries exactly **one** of
+    `timeDate`|`timeDuration` as a **static ISO-8601 literal that parses** — `timeCycle`, a FEEL expression,
+    a non-parsing literal, or zero/two time children each reject with element id + reason. Firing on a
+    **task** host abandons its in-flight job / supersedes its subscription (unchanged since M3-L3); firing
+    on a **scope** host (M5-L1) generalizes "abandon" to "interrupt the subtree without compensation" —
+    every completed step's ledger row is retained (`pending`/`committedLocal`), the drain deferred to the
+    next engine rewalk (idempotent, retain-only) — see
+    [`07-execution-semantics.md`](./07-execution-semantics.md).
 15. **Timer intermediate catch (M3-L4).** An `intermediateCatchEvent` + `timerEventDefinition` is a delay
     step on the token path, with exactly **one incoming** and **one outgoing** sequence flow (a join into
     it rejects with element id + reason). Allowed at process level **and inside a `transaction`**. Its
@@ -494,6 +548,16 @@ A BPMN document is accepted for publish only if **all** hold:
     conditions on its outgoing flows. At runtime the winning event (message correlation or timer fire) claims
     the decision row by a plain INSERT in the same batch as the transition — the loser's batch aborts and
     converts — and the token advances down the winning catch's single outgoing flow.
+18. **Error end event (M5-L1).** An `endEvent` + `errorEventDefinition` is accepted at process level or
+    inside any scope. Its `errorRef` MUST resolve to a declared root `<bpmn:error>` with a non-empty
+    `@errorCode` (the same publish-time resolution rule 11's error boundary uses; an absent or dangling
+    `errorRef` rejects with element id + reason — a throw has no catch-all shape, so it cannot be left
+    unset). Reaching it consumes the token and throws the error from the scope containing the end event;
+    runtime catching follows rule 11's attachment-chain walk.
+19. **`MAX_SCOPE_DEPTH` (M5-L1).** Scope nesting depth (a `transaction`/`subProcess` directly inside the
+    process is depth 1; each further nesting level adds 1) MUST NOT exceed **`MAX_SCOPE_DEPTH = 8`** —
+    depth 8 is accepted, depth 9 rejects with the offending scope's element id + reason. Enforced at
+    **publish** (not a runtime incident) because in M5-L1 the scope tree is fully static.
 
 Every rejection MUST state **what** was wrong, **which BPMN element** (by id), and **what the user can
 do** (constitution V — operator clarity).
@@ -537,6 +601,13 @@ with a matching `inclusiveGateway` join — single-entry/single-exit, validated 
 topology recorded in the graph IR. The multi-token runtime (frontier fan-out, AND/OR join barrier,
 branch-local merge, parallel-branch compensation) has shipped (M4-L2…L6).
 
+**ACCEPT** — embedded scopes (M5-L1): a plain `subProcess` nested inside a `transaction` (or vice versa),
+sharing the parent's variable space, with an error boundary on the `subProcess` routing to a token-path
+node and a timer boundary on the `transaction` routing to a Cancel end (the rollback-modeling pattern) —
+see [`02-activities.md`](./02-activities.md) and [`07-execution-semantics.md`](./07-execution-semantics.md).
+An **error end event** inside any scope is likewise accepted, its `errorRef` resolving to a declared
+`<bpmn:error>`.
+
 **REJECT** — a non-SESE concurrency region (no matching join, a branch escaping past the join, an
 uncontrolled merge, a mismatched join type, or two concurrent branches awaiting the same message name),
 or a `complexGateway` (not on the roadmap) — each with the offending element id:
@@ -557,6 +628,14 @@ expression — each with the offending element id.
 **REJECT** — a cancel end event outside a transaction:
 > `Cancel end event 'ProcCancel' is outside any transaction. A cancel end event is allowed only inside a
 >  <transaction>.`
+
+**REJECT** — a compensation handler with no transaction anywhere on its ancestor chain (M5-L1 ancestry
+rule 10):
+> `Service task 'refundCard' is isForCompensation but no enclosing scope is a <transaction> — the handler
+>  has no trigger (no Cancel can reach it).`
+
+**REJECT** — a scope nested past `MAX_SCOPE_DEPTH = 8` (M5-L1 rule 19):
+> `Scope 'InnerTx' exceeds MAX_SCOPE_DEPTH = 8 (nesting depth 9).`
 
 ## Resolved decisions & roadmap
 
@@ -591,10 +670,14 @@ expression — each with the offending element id.
 - **M5 — composition: ACCEPTED IN FULL (constitution v2.5.0), opening per layer** — non-transaction
   `subProcess`, scope-hosted error/timer boundaries, an error end event, `callActivity`,
   `multiInstanceLoopCharacteristics`, `escalation`, `signal`, and the first non-interrupting
-  signal/escalation boundaries. **M5-L1 (embedded scopes + hierarchical exceptions) is opening now** — see
+  signal/escalation boundaries. **M5-L1 (embedded scopes + hierarchical exceptions) has SHIPPED** — the
+  plain embedded `subProcess`, scope-hosted error/timer boundaries (Hazard-vs-Cancel), the error end event
+  (`uncaughtError` incident kind), hierarchical error bubbling, the two-tier commit shield
+  (`committedLocal`/`committed`), the root-relative reverse pass, and `MAX_SCOPE_DEPTH = 8` are all
+  runtime-open — see
   [Accepted in v2.5.0 (M5)](#accepted-in-v250-m5--composition-opening-per-layer) above; M5-L2
   (`callActivity`) through M5-L5 (`signal`) remain interim-rejected until their own layers open.
-  [`02-activities.md`](./02-activities.md).
+  [`02-activities.md`](./02-activities.md), [`07-execution-semantics.md`](./07-execution-semantics.md).
 
 > Any expansion of this profile requires amending the constitution first (Governance & scope). This file
 > is updated in lockstep with that amendment **and** with the `src/bpmn/validator.ts` accept/reject

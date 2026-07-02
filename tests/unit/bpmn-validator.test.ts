@@ -1896,4 +1896,41 @@ describe("M5-L1 embedded subProcess acceptance", () => {
     expect(r.ok).toBe(true);
     expect(r.graph!.nodes["undoA"]!.scopeId).toBe("S");
   });
+
+  // M5-L1 Task 9: error boundaries widen from serviceTask-only to also accept
+  // subProcess/transaction hosts (hierarchical error bubbling, spec §5.1).
+  it("accepts an error boundary attached to a subProcess", async () => {
+    const WITH_BOUNDARY = SUBPROC.replace(
+      '<bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="end"/>\n    <bpmn:endEvent id="end"/>',
+      `<bpmn:boundaryEvent id="sub_err" attachedToRef="sub"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="f_err" sourceRef="sub_err" targetRef="recover"/>
+    <bpmn:serviceTask id="recover"><bpmn:extensionElements><easy-bpmn:taskDefinition type="recover"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f_recover_end" sourceRef="recover" targetRef="recover_end"/>
+    <bpmn:endEvent id="recover_end"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="end"/>
+    <bpmn:endEvent id="end"/>`,
+    );
+    const r = await parseAndValidate(WITH_BOUNDARY);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["sub_err"]!.type).toBe("boundaryEvent");
+    expect(r.graph!.nodes["sub_err"]!.attachedToRef).toBe("sub");
+  });
+
+  it("accepts an error boundary attached to a transaction", async () => {
+    // The boundary event must share tx's IMMEDIATE scope ("sub"), so it is a
+    // sibling of tx inside the subProcess, not at the outer process scope.
+    const NESTED = SUBPROC.replace(
+      '<bpmn:serviceTask id="s_task"><bpmn:extensionElements><easy-bpmn:taskDefinition type="doWork"/></bpmn:extensionElements></bpmn:serviceTask>',
+      `<bpmn:transaction id="tx"><bpmn:startEvent id="t_start"/><bpmn:sequenceFlow id="tf1" sourceRef="t_start" targetRef="t_end"/><bpmn:endEvent id="t_end"/></bpmn:transaction>
+      <bpmn:boundaryEvent id="tx_err" attachedToRef="tx"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:sequenceFlow id="f_err" sourceRef="tx_err" targetRef="recover"/>
+      <bpmn:serviceTask id="recover"><bpmn:extensionElements><easy-bpmn:taskDefinition type="recover"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="f_recover_end" sourceRef="recover" targetRef="recover_end"/>
+      <bpmn:endEvent id="recover_end"/>`,
+    ).replace(/s_task/g, "tx");
+    const r = await parseAndValidate(NESTED);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["tx_err"]!.type).toBe("boundaryEvent");
+    expect(r.graph!.nodes["tx_err"]!.attachedToRef).toBe("tx");
+  });
 });

@@ -1155,8 +1155,8 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         }
       }
     } else if (n.boundaryKind === "error") {
-      if (attached.type !== "serviceTask") {
-        err(`Error boundary event '${n.id}' must be attached to a service task.`, n.id, "boundaryEvent");
+      if (attached.type !== "serviceTask" && attached.type !== "subProcess" && attached.type !== "transaction") {
+        err(`Error boundary event '${n.id}' must be attached to a service task, a subprocess, or a transaction.`, n.id, "boundaryEvent");
       }
       // errorRef handling (M3-L2, TASK-42):
       //  - PRESENT-but-unresolved (moddle dropped it; recovered via the dangling

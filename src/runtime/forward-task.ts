@@ -49,35 +49,63 @@ import {
 } from "../persistence/instances";
 import { insertSagaStepStmt } from "../persistence/saga";
 import { loadInst, type RunStep, type WaitForEvent } from "./engine-shared";
-import { nearestEnclosingTx } from "../bpmn/scope-tree";
+import { nearestEnclosingTx, scopesOf } from "../bpmn/scope-tree";
 import { createIncident, parkWaiting } from "./incidents";
 import { resolveScope } from "./frontier";
 import { branchHistoryTags, getToken, parseOverlay, readOverlay, rootTokenId, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
+import { drainScopeSubtree } from "./compensation";
 
 /**
- * The token-path node an error boundary on `elementId` routes the failed token
- * to, by `errorCode`. Free error-boundary routing (M3-L2, TASK-42): an activity
- * may carry many DISTINCT-`@errorCode` interrupting boundaries plus at most one
- * catch-all (validator-enforced), each targeting ANY token-path node — no longer
- * cancel-end-only. The matching precedence is:
- *   exact `@errorCode` → catch-all (`errorCode == null`) → null (→ caller Hazard).
+ * The error boundary hosted directly ON `hostId` that matches `errorCode`, if
+ * any. Free error-boundary routing (M3-L2, TASK-42): an activity (or, since
+ * M5-L1 Task 9, a scope) may carry many DISTINCT-`@errorCode` interrupting
+ * boundaries plus at most one catch-all (validator-enforced), each targeting
+ * ANY token-path node — no longer cancel-end-only. The matching precedence is:
+ *   exact `@errorCode` → catch-all (`errorCode == null`) → null (→ caller climbs).
  * After validation a null `errorCode` UNAMBIGUOUSLY means catch-all (a coded
  * boundary with an empty/missing `@errorCode` is rejected at publish), so the
  * catch-all matches ANY business code including ones not declared as a
  * `<bpmn:error>`. Deterministic regardless of node-iteration order: an exact
  * match returns immediately; otherwise the (single) catch-all is the fallback.
  */
-function errorBoundaryTarget(graph: ExecutionGraph, elementId: string, errorCode: string | null): string | null {
-  // The catch-all's target (its `next`, or null if it routes nowhere) doubles as
-  // the "no catch-all found" sentinel: both yield null, which the caller treats
-  // as an uncaught business error (→ Hazard). No separate presence flag needed.
-  let catchAll: string | null = null;
-  for (const [, node] of Object.entries(graph.nodes)) {
-    if (node.type !== "boundaryEvent" || node.boundaryKind !== "error" || node.attachedToRef !== elementId) continue;
-    if (node.errorCode != null && node.errorCode === errorCode) return node.next ?? null; // exact wins
-    if (node.errorCode == null) catchAll = node.next ?? null;
+function matchErrorBoundaryOn(
+  graph: ExecutionGraph,
+  hostId: string,
+  errorCode: string | null,
+): { boundaryId: string; next: string } | null {
+  let catchAll: { boundaryId: string; next: string } | null = null;
+  for (const [bid, node] of Object.entries(graph.nodes)) {
+    if (node.type !== "boundaryEvent" || node.boundaryKind !== "error" || node.attachedToRef !== hostId) continue;
+    if (node.errorCode != null && node.errorCode === errorCode && node.next) return { boundaryId: bid, next: node.next };
+    if (node.errorCode == null && node.next) catchAll = { boundaryId: bid, next: node.next };
   }
   return catchAll;
+}
+
+export interface ErrorCatchTarget {
+  boundaryId: string;
+  hostId: string;
+  hostIsScope: boolean;
+  next: string;
+}
+
+/**
+ * Hierarchical error catch (M5-L1 spec §5.1): the attachment-chain walk — the
+ * throwing element's own boundaries first, then each enclosing scope bottom-up;
+ * per level exact `@errorCode` beats catch-all; the first level with a match
+ * wins. Null → the caller Hazards (uncaught business error, no matching
+ * boundary anywhere on the chain). Level-0 (own boundary on `elementId`) is
+ * byte-identical to the pre-M5 `errorBoundaryTarget` behavior.
+ */
+export function errorCatchTarget(graph: ExecutionGraph, elementId: string, errorCode: string | null): ErrorCatchTarget | null {
+  const own = matchErrorBoundaryOn(graph, elementId, errorCode);
+  if (own) return { ...own, hostId: elementId, hostIsScope: false };
+  const scopes = scopesOf(graph);
+  for (let s = graph.nodes[elementId]?.scopeId ?? null; s != null; s = scopes[s]?.parentId ?? null) {
+    const m = matchErrorBoundaryOn(graph, s, errorCode);
+    if (m) return { ...m, hostId: s, hostIsScope: true };
+  }
+  return null;
 }
 
 export type ForwardOutcome = { kind: "next"; next: string } | { kind: "waiting" } | { kind: "incident" };
@@ -100,8 +128,11 @@ function appliedForwardOutcome(
   if (!job || job.output_applied !== 1) return null;
   if (job.status === "completed") return { kind: "next", next: node.next! };
   if (job.status === "failed" && job.error_code) {
-    const target = errorBoundaryTarget(graph, elementId, job.error_code);
-    if (target) return { kind: "next", next: target };
+    // Write-free re-derivation (M5-L1 spec §5.1): deterministic because the
+    // graph is immutable and — when the winning level was a scope — the drain
+    // + scopeExited row already happened in the applying step below.
+    const target = errorCatchTarget(graph, elementId, job.error_code);
+    if (target) return { kind: "next", next: target.next };
   }
   // Defensive — unreachable by construction: output_applied=1 is only ever set
   // on a completed apply or a business-routed failure (whose boundary target is
@@ -522,11 +553,13 @@ async function handleForwardFailure(
 
   const inst = await loadInst(env, instanceId);
   if (job.error_code) {
-    // Business error → route to the matching error boundary's target (any
-    // token-path node; exact @errorCode → catch-all). The token then walks
-    // forward like any other: it triggers compensation only if it REACHES a
-    // cancel end, otherwise the saga continues with the ledger intact.
-    const target = errorBoundaryTarget(graph, elementId, job.error_code);
+    // Business error → route to the matching error boundary's target via the
+    // hierarchical attachment-chain walk (M5-L1 spec §5.1): the throwing
+    // element's own boundaries first, then each enclosing scope bottom-up (any
+    // token-path node; exact @errorCode → catch-all per level). The token then
+    // walks forward like any other: it triggers compensation only if it REACHES
+    // a cancel end, otherwise the saga continues with the ledger intact.
+    const target = errorCatchTarget(graph, elementId, job.error_code);
     if (target) {
       const now = nowIso();
       const stmts: D1PreparedStatement[] = [
@@ -535,9 +568,15 @@ async function handleForwardFailure(
           instanceId,
           elementId,
           type: "businessErrorCaught",
-          diagnostics: { jobId: job.job_id, errorCode: job.error_code, boundaryTarget: target, occurrence: occ, ...branchHistoryTags(activeTokenId) },
+          diagnostics: {
+            jobId: job.job_id,
+            errorCode: job.error_code,
+            boundaryTarget: target.next,
+            occurrence: occ,
+            ...branchHistoryTags(activeTokenId),
+          },
         }),
-        applyTransitionStmt(env.DB, { instanceId, currentElementId: target, status: "running", now }),
+        applyTransitionStmt(env.DB, { instanceId, currentElementId: target.next, status: "running", now }),
         // Atomic with the route: the rewalk fast-forwards this visit by
         // re-deriving the same deterministic target from the persisted error_code.
         markFailedJobHandledStmt(env.DB, job.job_id, now),
@@ -555,7 +594,23 @@ async function handleForwardFailure(
         }
         throw err;
       }
-      return { kind: "next", next: target };
+      // M5-L1 Task 9: the catch host IS a scope (climbed past `elementId`'s own
+      // boundaries) → the abnormal exit drains every live token in that scope's
+      // subtree (idempotent retain-only, Task 8) and is audited. Not folded into
+      // the batch above — `drainScopeSubtree` issues its own dbBatch(es) per live
+      // token, and is safe to re-run on a step retry (retain-only, INSERT OR
+      // IGNORE + status-guarded flips).
+      if (target.hostIsScope) {
+        await drainScopeSubtree(env, graph, instanceId, target.hostId);
+        await historyStmt(env.DB, {
+          workspaceId: inst.workspace_id,
+          instanceId,
+          elementId: target.hostId,
+          type: "scopeExited",
+          diagnostics: { scope: target.hostId, via: target.boundaryId, abnormal: true },
+        }).run();
+      }
+      return { kind: "next", next: target.next };
     }
     // Uncaught business error → Hazard. Settle the guarding timer first (its own
     // batch — the Hazard terminal is a separate createIncident batch); if the timer

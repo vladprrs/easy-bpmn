@@ -1428,3 +1428,43 @@ export const RE_ENTRY_TX_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
     <bpmn:endEvent id="end"/>
   </bpmn:process>
 </bpmn:definitions>`;
+
+/**
+ * M5-L1 bubbling fixture: process > subProcess S1 (error boundary catch-all → recover task)
+ * > subProcess S2 (no boundary) > task A that fails with a business error. A has no own
+ * boundary → the error climbs A → S2 (none) → S1 (caught). Variant without S1's boundary
+ * (HAZARD_BUBBLE_BPMN) reaches the root → Hazard.
+ */
+export const SCOPE_ERR_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="def_scope_err" targetNamespace="http://example.com">
+  <bpmn:process id="proc_scope_err" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="S1"/>
+    <bpmn:subProcess id="S1">
+      <bpmn:startEvent id="s1_start"/>
+      <bpmn:sequenceFlow id="s1f1" sourceRef="s1_start" targetRef="S2"/>
+      <bpmn:subProcess id="S2">
+        <bpmn:startEvent id="s2_start"/>
+        <bpmn:sequenceFlow id="s2f1" sourceRef="s2_start" targetRef="A"/>
+        <bpmn:serviceTask id="A"><bpmn:extensionElements><easy-bpmn:taskDefinition type="failing" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+        <bpmn:sequenceFlow id="s2f2" sourceRef="A" targetRef="s2_end"/>
+        <bpmn:endEvent id="s2_end"/>
+      </bpmn:subProcess>
+      <bpmn:sequenceFlow id="s1f2" sourceRef="S2" targetRef="s1_end"/>
+      <bpmn:endEvent id="s1_end"/>
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="S1_err" attachedToRef="S1"><bpmn:errorEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="f2" sourceRef="S1_err" targetRef="recover"/>
+    <bpmn:serviceTask id="recover"><bpmn:extensionElements><easy-bpmn:taskDefinition type="recover" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f3" sourceRef="recover" targetRef="r_end"/>
+    <bpmn:endEvent id="r_end"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="S1" targetRef="end"/>
+    <bpmn:endEvent id="end"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/** Same shape WITHOUT S1's boundary/recover path — the uncaught error reaches the root. */
+export const HAZARD_BUBBLE_BPMN = SCOPE_ERR_BPMN
+  .replace(/<bpmn:boundaryEvent id="S1_err"[\s\S]*?<bpmn:endEvent id="r_end"\/>\n?/, "")
+  .replace('id="def_scope_err"', 'id="def_hazard_bubble"')
+  .replace('id="proc_scope_err"', 'id="proc_hazard_bubble"');

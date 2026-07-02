@@ -261,6 +261,31 @@ export async function listLockedForwardJobs(db: D1Database, instanceId: string):
   return res.results ?? [];
 }
 
+/** An in-flight forward job + its owning element — the scope-drain abandon targets (TASK-73). */
+export interface InFlightForwardJob {
+  job_id: string;
+  element_id: string;
+}
+
+/**
+ * In-flight (`created` OR `locked`) FORWARD jobs of an instance, with their owning
+ * element (TASK-73). `drainScopeSubtree` filters these by scope subtree and abandons
+ * the ones inside the drained scope: the per-token drain covers only jobs carried by
+ * a LIVE token, but the single-token (non-region) walk persists no token rows, so a
+ * forward job left `created`/`locked` inside a scope drained on a fast-forward path
+ * (e.g. an inner task's job re-created by an operator /retry whose overdue deadline
+ * had been recorded suppressed) would otherwise stay leasable after the scope exit.
+ */
+export async function listInFlightForwardJobs(db: D1Database, instanceId: string): Promise<InFlightForwardJob[]> {
+  const res = await stmt(
+    db,
+    `SELECT job_id, element_id FROM service_task_jobs
+      WHERE instance_id = ? AND is_compensation = 0 AND status IN ('created', 'locked')`,
+    [instanceId],
+  ).all<InFlightForwardJob>();
+  return res.results ?? [];
+}
+
 /**
  * Lease-expiry terminator claim (design §8.2 — the in-flight twin of
  * failUnleasableJobConditional): flip a still-`locked` job → `failed`, clearing the

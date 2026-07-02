@@ -310,6 +310,42 @@ The M3 machinery generalizes with the host = scope node:
   Workflow-mode lost-alarm backstop (`settleOverdueBoundaryTimerOnWake`, `engine.ts:274-275`)
   inherits the same batch, as it does today.
 
+#### 5.4.1 Timer fire on a frozen instance = record-and-apply-at-resume (TASK-73, PR #4 finding #4)
+
+An armed scope timer's DO alarm is unaware of instance status. Once armed at scope entry, the timer is
+disarmed on every scope **exit** the walk observes — but an instance can be parked **out** of the
+active-forward lane (`running` | `waiting`) into a **frozen** state by a path the arming logic never
+sees: `incident` (a *sibling/inner* technical failure freezing the instance under this scope, or another
+element's Hazard), `compensating` (an operator `/cancel` of a Hazard), or `compensationFailed`. If such an
+overdue alarm fired normally it would silently **unfreeze/interrupt** an instance the engine or operator
+deliberately parked, and could race an in-flight `/cancel`/`/retry`.
+
+**Policy (decided):** a timer that comes due while the instance is frozen is **recorded, not applied**.
+`fireTimer` (`src/runtime/timers.ts`) checks instance status after the base guards: a *done* instance
+(`completed`/`cancelled`/`compensated`) is the unchanged no-op; a *frozen* instance takes the
+**suppressed-record** branch — it claims the SAME decider a normal fire would (`timer_outcomes 'fired'` +
+the `timers` bookkeeping flip) plus a `timerFired {suppressed:true}` audit, and **nothing else**: no
+transition, no job abandon, no scope drain, no subscription supersede. (`running`/`waiting` are the
+normal-fire lane — a scope timer legitimately fires while its inner host wait is parked at `waiting`.)
+
+At operator `/retry` → resume → rewalk, the recorded decider makes `timerHasFired` fast-forward the walk
+onto the boundary path (`engine.ts` `driveLeaf` scope branch), where `drainScopeSubtree` settles the
+interrupted scope's stragglers — so the modeled deadline is **applied after the incident is resolved**,
+the freeze is never violated, and no new mechanism is introduced. Because the single-token (non-region)
+walk persists no token rows, that drain also abandons any in-flight (`created`/`locked`) forward job
+inside the subtree — e.g. the inner task's job re-created by `/retry` (`drainScopeSubtree`'s TASK-73
+subtree job scan), so no leasable straggler survives the scope exit.
+
+**Single-decide under a concurrent `/cancel`:** the suppressed claim is a PLAIN `timer_outcomes` INSERT
+(the gateway_decisions race contract), so a concurrent `cancelArmedTimersForInstance` sweep that claimed
+the decider first aborts the suppressed batch on the PK → no-op; conversely the sweep skips a timer that
+already has a decider. The timer is decided exactly once in either interleaving.
+
+**eventGateway timers** decide on `gateway_decisions` (built with their transition inside
+`planEventGatewayTimerFire`) — splitting that batch is out of scope here, and an EBG timer is not a scope
+timer. On a frozen instance its fire is **not lost**: the timer stays armed and the DO alarm is re-armed
+for a short backoff, so the deadline is re-evaluated once the freeze clears.
+
 ---
 
 ## 6. Validator delta

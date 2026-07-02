@@ -15,23 +15,28 @@
 
 import type { Env } from "../env";
 import type { ExecutionGraph } from "../bpmn/graph";
-import { isTerminalInstanceStatus, isoIsBefore, nowIso } from "../util";
+import { isoIsBefore, isoPlusMs, nowIso } from "../util";
 import { dbBatch } from "../persistence/db";
+import { historyStmt } from "../persistence/history";
 import { getVersionGraph } from "../persistence/definitions";
 import { getInstanceRow, type InstanceRow } from "../persistence/instances";
-import { flipTimerCancelledStmt, getTimer, getTimerOutcome, type TimerView } from "../persistence/timers";
+import { flipTimerCancelledStmt, flipTimerFiredStmt, getTimer, getTimerOutcome, insertTimerOutcomeStmt, type TimerView } from "../persistence/timers";
 import { getExecutor } from "./executor";
-import { isUniqueConstraintViolation, planBoundaryTimerFire, supersedeBrokerSubscription } from "./boundary-timer";
+import { armTimerDO, isUniqueConstraintViolation, planBoundaryTimerFire, supersedeBrokerSubscription } from "./boundary-timer";
 import { planIntermediateCatchFire } from "./intermediate-timer";
 import { planEventGatewayTimerFire } from "./event-gateway";
 
 /**
- * Settle a fired model timer (design §4.3). Re-reads D1 and NO-OPS unless every
- * fire precondition holds: the row exists and is still `armed`, no
- * `timer_outcomes` decision was recorded yet, `fire_at <= now`, and the instance
- * is non-terminal. Any of those failing is an idempotent no-op (a stray/late
- * alarm, a timer cancelled by an abnormal exit, an early/spurious alarm, or a
- * settled instance) — mirroring terminateUnleasableJob's re-check discipline.
+ * Settle a fired model timer (design §4.3). Re-reads D1 and NO-OPS unless the base
+ * fire preconditions hold: the row exists and is still `armed`, no `timer_outcomes`
+ * decision was recorded yet, `fire_at <= now`, and the instance is not DONE
+ * (completed/cancelled/compensated). Any of those failing is an idempotent no-op (a
+ * stray/late alarm, a timer cancelled by an abnormal exit, an early/spurious alarm,
+ * or a settled instance) — mirroring terminateUnleasableJob's re-check discipline.
+ *
+ * TASK-73: when the instance is FROZEN but resumable (incident / compensating /
+ * compensationFailed) the fire is neither dropped nor applied — it is RECORDED
+ * (suppressed) via `recordSuppressedTimerFire` and applied at the next resume.
  */
 export async function fireTimer(env: Env, timerId: string): Promise<void> {
   const timer = await getTimer(env.DB, timerId);
@@ -47,10 +52,35 @@ export async function fireTimer(env: Env, timerId: string): Promise<void> {
   // Not yet due (early/spurious alarm): fire_at strictly in the future.
   if (isoIsBefore(nowIso(), timer.fireAt)) return;
 
-  // A settled instance never fires a timer (a fired timer is a modeled path, not
-  // an incident, so it must not reanimate a terminal/cancelled/compensated run).
   const inst = await getInstanceRow(env.DB, timer.instanceId);
-  if (!inst || isTerminalInstanceStatus(inst.status)) return;
+  if (!inst) return;
+
+  // A DONE run never fires a timer (a fired timer is a modeled path, not an
+  // incident, so it must not reanimate a completed/cancelled/compensated instance).
+  // NOTE: these three are checked EXPLICITLY, not via isTerminalInstanceStatus —
+  // that predicate also lists `incident`/`compensationFailed` ("no forward progress
+  // WITHOUT operator action"), and those are handled by the frozen-record branch
+  // below (they CAN resume via /retry, so their overdue deadline is recorded, not
+  // dropped).
+  if (inst.status === "completed" || inst.status === "cancelled" || inst.status === "compensated") return;
+
+  // TASK-73 — record-and-apply-at-resume: an armed timer can come due while the
+  // instance has been parked OUT of the active-forward lane (`running` | `waiting`)
+  // into a FROZEN state — `incident` (a sibling/inner technical failure), `compensating`
+  // (an operator /cancel of a Hazard), or `compensationFailed` — by a path the arming
+  // logic never observed. Firing normally here would silently UNFREEZE/interrupt an
+  // instance the engine or operator deliberately parked, and could race an in-flight
+  // /cancel|/retry. Instead RECORD the fire in the existing decider (a suppressed
+  // `timer_outcomes 'fired'` claim + the bookkeeping flip + a suppressed audit) and
+  // return with NO transition / drain / abandon / supersede. At operator /retry →
+  // resume → rewalk, `timerHasFired` fast-forwards the walk onto the boundary path
+  // (engine.ts driveLeaf scope branch, which drains the interrupted subtree), so the
+  // modeled deadline is applied AFTER the freeze is resolved — never violating it.
+  // See docs/superpowers/specs/2026-07-02-m5-l1-embedded-scopes-design.md §"timer fire
+  // on a frozen instance" and docs/bpmn/09-easy-bpmn-profile.md (timer-boundary section).
+  if (inst.status !== "running" && inst.status !== "waiting") {
+    return recordSuppressedTimerFire(env, timer, inst);
+  }
 
   // Dispatch by construct (design §4.3/§4.4/§4.5). Boundary + intermediateCatch
   // decide on `timer_outcomes`; the eventGateway timer decides on
@@ -60,6 +90,51 @@ export async function fireTimer(env: Env, timerId: string): Promise<void> {
   if (timer.kind === "boundary") return fireBoundaryTimer(env, timer, inst);
   if (timer.kind === "intermediateCatch") return fireIntermediateCatchTimer(env, timer, inst);
   if (timer.kind === "eventGateway") return fireEventGatewayTimer(env, timer, inst);
+}
+
+/**
+ * TASK-73 — the suppressed-fire record for a timer that came due while the instance
+ * is FROZEN (incident / compensating / compensationFailed). Claims the SAME decider
+ * a normal boundary/intermediateCatch fire would (`timer_outcomes 'fired'` + the
+ * bookkeeping flip) plus a `timerFired {suppressed:true}` audit — and NOTHING else:
+ * no transition, no job abandon, no scope drain, no subscription supersede. The
+ * recorded decider makes `timerHasFired` fast-forward the walk onto the boundary path
+ * at the next resume (operator /retry), where the engine drains the interrupted scope
+ * — so the deadline is applied AFTER the freeze clears, never unfreezing it here.
+ *
+ * Single-decide: the PLAIN `timer_outcomes` INSERT is the race gate (the
+ * gateway_decisions contract). A concurrent operator /cancel sweep
+ * (cancelArmedTimersForInstance) claiming the decider first aborts THIS batch on the
+ * PK — caught and no-oped, so the timer is decided exactly once.
+ *
+ * eventGateway timers decide on `gateway_decisions` (built together with the
+ * transition inside planEventGatewayTimerFire, §4.5) — splitting that batch is out of
+ * scope (TASK-73), and an EBG timer is not a scope timer (outside this task's ACs).
+ * Rather than LOSE its fire, leave it ARMED and re-arm the DO for a short backoff so
+ * the deadline is re-evaluated once the freeze clears.
+ */
+async function recordSuppressedTimerFire(env: Env, timer: TimerView, inst: InstanceRow): Promise<void> {
+  if (timer.kind === "eventGateway") {
+    await armTimerDO(env, timer.timerId, isoPlusMs(nowIso(), 60_000));
+    return;
+  }
+  const now = nowIso();
+  try {
+    await dbBatch(env.DB, [
+      insertTimerOutcomeStmt(env.DB, { timerId: timer.timerId, outcome: "fired", now }), // THE CLAIM (single-decide)
+      flipTimerFiredStmt(env.DB, { timerId: timer.timerId, firedAt: now, now }),
+      historyStmt(env.DB, {
+        workspaceId: inst.workspace_id,
+        instanceId: timer.instanceId,
+        elementId: timer.elementId,
+        type: "timerFired",
+        diagnostics: { attachedToRef: timer.attachedToRef, occurrence: timer.occurrence, suppressed: true, instanceStatus: inst.status },
+      }),
+    ]);
+  } catch (err) {
+    if (isUniqueConstraintViolation(err)) return; // a concurrent /cancel sweep claimed the decider first → no-op
+    throw err;
+  }
 }
 
 /**

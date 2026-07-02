@@ -525,6 +525,14 @@ A BPMN document is accepted for publish only if **all** hold:
     every completed step's ledger row is retained (`pending`/`committedLocal`), the drain deferred to the
     next engine rewalk (idempotent, retain-only) — see
     [`07-execution-semantics.md`](./07-execution-semantics.md).
+    **Timer fire while the instance is frozen (M5-L1, TASK-73):** if the deadline comes due while the
+    instance is not in the active-forward lane — i.e. it has been parked into `incident` (a sibling/inner
+    technical failure) or `compensating`/`compensationFailed` (an operator `/cancel` of a Hazard) — the fire
+    is **recorded, not applied**. It is written to the same `timer_outcomes 'fired'` decider (with a
+    `timerFired {suppressed:true}` audit) but drives **no** transition, drain, or interrupt, so it **never
+    unfreezes** the parked instance. When the operator resolves the incident and `/retry`s, the recorded
+    decision fast-forwards the resume walk onto the boundary path and the interrupted scope is drained then —
+    the modeled deadline is applied only **after** the freeze clears, never violating it.
 15. **Timer intermediate catch (M3-L4).** An `intermediateCatchEvent` + `timerEventDefinition` is a delay
     step on the token path, with exactly **one incoming** and **one outgoing** sequence flow (a join into
     it rejects with element id + reason). Allowed at process level **and inside a `transaction`**. Its

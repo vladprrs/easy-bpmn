@@ -30,7 +30,7 @@ import {
   updateCompensationStatusStmt,
   type SagaStepView,
 } from "../persistence/saga";
-import { abandonJobOnTimerFireStmt } from "../persistence/jobs";
+import { abandonJobOnTimerFireStmt, listInFlightForwardJobs } from "../persistence/jobs";
 import { listLiveTokens, setTokenStatusStmt, type TokenRow } from "../persistence/tokens";
 import { eligibleCommittedLocalScopeIds, scopesOf, subtreeScopeIds } from "../bpmn/scope-tree";
 import { armCohortLeaseExpiryTerminators } from "./forward-task";
@@ -383,6 +383,22 @@ export async function drainScopeSubtree(env: Env, graph: ExecutionGraph, instanc
   // broker key would sit registered until the 1-hour TTL even though the instance
   // has moved on. Best-effort per subscription (mirrors the whole-instance release).
   await releaseSubscriptionsInScopeSubtree(env, graph, instanceId, rootScopeId, nowIso());
+  // TASK-73: abandon any IN-FLIGHT (created|locked) FORWARD job whose element lives
+  // in the drained subtree. The per-token loop above only reaches jobs carried by a
+  // LIVE token; the single-token (non-region) walk persists no token rows, so a job
+  // left `created`/`locked` inside a scope drained on a FAST-FORWARD path — e.g. an
+  // inner task's job re-created by an operator /retry whose overdue deadline had been
+  // recorded suppressed (fireTimer's frozen-record branch) — would otherwise stay
+  // leasable after the scope exit. Abandoning it (created/locked → failed, lock
+  // cleared) makes a late worker callback a no-op. Idempotent (status-guarded;
+  // already-failed → 0 rows) and retention-only: `is_compensation=0` excludes the
+  // reverse pass, and a completed/ledgered job is never touched. Same subtree
+  // predicate as the token loop (`scopeId ∈ subtree`, null = the process root).
+  for (const job of await listInFlightForwardJobs(env.DB, instanceId)) {
+    const jobScope = graph.nodes[job.element_id]?.scopeId ?? null;
+    if (jobScope == null ? rootScopeId != null : !subtree.includes(jobScope)) continue;
+    await abandonJobOnTimerFireStmt(env.DB, job.job_id, nowIso()).run();
+  }
   // M5-L1 Task 11 review-fix: this drain tears down the WHOLE subtree — every
   // DESCENDANT scope (strictly inside `rootScopeId`) is gone too, so its OWN armed
   // boundary timer must be settled `cancelled`. The exiting root scope's own timer is

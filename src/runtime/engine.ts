@@ -186,6 +186,14 @@ export const STEP_BUDGET_SOFT = 20000;
 export const MAX_SCOPE_DEPTH = 8;
 
 /**
+ * Call-tree depth cap (M5-L2, spec §7). Depth is fully STATIC: child versions are
+ * pinned at the caller's publish, so the call tree is an immutable DAG — enforced
+ * by the publish-time call resolution (call-resolution.ts), zero runtime surface.
+ * Depth 1 = a process with no callActivity.
+ */
+export const MAX_CALL_DEPTH = 4;
+
+/**
  * TEST-ONLY cap overrides (design §9 / L6.1). Integration tests lower a cap via an
  * env var so a bomb fixture trips it without 256 real branches / 20000 real steps;
  * production never sets these (the `Env` fields are optional + test-only). A

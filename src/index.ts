@@ -23,6 +23,7 @@ import {
   type ValidationIssue,
 } from "./contracts/api";
 import { parseAndValidate } from "./bpmn/validator";
+import { resolveCallActivities } from "./bpmn/call-resolution";
 import { AppError, BadRequestError, ConflictError, NotFoundError, PublishRejectedError } from "./runtime/errors";
 import { assertPayloadWithinLimit } from "./runtime/payload";
 import { getExecutor } from "./runtime/executor";
@@ -179,6 +180,14 @@ async function handlePublishDraft(env: Env, draftId: string): Promise<Response> 
     throw new PublishRejectedError(
       "Draft contains publish-blocking validation issues.",
       result.issues,
+    );
+  }
+
+  const callResolution = await resolveCallActivities(env.DB, row.workspace_id, result.graph);
+  if (!callResolution.ok) {
+    throw new PublishRejectedError(
+      "Draft contains publish-blocking callActivity resolution issues.",
+      callResolution.issues,
     );
   }
 

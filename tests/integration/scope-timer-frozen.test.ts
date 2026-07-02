@@ -221,3 +221,99 @@ describe("TASK-73 scope timer fires on a frozen instance — record-and-apply-at
     expect(fired[0].diagnostics.suppressed).toBe(true);
   });
 });
+
+// TASK-73 review fix (final whole-branch review): the suppressed-record policy is
+// restricted to hosts whose RESUME path heals what the suppressed fire skipped —
+// scope hosts (the engine's timerHasFired fast-forward drains the subtree) and the
+// intermediateCatch (nothing to clean). A TASK/RECEIVE host's fired fast-forward is
+// WRITE-FREE (forward-task.ts / the receive drive), so claiming the decider while
+// frozen would strand the host's re-created job leasable forever (or leak the
+// subscription + broker key). Those hosts instead RE-ARM the DO for a short backoff
+// (no decider claim) so the alarm re-fires after resume and the NORMAL fire batch
+// runs with its full host cleanup.
+
+/** A PLAIN serviceTask host with a boundary timer — the NON-scope host shape.
+ *  The DLQ (expired activation → jobActivationTimeout) manufactures the frozen
+ *  `incident` while the task's boundary timer is still armed: that terminal
+ *  deliberately leaves the timer armed (forward-task.ts poison/DLQ comment),
+ *  which is exactly the reviewer-cited live scenario. */
+const SVC_TIMER_DLQ_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="def_svc_timer_dlq" targetNamespace="http://example.com">
+  <bpmn:process id="proc_svc_timer_dlq" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="slowTask"/>
+    <bpmn:serviceTask id="slowTask"><bpmn:extensionElements><easy-bpmn:taskDefinition type="slow-frozen" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:boundaryEvent id="slow_timer" attachedToRef="slowTask"><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="f2" sourceRef="slow_timer" targetRef="afterTimer"/>
+    <bpmn:serviceTask id="afterTimer"><bpmn:extensionElements><easy-bpmn:taskDefinition type="afterTimer" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f3" sourceRef="afterTimer" targetRef="after_end"/>
+    <bpmn:endEvent id="after_end"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="slowTask" targetRef="end"/>
+    <bpmn:endEvent id="end"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+async function forwardJobRow(instanceId: string, taskType: string) {
+  return env.DB.prepare(
+    `SELECT * FROM service_task_jobs WHERE instance_id = ? AND task_type = ? AND is_compensation = 0 ORDER BY rowid DESC LIMIT 1`,
+  )
+    .bind(instanceId, taskType)
+    .first<any>();
+}
+
+describe("TASK-73 review fix — task-host boundary timer on a frozen instance re-arms (no suppressed claim)", () => {
+  it("[TASK-73] task host frozen (DLQ incident): fire is NOT recorded, timer stays armed; after /retry the alarm fires the NORMAL batch (boundary path + job abandoned)", async () => {
+    const token = await mintWorkerToken();
+    const { instance } = await publishAndStart(SVC_TIMER_DLQ_BPMN, { correlationKey: `svc73-dlq-${crypto.randomUUID()}`, variables: {} });
+    const instanceId = instance.body.instanceId as string;
+    expect(instance.body.status).toBe("waiting"); // parked at slowTask, timer armed
+
+    // Freeze via the DLQ: expire the never-leased job's activation and fire its
+    // per-job scheduler alarm → jobActivationTimeout incident. The DLQ terminal
+    // deliberately leaves the host's boundary timer ARMED.
+    const job = await forwardJobRow(instanceId, "slow-frozen");
+    expect(job.status).toBe("created");
+    await env.DB.prepare(`UPDATE service_task_jobs SET activation_expires_at = '2000-01-01T00:00:00Z' WHERE job_id = ?`).bind(job.job_id).run();
+    expect(await runDurableObjectAlarm(env.JOB_SCHEDULER.get(env.JOB_SCHEDULER.idFromName(job.job_id)))).toBe(true);
+    expect((await get(`/instances/${instanceId}`)).body.status).toBe("incident");
+    expect((await theTimer(instanceId)).status).toBe("armed");
+
+    // The timer comes due while frozen: NO decider claim (a suppressed claim would
+    // strand the /retry-re-created job leasable forever — the fired fast-forward on
+    // a task host is write-free), NO transition, timer still armed (re-arm-backoff).
+    const timerId = await fireDueBoundaryTimer(instanceId);
+    expect(await timerOutcome(timerId)).toBeNull();
+    expect((await theTimer(instanceId)).status).toBe("armed");
+    const frozen = await getInstanceRow(instanceId);
+    expect(frozen!.status).toBe("incident");
+    expect(frozen!.current_element_id).not.toBe("afterTimer");
+    expect(await timerFiredEvents(instanceId)).toHaveLength(0);
+
+    // Operator /retry → the job is re-created and the instance re-parks at slowTask.
+    const retry = await post(`/instances/${instanceId}/retry`, {});
+    expect(retry.status).toBe(200);
+
+    // The still-overdue timer now fires the NORMAL batch after resume — either via
+    // the resume rewalk's self-heal re-arm (forward-task.ts re-arms the DO at the
+    // rewound fire_at → workerd fires it in the background immediately) or via the
+    // TASK-73 backoff re-arm; the poll + manual alarm nudge below is deterministic
+    // for both. The fire is the FULL normal batch: decider 'fired', boundary path
+    // taken, host job ABANDONED (not leasable) — the cleanup a suppressed claim
+    // would have skipped forever.
+    for (let i = 0; i < 40 && (await timerOutcome(timerId)) === null; i++) {
+      await runDurableObjectAlarm(timerStub(timerId)); // nudge if not yet auto-fired
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(await timerOutcome(timerId)).toBe("fired");
+    const resumed = await getInstanceRow(instanceId);
+    expect(resumed!.current_element_id).toBe("afterTimer");
+    expect((await forwardJobRow(instanceId, "slow-frozen")).status).toBe("failed"); // abandoned by the fire batch
+    const fired = await timerFiredEvents(instanceId);
+    expect(fired).toHaveLength(1);
+    expect(fired[0].diagnostics.suppressed).toBeUndefined(); // the NORMAL fire, not a suppressed record
+
+    // The boundary continuation is live and completes the instance.
+    await leaseAndComplete(token, "afterTimer", {});
+    expect((await getInstanceRow(instanceId))!.status).toBe("completed");
+  });
+});

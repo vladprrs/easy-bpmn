@@ -533,12 +533,15 @@ A BPMN document is accepted for publish only if **all** hold:
     [`07-execution-semantics.md`](./07-execution-semantics.md).
     **Timer fire while the instance is frozen (M5-L1, TASK-73):** if the deadline comes due while the
     instance is not in the active-forward lane — i.e. it has been parked into `incident` (a sibling/inner
-    technical failure) or `compensating`/`compensationFailed` (an operator `/cancel` of a Hazard) — the fire
-    is **recorded, not applied**. It is written to the same `timer_outcomes 'fired'` decider (with a
-    `timerFired {suppressed:true}` audit) but drives **no** transition, drain, or interrupt, so it **never
-    unfreezes** the parked instance. When the operator resolves the incident and `/retry`s, the recorded
-    decision fast-forwards the resume walk onto the boundary path and the interrupted scope is drained then —
-    the modeled deadline is applied only **after** the freeze clears, never violating it.
+    technical failure) or `compensating`/`compensationFailed` (an operator `/cancel` of a Hazard) — a
+    **scope-host** timer's fire is **recorded, not applied**. It is written to the same `timer_outcomes
+    'fired'` decider (with a `timerFired {suppressed:true}` audit) but drives **no** transition, drain, or
+    interrupt, so it **never unfreezes** the parked instance. When the operator resolves the incident and
+    `/retry`s, the recorded decision fast-forwards the resume walk onto the boundary path and the
+    interrupted scope is drained then — the modeled deadline is applied only **after** the freeze clears,
+    never violating it. A **task/receiveTask-host** timer on a frozen instance instead **re-arms with a
+    short backoff** (no decider claim, no transition), so the alarm re-fires after resume and the normal
+    fire — with its full host cleanup (job abandon / subscription supersede) — applies the deadline then.
 15. **Timer intermediate catch (M3-L4).** An `intermediateCatchEvent` + `timerEventDefinition` is a delay
     step on the token path, with exactly **one incoming** and **one outgoing** sequence flow (a join into
     it rejects with element id + reason). Allowed at process level **and inside a `transaction`**. Its

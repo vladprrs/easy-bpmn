@@ -465,9 +465,13 @@ async function applyForwardCompletion(
       }).run();
       // Like the DLQ jobActivationTimeout race, this poison terminal does NOT settle
       // the host's boundary timer (no decider claim) — it is left `armed` on a now-
-      // terminal instance, harmlessly: triple-guarded (fireTimer's terminal-instance
-      // guard + the host job is no longer created/locked + the operator /cancel
-      // sweep), so a stray alarm never fires and never compensates.
+      // frozen (`incident`) instance, harmlessly: since TASK-73 a due alarm on a
+      // frozen instance with a TASK host RE-ARMS with a backoff (no decider claim,
+      // no transition — recordSuppressedTimerFire's host dispatch) instead of
+      // firing; a DONE (completed/cancelled/compensated) instance still drops the
+      // alarm outright, and the host job being no longer created/locked plus the
+      // operator /cancel sweep guard the remaining windows. After an operator
+      // /retry the re-armed alarm fires the NORMAL batch with full host cleanup.
       return createIncident(
         env,
         instanceId,

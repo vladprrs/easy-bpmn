@@ -341,6 +341,14 @@ subtree job scan), so no leasable straggler survives the scope exit.
 the decider first aborts the suppressed batch on the PK → no-op; conversely the sweep skips a timer that
 already has a decider. The timer is decided exactly once in either interleaving.
 
+**The suppressed record applies only to hosts whose resume path heals the skipped settle** (review fix):
+scope hosts (the fast-forward drain above) and the `intermediateCatch` (the catch IS the wait — nothing to
+clean). **Task-host and receiveTask-host boundary timers** re-arm instead: their fired fast-forward is
+write-free, so a suppressed claim would strand the `/retry`-re-created job leasable forever (or leak the
+active subscription + broker key, the exact TASK-72 leak) — on a frozen instance they re-arm the DO for a
+short backoff **without claiming the decider**, and the alarm re-fires after resume, running the NORMAL
+fire batch with its full host cleanup (job abandon / subscription supersede).
+
 **eventGateway timers** decide on `gateway_decisions` (built with their transition inside
 `planEventGatewayTimerFire`) — splitting that batch is out of scope here, and an EBG timer is not a scope
 timer. On a frozen instance its fire is **not lost**: the timer stays armed and the DO alarm is re-armed

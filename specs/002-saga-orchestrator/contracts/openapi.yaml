@@ -941,8 +941,8 @@ components:
         endKind:
           type: string
           nullable: true
-          enum: [none, cancel, compensate]
-          description: Event-definition kind for an endEvent.
+          enum: [none, cancel, error]
+          description: Event-definition kind for an endEvent (error end events ship with M5-L1).
         scopeId:
           type: string
           nullable: true

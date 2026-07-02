@@ -383,6 +383,12 @@ export async function drainScopeSubtree(env: Env, graph: ExecutionGraph, instanc
     const inst = await loadInst(env, instanceId);
     for (const timer of await listTimersForInstance(env.DB, instanceId)) {
       if (timer.kind !== "boundary" || timer.status !== "armed") continue;
+      // DELIBERATE: `descendants` holds SCOPE ids only, so TASK-hosted boundary
+      // timers (serviceTask/receiveTask hosts) inside the subtree are NOT settled
+      // here — their fire plans already no-op via the job/subscription status
+      // guards (the drain above abandoned the job / discarded the token), and a
+      // redundant settle would race the alarm on the decider PK for no benefit.
+      // Do not "fix" this by widening the filter to task hosts.
       if (!timer.attachedToRef || !descendants.has(timer.attachedToRef)) continue;
       await settleDrainedScopeTimer(env, instanceId, inst.workspace_id, timer);
     }

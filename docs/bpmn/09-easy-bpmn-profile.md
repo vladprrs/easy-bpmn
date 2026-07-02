@@ -18,10 +18,10 @@ set was **accepted in v2.3.0** and has now **shipped**: block-structured `parall
 parallel-branch compensation through **M4-L5**, and the concurrency caps, R2 overlay offload, per-token
 observability, and the `tokens` inspection array through **M4-L6**. The **whole M5 composition set was
 accepted, up front, in v2.5.0** and its runtime opens **per layer**: **M5-L1 (embedded scopes +
-hierarchical exceptions) has shipped** — see the interim markers below; M5-L2 (`callActivity`), M5-L3
-(`multiInstance`), M5-L4 (escalation + event subprocess), and M5-L5 (signal) remain **accepted-in-
-governance, interim-rejected at publish** until their own layers open. When in doubt, the constitution
-wins. The authoritative designs are
+hierarchical exceptions) has shipped**; **M5-L2 (`callActivity`) is opening** — see the interim markers
+below; M5-L3 (`multiInstance`), M5-L4 (escalation + event subprocess), and M5-L5 (signal) remain
+**accepted-in-governance, interim-rejected at publish** until their own layers open. When in doubt, the
+constitution wins. The authoritative designs are
 [`2026-06-08-saga-orchestrator-design.md`](../superpowers/specs/2026-06-08-saga-orchestrator-design.md)
 (M1) and
 [`2026-06-09-m2-conditional-sagas-design.md`](../superpowers/specs/2026-06-09-m2-conditional-sagas-design.md)
@@ -73,7 +73,7 @@ The profile grows one milestone at a time, each guarded by a constitution amendm
   M5-L1 through M5-L5. **M5-L1 (embedded scopes + hierarchical exceptions) has SHIPPED** — the plain
   embedded `subProcess`, error/timer boundaries on a scope, the error end event, hierarchical error
   bubbling, the two-tier commit shield, and the root-relative reverse pass are all runtime-open — see below.
-  [`02-activities.md`](./02-activities.md).
+  **M5-L2 (`callActivity`) is opening** — see below. [`02-activities.md`](./02-activities.md).
 
 ## What "no custom notation" means (precisely)
 
@@ -414,10 +414,20 @@ is the first layer's governance record.
   loop-back; a *condition-guarded* one still publishes but a runtime hit is caught by a deterministic
   `scopeReentry` incident (the walk-local `skippedScopes` backstop, TASK-71) rather than silently desyncing.
 
-**M5-L2…L5 — accepted (v2.5.0), runtime not yet open — publish still rejects (interim):**
+**M5-L2 (`callActivity`) — accepted-and-validated, runtime opening in this layer (in progress):** the
+[M5-L2 layer design](../superpowers/specs/2026-07-02-m5-l2-callactivity-design.md) and the recorded
+[M5-L2 Constitution Check](../../specs/002-saga-orchestrator/m5-L2-constitution-check.md) are this layer's
+governance record; the runtime and validator changes land over the layer's implementation tasks.
 
-- `bpmn:callActivity` (M5-L2) — **accepted (v2.5.0), runtime not yet open — publish still rejects
-  (interim)**; stays in the whitelist reject with an M5-L2 roadmap pointer until that layer opens it.
+- `bpmn:callActivity` — **runtime opening in this layer (M5-L2, in progress)**: a real child process
+  instance with its own Cloudflare Workflow, the publish-time `calledElement` version binding (Principle
+  II), the child create/output-apply idempotency triad (Principle III), child error bubbling to the
+  callActivity's own boundary and onward through M5-L1 hierarchical bubbling, and compensating a committed
+  `callActivity` by driving the child's own reverse pass (Principle VI). See the M5-L2 layer design linked
+  above for the full mechanism; this row moves to "shipped" once the layer's implementation tasks land.
+
+**M5-L3…L5 — accepted (v2.5.0), runtime not yet open — publish still rejects (interim):**
+
 - `multiInstanceLoopCharacteristics` (parallel and sequential, M5-L3) — **accepted (v2.5.0), runtime not
   yet open — publish still rejects (interim)**.
 - `escalation` throw/boundary and the event subprocess (`triggeredByEvent="true"`, M5-L4) — **accepted
@@ -445,7 +455,7 @@ opened by it):
 | Events | timer **start** events, `conditional` / `link` event definitions; a **top-level (process-level)** `signal` start event; **non-interrupting** *timer or conditional* boundary events and `timeCycle` triggers; `intermediateThrowEvent` other than `escalation`/`signal` (M5-L4/L5); **non-catch** message events (message throw/end); `compensateEventDefinition` on a throw/end; terminate end; a non-cancel end-event definition. (Interrupting boundary timers **and both the timer and the message intermediate catch** are shipped — see the supported set above; not here. `signal`/`escalation` throw/boundary/event-subprocess-start and **non-interrupting** signal/escalation boundaries are **M5-accepted (v2.5.0)** — see the M5 interim markers above; not here. An error **end** event is **M5-L1-accepted and opening now** — see above; not here.) |
 | Gateways | `complexGateway` (not on the roadmap), and any **implicit split (>1 outgoing sequence flow on a non-gateway node)** — pointers in lockstep with `DEFERRED_GATEWAY_REASONS` (`src/bpmn/profile.ts`). (`eventBasedGateway` is M3-accepted and **shipped at L4**; `parallelGateway`/`inclusiveGateway` are **M4-accepted and SESE-validated at publish since M4-L1** — all see the supported set above.) |
 | Flow | `conditionExpression` on any flow **not leaving an `exclusiveGateway`**, a `default` attribute on a non-gateway node, `messageFlow`, a sequence flow crossing a transaction boundary (a scope boundary, generalized by M5-L1 — see above) |
-| Structure | `adHocSubProcess`, `collaboration`, `participant` (pools), `laneSet`/`lane`, `choreography`, a non-process `calledElement` (GlobalTask). (Non-transaction `subProcess` is **M5-L1-accepted and opening now**; `callActivity` is **M5-accepted (v2.5.0), runtime not yet open until M5-L2** — see the M5 interim markers above; neither is here.) |
+| Structure | `adHocSubProcess`, `collaboration`, `participant` (pools), `laneSet`/`lane`, `choreography`, a non-process `calledElement` (GlobalTask). (Non-transaction `subProcess` is **M5-L1-accepted and opening now**; `callActivity` is **M5-L2-accepted and opening now** — see the M5 interim markers above; neither is here.) |
 | Loops/data | `standardLoopCharacteristics` (the activity **marker** — distinct from the accepted M2 cycles drawn as sequence flows through a gateway and from `multiInstanceLoopCharacteristics`), MI's standard ItemAwareElement data bindings (`loopDataInputRef`/`loopDataOutputRef`/`inputDataItem`/`outputDataItem`), an MI with no recognized cardinality source, `dataObject`/`dataStore`/`dataInput`/`dataOutput`. (`multiInstanceLoopCharacteristics` itself is **M5-accepted (v2.5.0), runtime not yet open until M5-L3** — see the M5 interim markers above; not here.) |
 | Model instantiation | `receiveTask instantiate="true"` (or any non-none instantiation path) |
 | Platform | built-in tasklist, forms/assignment, process migration, full Zeebe/Camunda compatibility, visual modeler, advanced Operate-style UI |
@@ -692,9 +702,10 @@ rule 10):
   (`uncaughtError` incident kind), hierarchical error bubbling, the two-tier commit shield
   (`committedLocal`/`committed`), the root-relative reverse pass, and `MAX_SCOPE_DEPTH = 8` are all
   runtime-open — see
-  [Accepted in v2.5.0 (M5)](#accepted-in-v250-m5--composition-opening-per-layer) above; M5-L2
-  (`callActivity`) through M5-L5 (`signal`) remain interim-rejected until their own layers open.
-  [`02-activities.md`](./02-activities.md), [`07-execution-semantics.md`](./07-execution-semantics.md).
+  [Accepted in v2.5.0 (M5)](#accepted-in-v250-m5--composition-opening-per-layer) above. **M5-L2
+  (`callActivity`) is opening** (governance recorded, runtime landing over this layer's implementation
+  tasks); M5-L3 (`multiInstance`) through M5-L5 (`signal`) remain interim-rejected until their own layers
+  open. [`02-activities.md`](./02-activities.md), [`07-execution-semantics.md`](./07-execution-semantics.md).
 
 > Any expansion of this profile requires amending the constitution first (Governance & scope). This file
 > is updated in lockstep with that amendment **and** with the `src/bpmn/validator.ts` accept/reject

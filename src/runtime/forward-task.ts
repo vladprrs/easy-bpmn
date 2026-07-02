@@ -111,28 +111,62 @@ export function errorCatchTarget(graph: ExecutionGraph, elementId: string, error
 export type ForwardOutcome = { kind: "next"; next: string } | { kind: "waiting" } | { kind: "incident" };
 
 /**
- * Write-free fast-forward predicate for a forward Service Task visit
- * (design M2 §5): once a job's terminal outcome has been APPLIED to the
- * instance (output_applied=1, set in the same dbBatch as the advance), the
- * rewalk derives the successor purely from graph + persisted job state —
- * a completed job advances on `node.next`; a business failure re-derives the
- * SAME deterministic boundary target from the persisted error_code. Returns
- * null when the visit still needs driving (the frontier).
+ * Fast-forward predicate for a forward Service Task visit (design M2 §5): once
+ * a job's terminal outcome has been APPLIED to the instance (output_applied=1,
+ * set in the same dbBatch as the advance), the rewalk derives the successor
+ * purely from graph + persisted job state — a completed job advances on
+ * `node.next`; a business failure re-derives the SAME deterministic catch
+ * target from the persisted error_code. Returns null when the visit still
+ * needs driving (the frontier). Write-free EXCEPT the one self-healing case
+ * inside: a scope-caught business failure whose post-batch drain/audit was
+ * crashed away is re-drained here (idempotent, existence-guarded — see the
+ * inline block).
  */
-function appliedForwardOutcome(
+async function appliedForwardOutcome(
+  env: Env,
+  instanceId: string,
   graph: ExecutionGraph,
   elementId: string,
   node: GraphNode,
   job: JobRow | null,
-): ForwardOutcome | null {
+): Promise<ForwardOutcome | null> {
   if (!job || job.output_applied !== 1) return null;
   if (job.status === "completed") return { kind: "next", next: node.next! };
   if (job.status === "failed" && job.error_code) {
-    // Write-free re-derivation (M5-L1 spec §5.1): deterministic because the
-    // graph is immutable and — when the winning level was a scope — the drain
-    // + scopeExited row already happened in the applying step below.
+    // Re-derivation (M5-L1 spec §5.1): deterministic because the graph is
+    // immutable — the same attachment-chain walk always yields the same target.
     const target = errorCatchTarget(graph, elementId, job.error_code);
-    if (target) return { kind: "next", next: target.next };
+    if (target) {
+      // Self-healing backstop for the scope-caught case: the applying path runs
+      // the subtree drain + `scopeExited` audit AFTER its dbBatch commits (which
+      // already flipped output_applied=1) — a crash in that window would
+      // otherwise skip them FOREVER, since every later drive fast-forwards
+      // through here, and unlike the beginCompensating precedent no future
+      // worker poll would revisit (stranding live subtree tokens and wedging the
+      // frontier barrier). The `scopeExited` row is the completion marker: both
+      // writers order drain-then-audit, so row-exists ⇒ the drain finished. On
+      // the steady state this costs ONE history read per rewalk of this visit.
+      // Narrowest existence predicate available here: (instance, scope,
+      // 'scopeExited') — this path has no reliable scope-exit occurrence (the
+      // JOB's occurrence is the task's, not the scope's), so a LOOPED scope
+      // that already exited abnormally once is not re-healed for a later
+      // crashed exit; its first-exit drain semantics still hold.
+      if (target.hostIsScope) {
+        const audited = await countHistoryEventsOfType(env.DB, instanceId, target.hostId, "scopeExited");
+        if (audited === 0) {
+          await drainScopeSubtree(env, graph, instanceId, target.hostId); // idempotent retain-only
+          const inst = await loadInst(env, instanceId);
+          await historyStmt(env.DB, {
+            workspaceId: inst.workspace_id,
+            instanceId,
+            elementId: target.hostId,
+            type: "scopeExited",
+            diagnostics: { scope: target.hostId, via: target.boundaryId, abnormal: true },
+          }).run();
+        }
+      }
+      return { kind: "next", next: target.next };
+    }
   }
   // Defensive — unreachable by construction: output_applied=1 is only ever set
   // on a completed apply or a business-routed failure (whose boundary target is
@@ -171,8 +205,9 @@ export async function driveForwardServiceTask(
 
   let job = await getForwardJob(env.DB, instanceId, elementId, occ);
 
-  // Already applied → pure in-memory cursor move, NO writes, NO step.
-  const applied = appliedForwardOutcome(graph, elementId, node, job);
+  // Already applied → pure cursor move (no step; write-free except the guarded
+  // self-healing re-drain of a crashed scope exit — see appliedForwardOutcome).
+  const applied = await appliedForwardOutcome(env, instanceId, graph, elementId, node, job);
   if (applied) return applied;
 
   if (job?.status === "completed") {
@@ -385,7 +420,7 @@ async function applyForwardCompletion(
   // Apply-once guard (idempotent step body): a Workflow step retry after the
   // batch below committed must not re-merge the output over newer variables.
   const live = await getForwardJob(env.DB, instanceId, elementId, occ);
-  const appliedAlready = appliedForwardOutcome(graph, elementId, node, live);
+  const appliedAlready = await appliedForwardOutcome(env, instanceId, graph, elementId, node, live);
   if (appliedAlready) return appliedAlready;
 
   const inst = await loadInst(env, instanceId);
@@ -546,9 +581,10 @@ async function handleForwardFailure(
 ): Promise<ForwardOutcome> {
   // Route-once guard (idempotent step body): a re-run after the business-error
   // batch committed fast-forwards to the recorded boundary target instead of
-  // duplicating businessErrorCaught + rewriting the cursor.
+  // duplicating businessErrorCaught + rewriting the cursor (and self-heals a
+  // crashed-away scope drain/audit — see appliedForwardOutcome).
   const live = await getForwardJob(env.DB, instanceId, elementId, occ);
-  const appliedAlready = appliedForwardOutcome(graph, elementId, node, live);
+  const appliedAlready = await appliedForwardOutcome(env, instanceId, graph, elementId, node, live);
   if (appliedAlready) return appliedAlready;
 
   const inst = await loadInst(env, instanceId);
@@ -599,7 +635,10 @@ async function handleForwardFailure(
       // subtree (idempotent retain-only, Task 8) and is audited. Not folded into
       // the batch above — `drainScopeSubtree` issues its own dbBatch(es) per live
       // token, and is safe to re-run on a step retry (retain-only, INSERT OR
-      // IGNORE + status-guarded flips).
+      // IGNORE + status-guarded flips). Post-batch drain+audit: a crash landing
+      // between the batch commit and here is healed by appliedForwardOutcome's
+      // idempotent, existence-guarded re-drain on the next drive (the batch set
+      // output_applied=1, so every later drive re-derives through that path).
       if (target.hostIsScope) {
         await drainScopeSubtree(env, graph, instanceId, target.hostId);
         await historyStmt(env.DB, {

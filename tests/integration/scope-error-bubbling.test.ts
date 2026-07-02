@@ -78,7 +78,11 @@ describe("M5-L1 hierarchical error bubbling (spec §5.1)", () => {
     expect((await getInstanceRow(instanceId))!.status).toBe("completed");
     // retained: A has no compensation wiring here, but S2's drain kept no live tokens
     const hist = await historyTypes(instanceId);
-    expect(hist.some((h) => h.type === "scopeExited" && h.element_id === "S1")).toBe(true); // abnormal exit audited
+    // Abnormal exit audited EXACTLY ONCE: this run spans multiple drives (the
+    // recover completion rewalks re-derive A's applied failure through
+    // appliedForwardOutcome), pinning the self-heal path's existence guard —
+    // repeated rewalks never duplicate the scopeExited row.
+    expect(hist.filter((h) => h.type === "scopeExited" && h.element_id === "S1")).toHaveLength(1);
   });
 
   it("no boundary anywhere → Hazard at root (serviceTaskFailure, no auto-compensation)", async () => {

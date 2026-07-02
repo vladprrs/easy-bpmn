@@ -118,10 +118,14 @@ describe("BPMN-lite profile validator", () => {
     expect(r.issues.some((i) => i.elementId === "R" && /no name|non-empty message name/i.test(i.reason))).toBe(true);
   });
 
-  it("rejects a subprocess", async () => {
+  // M5-L1 widened the accept matrix: an embedded subProcess is now a
+  // supported construct (see "M5-L1 embedded subProcess acceptance" below).
+  // SUBPROCESS_BPMN is an empty subprocess (no inner start/end event), so it
+  // is still rejected — now for structural reasons, not "unsupported construct".
+  it("rejects an embedded subprocess with no inner start event (structurally invalid)", async () => {
     const r = await parseAndValidate(SUBPROCESS_BPMN);
     expect(r.ok).toBe(false);
-    expect(r.issues.some((i) => i.elementId === "SP" && /subProcess/.test(i.reason))).toBe(true);
+    expect(r.issues.some((i) => i.elementId === "SP" && /none start event/.test(i.reason))).toBe(true);
   });
 
   it("rejects a send task", async () => {
@@ -1769,5 +1773,84 @@ describe("M4 concurrency profile", () => {
     const r = await parseAndValidate(PARALLEL_SAME_MESSAGE_BPMN);
     expect(r.ok).toBe(false);
     expect(r.issues.some((i) => /same message|broker key|distinct message/i.test(i.reason))).toBe(true);
+  });
+});
+
+describe("M5-L1 embedded subProcess acceptance", () => {
+  const SUBPROC = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="d" targetNamespace="http://example.com">
+  <bpmn:process id="proc" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="sub"/>
+    <bpmn:subProcess id="sub">
+      <bpmn:startEvent id="s_start"/>
+      <bpmn:sequenceFlow id="sf1" sourceRef="s_start" targetRef="s_task"/>
+      <bpmn:serviceTask id="s_task"><bpmn:extensionElements><easy-bpmn:taskDefinition type="doWork"/></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:sequenceFlow id="sf2" sourceRef="s_task" targetRef="s_end"/>
+      <bpmn:endEvent id="s_end"/>
+    </bpmn:subProcess>
+    <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="end"/>
+    <bpmn:endEvent id="end"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+  it("accepts a plain embedded subProcess and compiles its scope", async () => {
+    const r = await parseAndValidate(SUBPROC);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.nodes["sub"]!.type).toBe("subProcess");
+    expect(r.graph!.nodes["s_task"]!.scopeId).toBe("sub");
+    expect(r.graph!.scopes!["sub"]).toEqual({ id: "sub", kind: "subProcess", parentId: null, depth: 1, startId: "s_start" });
+  });
+
+  it("rejects an event subprocess (interim → M5-L4) with element id + reason", async () => {
+    const r = await parseAndValidate(SUBPROC.replace('<bpmn:subProcess id="sub">', '<bpmn:subProcess id="sub" triggeredByEvent="true">'));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "sub" && /M5-L4/.test(i.reason))).toBe(true);
+  });
+
+  it("rejects an adHocSubProcess with element id + reason", async () => {
+    const r = await parseAndValidate(SUBPROC.replace(/bpmn:subProcess/g, "bpmn:adHocSubProcess"));
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "sub")).toBe(true);
+  });
+
+  it("rejects multiInstanceLoopCharacteristics on a subProcess (interim → M5-L3)", async () => {
+    const withMi = SUBPROC.replace('<bpmn:startEvent id="s_start"/>', '<bpmn:multiInstanceLoopCharacteristics/><bpmn:startEvent id="s_start"/>');
+    const r = await parseAndValidate(withMi);
+    expect(r.ok).toBe(false);
+    expect(r.issues.some((i) => i.elementId === "sub" && /M5-L3/.test(i.reason))).toBe(true);
+  });
+
+  it("enforces MAX_SCOPE_DEPTH: depth 8 accepted, depth 9 rejected", async () => {
+    const nest = (depth: number): string => {
+      let inner = `<bpmn:startEvent id="d${depth}_start"/><bpmn:sequenceFlow id="d${depth}_f" sourceRef="d${depth}_start" targetRef="d${depth}_end"/><bpmn:endEvent id="d${depth}_end"/>`;
+      for (let d = depth; d >= 1; d--) {
+        inner = `<bpmn:startEvent id="d${d - 1}_start"/><bpmn:sequenceFlow id="d${d - 1}_f1" sourceRef="d${d - 1}_start" targetRef="sub${d}"/><bpmn:subProcess id="sub${d}">${inner}</bpmn:subProcess><bpmn:sequenceFlow id="d${d - 1}_f2" sourceRef="sub${d}" targetRef="d${d - 1}_end"/><bpmn:endEvent id="d${d - 1}_end"/>`;
+      }
+      return `<?xml version="1.0" encoding="UTF-8"?><bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="d" targetNamespace="http://example.com"><bpmn:process id="proc" isExecutable="true">${inner}</bpmn:process></bpmn:definitions>`;
+    };
+    expect((await parseAndValidate(nest(8))).ok).toBe(true);
+    const r9 = await parseAndValidate(nest(9));
+    expect(r9.ok).toBe(false);
+    expect(r9.issues.some((i) => /MAX_SCOPE_DEPTH|depth/.test(i.reason))).toBe(true);
+  });
+
+  it("tolerates and ignores foreign-namespace extension content inside a subProcess", async () => {
+    // spec §10 unit bullet: ignorable extension content must not reject.
+    const withForeign = SUBPROC.replace(
+      '<bpmn:startEvent id="s_start"/>',
+      '<bpmn:extensionElements xmlns:camunda="http://camunda.org/schema/1.0/bpmn"><camunda:properties/></bpmn:extensionElements><bpmn:startEvent id="s_start"/>',
+    );
+    expect((await parseAndValidate(withForeign)).ok).toBe(true);
+  });
+
+  it("accepts a transaction nested inside a subProcess and records parentage", async () => {
+    const NESTED = SUBPROC.replace(
+      '<bpmn:serviceTask id="s_task"><bpmn:extensionElements><easy-bpmn:taskDefinition type="doWork"/></bpmn:extensionElements></bpmn:serviceTask>',
+      `<bpmn:transaction id="tx"><bpmn:startEvent id="t_start"/><bpmn:sequenceFlow id="tf1" sourceRef="t_start" targetRef="t_end"/><bpmn:endEvent id="t_end"/></bpmn:transaction>`,
+    ).replace(/s_task/g, "tx");
+    const r = await parseAndValidate(NESTED);
+    expect(r.ok).toBe(true);
+    expect(r.graph!.scopes!["tx"]).toMatchObject({ kind: "transaction", parentId: "sub", depth: 2 });
   });
 });

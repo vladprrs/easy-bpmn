@@ -25,6 +25,10 @@ import { parseBpmnXml } from "./parser";
 import { TASK_DEFINITION_TYPE } from "./moddle-extension";
 import { parseCondition } from "../runtime/expressions";
 import { isValidIso8601DateTime, parseIso8601DurationMs } from "../runtime/iso8601";
+// M5-L1: the scope-nesting depth cap, enforced here at publish (spec §7). No
+// import cycle — engine.ts imports only `bpmn/graph` (type-only), never this
+// validator module; verified by grep before wiring this import.
+import { MAX_SCOPE_DEPTH } from "../runtime/engine";
 import { validateRegions, type RegionInput, type RegionInfoOut } from "./regions";
 import {
   ASSOCIATION_TYPE,
@@ -50,6 +54,7 @@ import type {
   GraphElement,
   GraphNode,
   NodeType,
+  ScopeMeta,
   TimerTriggerSpec,
   TransactionScope,
   ValidationIssueData,
@@ -180,7 +185,7 @@ interface AssocInfo {
 
 interface ScopeInfo {
   id: string;
-  kind: "process" | "transaction";
+  kind: "process" | "transaction" | "subProcess";
 }
 
 const SUPPORTED_HINT =
@@ -378,12 +383,29 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     return msgName;
   };
 
+  // M5-L1: the static scope-hierarchy map (spec §2) — a scope's parent scope id
+  // (null at the process root) and its nesting depth (1 = directly in the
+  // process). Populated alongside `scopes` by every classifyContainer call.
+  const scopeParent = new Map<string, string | null>();
+  const scopeDepth = new Map<string, number>();
+
   const classifyContainer = (
     container: ModdleElement,
     scopeId: string,
-    scopeKind: "process" | "transaction",
+    scopeKind: "process" | "transaction" | "subProcess",
+    parentScopeId: string | null,
+    depth: number,
   ): void => {
     scopes.push({ id: scopeId, kind: scopeKind });
+    scopeParent.set(scopeId, parentScopeId);
+    scopeDepth.set(scopeId, depth);
+    if (depth > MAX_SCOPE_DEPTH) {
+      err(
+        `Scope '${scopeId}' exceeds MAX_SCOPE_DEPTH = ${MAX_SCOPE_DEPTH} (nesting depth ${depth}).`,
+        scopeId,
+        scopeKind === "transaction" ? "transaction" : "subProcess",
+      );
+    }
 
     // Associations live in `artifacts`, not `flowElements`. Other artifacts
     // (text annotations, groups) are ignorable like DI — tolerated, not parsed.
@@ -456,7 +478,41 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
           );
         }
         nodes.push({ id: id ?? "", type: "transaction", name: (el.name as string) ?? undefined, scopeId });
-        classifyContainer(el, id ?? "", "transaction");
+        classifyContainer(el, id ?? "", "transaction", scopeId, depth + 1);
+        continue;
+      }
+
+      // M5-L1: plain embedded subProcess — a bookkeeping scope on the token path.
+      // An event subprocess (triggeredByEvent) and ad-hoc subprocesses are out of
+      // profile (interim rejects with roadmap pointers, spec §6); MI-on-subProcess
+      // is deferred to M5-L3.
+      if ($type === "bpmn:SubProcess") {
+        if (el.triggeredByEvent === true) {
+          err(
+            `Event subprocess '${id ?? "(no id)"}' (triggeredByEvent="true") is not yet supported — planned for milestone M5-L4.`,
+            id,
+            "subProcess",
+          );
+          continue;
+        }
+        if (el.loopCharacteristics != null) {
+          err(
+            `Subprocess '${id ?? "(no id)"}' has loop or multi-instance characteristics — multiInstance is planned for milestone M5-L3.`,
+            id,
+            "subProcess",
+          );
+          continue;
+        }
+        nodes.push({ id: id ?? "", type: "subProcess", name: (el.name as string) ?? undefined, scopeId });
+        classifyContainer(el, id ?? "", "subProcess", scopeId, depth + 1);
+        continue;
+      }
+      if ($type === "bpmn:AdHocSubProcess") {
+        err(
+          `Ad-hoc subprocess '${id ?? "(no id)"}' is not supported in this profile (no planned support).`,
+          id,
+          "subProcess",
+        );
         continue;
       }
 
@@ -742,7 +798,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     }
   };
 
-  classifyContainer(proc, processId, "process");
+  classifyContainer(proc, processId, "process", null, 0);
 
   const nodeById = new Map(nodes.map((n) => [n.id, n]));
 
@@ -852,7 +908,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     const starts = scopeNodes.filter((n) => n.type === "startEvent");
     const ends = scopeNodes.filter((n) => n.type === "endEvent");
     const noneEnds = ends.filter((e) => e.endKind === "none");
-    const where = kind === "transaction" ? `transaction '${sid}'` : "the process";
+    const where = kind === "transaction" ? `transaction '${sid}'` : kind === "subProcess" ? `subprocess '${sid}'` : "the process";
 
     if (starts.length !== 1) {
       err(`Exactly one none start event is required in ${where}; found ${starts.length}.`, sid, "startEvent");
@@ -1379,7 +1435,11 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     const flowsForRegion = flows.filter((f) => f.scopeId === sid);
     const input: RegionInput = {
       scopeId: sid,
-      scopeKind: scopeKindOf.get(sid)!,
+      // RegionInput["scopeKind"] predates M5-L1 and is unused inside regions.ts
+      // (declared but never read) — cast rather than widen that file's type for
+      // one inert field; a subProcess scope's SESE region validation is
+      // otherwise identical to a transaction's.
+      scopeKind: scopeKindOf.get(sid)! as unknown as RegionInput["scopeKind"],
       scopeNodes: scopeNodesForRegion as unknown as RegionInput["scopeNodes"],
       flows: flowsForRegion as unknown as RegionInput["flows"],
       outgoing,
@@ -1470,7 +1530,7 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       }
       for (const n of scopeNodes) {
         if (!visited.has(n.id)) {
-          err(`Element '${n.id}' is not reachable in ${sid === processId ? "the process" : `transaction '${sid}'`}.`, n.id, n.type);
+          err(`Element '${n.id}' is not reachable in ${sid === processId ? "the process" : `scope '${sid}'`}.`, n.id, n.type);
         }
       }
     }
@@ -1588,6 +1648,25 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       };
     }
 
+    // M5-L1: the static scope map (spec §2) + the flat compensation wiring
+    // (spec §3.3) — element-id-keyed, superseding the per-transaction
+    // `compensations` above for scope-aware lookups (that field is retained for
+    // legacy graphs). Process-level "scope" is not itself a scope entry — only
+    // transaction and subProcess scopes are meaningful nesting boundaries.
+    const scopeMetas: Record<string, ScopeMeta> = {};
+    for (const s of scopes) {
+      if (s.kind === "process") continue;
+      const inner = nodes.find((n) => n.scopeId === s.id && n.type === "startEvent");
+      const parent = scopeParent.get(s.id) ?? null;
+      scopeMetas[s.id] = {
+        id: s.id,
+        kind: s.kind,
+        parentId: parent === processId ? null : parent,
+        depth: scopeDepth.get(s.id) ?? 1,
+        startId: inner?.id ?? "",
+      };
+    }
+
     // Elements list (drives bpmn_elements rows + the version API response).
     const elements: GraphElement[] = [];
     for (const n of nodes) {
@@ -1637,6 +1716,8 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       ...(associationLinks.length > 0 ? { associations: associationLinks } : {}),
       ...(errorDecls.length > 0 ? { errors: errorDecls } : {}),
       ...(Object.keys(regionsByScope).length > 0 ? { regions: regionsByScope } : {}),
+      ...(Object.keys(scopeMetas).length > 0 ? { scopes: scopeMetas } : {}),
+      ...(compensationOf.size > 0 ? { compensations: Object.fromEntries(compensationOf) } : {}),
     };
   };
 

@@ -175,6 +175,14 @@ export const MAX_CONCURRENT_TOKENS = 256;
 export const STEP_BUDGET_SOFT = 20000;
 
 /**
+ * Scope-nesting depth cap (M5-L1, spec §7). Depth is fully STATIC in L1 (no
+ * callActivity / MI), so this is enforced by the VALIDATOR at publish — a
+ * fail-closed reject with element id + reason, zero runtime surface. The
+ * `scopeDepth` runtime incident becomes reachable only with M5-L2 call chains.
+ */
+export const MAX_SCOPE_DEPTH = 8;
+
+/**
  * TEST-ONLY cap overrides (design §9 / L6.1). Integration tests lower a cap via an
  * env var so a bomb fixture trips it without 256 real branches / 20000 real steps;
  * production never sets these (the `Env` fields are optional + test-only). A

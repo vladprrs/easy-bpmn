@@ -303,6 +303,25 @@ export const tokenInspectionSchema = z.object({
 });
 export type TokenInspection = z.infer<typeof tokenInspectionSchema>;
 
+/**
+ * M5-L2 (Task 11, spec §6/§9) — a callActivity parent/child linkage view,
+ * always present on the instance-inspection endpoint (unlike `timers`/`tokens`/
+ * `subscriptions`, which are omitted when empty): `parent` is non-null on a
+ * child instance, `children` lists every callActivity visit's bound child
+ * (across occurrences/iterations) with its own live/terminal status.
+ */
+export interface InstanceLineageChild {
+  elementId: string;
+  occurrence: number;
+  childInstanceId: string;
+  status: string;
+}
+
+export interface InstanceLineage {
+  parent: { instanceId: string; elementId: string | null } | null;
+  children: InstanceLineageChild[];
+}
+
 export interface ProcessInstanceInspection extends ProcessInstance {
   historySummary: HistoryEvent[];
   diagnostics: Record<string, unknown>;
@@ -333,6 +352,12 @@ export interface ProcessInstanceInspection extends ProcessInstance {
    * when the instance has ≥1 active subscription; the most common stuck case.
    */
   subscriptions?: SubscriptionView[];
+  /**
+   * Parent/child callActivity linkage (M5-L2, Task 11). Always present (never
+   * omitted like the other conditional blocks above): a root instance carries
+   * `parent: null`; a childless instance carries `children: []`.
+   */
+  lineage: InstanceLineage;
 }
 
 // ---- Operator remediation verbs ----

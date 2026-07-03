@@ -11,6 +11,7 @@ import type { ProcessInstanceInspection } from "../api/types";
 import type { ElementIndex } from "../lib/elements";
 import { Button, Badge } from "../components/ui";
 import { humanize } from "../lib/humanize";
+import { isLineageChild } from "../lib/lineage";
 
 export function IncidentCallout({
   instance,
@@ -27,6 +28,11 @@ export function IncidentCallout({
 }) {
   const stuck = instance.status === "compensationFailed";
   const inc = instance.openIncidents?.[0];
+  // M5-L2 (Task 11): a callActivity child's lifecycle is entirely a function of
+  // its parent's step-state machine (the server 409s a direct cancel/retry on
+  // one) — the callout still names the trouble, it just never offers a verb
+  // the API would refuse.
+  const isChild = isLineageChild(instance.lineage);
 
   if (stuck) {
     return (
@@ -42,11 +48,13 @@ export function IncidentCallout({
             <p className="mt-1 text-sm text-content-secondary">
               The flow ran backward and stopped at a compensation step. The one safe move is to resume it.
             </p>
-            <div className="mt-3">
-              <Button variant="primary" onClick={onRetry} disabled={acting}>
-                <RotateCcw className="h-4 w-4" /> Resume roll-back
-              </Button>
-            </div>
+            {!isChild && (
+              <div className="mt-3">
+                <Button variant="primary" onClick={onRetry} disabled={acting}>
+                  <RotateCcw className="h-4 w-4" /> Resume roll-back
+                </Button>
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -73,14 +81,16 @@ export function IncidentCallout({
             retried <span className="tabular">{inc.retryCount}</span>×
             {inc.resolution ? ` · ${humanize(inc.resolution).title}` : ""}
           </div>
-          <div className="mt-3 flex items-center gap-2">
-            <Button variant="primary" onClick={onRetry} disabled={acting}>
-              <RotateCcw className="h-4 w-4" /> Retry
-            </Button>
-            <Button variant="danger" onClick={onRequestCancel} disabled={acting}>
-              <Ban className="h-4 w-4" /> Cancel &amp; roll back
-            </Button>
-          </div>
+          {!isChild && (
+            <div className="mt-3 flex items-center gap-2">
+              <Button variant="primary" onClick={onRetry} disabled={acting}>
+                <RotateCcw className="h-4 w-4" /> Retry
+              </Button>
+              <Button variant="danger" onClick={onRequestCancel} disabled={acting}>
+                <Ban className="h-4 w-4" /> Cancel &amp; roll back
+              </Button>
+            </div>
+          )}
         </div>
       </div>
     </div>

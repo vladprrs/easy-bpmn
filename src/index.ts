@@ -105,6 +105,7 @@ import { eligibleCommittedLocalScopeIds, subtreeScopeIds } from "./bpmn/scope-tr
 import {
   cancelInstanceRequestSchema,
   retryInstanceRequestSchema,
+  type InstanceLineage,
   type InstanceListResponse,
   type SagaInspection,
   type TokenInspection,
@@ -348,6 +349,22 @@ async function handleGetInstance(env: Env, instanceId: string): Promise<Response
   // `waiting` instance shows WHAT it is waiting for (the most common stuck case).
   const subscriptions = await listInstanceSubscriptions(env.DB, instanceId);
 
+  // M5-L2 (Task 11): the parent/child callActivity linkage view — a raw-row
+  // re-read for parent_element_id (mapInstance/ProcessInstance carries only
+  // parentInstanceId) + every callActivity visit's bound child, joined to that
+  // child's own live/terminal status (listChildrenOfInstance, child-instances.ts).
+  const raw = await getInstanceRow(env.DB, instanceId);
+  const children = await listChildrenOfInstance(env.DB, instanceId);
+  const lineage: InstanceLineage = {
+    parent: raw?.parent_instance_id ? { instanceId: raw.parent_instance_id, elementId: raw.parent_element_id } : null,
+    children: children.map((c) => ({
+      elementId: c.parent_element_id,
+      occurrence: c.occurrence,
+      childInstanceId: c.child_instance_id,
+      status: c.child_status,
+    })),
+  };
+
   const inspection: ProcessInstanceInspection = {
     ...instance,
     ...(liveTokenCount > 1 ? { currentElementId: null } : {}),
@@ -364,6 +381,7 @@ async function handleGetInstance(env: Env, instanceId: string): Promise<Response
     ...(timers.length > 0 ? { timers } : {}),
     ...(tokens.length > 0 ? { tokens } : {}),
     ...(subscriptions.length > 0 ? { subscriptions } : {}),
+    lineage,
   };
   return json(inspection, 200);
 }
@@ -395,6 +413,10 @@ async function handleListInstances(env: Env, url: URL): Promise<Response> {
   const limit = Math.min(Math.max(1, parseInt(url.searchParams.get("limit") ?? "50", 10) || 50), 200);
   const cursorRaw = url.searchParams.get("cursor");
   const cursor = cursorRaw ? parseInt(cursorRaw, 10) : undefined;
+  // M5-L2 (Task 11): `?root=true` restricts to saga-root instances (excludes
+  // callActivity children) — the operator discovery default. Absent/any other
+  // value includes children (back-compat).
+  const rootOnly = url.searchParams.get("root") === "true";
   const { items, nextCursor } = await listInstancesFiltered(env.DB, {
     workspaceId,
     statuses,
@@ -402,6 +424,7 @@ async function handleListInstances(env: Env, url: URL): Promise<Response> {
     sagaId,
     limit,
     cursor,
+    rootOnly,
   });
   const response: InstanceListResponse = { instances: items, nextCursor };
   return json(response, 200);

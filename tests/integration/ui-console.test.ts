@@ -7,10 +7,14 @@ import { beforeAll, describe, expect, it } from "vitest";
 import {
   DEMO_BPMN,
   SAGA_BPMN,
+  createDraft,
   drainSampleWorkers,
   get,
   publishAndStart,
+  publishDraft,
 } from "../helpers";
+import { CALL_CHILD_BPMN, CALL_PARENT_BPMN, SIMPLE_CHILD_BPMN, SIMPLE_PARENT_BPMN } from "./call-activity-fixtures";
+import { childInstanceIdFor } from "../../src/runtime/call-activity";
 
 const BASE = "https://easy-bpmn.test";
 
@@ -260,6 +264,86 @@ describe("M-UI instance diagnostics (§9, §12)", () => {
 
     const byMultiStatus = await get(`/instances?workspaceId=default&status=waiting,incident`);
     expect(byMultiStatus.body.instances.some((i: any) => i.instanceId === id)).toBe(true);
+  });
+});
+
+describe("M-UI callActivity lineage (M5-L2 Task 11, §6/§9)", () => {
+  it("GET /instances/{id} carries a lineage block: parent.children[] and child.parent", async () => {
+    const childDraft = await createDraft(SIMPLE_CHILD_BPMN);
+    await publishDraft(childDraft.body.draftId);
+
+    const { instance } = await publishAndStart(SIMPLE_PARENT_BPMN, {
+      correlationKey: "ui-lineage",
+      variables: { seed: 1 },
+    });
+    const parentId = instance.body.instanceId as string;
+    expect(instance.body.status).toBe("waiting"); // parked on call1, child already spawned
+
+    const childId = await childInstanceIdFor(parentId, "call1", 0);
+
+    const parentView = await get(`/instances/${parentId}`);
+    expect(parentView.status).toBe(200);
+    expect(parentView.body.lineage.parent).toBeNull();
+    expect(parentView.body.lineage.children).toHaveLength(1);
+    expect(parentView.body.lineage.children[0]).toMatchObject({
+      elementId: "call1",
+      occurrence: 0,
+      childInstanceId: childId,
+      status: "waiting",
+    });
+
+    const childView = await get(`/instances/${childId}`);
+    expect(childView.status).toBe(200);
+    expect(childView.body.lineage.parent).toEqual({ instanceId: parentId, elementId: "call1" });
+    expect(childView.body.lineage.children).toEqual([]);
+
+    // A root (non-callActivity) instance carries an always-present, empty lineage block.
+    const { instance: plain } = await publishAndStart(DEMO_BPMN, { correlationKey: "ui-lineage-plain", variables: {} });
+    const plainView = await get(`/instances/${plain.body.instanceId}`);
+    expect(plainView.body.lineage).toEqual({ parent: null, children: [] });
+  });
+
+  it("GET /instances?root=true excludes callActivity children; absent includes them", async () => {
+    const childDraft = await createDraft(SIMPLE_CHILD_BPMN);
+    await publishDraft(childDraft.body.draftId);
+
+    const { instance } = await publishAndStart(SIMPLE_PARENT_BPMN, {
+      correlationKey: "ui-root-filter",
+      variables: { seed: 2 },
+    });
+    const parentId = instance.body.instanceId as string;
+    const childId = await childInstanceIdFor(parentId, "call1", 0);
+
+    const rooted = await get(`/instances?workspaceId=default&root=true`);
+    expect(rooted.status).toBe(200);
+    expect(rooted.body.instances.some((i: any) => i.instanceId === parentId)).toBe(true);
+    expect(rooted.body.instances.some((i: any) => i.instanceId === childId)).toBe(false);
+
+    const unfiltered = await get(`/instances?workspaceId=default`);
+    expect(unfiltered.body.instances.some((i: any) => i.instanceId === parentId)).toBe(true);
+    expect(unfiltered.body.instances.some((i: any) => i.instanceId === childId)).toBe(true);
+  });
+
+  it("GET /instances?status=errored accepts the child-only errored terminal as a filter value", async () => {
+    const childDraft = await createDraft(CALL_CHILD_BPMN);
+    await publishDraft(childDraft.body.draftId);
+
+    const { instance } = await publishAndStart(CALL_PARENT_BPMN, {
+      correlationKey: "ui-status-errored",
+      variables: { failChild: true },
+    });
+    const parentId = instance.body.instanceId as string;
+    // Drain the whole path so the child settles into `errored` (own-boundary catch
+    // on call1 routes the parent onward to completion — call-activity-errors.test.ts).
+    await drainSampleWorkers({ taskTypes: ["charge-card", "reserve-stock", "log-only"] });
+
+    const childId = await childInstanceIdFor(parentId, "call1", 0);
+    const child = await get(`/instances/${childId}`);
+    expect(child.body.status).toBe("errored");
+
+    const byErrored = await get(`/instances?workspaceId=default&status=errored`);
+    expect(byErrored.status).toBe(200);
+    expect(byErrored.body.instances.some((i: any) => i.instanceId === childId)).toBe(true);
   });
 });
 

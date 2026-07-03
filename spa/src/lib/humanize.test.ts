@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { humanize, humanizeProcessName, isOpaqueId, narrate, KNOWN_EMITTED_TYPES } from "./humanize";
+import { statusTone } from "./format";
 
 // The authoritative set grepped from the Worker runtime (src/runtime/*, the
 // correlation broker, src/index.ts, src/persistence/*). If the engine adds a new
@@ -47,6 +48,16 @@ describe("event humanization (§13, G3)", () => {
     expect(h.mapped).toBe(false);
     expect(h.title).toBe("Some Brand New Engine Event");
     expect(h.tone).toBe("muted");
+  });
+});
+
+describe("instance-status humanization (M5-L2 callActivity, Task 11)", () => {
+  it("humanizes the child-only `errored` terminal as a distinct, danger-toned label", () => {
+    const h = humanize("errored");
+    expect(h.mapped).toBe(true);
+    expect(h.title).toBe("Errored (child)");
+    expect(h.tone).toBe("danger");
+    expect(statusTone("errored")).toBe("danger");
   });
 });
 

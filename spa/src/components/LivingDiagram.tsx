@@ -13,8 +13,9 @@ import "bpmn-js/dist/assets/diagram-js.css";
 import { glassRendererModule } from "./bpmn/GlassRenderer";
 import { AuroraField, type Hotspot } from "./bpmn/AuroraField";
 import { layoutDiagram } from "./bpmn/layout";
-import type { BpmnElement } from "../api/types";
+import type { BpmnElement, InstanceLineage } from "../api/types";
 import type { DiagramOverlay, FlowPlan, HeatPlan } from "../lib/flow";
+import { childForElement } from "../lib/lineage";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const XLINK = "http://www.w3.org/1999/xlink";
@@ -57,6 +58,8 @@ export default function LivingDiagram({
   reverse = false,
   selectedElement,
   onSelectElement,
+  lineage,
+  onOpenChild,
 }: {
   bpmnXml: string | null;
   elements: BpmnElement[];
@@ -67,6 +70,12 @@ export default function LivingDiagram({
   reverse?: boolean;
   selectedElement: string | null;
   onSelectElement: (id: string | null) => void;
+  /** M5-L2 (Task 11) — present in single-instance mode; lets a callActivity node
+   *  resolve its bound child on click. */
+  lineage?: InstanceLineage;
+  /** Fired instead of onSelectElement when a callActivity node with a bound
+   *  child is clicked — the caller navigates to that child's own run. */
+  onOpenChild?: (childInstanceId: string) => void;
 }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -76,6 +85,15 @@ export default function LivingDiagram({
   // parent-render identity of onSelectElement.
   const onSelectRef = useRef(onSelectElement);
   onSelectRef.current = onSelectElement;
+  // Same stability trick for the M5-L2 callActivity-click plumbing: the elements
+  // list, lineage block, and onOpenChild callback all change identity on every
+  // Stage re-render, but the click handler is wired ONCE in the import effect.
+  const elementsRef = useRef(elements);
+  elementsRef.current = elements;
+  const lineageRef = useRef(lineage);
+  lineageRef.current = lineage;
+  const onOpenChildRef = useRef(onOpenChild);
+  onOpenChildRef.current = onOpenChild;
   const appliedMarkers = useRef<{ id: string; cls: string }[]>([]);
   const tokenNodes = useRef<SVGGElement[]>([]);
   const overlayIds = useRef<string[]>([]);
@@ -152,7 +170,19 @@ export default function LivingDiagram({
         // re-import), so they're wired exactly once here.
         viewer.on("element.click", (e: any) => {
           const id = e?.element?.id;
-          if (id) onSelectRef.current(id);
+          if (!id) return;
+          // M5-L2 (Task 11): a callActivity node with an already-bound child
+          // navigates straight to that run instead of merely selecting the
+          // node (highest occurrence wins — childForElement, lib/lineage.ts).
+          const el = elementsRef.current.find((x) => x.elementId === id);
+          if (el?.type === "callActivity" && onOpenChildRef.current) {
+            const child = childForElement(lineageRef.current, id);
+            if (child) {
+              onOpenChildRef.current(child.childInstanceId);
+              return;
+            }
+          }
+          onSelectRef.current(id);
         });
         // Hover: lift the node you're reading, let its peers recede (CSS-driven).
         const host = hostRef.current;

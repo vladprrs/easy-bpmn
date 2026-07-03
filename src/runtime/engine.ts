@@ -143,6 +143,14 @@ interface RunOptions {
    */
   startAt?: string;
   incomingEvent?: MessageEventPayload;
+  /**
+   * M5-L2 (Task 6 reads this; no behavior here — pass-through only). Set by
+   * DirectExecutor.start when starting a callActivity child INLINE from inside
+   * the parent's held drive lock: the post-drive parent-notify hook must not
+   * re-enter the parent (spec §3). Workflow mode never sets it — the child
+   * Workflow starts out-of-band, so the notify hook is safe there.
+   */
+  suppressParentNotify?: boolean;
 }
 
 /**

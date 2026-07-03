@@ -537,9 +537,6 @@ async function handleRetryInstance(env: Env, instanceId: string, request: Reques
   // child too, so a fix like `releaseFails:false` reaches the descendant job
   // that actually needs it.
   const cascaded = await retryChildSubtree(env, instanceId, body.variables as JsonObject | undefined, now);
-  if (cascaded) {
-    await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, type: "operatorRetry", diagnostics: { target: "childSubtree" } });
-  }
 
   // The ROOT's own status is checked independently of `cascaded` — a
   // callActivity step's compensation dispatches to the CHILD's own reverse
@@ -553,13 +550,33 @@ async function handleRetryInstance(env: Env, instanceId: string, request: Reques
   // parent's reverse pass. A plain forward-incident cascade (no compensation
   // involved) leaves the root merely `waiting`, so this is a no-op there —
   // just re-drive so a now-completed/healed child applies.
+  //
+  // INVARIANT (Task 10 review): a successful cascade must never surface as an
+  // operator error, and no audit row may be written on a path that then
+  // reports failure. So: (1) a root-branch refusal (ConflictError) with
+  // cascaded=true is swallowed — the children DID heal, the verb succeeded —
+  // and the parent is still re-driven; (2) the `childSubtree` audit row is
+  // written only AFTER the root branch settles, at the point where the 200 is
+  // already determined. With cascaded=false the pre-Task-10 fail-fast
+  // behavior is preserved byte-for-byte (throw before any write).
   const fresh = await getInstanceRow(env.DB, instanceId);
   if (fresh?.status === "compensationFailed" || fresh?.status === "incident") {
-    await retryInstanceCore(env, instanceId, undefined, now); // root's own row already merged above; this also resumes inline
+    try {
+      await retryInstanceCore(env, instanceId, undefined, now); // root's own row already merged above; this also resumes inline
+    } catch (err) {
+      if (!cascaded || !(err instanceof ConflictError)) throw err;
+      // The cascade healed descendants but the root's own branch refused
+      // (e.g. a status race settled it, or no retryable step of its own).
+      // Still re-drive so a now-healed child applies to the parent.
+      await resumeInline(env, instanceId);
+    }
   } else if (cascaded) {
     await resumeInline(env, instanceId); // re-drive the parent so a now-completed child applies
   } else {
     throw new ConflictError(`Instance ${instanceId} has nothing to retry from status '${fresh?.status}'.`);
+  }
+  if (cascaded) {
+    await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, type: "operatorRetry", diagnostics: { target: "childSubtree" } });
   }
   return handleGetInstance(env, instanceId);
 }
@@ -632,6 +649,15 @@ async function retryInstanceCore(env: Env, instanceId: string, variables: JsonOb
  * drive completes). Returns true if anything anywhere in the subtree was
  * retried, so the caller can distinguish "cascaded" from "nothing to cascade,
  * fall through to the root's own status".
+ *
+ * Operator-supplied retry variables are a SAGA-WIDE patch: shallow-merged
+ * into the ROOT and into EVERY child instance this cascade retries
+ * (incident|compensationFailed). This is deliberate, not incidental — direct
+ * child verbs are 409'd in v1, so the root verb is the only lever an operator
+ * has for a variable-caused child failure (spec §6); a patch that stopped at
+ * the root would never reach the descendant job whose frozen input_variables
+ * actually caused the failure. Children NOT being retried (healthy, running,
+ * or terminal) are never touched.
  */
 async function retryChildSubtree(env: Env, instanceId: string, variables: JsonObject | undefined, now: string): Promise<boolean> {
   let any = false;

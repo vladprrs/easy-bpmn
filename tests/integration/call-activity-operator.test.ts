@@ -4,6 +4,7 @@ import { createDraft, drainSampleWorkers, get, mintWorkerToken, post, publishAnd
 import {
   CHECK_LEAF_BPMN,
   CHECK_MID_BPMN,
+  CHECK_PARALLEL_PARENT_BPMN,
   CHECK_ROOT_BPMN,
   SIMPLE_CHILD_BPMN,
   SIMPLE_PARENT_BPMN,
@@ -22,6 +23,13 @@ async function instRow(instanceId: string) {
   )
     .bind(instanceId)
     .first<{ status: string; error_code: string | null; current_element_id: string | null }>();
+}
+
+async function varsOf(instanceId: string): Promise<Record<string, unknown>> {
+  const row = await env.DB.prepare(`SELECT variables FROM process_instances WHERE instance_id = ?`)
+    .bind(instanceId)
+    .first<{ variables: string }>();
+  return JSON.parse(row?.variables ?? "{}") as Record<string, unknown>;
 }
 
 async function historyOfType(instanceId: string, type: string): Promise<Array<{ elementId: string | null; diagnostics: Record<string, unknown> }>> {
@@ -104,5 +112,55 @@ describe("callActivity operator verbs (M5-L2 Task 10)", () => {
     const dup = await post(`/instances/${rootId}/retry`, {});
     expect(dup.status).toBe(409);
     expect(await historyOfType(rootId, "operatorRetry")).toHaveLength(1);
+  });
+
+  // The saga-wide variable-patch contract (deliberate semantics, not an
+  // accident of implementation): operator-supplied retry variables are
+  // shallow-merged into the ROOT and into EVERY child instance the cascade
+  // retries (incident|compensationFailed) — direct child verbs are 409'd in
+  // v1, so the root verb is the operator's only lever for a variable-caused
+  // child failure (spec §6). Also pins the response invariant: a successful
+  // cascade returns 200 even though the root itself has nothing retryable.
+  it("[3] saga-wide patch: one root /retry heals BOTH incident siblings, the patch lands on EACH child's own row", async () => {
+    const leafDraft = await createDraft(CHECK_LEAF_BPMN);
+    await publishDraft(leafDraft.body.draftId);
+    const token = await mintWorkerToken();
+
+    const { instance } = await publishAndStart(CHECK_PARALLEL_PARENT_BPMN, { correlationKey: "ca-op-siblings", variables: { forceFail: true } });
+    const rootId = instance.body.instanceId as string;
+    const childA = await childInstanceIdFor(rootId, "callA", 0);
+    const childB = await childInstanceIdFor(rootId, "callB", 0);
+
+    // Both sibling children exhaust their external-check independently — TWO
+    // concurrent incidents under one waiting root.
+    await drainSampleWorkers({ taskTypes: ["external-check"], token, maxRounds: 10 });
+    expect((await instRow(childA))?.status).toBe("incident");
+    expect((await instRow(childB))?.status).toBe("incident");
+    expect((await instRow(rootId))?.status).toBe("waiting");
+
+    // Cascade healed + root has nothing retryable of its own → 200, not 409
+    // (the review invariant: a successful cascade never surfaces as an error).
+    const retry = await post(`/instances/${rootId}/retry`, { variables: { forceFail: false } });
+    expect(retry.status).toBe(200);
+
+    // The DELIBERATE saga-wide semantics: the patch was merged into BOTH
+    // retried children's own rows (each child's re-armed job reads its own
+    // frozen input_variables from that row), and both were actually retried.
+    expect((await varsOf(childA)).forceFail).toBe(false);
+    expect((await varsOf(childB)).forceFail).toBe(false);
+    for (const cid of [childA, childB]) {
+      const h = await historyOfType(cid, "operatorRetry");
+      expect(h).toHaveLength(1);
+      expect(h[0]!.diagnostics).toMatchObject({ target: "forward" });
+    }
+    const rootHistory = await historyOfType(rootId, "operatorRetry");
+    expect(rootHistory).toHaveLength(1);
+    expect(rootHistory[0]!.diagnostics).toMatchObject({ target: "childSubtree" });
+
+    // Both heal; the AND-join releases; the whole saga completes.
+    await drainSampleWorkers({ taskTypes: ["external-check"], token, maxRounds: 10 });
+    expect((await instRow(childA))?.status).toBe("completed");
+    expect((await instRow(childB))?.status).toBe("completed");
+    expect((await instRow(rootId))?.status).toBe("completed");
   });
 });

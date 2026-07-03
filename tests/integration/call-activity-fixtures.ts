@@ -471,3 +471,26 @@ export const CHECK_ROOT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
     <bpmn:endEvent id="rc-end"/>
   </bpmn:process>
 </bpmn:definitions>`;
+
+// Task 10 (review, saga-wide variable-patch contract): a root with an AND fork
+// invoking TWO sibling callActivities (both check-leaf-proc) — both children
+// can sit in `incident` simultaneously, so one root /retry must heal BOTH and
+// the operator patch must land on EACH retried child's own row.
+export const CHECK_PARALLEL_PARENT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="check-par-defs" targetNamespace="http://example.com">
+  <bpmn:process id="check-par-proc" isExecutable="true">
+    <bpmn:startEvent id="cp-start"><bpmn:outgoing>cpf1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="cpf1" sourceRef="cp-start" targetRef="cp-fork"/>
+    <bpmn:parallelGateway id="cp-fork"><bpmn:incoming>cpf1</bpmn:incoming><bpmn:outgoing>cpa</bpmn:outgoing><bpmn:outgoing>cpb</bpmn:outgoing></bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="cpa" sourceRef="cp-fork" targetRef="callA"/>
+    <bpmn:callActivity id="callA" calledElement="check-leaf-proc"><bpmn:incoming>cpa</bpmn:incoming><bpmn:outgoing>cpja</bpmn:outgoing></bpmn:callActivity>
+    <bpmn:sequenceFlow id="cpja" sourceRef="callA" targetRef="cp-join"/>
+    <bpmn:sequenceFlow id="cpb" sourceRef="cp-fork" targetRef="callB"/>
+    <bpmn:callActivity id="callB" calledElement="check-leaf-proc"><bpmn:incoming>cpb</bpmn:incoming><bpmn:outgoing>cpjb</bpmn:outgoing></bpmn:callActivity>
+    <bpmn:sequenceFlow id="cpjb" sourceRef="callB" targetRef="cp-join"/>
+    <bpmn:parallelGateway id="cp-join"><bpmn:incoming>cpja</bpmn:incoming><bpmn:incoming>cpjb</bpmn:incoming><bpmn:outgoing>cpf2</bpmn:outgoing></bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="cpf2" sourceRef="cp-join" targetRef="cp-end"/>
+    <bpmn:endEvent id="cp-end"><bpmn:incoming>cpf2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;

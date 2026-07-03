@@ -27,8 +27,10 @@ export interface DeliverJobArgs {
   elementId: string;
   // Worker-result delivery only (completed|failed). The `timerFired` member of the
   // wait union (M3-L3) is delivered via wakeTimer, never this path — narrowing it
-  // out keeps `event.jobId` non-optional here.
-  event: Extract<JobResultEvent, { outcome: "completed" | "failed" }>;
+  // out keeps `event.jobId` non-optional here. OPTIONAL under single-wake (TASK-54):
+  // both executors ignore it (the tickle is contentless — the engine re-reads D1),
+  // so the M5-L2 child→parent notify reuses this seam WITHOUT a synthetic event.
+  event?: Extract<JobResultEvent, { outcome: "completed" | "failed" }>;
 }
 
 export interface Executor {

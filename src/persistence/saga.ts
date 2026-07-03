@@ -56,7 +56,13 @@ export interface SagaStepView {
   elementId: string;
   /** Loop-iteration discriminator (design M2 §8); 0 for non-looped steps. */
   occurrence: number;
-  forwardJobId: string;
+  /**
+   * The forward job that produced this step, or `null` for a callActivity child
+   * step (M5-L2). `saga_steps.forward_job_id` is NOT NULL (migration 0002), so a
+   * child step stores the empty-string sentinel `""` at insert; mapSagaStep folds
+   * `""` → null here so callers see an honest "no forward job".
+   */
+  forwardJobId: string | null;
   capturedInput: JsonObject;
   capturedOutput: JsonObject | null;
   compensationElementId: string | null;
@@ -77,7 +83,9 @@ export function mapSagaStep(row: SagaStepRow): SagaStepView {
     seq: row.seq,
     elementId: row.element_id,
     occurrence: row.occurrence,
-    forwardJobId: row.forward_job_id,
+    // M5-L2 sentinel fold: a callActivity child step stores "" (forward_job_id is
+    // NOT NULL) — surface it as null so it reads as "no forward job".
+    forwardJobId: row.forward_job_id || null,
     capturedInput: parseJson<JsonObject>(row.captured_input, {}),
     capturedOutput: row.captured_output ? parseJson<JsonObject>(row.captured_output, {}) : null,
     compensationElementId: row.compensation_element_id,
@@ -141,6 +149,9 @@ export function insertSagaStepStmt(
     instanceId: string;
     scopeId: string;
     elementId: string;
+    /** The producing forward job id. A callActivity child step (M5-L2) has no
+     *  forward job — pass the empty-string sentinel `""` (the column is NOT NULL);
+     *  mapSagaStep folds it back to null. */
     forwardJobId: string;
     capturedInput: JsonObject;
     capturedOutput: JsonObject | null;
@@ -256,6 +267,26 @@ export async function getSagaStep(
     db,
     `SELECT * FROM saga_steps WHERE instance_id = ? AND element_id = ? AND occurrence = ?`,
     [instanceId, elementId, occurrence],
+  );
+  return row ? mapSagaStep(row) : null;
+}
+
+/**
+ * The ledger step that invoked a given child instance (M5-L2 spec §5): the
+ * reverse-pass dispatch and the child-notify self-heal read it to tell whether
+ * the parent has already settled this child's step (compensated | failed). At
+ * most one row per (instance, child) — a callActivity visit binds exactly one
+ * child instance.
+ */
+export async function getSagaStepByChildId(
+  db: D1Database,
+  instanceId: string,
+  childInstanceId: string,
+): Promise<SagaStepView | null> {
+  const row = await dbFirst<SagaStepRow>(
+    db,
+    `SELECT * FROM saga_steps WHERE instance_id = ? AND child_instance_id = ? LIMIT 1`,
+    [instanceId, childInstanceId],
   );
   return row ? mapSagaStep(row) : null;
 }

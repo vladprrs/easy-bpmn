@@ -292,7 +292,7 @@ export function variableSnapshotStmt(
   db: D1Database,
   input: {
     instanceId: string;
-    source: "start" | "serviceTask" | "message";
+    source: "start" | "serviceTask" | "message" | "callActivity";
     sourceId?: string | null;
     variables: JsonObject;
     now: string;

@@ -35,7 +35,7 @@ async function historyTypeCounts(instanceId: string): Promise<Record<string, num
 }
 
 describe("callActivity forward lifecycle (M5-L2 Task 6)", () => {
-  it("runs a callActivity end-to-end: child instance created, output merged, parent completes", async () => {
+  it("[CA-FWD-01] runs a callActivity end-to-end: child instance created, output merged, parent completes", async () => {
     const childDraft = await createDraft(SIMPLE_CHILD_BPMN);
     await publishDraft(childDraft.body.draftId);
 

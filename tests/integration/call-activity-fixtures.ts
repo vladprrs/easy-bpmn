@@ -494,3 +494,124 @@ export const CHECK_PARALLEL_PARENT_BPMN = `<?xml version="1.0" encoding="UTF-8"?
     <bpmn:endEvent id="cp-end"><bpmn:incoming>cpf2</bpmn:incoming></bpmn:endEvent>
   </bpmn:process>
 </bpmn:definitions>`;
+
+// ---------------------------------------------------------------------------
+// Task 12 controller additions.
+// ---------------------------------------------------------------------------
+
+// Controller addition #1 (carried Task 7/8 review finding, deferred to Task
+// 12): a combined fixture pairing BOTH an error boundary AND a timer boundary
+// on the SAME callActivity (call1) — the direct assertion that Task 8's
+// carried timer-disarm fix (`applyChildErrored`'s `cancelSettle`) never got a
+// dedicated fixture for. Same own-boundary-catch shape as CALL_PARENT_BPMN,
+// plus a long-lived (PT10S, never fires in-test) timer boundary on call1 that
+// must be disarmed atomically with the error route.
+export const CALL_PARENT_ERR_AND_TIMER_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="parent-errtimer-defs" targetNamespace="http://example.com">
+  <bpmn:error id="errChild4" name="ChildFailed" errorCode="CHILD_FAILED"/>
+  <bpmn:process id="parent-errtimer-proc" isExecutable="true">
+    <bpmn:startEvent id="pet-start"/>
+    <bpmn:sequenceFlow id="petf1" sourceRef="pet-start" targetRef="pet-tx"/>
+    <bpmn:transaction id="pet-tx" name="Place order">
+      <bpmn:startEvent id="pett-start"/>
+      <bpmn:sequenceFlow id="pettf1" sourceRef="pett-start" targetRef="pet-charge"/>
+      <bpmn:serviceTask id="pet-charge" name="Charge card">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="charge-card" retries="2"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="pet-charge-comp" attachedToRef="pet-charge"><bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="pet-refund" isForCompensation="true">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="refund-card" retries="5"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:association id="pet-a1" associationDirection="One" sourceRef="pet-charge-comp" targetRef="pet-refund"/>
+      <bpmn:sequenceFlow id="pettf2" sourceRef="pet-charge" targetRef="pett-end"/>
+      <bpmn:endEvent id="pett-end"/>
+    </bpmn:transaction>
+    <bpmn:sequenceFlow id="petf2" sourceRef="pet-tx" targetRef="call1"/>
+    <bpmn:callActivity id="call1" calledElement="child-proc"/>
+    <bpmn:boundaryEvent id="call1-err" attachedToRef="call1"><bpmn:errorEventDefinition errorRef="errChild4"/></bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="call1-timer" attachedToRef="call1">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT10S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="pet-handle" name="Handle child failure">
+      <bpmn:extensionElements><easy-bpmn:taskDefinition type="log-only" retries="1"/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="petf-err" sourceRef="call1-err" targetRef="pet-handle"/>
+    <bpmn:sequenceFlow id="petf-handle" sourceRef="pet-handle" targetRef="pet-end2"/>
+    <bpmn:endEvent id="pet-end2"/>
+    <bpmn:serviceTask id="pet-timeout" name="Timeout handle (never reached)">
+      <bpmn:extensionElements><easy-bpmn:taskDefinition type="log-only" retries="1"/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="petf-timer" sourceRef="call1-timer" targetRef="pet-timeout"/>
+    <bpmn:sequenceFlow id="petf-timeout-end" sourceRef="pet-timeout" targetRef="pet-end3"/>
+    <bpmn:endEvent id="pet-end3"/>
+    <bpmn:sequenceFlow id="petf3" sourceRef="call1" targetRef="pet-end"/>
+    <bpmn:endEvent id="pet-end"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+// Controller addition #2 / probe (a) (Task 9 review concern #2, deferred to
+// Task 12): an OUTER transaction containing an earlier compensable step
+// (qd-charge, comp refund-card) then a plain (non-transaction) subProcess QSD
+// with an AND fork — branch A = call1(child-tx-park-proc) (its OWN tx
+// commits, then it parks forever), branch B = a sibling task that business-
+// errors (SIBLING_FAILED) uncaught at its own level, bubbling to QSD's own
+// error boundary. The scope-drain that cancels call1's still-running child
+// (`drainScopeSubtree`, NOT the straggler-scan `ledgerStragglers` path) is
+// followed by a LATER cancel of the OUTER transaction (via a cancel end
+// reached from the boundary's handler) — this is what proves (or disproves)
+// whether the child's committedLocal step is ever reached by the outer
+// reverse pass.
+export const CALL_PARENT_SCOPEDRAIN_TX_CANCEL_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="qd-defs" targetNamespace="http://example.com">
+  <bpmn:error id="errSibQd" name="SiblingFailed" errorCode="SIBLING_FAILED"/>
+  <bpmn:process id="qd-proc" isExecutable="true">
+    <bpmn:startEvent id="qd-start"/>
+    <bpmn:sequenceFlow id="qdf1" sourceRef="qd-start" targetRef="qd-tx"/>
+    <bpmn:transaction id="qd-tx" name="Outer">
+      <bpmn:startEvent id="qdt-start"/>
+      <bpmn:sequenceFlow id="qdtf1" sourceRef="qdt-start" targetRef="qd-charge"/>
+      <bpmn:serviceTask id="qd-charge" name="Charge card">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="charge-card" retries="2"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="qd-charge-comp" attachedToRef="qd-charge"><bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="qd-refund" isForCompensation="true">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="refund-card" retries="5"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:association id="qd-a1" associationDirection="One" sourceRef="qd-charge-comp" targetRef="qd-refund"/>
+      <bpmn:sequenceFlow id="qdtf2" sourceRef="qd-charge" targetRef="QSD"/>
+      <bpmn:subProcess id="QSD">
+        <bpmn:startEvent id="qsdi-start"><bpmn:outgoing>qsdi0</bpmn:outgoing></bpmn:startEvent>
+        <bpmn:sequenceFlow id="qsdi0" sourceRef="qsdi-start" targetRef="qfork"/>
+        <bpmn:parallelGateway id="qfork"><bpmn:incoming>qsdi0</bpmn:incoming><bpmn:outgoing>qfa</bpmn:outgoing><bpmn:outgoing>qfb</bpmn:outgoing></bpmn:parallelGateway>
+        <bpmn:sequenceFlow id="qfa" sourceRef="qfork" targetRef="call1"/>
+        <bpmn:callActivity id="call1" calledElement="child-tx-park-proc"><bpmn:incoming>qfa</bpmn:incoming><bpmn:outgoing>qja</bpmn:outgoing></bpmn:callActivity>
+        <bpmn:sequenceFlow id="qja" sourceRef="call1" targetRef="qjoin"/>
+        <bpmn:sequenceFlow id="qfb" sourceRef="qfork" targetRef="qsibling"/>
+        <bpmn:serviceTask id="qsibling" name="Sibling">
+          <bpmn:extensionElements><easy-bpmn:taskDefinition type="sibling-task" retries="1"/></bpmn:extensionElements>
+          <bpmn:incoming>qfb</bpmn:incoming><bpmn:outgoing>qjb</bpmn:outgoing>
+        </bpmn:serviceTask>
+        <bpmn:sequenceFlow id="qjb" sourceRef="qsibling" targetRef="qjoin"/>
+        <bpmn:parallelGateway id="qjoin"><bpmn:incoming>qja</bpmn:incoming><bpmn:incoming>qjb</bpmn:incoming><bpmn:outgoing>qsdi1</bpmn:outgoing></bpmn:parallelGateway>
+        <bpmn:sequenceFlow id="qsdi1" sourceRef="qjoin" targetRef="qsdi-end"/>
+        <bpmn:endEvent id="qsdi-end"><bpmn:incoming>qsdi1</bpmn:incoming></bpmn:endEvent>
+      </bpmn:subProcess>
+      <bpmn:boundaryEvent id="QSD-err" attachedToRef="QSD"><bpmn:errorEventDefinition errorRef="errSibQd"/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="qsd-handle" name="Handle">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="log-only" retries="1"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:sequenceFlow id="qdtf-err" sourceRef="QSD-err" targetRef="qsd-handle"/>
+      <bpmn:sequenceFlow id="qdtf-cancel" sourceRef="qsd-handle" targetRef="qdt-cancel"/>
+      <bpmn:endEvent id="qdt-cancel"><bpmn:cancelEventDefinition/></bpmn:endEvent>
+      <bpmn:sequenceFlow id="qdtf3" sourceRef="QSD" targetRef="qdt-ok"/>
+      <bpmn:endEvent id="qdt-ok"/>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="qd-tx-cancel" attachedToRef="qd-tx"><bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="qdf2" sourceRef="qd-tx" targetRef="qd-done"/>
+    <bpmn:endEvent id="qd-done"/>
+    <bpmn:sequenceFlow id="qdf3" sourceRef="qd-tx-cancel" targetRef="qd-failed"/>
+    <bpmn:endEvent id="qd-failed"/>
+  </bpmn:process>
+</bpmn:definitions>`;

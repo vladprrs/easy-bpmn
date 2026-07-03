@@ -47,7 +47,7 @@ async function historyEventsOfType(instanceId: string, type: string): Promise<Ar
 }
 
 describe("callActivity error settle + parent routing (M5-L2 Task 7)", () => {
-  it("boundary catch on call1: parent routes via call1-err to the handler and completes", async () => {
+  it("[CA-ERR-BOUNDARY-01] boundary catch on call1: parent routes via call1-err to the handler and completes", async () => {
     const childDraft = await createDraft(CALL_CHILD_BPMN);
     await publishDraft(childDraft.body.draftId);
 

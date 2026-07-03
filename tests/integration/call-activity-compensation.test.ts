@@ -56,7 +56,7 @@ async function historyOfType(instanceId: string, type: string): Promise<Array<{ 
 }
 
 describe("callActivity child compensation (M5-L2 Task 9)", () => {
-  it("[1] committed callActivity compensates via the child's reverse pass, in reverse order before the parent's earlier step", async () => {
+  it("[1] [CA-COMP-CHILD-01] committed callActivity compensates via the child's reverse pass, in reverse order before the parent's earlier step", async () => {
     const childDraft = await createDraft(CALL_CHILD_BPMN);
     await publishDraft(childDraft.body.draftId);
     const token = await mintWorkerToken();
@@ -113,7 +113,7 @@ describe("callActivity child compensation (M5-L2 Task 9)", () => {
     expect((await sagaSteps(parentId)).find((r) => r.element_id === "px-charge")?.compensation_status).toBe("compensated");
   });
 
-  it("[2] no-op compensator: an empty-ledger committed child settles compensated immediately, no comp job, no park", async () => {
+  it("[2] [CA-COMP-NOOP-01] no-op compensator: an empty-ledger committed child settles compensated immediately, no comp job, no park", async () => {
     const childDraft = await createDraft(SIMPLE_CHILD_BPMN);
     await publishDraft(childDraft.body.draftId);
     const token = await mintWorkerToken();
@@ -155,7 +155,7 @@ describe("callActivity child compensation (M5-L2 Task 9)", () => {
     expect((await instRow(parentId))?.status).toBe("compensated");
   });
 
-  it("[3] child compensationFailed surfaces as the PARENT's own compensationFailure incident on call1", async () => {
+  it("[3] [CA-COMP-FAILED-01] child compensationFailed surfaces as the PARENT's own compensationFailure incident on call1", async () => {
     const childDraft = await createDraft(CALL_CHILD_BPMN);
     await publishDraft(childDraft.body.draftId);
     const token = await mintWorkerToken();

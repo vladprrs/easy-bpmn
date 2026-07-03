@@ -107,7 +107,7 @@ describe("M5-L2 publish-time call-tree resolution (spec §7)", () => {
     expect(parentGraphAfter.nodes["call1"]!.calledDefinitionVersionId).toBe(childV1.body.definitionVersionId);
   });
 
-  it("[2 Unresolved] rejects a calledElement that does not resolve to any published process, naming the call activity and the target", async () => {
+  it("[2 Unresolved] [CA-REJECT-UNRESOLVED-01] rejects a calledElement that does not resolve to any published process, naming the call activity and the target", async () => {
     const draft = await createDraft(callerBpmn("parent-unresolved", "nope-proc-xyz"), "parent-unresolved");
     const res = await publishDraft(draft.body.draftId);
     expect(res.status).toBe(409);
@@ -117,7 +117,7 @@ describe("M5-L2 publish-time call-tree resolution (spec §7)", () => {
     ).toBe(true);
   });
 
-  it("[3 Message-wait, direct child] the child publishes standalone; the parent's publish rejects naming the child's receive element", async () => {
+  it("[3 Message-wait, direct child] [CA-REJECT-MSG-01] the child publishes standalone; the parent's publish rejects naming the child's receive element", async () => {
     const childDraft = await createDraft(receiveWaitBpmn("child-msg-direct"), "child-msg-direct");
     const childRes = await publishDraft(childDraft.body.draftId);
     expect(childRes.status).toBe(201);
@@ -149,7 +149,7 @@ describe("M5-L2 publish-time call-tree resolution (spec §7)", () => {
     expect(parentRes.status).toBe(201);
   });
 
-  it("[5 Depth] a chain of trivial one-callActivity processes rejects at depth 5 > MAX_CALL_DEPTH=4; depth 4 succeeds", async () => {
+  it("[5 Depth] [CA-REJECT-DEPTH-01] a chain of trivial one-callActivity processes rejects at depth 5 > MAX_CALL_DEPTH=4; depth 4 succeeds", async () => {
     const d1 = await createDraft(trivialBpmn("depth-d1"), "depth-d1");
     expect((await publishDraft(d1.body.draftId)).status).toBe(201);
 

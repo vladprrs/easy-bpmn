@@ -66,7 +66,7 @@ async function fireTimerNow(instanceId: string): Promise<string> {
 }
 
 describe("callActivity cascading drain/cancel (M5-L2 Task 8)", () => {
-  it("[1] timer Hazard on the callActivity: fires -> child cancelled, forward job abandoned, NO compensation, ledger retained", async () => {
+  it("[1] [CA-HAZARD-TIMER-01] timer Hazard on the callActivity: fires -> child cancelled, forward job abandoned, NO compensation, ledger retained", async () => {
     const childDraft = await createDraft(CALL_CHILD_TX_PARK_BPMN);
     await publishDraft(childDraft.body.draftId);
     const token = await mintWorkerToken();

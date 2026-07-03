@@ -38,7 +38,7 @@ async function historyOfType(instanceId: string, type: string): Promise<Array<{ 
 }
 
 describe("callActivity operator verbs (M5-L2 Task 10)", () => {
-  it("[1] direct /cancel and /retry on a callActivity CHILD both 409, naming the parent", async () => {
+  it("[1] [CA-OP-CHILD-409-01] direct /cancel and /retry on a callActivity CHILD both 409, naming the parent", async () => {
     const childDraft = await createDraft(SIMPLE_CHILD_BPMN);
     await publishDraft(childDraft.body.draftId);
 
@@ -60,7 +60,7 @@ describe("callActivity operator verbs (M5-L2 Task 10)", () => {
     expect((await instRow(childId))?.status).toBe("waiting");
   });
 
-  it("[2] cascading /retry heals the DEEPEST (grandchild) forward incident first, skipping the mid ancestor", async () => {
+  it("[2] [CA-INCIDENT-RETRY-01] cascading /retry heals the DEEPEST (grandchild) forward incident first, skipping the mid ancestor", async () => {
     const leafDraft = await createDraft(CHECK_LEAF_BPMN);
     await publishDraft(leafDraft.body.draftId);
     const midDraft = await createDraft(CHECK_MID_BPMN);

@@ -39,6 +39,7 @@ import { WAKE_TYPE, wakeBackstop } from "./wake";
 import { buildBoundaryCancelSettle, convertOnFire, isUniqueConstraintViolation, settleDrainedScopeTimer } from "./boundary-timer";
 import { listTimersForInstance } from "../persistence/timers";
 import { releaseSubscriptionsInScopeSubtree } from "./instance-release";
+import { cancelChildrenInSubtree } from "./child-cascade";
 
 /**
  * The failure-path target of the cancel boundary attached to transaction `scopeId`.
@@ -421,6 +422,13 @@ export async function drainScopeSubtree(env: Env, graph: ExecutionGraph, instanc
       await settleDrainedScopeTimer(env, instanceId, inst.workspace_id, timer);
     }
   }
+  // M5-L2 (Task 8): cascade-cancel every non-terminal callActivity CHILD invoked
+  // from inside the drained subtree — a scope drain discards the parent's own
+  // live token at call1 (no forward job to abandon there, see
+  // `resolveForwardJobForToken`), but the CHILD's own Workflow keeps running
+  // unless explicitly cancelled. Idempotent (cancelChildCascade's own
+  // terminal/compensating short-circuit) — safe to re-run on a step retry.
+  await cancelChildrenInSubtree(env, graph, instanceId, rootScopeId);
 }
 
 async function createCompensationJob(env: Env, instanceId: string, graph: ExecutionGraph, step: SagaStepView): Promise<JobRow> {

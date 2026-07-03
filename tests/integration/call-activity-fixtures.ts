@@ -211,3 +211,147 @@ export const SIMPLE_PARENT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
     <bpmn:endEvent id="sp-end"/>
   </bpmn:process>
 </bpmn:definitions>`;
+
+// ---------------------------------------------------------------------------
+// Task 8 — cascading drain/cancel fixtures (timer Hazard, scope-drain,
+// operator-cancel cascade, never-regress). SIMPLE_CHILD_BPMN's `sc-echo` task
+// (type "echo") doubles as the "never completes" park: a test simply never
+// drains that task type, leaving the child running/waiting forever.
+// ---------------------------------------------------------------------------
+
+// Child: start -> tx[reserve-stock-park (comp: release-stock-park)] -> park
+// (never drained). The tx COMMITS (sealing its ledger row uncompensable, spec
+// §3's committed shield) before the child parks, so the Hazard test has a real
+// ledger row to prove is RETAINED (never compensated) by the cancel-cascade.
+export const CALL_CHILD_TX_PARK_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="child-tx-park-defs" targetNamespace="http://example.com">
+  <bpmn:process id="child-tx-park-proc" isExecutable="true">
+    <bpmn:startEvent id="ctp-start"/>
+    <bpmn:sequenceFlow id="ctpf1" sourceRef="ctp-start" targetRef="ctp-tx"/>
+    <bpmn:transaction id="ctp-tx">
+      <bpmn:startEvent id="ctpt-start"/>
+      <bpmn:sequenceFlow id="ctptf1" sourceRef="ctpt-start" targetRef="ctp-reserve"/>
+      <bpmn:serviceTask id="ctp-reserve" name="Reserve">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="reserve-stock-park" retries="1"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="ctp-comp-b" attachedToRef="ctp-reserve"><bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="ctp-release" isForCompensation="true">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="release-stock-park" retries="1"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:association id="ctp-assoc" associationDirection="One" sourceRef="ctp-comp-b" targetRef="ctp-release"/>
+      <bpmn:sequenceFlow id="ctptf2" sourceRef="ctp-reserve" targetRef="ctpt-end"/>
+      <bpmn:endEvent id="ctpt-end"/>
+    </bpmn:transaction>
+    <bpmn:sequenceFlow id="ctpf2" sourceRef="ctp-tx" targetRef="ctp-park"/>
+    <bpmn:serviceTask id="ctp-park" name="Park">
+      <bpmn:extensionElements><easy-bpmn:taskDefinition type="child-park" retries="1"/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="ctpf3" sourceRef="ctp-park" targetRef="ctp-end"/>
+    <bpmn:endEvent id="ctp-end"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+// Parent: start -> call1(child-tx-park-proc) -[timer PT0.5S]-> onTimeout(handler) -> end2
+//                          \-------------------------------------------/ call1 -> end (normal path, never reached in the Hazard test)
+export const CALL_PARENT_TIMER_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="parent-timer-defs" targetNamespace="http://example.com">
+  <bpmn:process id="parent-timer-proc" isExecutable="true">
+    <bpmn:startEvent id="pt-start"/>
+    <bpmn:sequenceFlow id="ptf1" sourceRef="pt-start" targetRef="call1"/>
+    <bpmn:callActivity id="call1" calledElement="child-tx-park-proc"/>
+    <bpmn:boundaryEvent id="call1-timer" attachedToRef="call1">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT0.5S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="ptf-timer" sourceRef="call1-timer" targetRef="pt-timeout"/>
+    <bpmn:serviceTask id="pt-timeout" name="Timeout handler">
+      <bpmn:extensionElements><easy-bpmn:taskDefinition type="timeout-handler" retries="1"/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="ptf-handled" sourceRef="pt-timeout" targetRef="pt-end2"/>
+    <bpmn:endEvent id="pt-end2"/>
+    <bpmn:sequenceFlow id="ptf2" sourceRef="call1" targetRef="pt-end"/>
+    <bpmn:endEvent id="pt-end"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+// Parent: a plain (non-transaction) subProcess SD with an AND fork — branch A
+// = call1(simple-child) (parks; never drained), branch B = a `sibling` task
+// that business-errors (SIBLING_FAILED, no OWN boundary) and bubbles to SD's
+// own error boundary → SD-handle → end2. The scope drain triggered by that
+// bubble must cascade-cancel call1's still-running child.
+export const CALL_PARENT_SCOPE_DRAIN_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="parent-scopedrain-defs" targetNamespace="http://example.com">
+  <bpmn:error id="errSib" name="SiblingFailed" errorCode="SIBLING_FAILED"/>
+  <bpmn:process id="parent-scopedrain-proc" isExecutable="true">
+    <bpmn:startEvent id="sd-start"><bpmn:outgoing>sdf1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="sdf1" sourceRef="sd-start" targetRef="SD"/>
+    <bpmn:subProcess id="SD">
+      <bpmn:startEvent id="sdi-start"><bpmn:outgoing>sdi0</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:sequenceFlow id="sdi0" sourceRef="sdi-start" targetRef="fork"/>
+      <bpmn:parallelGateway id="fork"><bpmn:incoming>sdi0</bpmn:incoming><bpmn:outgoing>fa</bpmn:outgoing><bpmn:outgoing>fb</bpmn:outgoing></bpmn:parallelGateway>
+      <bpmn:sequenceFlow id="fa" sourceRef="fork" targetRef="call1"/>
+      <bpmn:callActivity id="call1" calledElement="simple-child"><bpmn:incoming>fa</bpmn:incoming><bpmn:outgoing>ja</bpmn:outgoing></bpmn:callActivity>
+      <bpmn:sequenceFlow id="ja" sourceRef="call1" targetRef="join"/>
+      <bpmn:sequenceFlow id="fb" sourceRef="fork" targetRef="sibling"/>
+      <bpmn:serviceTask id="sibling" name="Sibling">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="sibling-task" retries="1"/></bpmn:extensionElements>
+        <bpmn:incoming>fb</bpmn:incoming><bpmn:outgoing>jb</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:sequenceFlow id="jb" sourceRef="sibling" targetRef="join"/>
+      <bpmn:parallelGateway id="join"><bpmn:incoming>ja</bpmn:incoming><bpmn:incoming>jb</bpmn:incoming><bpmn:outgoing>sdi1</bpmn:outgoing></bpmn:parallelGateway>
+      <bpmn:sequenceFlow id="sdi1" sourceRef="join" targetRef="sdi-end"/>
+      <bpmn:endEvent id="sdi-end"><bpmn:incoming>sdi1</bpmn:incoming></bpmn:endEvent>
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="SD-err" attachedToRef="SD"><bpmn:errorEventDefinition errorRef="errSib"/></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="sdf-err" sourceRef="SD-err" targetRef="sd-handle"/>
+    <bpmn:serviceTask id="sd-handle" name="Handle">
+      <bpmn:extensionElements><easy-bpmn:taskDefinition type="log-only" retries="1"/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="sdf-handle" sourceRef="sd-handle" targetRef="sd-end2"/>
+    <bpmn:endEvent id="sd-end2"/>
+    <bpmn:sequenceFlow id="sdf2" sourceRef="SD" targetRef="sd-end"/>
+    <bpmn:endEvent id="sd-end"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+// Three-level call chain (depth 3 <= MAX_CALL_DEPTH=4), no transactions anywhere
+// (a pure straight-line callActivity chain): leaf parks on a never-drained task.
+export const CALL_LEAF_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="call-leaf-defs" targetNamespace="http://example.com">
+  <bpmn:process id="call-leaf-proc" isExecutable="true">
+    <bpmn:startEvent id="lf-start"/>
+    <bpmn:sequenceFlow id="lff1" sourceRef="lf-start" targetRef="lf-park"/>
+    <bpmn:serviceTask id="lf-park" name="Park">
+      <bpmn:extensionElements><easy-bpmn:taskDefinition type="leaf-park" retries="1"/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="lff2" sourceRef="lf-park" targetRef="lf-end"/>
+    <bpmn:endEvent id="lf-end"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+export const CALL_MID_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="call-mid-defs" targetNamespace="http://example.com">
+  <bpmn:process id="call-mid-proc" isExecutable="true">
+    <bpmn:startEvent id="md-start"/>
+    <bpmn:sequenceFlow id="mdf1" sourceRef="md-start" targetRef="call2"/>
+    <bpmn:callActivity id="call2" calledElement="call-leaf-proc"/>
+    <bpmn:sequenceFlow id="mdf2" sourceRef="call2" targetRef="md-end"/>
+    <bpmn:endEvent id="md-end"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+export const CALL_ROOT_3LEVEL_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="call-root3-defs" targetNamespace="http://example.com">
+  <bpmn:process id="call-root3-proc" isExecutable="true">
+    <bpmn:startEvent id="rt-start"/>
+    <bpmn:sequenceFlow id="rtf1" sourceRef="rt-start" targetRef="call1"/>
+    <bpmn:callActivity id="call1" calledElement="call-mid-proc"/>
+    <bpmn:sequenceFlow id="rtf2" sourceRef="call1" targetRef="rt-end"/>
+    <bpmn:endEvent id="rt-end"/>
+  </bpmn:process>
+</bpmn:definitions>`;

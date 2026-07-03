@@ -103,6 +103,17 @@ const SAMPLE_WORKERS: Record<string, SampleWorker> = {
   "send-email": () => ({ status: "completed", outputVariables: { emailed: true } }),
   "send-sms": () => ({ status: "completed", outputVariables: { smsed: true } }),
   "log-only": () => ({ status: "completed", outputVariables: { logged: true } }),
+
+  // --- M5-L2 Task 8 cascading drain/cancel workers (CALL_CHILD_TX_PARK_BPMN /
+  // CALL_PARENT_SCOPE_DRAIN_BPMN). `reserve-stock-park` completes so the child's
+  // transaction commits before it parks; `release-stock-park` is its compensator
+  // (must NEVER run in the Hazard test — that is the assertion). `sibling-task`
+  // always raises a caught business error so a scope-drain test has a live
+  // sibling branch to bubble from while a parallel callActivity branch is
+  // still parked on its own child.
+  "reserve-stock-park": () => ({ status: "completed", outputVariables: { reservedForPark: true } }),
+  "release-stock-park": () => ({ status: "completed", outputVariables: { releasedForPark: true } }),
+  "sibling-task": () => ({ status: "failed", reason: "sibling task failed", errorCode: "SIBLING_FAILED" }),
 };
 
 export function hasSampleWorker(taskType: string): boolean {

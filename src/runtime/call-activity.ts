@@ -20,7 +20,7 @@ import {
   type JsonObject,
 } from "../util";
 import { dbBatch, stmt } from "../persistence/db";
-import { countHistoryEventsOfType, historyStmt } from "../persistence/history";
+import { countHistoryEventsOfType, historyStmt, latestScopeEntryOccurrence } from "../persistence/history";
 import {
   applyTransitionStmt,
   createChildInstanceStmt,
@@ -36,10 +36,20 @@ import {
 } from "../persistence/child-instances";
 import { getSagaStepByChildId, insertSagaStepStmt } from "../persistence/saga";
 import { getVersionGraph } from "../persistence/definitions";
-import { armTimerDO, buildBoundaryArm, timerBoundaryFor, timerHasFired } from "./boundary-timer";
+import {
+  armTimerDO,
+  buildBoundaryArm,
+  buildBoundaryCancelSettle,
+  convertOnFire,
+  isUniqueConstraintViolation,
+  settleBoundaryTimerCancel,
+  timerBoundaryFor,
+  timerHasFired,
+} from "./boundary-timer";
 import { errorCatchTarget } from "./forward-task";
 import { createIncident } from "./incidents";
 import { drainScopeSubtree } from "./compensation";
+import { cancelChildCascade } from "./child-cascade";
 import { resolveScope } from "./frontier";
 import { loadInst, type RunStep } from "./engine-shared";
 import { getExecutor } from "./executor";
@@ -94,9 +104,19 @@ export async function driveCallActivity(
   activeTokenId?: string,
 ): Promise<CallOutcome> {
   const tag = `${elementId}#${occ}`;
-  // Boundary-timer fast-forward — identical to forward-task.ts.
+  // Boundary-timer fast-forward — the decider check is identical to
+  // forward-task.ts; unlike a plain task, a fired callActivity timer ALSO owes a
+  // Hazard cancel-cascade of the visit's child (Task 8). Deferred to here (not
+  // folded into the fire batch itself) for the same atomicity reason
+  // engine.ts's scope-timer-exit branch defers `drainScopeSubtree` — the fire
+  // batch (planBoundaryTimerFire, boundary-timer.ts) stays single/
+  // persist-before-advance, and `cancelChildCascade`'s own terminal short-circuit
+  // makes this step idempotent across every later rewalk that lands here.
   const tb = timerBoundaryFor(graph, elementId);
-  if (tb && (await timerHasFired(env, instanceId, tb, occ))) return { kind: "next", next: tb.node.next! };
+  if (tb && (await timerHasFired(env, instanceId, tb, occ))) {
+    await runStep(`call-timer-exit:${tag}`, () => cancelChildOnTimerFire(env, instanceId, elementId, occ));
+    return { kind: "next", next: tb.node.next! };
+  }
 
   let row = await getChildInstanceForVisit(env.DB, instanceId, elementId, occ);
   // Applied → pure write-free cursor move re-derived from the child terminal state.
@@ -133,6 +153,21 @@ export async function driveCallActivity(
   }
   await runStep(`call-park:${tag}`, () => parkCallWaiting(env, instanceId, elementId, occ));
   return { kind: "waiting" };
+}
+
+/**
+ * Timer-Hazard settle for a callActivity visit (Task 8): read the visit's
+ * provenance row and, if it bound a child, cascade-cancel it. A missing row
+ * means the invoke step never ran for this occurrence (nothing to cancel) —
+ * defensive; `planBoundaryTimerFire`'s callActivity branch only fires once a
+ * row exists. `cancelChildCascade` is itself idempotent (terminal/compensating
+ * short-circuit), so a re-run of this step (Workflow retry, or a later rewalk
+ * re-hitting the same fired visit) is a cheap no-op.
+ */
+async function cancelChildOnTimerFire(env: Env, instanceId: string, elementId: string, occ: number): Promise<void> {
+  const row = await getChildInstanceForVisit(env.DB, instanceId, elementId, occ);
+  if (!row) return;
+  await cancelChildCascade(env, row.child_instance_id);
 }
 
 /**
@@ -319,6 +354,16 @@ export async function settleChildErrored(env: Env, instanceId: string, elementId
  * exactly like appliedForwardOutcome's own backstop. Draining BEFORE the batch
  * (as the brief's sketch shows) would make that self-heal unreachable dead
  * code, since the flip and the scopeExited marker would always co-commit.
+ *
+ * Task 8 carry (review finding from Task 7): the callActivity's OWN guarding
+ * boundary timer — and, when the catch climbed to an enclosing scope, THAT
+ * scope's own boundary timer — must be disarmed atomically with the error
+ * route, exactly like `handleForwardFailure`'s `buildBoundaryCancelSettle`
+ * composition (forward-task.ts). Without this a fixture pairing an error
+ * boundary AND a timer boundary on the same callActivity (or its catching
+ * scope) would leak an armed `timer_outcomes`-less timer row past the error
+ * route. On a decider conflict (the timer fired first) the whole batch aborts
+ * and we convert to the boundary path instead — never double-advance.
  */
 async function applyChildErrored(
   env: Env,
@@ -336,7 +381,15 @@ async function applyChildErrored(
   const applyFlip = markChildOutputAppliedStmt(env.DB, { parentInstanceId: instanceId, parentElementId: elementId, occurrence: occ, iterationIndex: 0, now });
   const target = errorCatchTarget(graph, elementId, child.error_code);
   if (target) {
-    await dbBatch(env.DB, [
+    // Task 8 carry: disarm call1's OWN guarding timer, and (when the catch
+    // climbed to a scope) that scope's OWN guarding timer, atomically with the
+    // error route — mirrors handleForwardFailure's cancelSettle/scopeCancelSettle.
+    const scopeOcc = target.hostIsScope ? await latestScopeEntryOccurrence(env.DB, instanceId, target.hostId) : 0;
+    const cancelSettle = buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: elementId, occ, now });
+    const scopeCancelSettle = target.hostIsScope
+      ? buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: target.hostId, occ: scopeOcc, now })
+      : null;
+    const stmts: D1PreparedStatement[] = [
       applyFlip,
       historyStmt(env.DB, {
         workspaceId: inst.workspace_id,
@@ -346,7 +399,22 @@ async function applyChildErrored(
         diagnostics: { childInstanceId: row.child_instance_id, errorCode: child.error_code, caughtBy: target.boundaryId, occurrence: occ, ...branchHistoryTags(activeTokenId) },
       }),
       applyTransitionStmt(env.DB, { instanceId, currentElementId: target.next, status: "running", now }),
-    ]);
+    ];
+    if (cancelSettle) stmts.push(...cancelSettle.stmts);
+    if (scopeCancelSettle) stmts.push(...scopeCancelSettle.stmts);
+    try {
+      await dbBatch(env.DB, stmts);
+    } catch (err) {
+      if (isUniqueConstraintViolation(err)) {
+        const converted = await convertOnFire(env, graph, instanceId, elementId, occ);
+        if (converted) return { kind: "next", next: converted };
+        if (target.hostIsScope) {
+          const scopeConverted = await convertOnFire(env, graph, instanceId, target.hostId, scopeOcc);
+          if (scopeConverted) return { kind: "next", next: scopeConverted };
+        }
+      }
+      throw err;
+    }
     if (target.hostIsScope) {
       // Idempotent retain-only (Task 8) — safe to re-run on a step retry; the
       // scopeExited write below is the completion marker appliedCallOutcome
@@ -362,6 +430,11 @@ async function applyChildErrored(
     }
     return { kind: "next", next: target.next };
   }
+  // Uncaught: settle call1's OWN guarding timer 'cancelled' in its own batch
+  // before raising the incident (mirrors handleForwardFailure's uncaught path);
+  // if the timer fired first, convert to the boundary path instead of an incident.
+  const settledUncaught = await settleBoundaryTimerCancel(env, graph, instanceId, inst.workspace_id, elementId, occ);
+  if (typeof settledUncaught === "object") return { kind: "next", next: settledUncaught.converted };
   await dbBatch(env.DB, [
     applyFlip,
     historyStmt(env.DB, {

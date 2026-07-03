@@ -134,3 +134,26 @@ export async function listChildrenOfInstance(
     [parentInstanceId],
   );
 }
+
+/**
+ * Every child ever bound to ONE callActivity element (all occurrences /
+ * iterations of that element), joined to the child's own current status +
+ * error_code — the query `cancelChildrenInSubtree` (Task 8, child-cascade.ts)
+ * uses to find every child a given callActivity element invoked, so a scope
+ * drain / operator cancel can cascade-cancel each still-live one.
+ */
+export async function listChildrenByElement(
+  db: D1Database,
+  parentInstanceId: string,
+  parentElementId: string,
+): Promise<Array<ChildInstanceRow & { child_status: string; child_error_code: string | null }>> {
+  return dbAll<ChildInstanceRow & { child_status: string; child_error_code: string | null }>(
+    db,
+    `SELECT ci.*, pi.status AS child_status, pi.error_code AS child_error_code
+       FROM child_instances ci
+       JOIN process_instances pi ON pi.instance_id = ci.child_instance_id
+      WHERE ci.parent_instance_id = ? AND ci.parent_element_id = ?
+      ORDER BY ci.occurrence, ci.iteration_index`,
+    [parentInstanceId, parentElementId],
+  );
+}

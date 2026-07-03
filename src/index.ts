@@ -88,6 +88,7 @@ import { listInstanceSubscriptions, listInstancesFiltered } from "./persistence/
 import { getIdempotentResult, putIdempotentResult } from "./persistence/idempotency";
 import { loadGraphForInstance, resumeInline } from "./runtime/engine";
 import { cancelArmedTimersForInstance } from "./runtime/boundary-timer";
+import { cancelChildrenInSubtree } from "./runtime/child-cascade";
 import { releaseActiveSubscriptionsForInstance } from "./runtime/instance-release";
 import { armCohortLeaseExpiryTerminators } from "./runtime/forward-task";
 import { listTimersForInstance } from "./persistence/timers";
@@ -448,6 +449,13 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
   // M3-L3 (TASK-44, design §4.3.2 exit d): settle every armed boundary timer so a
   // stray alarm afterwards is a decided no-op — no mid-compensation firing (gate 10).
   await cancelArmedTimersForInstance(env, instanceId);
+  // M5-L2 (Task 8): an operator /cancel is a PROCESS-ROOT drain — cascade-cancel
+  // every non-terminal callActivity child anywhere in the process (rootScopeId
+  // null spans every scope), transitively reaching every grandchild too.
+  // Independent of whether THIS instance ends up cancelled outright (empty
+  // ledger, below) or enters `compensating` — either way its live children must
+  // not keep running unobserved.
+  await cancelChildrenInSubtree(env, graph, instanceId, null);
   await getExecutor(env).terminate(instanceId);
 
   // M5-L1 (Task 8): operator /cancel is a PROCESS-ROOT cancel. The compensable count

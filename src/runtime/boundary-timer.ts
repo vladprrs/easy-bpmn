@@ -51,6 +51,7 @@ import {
   timerIdFor,
   type TimerView,
 } from "../persistence/timers";
+import { getChildInstanceForVisit } from "../persistence/child-instances";
 
 export interface TimerBoundary {
   boundaryId: string;
@@ -435,6 +436,39 @@ export async function planBoundaryTimerFire(
         flipTimerFiredStmt(env.DB, { timerId: timer.timerId, firedAt: now, now }),
         subscriptionSupersededStmt(env.DB, sub.subscription_id, now), // active → superseded
         historyStmt(env.DB, { workspaceId, instanceId, elementId: timer.elementId, type: "timerFired", diagnostics: { attachedToRef: hostId, subscriptionId: sub.subscription_id, occurrence: occ, boundaryTarget: next } }),
+        applyTransitionStmt(env.DB, { instanceId, currentElementId: next, status: "running", now }),
+      ],
+    };
+  }
+
+  // M5-L2 (Task 8): a boundary timer on a callActivity INTERRUPTS WITHOUT
+  // COMPENSATION (the same Hazard-vs-Cancel shape as a scope timer, below) — the
+  // visit's CHILD instance is cancelled, retaining its saga ledger. There is no
+  // service_task_jobs row to abandon for a callActivity host (unlike serviceTask
+  // above); the child cancel-cascade is deferred to driveCallActivity's own
+  // `timerHasFired` fast-forward (call-activity.ts), which every later rewalk
+  // re-runs idempotently — exactly the same atomicity reason the scope-host
+  // branch below defers `drainScopeSubtree` to the rewalk instead of folding it
+  // into this batch (this batch stays single/persist-before-advance).
+  if (host?.type === "callActivity") {
+    // GUARD: the timer's visit must still be the live wait. A child that already
+    // resolved forward (terminal per isTerminalInstanceStatus — completed OR
+    // errored) means completion won the race → skip, mirroring the serviceTask
+    // job-status guard above. An `outputApplied` provenance row (the parent
+    // already consumed the child's terminal) is the same check one level up —
+    // kept for symmetry with the other branches' shape.
+    const row = await getChildInstanceForVisit(env.DB, instanceId, hostId, occ);
+    if (!row || row.status === "outputApplied") return { kind: "skip" };
+    const child = await getInstanceRow(env.DB, row.child_instance_id);
+    if (!child || isTerminalInstanceStatus(child.status)) return { kind: "skip" };
+    return {
+      kind: "fire",
+      next,
+      wake: { instanceId, workflowEventType: WAKE_TYPE, timerId: timer.timerId },
+      stmts: [
+        insertTimerOutcomeStmt(env.DB, { timerId: timer.timerId, outcome: "fired", now }), // THE CLAIM
+        flipTimerFiredStmt(env.DB, { timerId: timer.timerId, firedAt: now, now }),
+        historyStmt(env.DB, { workspaceId, instanceId, elementId: timer.elementId, type: "timerFired", diagnostics: { attachedToRef: hostId, childInstanceId: row.child_instance_id, occurrence: occ, boundaryTarget: next } }),
         applyTransitionStmt(env.DB, { instanceId, currentElementId: next, status: "running", now }),
       ],
     };

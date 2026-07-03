@@ -316,6 +316,74 @@ export const CALL_PARENT_SCOPE_DRAIN_BPMN = `<?xml version="1.0" encoding="UTF-8
   </bpmn:process>
 </bpmn:definitions>`;
 
+// ---------------------------------------------------------------------------
+// Task 9 — child-compensation fixtures. The canonical composed-cancel parent:
+// a top-level transaction containing a compensable service task (px-charge,
+// comp refund-card), then call1, then a steerable post-call settle task
+// (branch-settle: `failSettle` → SETTLE_REJECTED business error → its error
+// boundary → the cancel end → the parent reverse pass), with a cancel boundary
+// on the transaction (SAGA_BPMN's wiring). The reverse order under cancel is
+// call1 (the child's OWN reverse pass — release-stock) BEFORE the earlier
+// px-charge step (refund-card). Task 7's fixture-repair lesson respected: the
+// error boundary sits on px-settle INSIDE the tx and exits to the cancel end in
+// the SAME scope; only the CANCEL boundary sits on the tx itself.
+// ---------------------------------------------------------------------------
+export const CALL_PARENT_TX_CANCEL_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="parent-txcancel-defs" targetNamespace="http://example.com">
+  <bpmn:error id="errSettle" name="Settle rejected" errorCode="SETTLE_REJECTED"/>
+  <bpmn:process id="parent-txcancel-proc" isExecutable="true">
+    <bpmn:startEvent id="px-start"/>
+    <bpmn:sequenceFlow id="pxf1" sourceRef="px-start" targetRef="px-tx"/>
+    <bpmn:transaction id="px-tx" name="Place order">
+      <bpmn:startEvent id="pxt-start"/>
+      <bpmn:sequenceFlow id="pxtf1" sourceRef="pxt-start" targetRef="px-charge"/>
+      <bpmn:serviceTask id="px-charge" name="Charge card">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="charge-card" retries="2"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="px-charge-comp" attachedToRef="px-charge"><bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="px-refund" isForCompensation="true">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="refund-card" retries="5"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:association id="px-a1" associationDirection="One" sourceRef="px-charge-comp" targetRef="px-refund"/>
+      <bpmn:sequenceFlow id="pxtf2" sourceRef="px-charge" targetRef="call1"/>
+      <bpmn:callActivity id="call1" calledElement="child-proc"/>
+      <bpmn:sequenceFlow id="pxtf3" sourceRef="call1" targetRef="px-settle"/>
+      <bpmn:serviceTask id="px-settle" name="Settle">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="branch-settle" retries="1"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="px-settle-err" attachedToRef="px-settle"><bpmn:errorEventDefinition errorRef="errSettle"/></bpmn:boundaryEvent>
+      <bpmn:sequenceFlow id="pxtf4" sourceRef="px-settle" targetRef="pxt-ok"/>
+      <bpmn:endEvent id="pxt-ok"/>
+      <bpmn:sequenceFlow id="pxf-cancel" sourceRef="px-settle-err" targetRef="pxt-cancel"/>
+      <bpmn:endEvent id="pxt-cancel"><bpmn:cancelEventDefinition/></bpmn:endEvent>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="px-tx-cancel" attachedToRef="px-tx"><bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="pxf2" sourceRef="px-tx" targetRef="px-done"/>
+    <bpmn:endEvent id="px-done"/>
+    <bpmn:sequenceFlow id="pxf3" sourceRef="px-tx-cancel" targetRef="px-failed"/>
+    <bpmn:endEvent id="px-failed"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+// Variant (Task 9 test 2, no-op compensator): the SAME parent shape calling the
+// no-transaction `simple-child` (echo) — a committed child with an EMPTY
+// compensable ledger. Derived by string surgery so the two stay structurally in
+// lockstep (a test must still assert it publishes).
+export const CALL_PARENT_TX_CANCEL_SIMPLE_BPMN = CALL_PARENT_TX_CANCEL_BPMN
+  .replace('id="parent-txcancel-defs"', 'id="parent-txcancel-simple-defs"')
+  .replace('id="parent-txcancel-proc"', 'id="parent-txcancel-simple-proc"')
+  .replace('calledElement="child-proc"', 'calledElement="simple-child"');
+
+// Variant (Task 9 test 4, interrupted child): the SAME parent shape calling
+// `child-tx-park-proc` (the Task-8 fixture whose tx COMMITS then parks forever)
+// — the operator /cancel cascade cancels the child mid-flight, then the parent
+// reverse pass drives the cancelled child's reverse over its retained ledger.
+export const CALL_PARENT_TX_CANCEL_PARK_BPMN = CALL_PARENT_TX_CANCEL_BPMN
+  .replace('id="parent-txcancel-defs"', 'id="parent-txcancel-park-defs"')
+  .replace('id="parent-txcancel-proc"', 'id="parent-txcancel-park-proc"')
+  .replace('calledElement="child-proc"', 'calledElement="child-tx-park-proc"');
+
 // Three-level call chain (depth 3 <= MAX_CALL_DEPTH=4), no transactions anywhere
 // (a pure straight-line callActivity chain): leaf parks on a never-drained task.
 export const CALL_LEAF_BPMN = `<?xml version="1.0" encoding="UTF-8"?>

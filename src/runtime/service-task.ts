@@ -59,8 +59,13 @@ const SAMPLE_WORKERS: Record<string, SampleWorker> = {
     status: "completed",
     outputVariables: { reservationId: `res-${req.instanceId.slice(-6)}`, reservedQty: req.variables.qty ?? 1 },
   }),
-  // Compensation handler for reserve-stock.
-  "release-stock": () => ({ status: "completed", outputVariables: { released: true } }),
+  // Compensation handler for reserve-stock — steerable (mirrors refund-card) so
+  // the M5-L2 child-compensator-failure scenario can drive it to retry-exhaustion:
+  // `releaseFails: true` → a TECHNICAL failure (no errorCode).
+  "release-stock": (req) =>
+    req.variables.releaseFails === true
+      ? { status: "failed", reason: "release rejected by warehouse", diagnostics: { attempt: req.attempt } }
+      : { status: "completed", outputVariables: { released: true } },
   // Steerable: chargeFails → a TECHNICAL failure (no errorCode) so it exhausts
   // retries → Hazard incident inside the transaction (no auto-compensation).
   "charge-card": (req) =>

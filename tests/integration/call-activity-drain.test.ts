@@ -109,9 +109,12 @@ describe("callActivity cascading drain/cancel (M5-L2 Task 8)", () => {
     const steps = await sagaStepsFor(childId);
     const reserveStep = steps.find((s) => s.element_id === "ctp-reserve");
     expect(reserveStep).toBeDefined(); // retained, not deleted
-    // The child's tx (its own outermost scope) already committed (sealed
-    // 'committed') BEFORE the child parked — the cascade-cancel must not touch it.
-    expect(reserveStep!.compensation_status).toBe("committed");
+    // The child's tx already committed BEFORE the child parked — the
+    // cascade-cancel must not touch it. Task 9 (R1 seal semantics): a CHILD
+    // instance's outermost tx commit is only LOCAL (`committedLocal`) — the
+    // parent is a real outer scope whose reverse pass may later undo it; only
+    // a ROOT instance's outermost commit seals terminal 'committed'.
+    expect(reserveStep!.compensation_status).toBe("committedLocal");
 
     // Idempotent re-drive: a duplicate cascade-cancel of the already-cancelled
     // child (Workflow retry / a later rewalk landing on the same fired visit)

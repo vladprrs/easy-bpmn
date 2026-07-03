@@ -17,10 +17,12 @@ import {
   createJobStmt,
   getCompensationJob,
   getForwardJobByElement,
+  getInstanceRow,
   incidentStmt,
   listForwardJobsForInstance,
   type JobRow,
 } from "../persistence/instances";
+import { listChildrenByElement } from "../persistence/child-instances";
 import {
   attachCompensationJobStmt,
   filterLineageQuiesced,
@@ -39,7 +41,7 @@ import { WAKE_TYPE, wakeBackstop } from "./wake";
 import { buildBoundaryCancelSettle, convertOnFire, isUniqueConstraintViolation, settleDrainedScopeTimer } from "./boundary-timer";
 import { listTimersForInstance } from "../persistence/timers";
 import { releaseSubscriptionsInScopeSubtree } from "./instance-release";
-import { cancelChildrenInSubtree } from "./child-cascade";
+import { cancelChildCascade, cancelChildrenInSubtree } from "./child-cascade";
 
 /**
  * The failure-path target of the cancel boundary attached to transaction `scopeId`.
@@ -204,6 +206,53 @@ async function runCompensation(
     const step = eligible[0]!; // highest seq among the eligible (selectScope orders seq DESC)
     const ctag = `${step.elementId}#${step.occurrence}`;
 
+    if (step.childInstanceId) {
+      // M5-L2 (design §5): a child-instance step — compensate by driving the
+      // child's OWN reverse pass over its retained ledger, never a compensation
+      // job. Every runStep issuance below is gated on a child-status read taken
+      // OUTSIDE the step (memoization safety: a memoized result is always
+      // final); the child's reverse terminal tickles the parent (comp-wake).
+      const child = await getInstanceRow(env.DB, step.childInstanceId);
+      if (!child) {
+        // Defensive: no child instance = nothing to undo — close the step.
+        await runStep(`comp-done:${ctag}`, () => markStepCompensated(env, instanceId, step));
+        continue;
+      }
+      if (child.status === "compensated") {
+        await runStep(`comp-done:${ctag}`, () => markStepCompensated(env, instanceId, step));
+        continue;
+      }
+      if (child.status === "compensationFailed") {
+        // The child's failed reverse surfaces as the PARENT's OWN
+        // compensationFailure incident on the callActivity element.
+        await runStep(`comp-fail:${ctag}`, () => markStepCompensationFailed(env, instanceId, step));
+        return "failed";
+      }
+      if (child.status === "completed" || child.status === "cancelled") {
+        // Dynamic import: call-activity.ts imports compensation.ts
+        // (drainScopeSubtree), so a static import here would cycle — the
+        // forward-task.ts resumeInline precedent.
+        const { beginChildCompensation } = await import("./call-activity");
+        await runStep(`comp-child:${ctag}`, () => beginChildCompensation(env, instanceId, step));
+        // Re-read the child on the next pass — beginChildCompensation always
+        // moves the child out of {completed, cancelled} (the no-op shortcut may
+        // have settled it `compensated` synchronously), so this cannot spin.
+        continue;
+      }
+      // Child 'compensating' (or a late 'incident' inside its reverse) → park on
+      // the single wake; the child's terminal tickles the parent (notify + the
+      // DO-alarm self-heal), and the wake timeout self-heals a lost tickle.
+      if (!waitFor) return "waiting";
+      const childTimeout = await wakeBackstop(env, instanceId);
+      try {
+        await waitFor({ name: `comp-wake#${compWakeSeq}`, workflowEventType: WAKE_TYPE, timeout: childTimeout });
+      } catch {
+        /* lost/expired wake → self-heal: fall through to re-read */
+      }
+      compWakeSeq += 1;
+      continue;
+    }
+
     let comp = await getCompensationJob(env.DB, instanceId, step.elementId, step.occurrence);
     if (!comp) {
       comp = await runStep(`comp-create:${ctag}`, () => createCompensationJob(env, instanceId, graph, step));
@@ -260,6 +309,14 @@ async function ledgerStragglers(env: Env, instanceId: string, graph: ExecutionGr
     const posScope = graph.nodes[t.position_element_id]?.scopeId ?? null;
     if (posScope == null ? rootScopeId != null : !subtree.includes(posScope)) continue; // not in this cohort
     const now = nowIso();
+    // M5-L2 (Task 9): a token parked ON a callActivity carries a CHILD INSTANCE,
+    // not a forward job — retain it as a child ledger step so the reverse-pass
+    // dispatch drives the child's own reverse (design §4 "Cancel path": a child
+    // interrupted mid-flight still compensates exactly its committed steps).
+    if (graph.nodes[t.position_element_id]?.type === "callActivity") {
+      await retainCallStraggler(env, graph, instanceId, t, now);
+      continue;
+    }
     const job = await resolveForwardJobForToken(env, graph, instanceId, t.position_element_id);
     if (job && job.status === "completed") {
       await dbBatch(env.DB, await retainStragglerStmts(env, graph, instanceId, t, job, now));
@@ -270,6 +327,56 @@ async function ledgerStragglers(env: Env, instanceId: string, graph: ExecutionGr
     }
     // else: job created/locked (in-flight) → leave live for the terminator.
   }
+}
+
+/**
+ * Retain a live token parked on a callActivity (M5-L2 Task 9): the visit's child
+ * was interrupted by the cancel (an operator /cancel already cascade-cancelled it;
+ * a tx cancel-end may reach a still-live one — cascade-cancel it here, the same
+ * Hazard interrupt, idempotent via cancelChildCascade's own short-circuit), then
+ * ledger the child step (INSERT OR IGNORE keyed by element + occurrence, exactly
+ * like a forward straggler) and CONSUME the token. The reverse-pass dispatch then
+ * compensates it by driving the child's own reverse pass over its retained
+ * committedLocal steps. A token whose invoke never bound a child owes nothing —
+ * discard (mirrors the no-job branch).
+ */
+async function retainCallStraggler(env: Env, graph: ExecutionGraph, instanceId: string, t: TokenRow, now: string): Promise<void> {
+  const pos = t.position_element_id;
+  const rows = await listChildrenByElement(env.DB, instanceId, pos);
+  const row = rows[rows.length - 1]; // the LATEST visit — the one this live token parked on
+  if (!row) {
+    await dbBatch(env.DB, [setTokenStatusStmt(env.DB, t.token_id, "discarded", now)]);
+    return;
+  }
+  // Never wait on a running child inside the reverse pass — interrupt it (Hazard,
+  // Task 8 semantics; ledger retained). No-op when the cancel cascade already ran.
+  await cancelChildCascade(env, row.child_instance_id);
+  const stmts: D1PreparedStatement[] = [];
+  if (!(await getSagaStep(env.DB, instanceId, pos, row.occurrence))) {
+    stmts.push(
+      insertSagaStepStmt(env.DB, {
+        stepId: newId("step"),
+        instanceId,
+        scopeId: graph.nodes[pos]?.scopeId ?? "",
+        elementId: pos,
+        // forward_job_id is NOT NULL — a child step carries the "" sentinel
+        // (mapSagaStep folds it back to null), same as applyChildTerminal.
+        forwardJobId: "",
+        capturedInput: {},
+        capturedOutput: null,
+        compensationElementId: null,
+        compensationTaskType: null,
+        compensationStatus: "pending",
+        traceId: traceIdFor(instanceId),
+        occurrence: row.occurrence,
+        tokenId: t.token_id,
+        childInstanceId: row.child_instance_id,
+        now,
+      }),
+    );
+  }
+  stmts.push(setTokenStatusStmt(env.DB, t.token_id, "consumed", now));
+  await dbBatch(env.DB, stmts);
 }
 
 /**

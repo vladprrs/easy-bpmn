@@ -25,6 +25,7 @@ import {
   applyTransitionStmt,
   createChildInstanceStmt,
   getInstanceRow,
+  transitionStatusGuarded,
   variableSnapshotStmt,
   type InstanceRow,
 } from "../persistence/instances";
@@ -34,7 +35,8 @@ import {
   insertChildInstanceStmt,
   markChildOutputAppliedStmt,
 } from "../persistence/child-instances";
-import { getSagaStepByChildId, insertSagaStepStmt } from "../persistence/saga";
+import { countCompensableSteps, getSagaStepByChildId, insertSagaStepStmt, type SagaStepView } from "../persistence/saga";
+import { eligibleCommittedLocalScopeIds, subtreeScopeIds } from "../bpmn/scope-tree";
 import { getVersionGraph } from "../persistence/definitions";
 import {
   armTimerDO,
@@ -53,7 +55,7 @@ import { cancelChildCascade } from "./child-cascade";
 import { resolveScope } from "./frontier";
 import { loadInst, type RunStep } from "./engine-shared";
 import { getExecutor } from "./executor";
-import { branchHistoryTags, getToken, parseOverlay, readOverlay, rootTokenId, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
+import { branchHistoryTags, getToken, listLiveTokens, parseOverlay, readOverlay, rootTokenId, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
 import { CHILD_NOTIFY_BACKOFF_MS } from "../durable-objects/job-scheduler";
 import { CHILD_WAIT_BACKSTOP_MS } from "./wake";
 
@@ -507,6 +509,70 @@ async function parkCallWaiting(env: Env, instanceId: string, elementId: string, 
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "callActivityWaiting", diagnostics: { occurrence: occ } }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: elementId, status: "waiting", now: nowIso() }),
   ]);
+}
+
+/**
+ * Enter a child's OWN reverse compensation pass (M5-L2 Task 9, design §5) — the
+ * compensator of a committed callActivity saga step. A distinct, narrow entry
+ * point that bypasses the terminal guards: CAS `{completed, cancelled} →
+ * compensating` (`completed` = the committed callActivity; `cancelled` = the
+ * drain-interrupted child of §4 whose committed steps still need compensation),
+ * write the element-less cancel marker (the child's compensation resume derives
+ * the PROCESS-ROOT reverse pass — the marker's element id is the PARENT-graph
+ * call site, absent from the child graph, so the engine maps it to root null),
+ * take the empty-ledger no-op shortcut straight to `compensated` (no park), else
+ * drive the (terminated) child inline. Idempotent: a re-entry finds the child in
+ * `compensating`/a terminal and returns without touching anything; a lost CAS
+ * race leaves the winner owning the reverse.
+ */
+export async function beginChildCompensation(env: Env, parentInstanceId: string, step: SagaStepView): Promise<void> {
+  const childId = step.childInstanceId!;
+  const child = await getInstanceRow(env.DB, childId);
+  if (!child || !["completed", "cancelled"].includes(child.status)) return; // idempotent: someone already entered (or nothing to undo)
+  const now = nowIso();
+  const changed = await transitionStatusGuarded(env.DB, childId, ["completed", "cancelled"], "compensating", now);
+  if (changed === 0) return; // lost the CAS — the winner owns the reverse
+  await historyStmt(env.DB, {
+    workspaceId: child.workspace_id,
+    instanceId: childId,
+    // The parent-graph call site — NOT a child-graph element, so the child's
+    // compensation resume (engine latestCancelRootElement mapping) derives the
+    // process-root (null) reverse pass; kept for operator diagnostics.
+    elementId: child.parent_element_id ?? "",
+    type: "transactionCancelled",
+    diagnostics: { by: "parentCompensation", parentInstanceId },
+  }).run();
+  const childGraph = await getVersionGraph(env.DB, child.definition_version_id);
+  if (!childGraph) throw new Error(`Invariant violation: child version ${child.definition_version_id} has no parsed profile.`);
+  const pending = await countCompensableSteps(env.DB, childId, subtreeScopeIds(childGraph, null), eligibleCommittedLocalScopeIds(childGraph, null));
+  // Live-token guard on the shortcut (mirrors handleCancelInstance's cohort
+  // guard): a cancelled REGION child may carry a live token whose completed
+  // forward job is not yet ledgered — the child's own straggler scan must run,
+  // so only an empty ledger AND a quiesced cohort settles synchronously.
+  const liveTokens = pending === 0 ? await listLiveTokens(env.DB, childId) : [];
+  if (pending === 0 && liveTokens.length === 0) {
+    // No-op compensator (design §5.1): nothing committed → settle immediately,
+    // WITHOUT parking the parent (its dispatch re-reads `compensated` on the
+    // very next pass).
+    await transitionStatusGuarded(env.DB, childId, ["compensating"], "compensated", now);
+    await historyStmt(env.DB, {
+      workspaceId: child.workspace_id,
+      instanceId: childId,
+      elementId: childGraph.processId,
+      type: "compensationCompleted",
+      diagnostics: { outcome: "compensated", emptyLedger: true },
+    }).run();
+    return;
+  }
+  // Drive the (terminated) child's reverse pass inline — the operator-resume-
+  // after-termination path carries its comp jobs (executor deliverJobResult
+  // falls back to an inline drive for a dead Workflow). suppressParentNotify:
+  // this call sits INSIDE the parent's own drive; the parent loop re-reads the
+  // child status right after (dispatch `continue`). Dynamic import: engine.ts
+  // statically imports this module — the forward-task.ts resumeInline precedent.
+  const { runInstance } = await import("./engine");
+  const inlineStep = <T>(_name: string, fn: () => Promise<T>): Promise<T> => fn();
+  await runInstance(env, childId, { runStep: inlineStep, waitFor: null, suppressParentNotify: true });
 }
 
 /**

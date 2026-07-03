@@ -950,9 +950,18 @@ async function commitTransaction(env: Env, instanceId: string, graph: ExecutionG
   // M5-L1 commit shield (spec §3.2): a NESTED tx (some enclosing tx above it) flips
   // only its OWNED scopes to non-terminal committedLocal; the OUTERMOST commit seals
   // its whole subtree to terminal 'committed'.
+  //
+  // M5-L2 refinement (Task 9, callActivity design §4/§5): for a CHILD instance
+  // (`parent_instance_id` set) the PARENT process is a real outer scope — its
+  // reverse pass may later compensate this child's committed set by driving the
+  // child's own process-root reverse pass over the retained ledger. So a child's
+  // otherwise-outermost tx commit is only LOCAL (`committedLocal`, the
+  // seal:false/owned flip), never sealed 'committed'; a ROOT instance
+  // (`parent_instance_id` NULL) keeps the exact M5-L1 seal.
   const parentScope = scopesOf(graph)[txId]?.parentId ?? null;
   const enclosingTx = nearestEnclosingTx(graph, parentScope);
-  const flip = enclosingTx != null
+  const sealsOutermost = enclosingTx == null && inst.parent_instance_id == null;
+  const flip = !sealsOutermost
     ? markScopeStepsCommittedStmt(env.DB, { instanceId, scopeIds: ownedScopeIds(graph, txId), seal: false, now })
     : markScopeStepsCommittedStmt(env.DB, { instanceId, scopeIds: subtreeScopeIds(graph, txId), seal: true, now });
   const stmts: D1PreparedStatement[] = [
@@ -964,7 +973,7 @@ async function commitTransaction(env: Env, instanceId: string, graph: ExecutionG
     // absent folds to 0 (backward-safe for pre-M5-L1 history rows). It MUST be the
     // TX's entry occurrence (`scopeOcc`, the occurrence the timer was armed at),
     // NOT the end element's walk occurrence — the two diverge under re-entry.
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionCommitted", diagnostics: { transaction: txId, sealed: enclosingTx == null, occurrence: scopeOcc } }),
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionCommitted", diagnostics: { transaction: txId, sealed: sealsOutermost, occurrence: scopeOcc } }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: outer ?? endElementId, status: "running", now }),
   ];
   // M5-L1 (Task 11): disarm the tx's own boundary timer (if any) ATOMICALLY with

@@ -189,7 +189,7 @@ describe("callActivity child compensation (M5-L2 Task 9)", () => {
   // Task 10 unskips: the cascading /retry (POST /instances/{parent}/retry)
   // recursively repairs the CHILD's failed compensator first, then the parent's
   // own reverse pass resumes and settles.
-  it.skip("[3b] cascading /retry heals a child compensationFailed (Task 10)", async () => {
+  it("[3b] cascading /retry heals a child compensationFailed (Task 10)", async () => {
     const childDraft = await createDraft(CALL_CHILD_BPMN);
     await publishDraft(childDraft.body.draftId);
     const token = await mintWorkerToken();

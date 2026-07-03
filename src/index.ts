@@ -89,6 +89,7 @@ import { getIdempotentResult, putIdempotentResult } from "./persistence/idempote
 import { loadGraphForInstance, resumeInline } from "./runtime/engine";
 import { cancelArmedTimersForInstance } from "./runtime/boundary-timer";
 import { cancelChildrenInSubtree } from "./runtime/child-cascade";
+import { listChildrenOfInstance } from "./persistence/child-instances";
 import { releaseActiveSubscriptionsForInstance } from "./runtime/instance-release";
 import { armCohortLeaseExpiryTerminators } from "./runtime/forward-task";
 import { listTimersForInstance } from "./persistence/timers";
@@ -419,6 +420,14 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
   await parseBody(cancelInstanceRequestSchema, request).catch(() => ({}));
   const inst = await getInstance(env.DB, instanceId);
   if (!inst) throw new NotFoundError(`Process instance ${instanceId} not found.`);
+  // M5-L2 (Task 10, spec §6): a callActivity child's lifecycle is entirely a
+  // function of its parent's own step-state machine — direct operator control
+  // on a child would let its status diverge from what the parent believes.
+  // Cascading (drain-then-compensate on cancel, depth-first heal on retry) is
+  // the only supported path; a direct verb on a child 409s naming the parent.
+  if (inst.parentInstanceId) {
+    throw new ConflictError(`Instance ${instanceId} is a callActivity child of ${inst.parentInstanceId} — operate on the saga root.`);
+  }
   if (!(CANCELLABLE_FROM as readonly string[]).includes(inst.status)) {
     throw new ConflictError(`Instance ${instanceId} cannot be cancelled from status '${inst.status}'.`);
   }
@@ -511,15 +520,67 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
 }
 
 async function handleRetryInstance(env: Env, instanceId: string, request: Request): Promise<Response> {
-  const body = await parseBody(retryInstanceRequestSchema, request).catch(() => ({}) as { variables?: JsonObject });
   const inst = await getInstance(env.DB, instanceId);
   if (!inst) throw new NotFoundError(`Process instance ${instanceId} not found.`);
+  // M5-L2 (Task 10, spec §6): same 409 as /cancel — a direct verb on a child is
+  // forbidden; only cascading (below) is supported.
+  if (inst.parentInstanceId) {
+    throw new ConflictError(`Instance ${instanceId} is a callActivity child of ${inst.parentInstanceId} — operate on the saga root.`);
+  }
+  const body = await parseBody(retryInstanceRequestSchema, request).catch(() => ({}) as { variables?: JsonObject });
   const now = nowIso();
   if (body.variables) await mergeInstanceVariables(env.DB, instanceId, body.variables as JsonObject, now);
-  const fresh = await getInstanceRow(env.DB, instanceId);
-  const variablesJson = fresh?.variables ?? "{}";
 
-  if (inst.status === "compensationFailed") {
+  // M5-L2 (Task 10, spec §4/§6): cascade FIRST — heal the deepest child
+  // incident/compensationFailed. The same operator-supplied patch (already
+  // merged onto the root's own row above) is threaded into every retried
+  // child too, so a fix like `releaseFails:false` reaches the descendant job
+  // that actually needs it.
+  const cascaded = await retryChildSubtree(env, instanceId, body.variables as JsonObject | undefined, now);
+  if (cascaded) {
+    await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, type: "operatorRetry", diagnostics: { target: "childSubtree" } });
+  }
+
+  // The ROOT's own status is checked independently of `cascaded` — a
+  // callActivity step's compensation dispatches to the CHILD's own reverse
+  // pass (compensation.ts), so a child compensationFailed surfaces the exact
+  // same "failed" shape on the PARENT's own saga_steps row (spec §5) and
+  // drives the PARENT itself into `compensationFailed` too (its own
+  // compensationFailure incident on the call1 element). Healing only the
+  // child would leave the parent parked there forever — retryInstanceCore
+  // resets the SAME call1 step back to `pending` (no job to reset; the
+  // dispatch fork just re-evaluates the now-healthy child) and un-parks the
+  // parent's reverse pass. A plain forward-incident cascade (no compensation
+  // involved) leaves the root merely `waiting`, so this is a no-op there —
+  // just re-drive so a now-completed/healed child applies.
+  const fresh = await getInstanceRow(env.DB, instanceId);
+  if (fresh?.status === "compensationFailed" || fresh?.status === "incident") {
+    await retryInstanceCore(env, instanceId, undefined, now); // root's own row already merged above; this also resumes inline
+  } else if (cascaded) {
+    await resumeInline(env, instanceId); // re-drive the parent so a now-completed child applies
+  } else {
+    throw new ConflictError(`Instance ${instanceId} has nothing to retry from status '${fresh?.status}'.`);
+  }
+  return handleGetInstance(env, instanceId);
+}
+
+/**
+ * The shared body of an operator /retry on ONE instance — extracted (Task 10)
+ * from handleRetryInstance's two status branches so the handler and the
+ * depth-first cascade below share one implementation. Operates on the RAW row
+ * (not the mapped ProcessInstance) so it works on a callActivity CHILD too. If
+ * `variables` is supplied it is merged into THIS instance's own row first —
+ * the cascade path needs this: only the instance named in the HTTP request
+ * gets merged by the caller, so a descendant's own job input still needs the
+ * patch threaded down explicitly.
+ */
+async function retryInstanceCore(env: Env, instanceId: string, variables: JsonObject | undefined, now: string): Promise<void> {
+  if (variables) await mergeInstanceVariables(env.DB, instanceId, variables, now);
+  const raw = await getInstanceRow(env.DB, instanceId);
+  if (!raw) throw new NotFoundError(`Process instance ${instanceId} not found.`);
+  const variablesJson = raw.variables ?? "{}";
+
+  if (raw.status === "compensationFailed") {
     const failed = await getFailedStep(env.DB, instanceId);
     if (!failed) throw new ConflictError(`Instance ${instanceId} has no failed compensation step to retry.`);
     const incident = await getIncidentForInstance(env.DB, instanceId);
@@ -533,12 +594,12 @@ async function handleRetryInstance(env: Env, instanceId: string, request: Reques
     }
     const changed = await transitionStatusGuarded(env.DB, instanceId, ["compensationFailed"], "compensating", now);
     if (changed === 0) throw new ConflictError(`Instance ${instanceId} is no longer retryable.`);
-    await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, elementId: failed.elementId, type: "operatorRetry", diagnostics: { target: "compensation" } });
+    await recordHistory(env.DB, { workspaceId: raw.workspace_id, instanceId, elementId: failed.elementId, type: "operatorRetry", diagnostics: { target: "compensation" } });
     await resumeInline(env, instanceId);
-    return handleGetInstance(env, instanceId);
+    return;
   }
 
-  if (inst.status === "incident") {
+  if (raw.status === "incident") {
     const incident = await getIncidentForInstance(env.DB, instanceId);
     const elementId = incident?.elementId;
     if (!elementId) throw new ConflictError(`Instance ${instanceId} has no incident element to retry.`);
@@ -555,12 +616,36 @@ async function handleRetryInstance(env: Env, instanceId: string, request: Reques
     }
     const changed = await transitionStatusGuarded(env.DB, instanceId, ["incident"], "running", now);
     if (changed === 0) throw new ConflictError(`Instance ${instanceId} is no longer retryable.`);
-    await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, elementId, type: "operatorRetry", diagnostics: { target: "forward" } });
+    await recordHistory(env.DB, { workspaceId: raw.workspace_id, instanceId, elementId, type: "operatorRetry", diagnostics: { target: "forward" } });
     await resumeInline(env, instanceId, elementId);
-    return handleGetInstance(env, instanceId);
+    return;
   }
 
-  throw new ConflictError(`Instance ${instanceId} has nothing to retry from status '${inst.status}'.`);
+  throw new ConflictError(`Instance ${instanceId} has nothing to retry from status '${raw.status}'.`);
+}
+
+/**
+ * Depth-first operator-retry cascade (M5-L2 Task 10, spec §4/§6): heal the
+ * DEEPEST child incidents/compensationFailed instances first — a node with a
+ * subtree that itself needed healing is skipped THIS pass (it has nothing of
+ * its own to retry; its own status only settles once the healed descendant's
+ * drive completes). Returns true if anything anywhere in the subtree was
+ * retried, so the caller can distinguish "cascaded" from "nothing to cascade,
+ * fall through to the root's own status".
+ */
+async function retryChildSubtree(env: Env, instanceId: string, variables: JsonObject | undefined, now: string): Promise<boolean> {
+  let any = false;
+  for (const c of await listChildrenOfInstance(env.DB, instanceId)) {
+    if (await retryChildSubtree(env, c.child_instance_id, variables, now)) {
+      any = true;
+      continue;
+    }
+    if (c.child_status === "incident" || c.child_status === "compensationFailed") {
+      await retryInstanceCore(env, c.child_instance_id, variables, now);
+      any = true;
+    }
+  }
+  return any;
 }
 
 // ---------------------------------------------------------------------------

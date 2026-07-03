@@ -423,3 +423,51 @@ export const CALL_ROOT_3LEVEL_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
     <bpmn:endEvent id="rt-end"/>
   </bpmn:process>
 </bpmn:definitions>`;
+
+// ---------------------------------------------------------------------------
+// Task 10 — operator verbs (409-on-children + cascading /retry) fixtures. A
+// straight 3-level callActivity chain (root -> mid -> leaf) where ONLY the
+// leaf runs a real steerable service task (`external-check`'s `forceFail`
+// steer, retries=1, exhausts to a child-local `incident`). Neither the root
+// nor the mid ever incidents on their OWN element — each is simply parked
+// `waiting` on its own callActivity — so a cascading /retry on the ROOT must
+// recurse PAST the mid (skipping it — it has nothing of its own to retry) to
+// reach and heal the DEEPEST (leaf) incident.
+// ---------------------------------------------------------------------------
+export const CHECK_LEAF_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="check-leaf-defs" targetNamespace="http://example.com">
+  <bpmn:process id="check-leaf-proc" isExecutable="true">
+    <bpmn:startEvent id="lc-start"/>
+    <bpmn:sequenceFlow id="lcf1" sourceRef="lc-start" targetRef="lc-check"/>
+    <bpmn:serviceTask id="lc-check" name="Check">
+      <bpmn:extensionElements><easy-bpmn:taskDefinition type="external-check" retries="1"/></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="lcf2" sourceRef="lc-check" targetRef="lc-end"/>
+    <bpmn:endEvent id="lc-end"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+export const CHECK_MID_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="check-mid-defs" targetNamespace="http://example.com">
+  <bpmn:process id="check-mid-proc" isExecutable="true">
+    <bpmn:startEvent id="mc-start"/>
+    <bpmn:sequenceFlow id="mcf1" sourceRef="mc-start" targetRef="call2"/>
+    <bpmn:callActivity id="call2" calledElement="check-leaf-proc"/>
+    <bpmn:sequenceFlow id="mcf2" sourceRef="call2" targetRef="mc-end"/>
+    <bpmn:endEvent id="mc-end"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+export const CHECK_ROOT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="check-root-defs" targetNamespace="http://example.com">
+  <bpmn:process id="check-root-proc" isExecutable="true">
+    <bpmn:startEvent id="rc-start"/>
+    <bpmn:sequenceFlow id="rcf1" sourceRef="rc-start" targetRef="call1"/>
+    <bpmn:callActivity id="call1" calledElement="check-mid-proc"/>
+    <bpmn:sequenceFlow id="rcf2" sourceRef="call1" targetRef="rc-end"/>
+    <bpmn:endEvent id="rc-end"/>
+  </bpmn:process>
+</bpmn:definitions>`;

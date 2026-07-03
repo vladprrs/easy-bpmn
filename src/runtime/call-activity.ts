@@ -19,8 +19,8 @@ import {
   traceIdFor,
   type JsonObject,
 } from "../util";
-import { dbBatch } from "../persistence/db";
-import { historyStmt } from "../persistence/history";
+import { dbBatch, stmt } from "../persistence/db";
+import { countHistoryEventsOfType, historyStmt } from "../persistence/history";
 import {
   applyTransitionStmt,
   createChildInstanceStmt,
@@ -39,6 +39,7 @@ import { getVersionGraph } from "../persistence/definitions";
 import { armTimerDO, buildBoundaryArm, timerBoundaryFor, timerHasFired } from "./boundary-timer";
 import { errorCatchTarget } from "./forward-task";
 import { createIncident } from "./incidents";
+import { drainScopeSubtree } from "./compensation";
 import { resolveScope } from "./frontier";
 import { loadInst, type RunStep } from "./engine-shared";
 import { getExecutor } from "./executor";
@@ -99,7 +100,7 @@ export async function driveCallActivity(
 
   let row = await getChildInstanceForVisit(env.DB, instanceId, elementId, occ);
   // Applied → pure write-free cursor move re-derived from the child terminal state.
-  if (row?.status === "outputApplied") return appliedCallOutcome(env, graph, elementId, node, row);
+  if (row?.status === "outputApplied") return appliedCallOutcome(env, instanceId, graph, elementId, node, row);
 
   if (!row) {
     const created = await runStep(`call-create:${tag}`, () => invokeChild(env, instanceId, graph, elementId, occ, node, activeTokenId));
@@ -223,7 +224,7 @@ async function applyChildTerminal(
 ): Promise<CallOutcome> {
   const row = await getChildInstanceForVisit(env.DB, instanceId, elementId, occ);
   if (!row) throw new Error(`Invariant violation: call-apply without a child_instances row (${elementId}#${occ}).`);
-  if (row.status === "outputApplied") return appliedCallOutcome(env, graph, elementId, node, row); // idempotent re-run
+  if (row.status === "outputApplied") return appliedCallOutcome(env, instanceId, graph, elementId, node, row); // idempotent re-run
   const child = (await getInstanceRow(env.DB, row.child_instance_id))!;
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
@@ -279,21 +280,107 @@ async function applyChildTerminal(
 }
 
 /**
- * TODO(m5-l2 task 7): the child errored-terminal routing — match an error
- * boundary on the callActivity (errorCatchTarget), else bubble, else uncaughtError.
- * Until Task 7 opens, an errored child parks the saga as an incident.
+ * Child-side settle (spec §4, Task 7): a callActivity CHILD's uncaught error end
+ * is a TERMINAL WITH A CODE for the parent to route — never a child-local
+ * `uncaughtError` incident (that branch is reserved for a ROOT instance's uncaught
+ * error end, unchanged since M5-L1). One-way status guard: never regress an
+ * already-terminal child (mirrors createIncident's own terminal guard, and makes
+ * a duplicate re-run of the `err-end` step a no-op).
+ */
+export async function settleChildErrored(env: Env, instanceId: string, elementId: string, errorCode: string | null, occ: number): Promise<void> {
+  const inst = await loadInst(env, instanceId);
+  if (isTerminalInstanceStatus(inst.status)) return; // idempotent / never regress
+  const now = nowIso();
+  await dbBatch(env.DB, [
+    stmt(
+      env.DB,
+      `UPDATE process_instances SET status='errored', error_code=?, current_element_id=?, completed_at=?, updated_at=?
+         WHERE instance_id=? AND status NOT IN ('completed','incident','compensated','compensationFailed','cancelled','errored')`,
+      [errorCode, elementId, now, now, instanceId],
+    ),
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId, type: "childErrored", diagnostics: { errorCode, occurrence: occ } }),
+  ]);
+}
+
+/**
+ * Parent-side routing for a child that settled `errored` (spec §4, Task 7):
+ * mirrors forward-task.ts's `handleForwardFailure` business-error apply — match
+ * an error boundary via the SAME hierarchical attachment-chain walk
+ * (`errorCatchTarget`) the worker-task path uses, else raise an uncaught
+ * `uncaughtError` incident.
+ *
+ * Ordering (deliberately mirrors handleForwardFailure's REAL order, not the
+ * task brief's inline sketch): the flip + `callActivityErrored` audit + advance
+ * commit FIRST — that batch alone is what `appliedCallOutcome`'s fast-forward
+ * predicate (child terminal + immutable graph) keys off. A scope-caught target
+ * then drains the catching scope's live subtree (idempotent retain-only) and
+ * writes `scopeExited` AFTER, as a separate write — so a crash in that window
+ * is healed by `appliedCallOutcome`'s existence-guarded re-drain (below),
+ * exactly like appliedForwardOutcome's own backstop. Draining BEFORE the batch
+ * (as the brief's sketch shows) would make that self-heal unreachable dead
+ * code, since the flip and the scopeExited marker would always co-commit.
  */
 async function applyChildErrored(
-  _env: Env,
-  _instanceId: string,
-  _graph: ExecutionGraph,
-  _elementId: string,
-  _occ: number,
+  env: Env,
+  instanceId: string,
+  graph: ExecutionGraph,
+  elementId: string,
+  occ: number,
   _node: GraphNode,
-  _row: { child_instance_id: string },
-  _child: InstanceRow,
-  _activeTokenId?: string,
+  row: { child_instance_id: string },
+  child: InstanceRow,
+  activeTokenId?: string,
 ): Promise<CallOutcome> {
+  const inst = await loadInst(env, instanceId);
+  const now = nowIso();
+  const applyFlip = markChildOutputAppliedStmt(env.DB, { parentInstanceId: instanceId, parentElementId: elementId, occurrence: occ, iterationIndex: 0, now });
+  const target = errorCatchTarget(graph, elementId, child.error_code);
+  if (target) {
+    await dbBatch(env.DB, [
+      applyFlip,
+      historyStmt(env.DB, {
+        workspaceId: inst.workspace_id,
+        instanceId,
+        elementId,
+        type: "callActivityErrored",
+        diagnostics: { childInstanceId: row.child_instance_id, errorCode: child.error_code, caughtBy: target.boundaryId, occurrence: occ, ...branchHistoryTags(activeTokenId) },
+      }),
+      applyTransitionStmt(env.DB, { instanceId, currentElementId: target.next, status: "running", now }),
+    ]);
+    if (target.hostIsScope) {
+      // Idempotent retain-only (Task 8) — safe to re-run on a step retry; the
+      // scopeExited write below is the completion marker appliedCallOutcome
+      // checks for its own self-heal.
+      await drainScopeSubtree(env, graph, instanceId, target.hostId);
+      await historyStmt(env.DB, {
+        workspaceId: inst.workspace_id,
+        instanceId,
+        elementId: target.hostId,
+        type: "scopeExited",
+        diagnostics: { scope: target.hostId, via: target.boundaryId, abnormal: true },
+      }).run();
+    }
+    return { kind: "next", next: target.next };
+  }
+  await dbBatch(env.DB, [
+    applyFlip,
+    historyStmt(env.DB, {
+      workspaceId: inst.workspace_id,
+      instanceId,
+      elementId,
+      type: "callActivityErrored",
+      diagnostics: { childInstanceId: row.child_instance_id, errorCode: child.error_code, occurrence: occ },
+    }),
+  ]);
+  await createIncident(
+    env,
+    instanceId,
+    elementId,
+    0,
+    `Call activity child errored ('${child.error_code}') with no matching error boundary up the scope chain.`,
+    { childInstanceId: row.child_instance_id, errorCode: child.error_code },
+    "uncaughtError",
+  );
   return { kind: "incident" };
 }
 
@@ -302,12 +389,35 @@ async function applyChildErrored(
  * appliedForwardOutcome): re-read the child terminal and derive the successor
  * from the immutable graph. `completed` → node.next; `errored` → the deterministic
  * error-catch target, or an incident if uncaught.
+ *
+ * Self-heal (mirrors appliedForwardOutcome's own scope-caught backstop): the
+ * `applyChildErrored` batch and `drainScopeSubtree` are NOT one atomic unit — a
+ * crash between the batch commit (which already flipped `outputApplied`) and the
+ * drain would otherwise be skipped forever, since every later rewalk fast-forwards
+ * through here. Guarded by the `scopeExited` marker's existence so the re-drain
+ * only ever runs once.
  */
-async function appliedCallOutcome(env: Env, graph: ExecutionGraph, elementId: string, node: GraphNode, row: { child_instance_id: string }): Promise<CallOutcome> {
+async function appliedCallOutcome(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, node: GraphNode, row: { child_instance_id: string }): Promise<CallOutcome> {
   const child = await getInstanceRow(env.DB, row.child_instance_id);
   if (child?.status === "errored") {
     const target = errorCatchTarget(graph, elementId, child.error_code ?? null);
-    if (target) return { kind: "next", next: target.next };
+    if (target) {
+      if (target.hostIsScope) {
+        const audited = await countHistoryEventsOfType(env.DB, instanceId, target.hostId, "scopeExited");
+        if (audited === 0) {
+          await drainScopeSubtree(env, graph, instanceId, target.hostId); // idempotent retain-only
+          const inst = await loadInst(env, instanceId);
+          await historyStmt(env.DB, {
+            workspaceId: inst.workspace_id,
+            instanceId,
+            elementId: target.hostId,
+            type: "scopeExited",
+            diagnostics: { scope: target.hostId, via: target.boundaryId, abnormal: true },
+          }).run();
+        }
+      }
+      return { kind: "next", next: target.next };
+    }
     return { kind: "incident" };
   }
   return { kind: "next", next: node.next! };

@@ -111,7 +111,7 @@ import { completeInstanceGuarded } from "../persistence/instances";
 import { branchHistoryTags, listLiveTokens, setTokenStatusStmt, rootTokenId, getToken, parseOverlay, readOverlay, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
 import { withDriveLock } from "../persistence/drive-lock";
 import { driveForwardServiceTask, terminateUnleasableJob, errorCatchTarget } from "./forward-task";
-import { driveCallActivity, notifyParentOfChildTerminal, PARENT_CONSUMABLE_CHILD_STATUSES } from "./call-activity";
+import { driveCallActivity, notifyParentOfChildTerminal, settleChildErrored, PARENT_CONSUMABLE_CHILD_STATUSES } from "./call-activity";
 import { beginCompensating, settleAfterCompensation, cancelBoundaryTarget, drainScopeSubtree } from "./compensation";
 import {
   armTimerDO,
@@ -615,6 +615,14 @@ async function loop(
               return catchT.next;
             });
             return { kind: "next", next };
+          }
+          // M5-L2 (spec §4): a CHILD's uncaught error end is a TERMINAL WITH A CODE
+          // for the parent to route — never a child-local uncaughtError incident.
+          // A root instance (parent_instance_id null) keeps the pre-M5-L2 path.
+          const instForErr = await loadInst(env, instanceId);
+          if (instForErr.parent_instance_id) {
+            await runStep(`err-end:${tag}`, () => settleChildErrored(env, instanceId, cur, node.errorCode ?? null, occ));
+            return { kind: "incident" }; // walk stops; D1 'errored' is the truth (not an incident row)
           }
           await runStep(`err-end:${tag}`, () =>
             createIncident(

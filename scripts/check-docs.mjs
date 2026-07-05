@@ -169,7 +169,7 @@ if (/\b(parallel|inclusive)\s+gateways?[^.]*\b(deferred|out of scope|M4 \(deferr
 //    and STEP_BUDGET_SOFT (each value is repeated across several docs and would rot
 //    silently if the engine retunes it).
 const engineText = readFileSync(engineSrc, "utf8");
-const SYNCED_CONSTANTS = ["MAX_ELEMENT_OCCURRENCES", "MAX_CONCURRENT_TOKENS", "STEP_BUDGET_SOFT", "MAX_SCOPE_DEPTH"];
+const SYNCED_CONSTANTS = ["MAX_ELEMENT_OCCURRENCES", "MAX_CONCURRENT_TOKENS", "STEP_BUDGET_SOFT", "MAX_SCOPE_DEPTH", "MAX_CALL_DEPTH"];
 const constDocPaths = [...mdFiles(bpmnDir), ...mdFiles(sagaSpecDir)];
 for (const name of SYNCED_CONSTANTS) {
   const engineMatch = engineText.match(new RegExp(`${name} = (\\d+)`));

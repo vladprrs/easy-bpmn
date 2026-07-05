@@ -14,9 +14,10 @@ makes a standard subset of BPMN 2.0 executable without Camunda/Zeebe. Implemente
 - **M3** — time & failure taxonomy (interrupting boundary/intermediate timers, message intermediate catch, `eventBasedGateway`, free error routing, the `timeout` incident-kind split + honored `retryable`) — **shipped** (constitution v2.2.0; the runtime opened per validator layer, now complete).
 - **M4** — concurrency (block-structured `parallelGateway` AND / `inclusiveGateway` OR (SESE), the token frontier, AND/OR-join barrier, branch-local variable merge, parallel-branch compensation) — **shipped** (constitution v2.3.0 added the construct set, with the single-wake un-guarded-wait semantics recorded in the v2.3.1 PATCH; the single-wake engine, TASK-54, **re-validated GREEN on real Cloudflare Workflows 2026-06-14**, Worker Version `f194b722` — the L6.6 multi-wait defect is resolved).
 - **M-UI** — operator console: a **read-only** React SPA (in `spa/`) served same-origin by the Worker via Cloudflare Static Assets, session-cookie auth (`/ui/login|logout|me`), read/aggregation endpoints (`/projects`, `/attention`, `/sagas`, `/instances/{id}/jobs`, `GET /messages` search, `/definitions/versions/{id}/bpmn`, `/instances/{id}/stream` SSE), plus `GET /instances` search/sagaId/multi-status, a `subscriptions` block on instance inspection, and a `?since=` history delta — **shipped** (constitution **v2.4.0** removed the "advanced Operate-style UI" exclusion). The only write surface is still the existing `cancel`/`retry`; all inspection reads D1 (the invariant is preserved). Backend in `src/ui/*` + `src/persistence/ui-queries.ts`; contract/integration in `tests/integration/ui-console.test.ts` + `tests/unit/ui-session.test.ts`.
-- **M5-L1** — embedded scopes + hierarchical exceptions (non-transaction embedded `subProcess`, the typed scope tree, the two-tier `committedLocal`/`committed` commit shield, the root-relative subtree reverse pass, hierarchical error bubbling with error boundaries on scopes, the error end event with the `uncaughtError` incident kind, timer boundaries on scopes with Hazard-vs-Cancel interrupt-without-compensation semantics, and the publish-time `MAX_SCOPE_DEPTH` cap) — **shipped** (constitution **v2.5.0** accepted the whole five-layer M5 composition set up front; the runtime opens per layer, and M5-L1 is the first to open). M5-L2 (`callActivity`) through M5-L5 (`signal`) remain accepted-in-governance, interim-rejected at publish, until their own layers open.
+- **M5-L1** — embedded scopes + hierarchical exceptions (non-transaction embedded `subProcess`, the typed scope tree, the two-tier `committedLocal`/`committed` commit shield, the root-relative subtree reverse pass, hierarchical error bubbling with error boundaries on scopes, the error end event with the `uncaughtError` incident kind, timer boundaries on scopes with Hazard-vs-Cancel interrupt-without-compensation semantics, and the publish-time `MAX_SCOPE_DEPTH` cap) — **shipped** (constitution **v2.5.0** accepted the whole five-layer M5 composition set up front; the runtime opens per layer, and M5-L1 is the first to open).
+- **M5-L2** — `callActivity` as a reusable sub-saga (each visit creates a real child process instance with its own Cloudflare Workflow; publish-time version binding pinned immutably in the caller's stored graph; the `child_instances` provenance table as the rewalk idempotency predicate; the child-only `errored` terminal whose business error routes at the parent exactly like a worker error at the callActivity; child→parent wake through the deliverJobResult seam with a JobScheduler DO child-notify alarm self-heal; depth-first cascading drain/cancel into live children; committed-callActivity compensation by driving the child's own reverse pass; cascading operator verbs with 409 on direct child cancel/retry; the `lineage` block + `?root=true` console delta; and the publish-time `MAX_CALL_DEPTH = 4` call-tree cap) — **shipped** (no constitution bump: **v2.5.0** already accepted the whole M5 set; M5-L2 only opens its runtime layer). M5-L3 (`multiInstanceLoopCharacteristics`), M5-L4 (escalation), M5-L5 (`signal`), and the event subprocess remain accepted-in-governance, interim-rejected at publish, until their own layers open.
 
-**M5-L2 (`callActivity`) is the next layer.** The Worker is live at `https://bpmn.rntme.com`
+**M5-L3 (`multiInstanceLoopCharacteristics`) is the next layer.** The Worker is live at `https://bpmn.rntme.com`
 (Cloudflare Workers + D1 + Durable Object broker + Workflow), with GitHub Actions CI/CD at the repo root.
 
 ## Source-of-truth hierarchy (read this before changing anything)
@@ -78,7 +79,7 @@ instance) · `src/durable-objects/correlation-broker.ts` (correlation only) ·
 `src/durable-objects/job-scheduler.ts` (per-job un-leasable DLQ timer — one DO per service_task_job) ·
 `src/runtime/engine.ts` (the rewalk/occurrence execution engine) ·
 `src/runtime/executor.ts` (WorkflowExecutor vs DirectExecutor seam) ·
-`src/runtime/*` (service-task, retry-policy, expressions, payload, errors) · `src/observability/*`.
+`src/runtime/*` (service-task, call-activity, retry-policy, expressions, payload, errors) · `src/observability/*`.
 
 ## Engine: rewalk/occurrence model (M2 — critical, non-obvious)
 
@@ -97,8 +98,10 @@ counts — during a Workflow replay those reads see post-crash state and would d
   (a `concurrencyLimit` incident on the token frontier) and `STEP_BUDGET_SOFT = 20000` (a `stepBudget`
   incident). M5-L1 adds `MAX_SCOPE_DEPTH = 8` (also in `src/runtime/engine.ts`) — a **publish-time**
   validator reject on scope nesting depth (not a runtime incident: in M5-L1 the scope tree is fully
-  static). `npm run check:docs` enforces that every copy of each of these constants in
-  `docs/bpmn/` and `specs/002-saga-orchestrator/` matches the engine source.
+  static). M5-L2 adds `MAX_CALL_DEPTH = 4` (same file) — likewise a **publish-time** reject, enforced
+  by call-tree resolution (`src/bpmn/call-resolution.ts`) over the immutable pinned-version DAG (depth 1
+  = a process with no `callActivity`). `npm run check:docs` enforces that every copy of each of these
+  constants in `docs/bpmn/` and `specs/002-saga-orchestrator/` matches the engine source.
 
 ## Non-obvious invariants (enforce these in code and tests)
 
@@ -112,7 +115,7 @@ counts — during a Workflow replay those reads see post-crash state and would d
   extensions and Diagram Interchange are ignored.
 - **Reject unsupported *flow nodes* before publish, with element id + reason** (complex gateways, non-block-structured (non-SESE) parallel/inclusive
   gateways, user tasks, event subprocesses (`triggeredByEvent="true"`) and ad-hoc subprocesses,
-  `callActivity`, `multiInstanceLoopCharacteristics`, conditional/default flows not leaving an
+  `multiInstanceLoopCharacteristics`, conditional/default flows not leaving an
   `exclusiveGateway`, `instantiate="true"`, etc. — `exclusiveGateway` + FEEL conditions + default flows +
   token-path cycles are IN since M2 / constitution v2.1.0; the **M3 set** — interrupting boundary/
   intermediate timers, message intermediate catch, `eventBasedGateway`, free error routing — is **IN since
@@ -120,7 +123,10 @@ counts — during a Workflow replay those reads see post-crash state and would d
   complete — see `docs/bpmn/09-easy-bpmn-profile.md`); block-structured (SESE) `parallelGateway` (AND) +
   `inclusiveGateway` (OR) are **IN since M4 / constitution v2.3.0**; plain embedded (non-transaction)
   `subProcess`, scope-hosted error/timer boundaries, and the error end event are **IN since M5-L1 /
-  constitution v2.5.0** — `callActivity`, `multiInstanceLoopCharacteristics`, escalation, signal, and the
+  constitution v2.5.0**; `callActivity` is **IN since M5-L2** (same constitution version — the runtime
+  opens per layer), with its own publish rejects: unresolved `calledElement`, call-tree depth >
+  `MAX_CALL_DEPTH = 4`, and any `receiveTask`/message `intermediateCatchEvent` anywhere in the resolved
+  call tree (a v1 narrowing) — `multiInstanceLoopCharacteristics`, escalation, signal, and the
   event subprocess remain interim-rejected until their own M5 layers open). But
   **tolerate and ignore**
   *ignorable extension content* — foreign-namespace `<extensionElements>` (`camunda:`/`zeebe:`/…), Diagram

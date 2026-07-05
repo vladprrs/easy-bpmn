@@ -20,7 +20,11 @@ and M4 (concurrency) have since shipped — the M4 concurrency section is append
 below; **M5 (composition)** is the current (and last) roadmap milestone, opened by
 the constitution v2.5.0 amendment and decomposed into five runtime layers
 (M5-L1…L5) — the **M5-L1 (embedded scopes + hierarchical exceptions)** section is
-appended below.
+appended below and has since shipped, and **M5-L2 (`callActivity` reusable
+sub-sagas)** has likewise shipped (governance record:
+`specs/002-saga-orchestrator/m5-L2-constitution-check.md`; design:
+`docs/superpowers/specs/2026-07-02-m5-l2-callactivity-design.md`); M5-L3…L5 remain
+pending.
 
 ## Constitution Alignment *(mandatory)*
 
@@ -823,7 +827,8 @@ runtime subset)
 M5-L1; wins where more specific than the decomposition doc), `docs/superpowers/specs/2026-06-20-m5-composition-design.md`
 §6 M5-L1 (decomposition), `specs/002-saga-orchestrator/m5-L1-constitution-check.md` (recorded Constitution
 Check)
-**Status**: Governance opened (this section, Task 1 of the M5-L1 plan); implementation not yet started.
+**Status**: **Shipped** — the M5-L1 runtime layer opened and validated under constitution v2.5.0 (no
+further amendment; the M5 set was accepted whole).
 Plan: `docs/superpowers/plans/2026-07-02-m5-l1-embedded-scopes.md` (15 tasks, TDD, governance-first).
 
 ### Constitution Alignment
@@ -833,7 +838,8 @@ validator/runtime for plain embedded `bpmn:subProcess` (one none-start, ≥1 end
 scope, arbitrary nesting of subProcess/transaction), error and timer `boundaryEvent`s hosted on a
 `subProcess`/`transaction`, and the error **end** event (`endEvent` + `errorEventDefinition`). The
 `triggeredByEvent="true"` event subprocess, `multiInstanceLoopCharacteristics`, and `callActivity` stay
-**interim-rejected** with an M5-L4/L3/L2 roadmap pointer respectively; `adHocSubProcess` and
+**interim-rejected** with an M5-L4/L3/L2 roadmap pointer respectively (`callActivity` has **since
+shipped** — its M5-L2 layer opened the runtime); `adHocSubProcess` and
 `standardLoopCharacteristics` stay permanently rejected. The no-custom-notation clause, XSD-validity, and
 modeler round-trippability are unchanged.
 
@@ -888,12 +894,16 @@ invariant is re-affirmed.
 
 - Event subprocess (`triggeredByEvent="true"`) → M5-L4 (interim reject with roadmap pointer).
 - `multiInstanceLoopCharacteristics` on any activity → M5-L3 (interim reject).
-- `callActivity` → M5-L2 (stays in the whitelist reject).
+- `callActivity` → M5-L2 (**since shipped** — the whitelist reject is lifted: `calledElement` is pinned
+  to an immutable published version at the caller's publish and the call tree is capped at
+  `MAX_CALL_DEPTH = 4` at publish; see `specs/002-saga-orchestrator/m5-L2-constitution-check.md`).
 - `compensateEventDefinition` boundary on a subProcess (compensate-as-unit) → post-M5 (decomposition §6
   M5-L1 decision 6): in L1 a subProcess's completed steps are simply rows in the enclosing transaction's
   ledger.
 - Escalation, signal, non-interrupting boundaries → M5-L4/L5.
-- Console UI changes → thread G deltas start at M5-L2; L1 ships only the new history events.
+- Console UI changes → thread G deltas started at M5-L2 as planned (**since shipped**: the `lineage`
+  block on instance inspection, the `GET /instances?root=true` filter, console parent/child navigation,
+  and the child-only `errored` status); L1 shipped only the new history events.
 
 ### The ledger invariant
 
@@ -985,10 +995,14 @@ three existing caps (`MAX_ELEMENT_OCCURRENCES`, `MAX_CONCURRENT_TOKENS`, `STEP_B
 refinement of decomposition §4 (recorded in `m5-L1-constitution-check.md` Complexity Tracking (a)): in L1
 scope depth is **fully static** (no `callActivity`, no `multiInstance`), so the cap is enforced by the
 **validator at publish** (element id + reason) — fail-closed, zero runtime surface. The `scopeDepth`
-*runtime incident* named by the decomposition doc becomes reachable only once M5-L2 introduces dynamic
-depth (call chains), and is deferred to that layer. This governance-opening section fixes no numeric
-value; the value is defined in `src/runtime/engine.ts` and `check:docs`-synced when the validator task
-lands.
+*runtime incident* named by the decomposition doc was anticipated to become reachable once M5-L2
+introduced dynamic depth (call chains) — in the event it did **not**: the shipped M5-L2 kept the call
+tree fully static too (`calledElement` is resolved and pinned to an immutable version at the caller's
+publish, and call-tree depth is capped by `MAX_CALL_DEPTH = 4` at publish via
+`src/bpmn/call-resolution.ts`), so no runtime depth incident exists after L2 either; the incident stays
+deferred until some layer introduces genuinely dynamic depth. This governance-opening section fixes no
+numeric value; the value is defined in `src/runtime/engine.ts` and `check:docs`-synced when the validator
+task lands.
 
 ### User Scenarios & Testing
 

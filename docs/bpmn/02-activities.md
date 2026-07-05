@@ -65,7 +65,7 @@ inline. XML: `<subProcess>` (or `<transaction>`, `<adHocSubProcess>`).
 | **Event sub-process** | `subProcess triggeredByEvent="true"` | No incoming/outgoing sequence flow. Sits *inside* a process/sub-process and is triggered by its single start event (message, timer, error, escalation, signal, conditional, compensation…). Interrupting or non-interrupting. Drawn with a **dotted** border. |
 | **Transaction** | `transaction` | All-or-nothing semantics. Drawn with a **double** border. Can be ended by a *cancel end* event → triggers a *cancel boundary* event on the transaction and runs compensation. |
 | **Ad-hoc sub-process** | `adHocSubProcess` | Contained activities run in **any order**, repeatedly, or not at all, until a completion condition holds. Marked with a tilde `~`. |
-| **Call Activity** | `callActivity` (attr `calledElement`) | Invokes a *separate, reusable* process definition (or a global task). Drawn with a **thick** border. Requires explicit in/out data mapping. |
+| **Call Activity** | `callActivity` (attr `calledElement`) | Invokes a *separate, reusable* process definition (or a global task). Drawn with a **thick** border. Standard BPMN requires explicit in/out data mapping; **`easy-bpmn` deliberately diverges** (Zeebe-aligned): variables **pass through both ways** — the parent's variables seed the child, and a completed child's variables merge back (an explicit `easy-bpmn:ioMapping` extension is deferred). |
 
 > **Call activity vs sub-process:** an embedded sub-process is defined *inline*; a call activity
 > *references* another top-level process by id (`calledElement`) and reuses it.
@@ -118,17 +118,35 @@ publish-time `MAX_SCOPE_DEPTH = 8` cap (see
 [`07-execution-semantics.md`](./07-execution-semantics.md)). Error and (interrupting) timer boundary events
 may now attach to a `subProcess` (or a `transaction`) in addition to a task — see
 [`01-events.md`](./01-events.md) for the Hazard-vs-Cancel firing semantics. The `adHocSubProcess` and event
-sub-process (`triggeredByEvent="true"`) remain rejected; `callActivity` and
-`multiInstanceLoopCharacteristics` are constitution-accepted (v2.5.0) but stay interim-rejected until M5-L2
-/ M5-L3 open their runtime.
+sub-process (`triggeredByEvent="true"`) remain rejected; `multiInstanceLoopCharacteristics` is
+constitution-accepted (v2.5.0) but stays interim-rejected until M5-L3 opens its runtime (`callActivity`
+opened in M5-L2 — see below).
+
+**In scope since M5-L2 (reusable sub-sagas):** the `callActivity`. Each visit invokes a *separate,
+published* process definition as a **real child instance** with its own Workflow — a reusable
+**sub-saga**. `calledElement` resolves at the **caller's publish** to the latest published version of the
+target process in the same workspace and is **pinned immutably** in the caller's stored graph
+(Principle II) — runtime "latest"/version binding is not honored, and `camunda:calledElementBinding` /
+`camunda:calledElementVersion` are tolerated-and-ignored foreign-namespace attributes. Variables **pass
+through both ways** (see the table note above). The call tree is capped at publish time by
+`MAX_CALL_DEPTH = 4` (depth 1 = a process with no `callActivity`); publish also rejects, with element id +
+reason: an unresolved or non-process `calledElement`, call cycles, and any `receiveTask` or message
+`intermediateCatchEvent` **anywhere in the resolved call tree** (a child correlates on a technical
+`child:<childInstanceId>` key, so it has no correlation-key source — a deliberate v1 narrowing). A child's
+uncaught error settles the child `errored` and routes at the **parent** exactly like a worker business
+error thrown at the `callActivity`; a committed `callActivity` compensates by driving the **child's own
+reverse pass** over its retained ledger. `multiInstanceLoopCharacteristics` on a `callActivity` stays
+rejected until M5-L3. See [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
 
 **Out of scope (reject before publish):** the abstract `task`, `userTask`, `sendTask`, `manualTask`,
 `scriptTask`, `businessRuleTask`, the event sub-process (`triggeredByEvent="true"`) and `adHocSubProcess`,
-`callActivity`, the loop and multi-instance markers, and any task with `instantiate="true"` (instances start
-via the API). (The plain embedded `subProcess` is no longer in this list — see M5-L1 above.)
+the loop and multi-instance markers, and any task with `instantiate="true"` (instances start via the API).
+(The plain embedded `subProcess` and the `callActivity` are no longer in this list — see M5-L1 / M5-L2
+above.)
 
 The baseline activity vocabulary is *call a worker* (service task) and *wait for a message* (receive task);
 since M1 it also includes the `transaction` sub-process with compensation / error / cancel boundary events
 — the canonical saga scope; since M5-L1 it also includes the plain embedded `subProcess` as a
-non-transactional bookkeeping scope, nestable with `transaction` in either order. See
+non-transactional bookkeeping scope, nestable with `transaction` in either order; since M5-L2 it also
+includes the `callActivity` — *invoke a published process as a reusable sub-saga*. See
 [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).

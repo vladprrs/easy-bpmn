@@ -43,6 +43,10 @@ export interface SagaStepRow {
   // token (M1–M3 / root) path. The lineage-quiescence-ordered reverse pass uses it
   // to compensate a step only once its branch lineage has no live token (§8.4).
   token_id: string | null;
+  // M5-L2 (0008) — step-kind dispatch for the reverse pass (spec §5): NULL = a
+  // worker-task step; non-NULL = compensate by driving this child instance's
+  // own reverse pass instead of a compensation job.
+  child_instance_id: string | null;
 }
 
 export interface SagaStepView {
@@ -52,7 +56,13 @@ export interface SagaStepView {
   elementId: string;
   /** Loop-iteration discriminator (design M2 §8); 0 for non-looped steps. */
   occurrence: number;
-  forwardJobId: string;
+  /**
+   * The forward job that produced this step, or `null` for a callActivity child
+   * step (M5-L2). `saga_steps.forward_job_id` is NOT NULL (migration 0002), so a
+   * child step stores the empty-string sentinel `""` at insert; mapSagaStep folds
+   * `""` → null here so callers see an honest "no forward job".
+   */
+  forwardJobId: string | null;
   capturedInput: JsonObject;
   capturedOutput: JsonObject | null;
   compensationElementId: string | null;
@@ -62,6 +72,8 @@ export interface SagaStepView {
   traceId: string | null;
   /** M4-L5: the branch token that produced this row; NULL on the root/single-token path. */
   tokenId: string | null;
+  /** M5-L2: non-NULL ⇒ compensate via this child instance's own reverse pass. */
+  childInstanceId: string | null;
 }
 
 export function mapSagaStep(row: SagaStepRow): SagaStepView {
@@ -71,7 +83,9 @@ export function mapSagaStep(row: SagaStepRow): SagaStepView {
     seq: row.seq,
     elementId: row.element_id,
     occurrence: row.occurrence,
-    forwardJobId: row.forward_job_id,
+    // M5-L2 sentinel fold: a callActivity child step stores "" (forward_job_id is
+    // NOT NULL) — surface it as null so it reads as "no forward job".
+    forwardJobId: row.forward_job_id || null,
     capturedInput: parseJson<JsonObject>(row.captured_input, {}),
     capturedOutput: row.captured_output ? parseJson<JsonObject>(row.captured_output, {}) : null,
     compensationElementId: row.compensation_element_id,
@@ -80,6 +94,7 @@ export function mapSagaStep(row: SagaStepRow): SagaStepView {
     compensationStatus: row.compensation_status as CompensationStatus,
     traceId: row.trace_id,
     tokenId: row.token_id,
+    childInstanceId: row.child_instance_id,
   };
 }
 
@@ -134,6 +149,9 @@ export function insertSagaStepStmt(
     instanceId: string;
     scopeId: string;
     elementId: string;
+    /** The producing forward job id. A callActivity child step (M5-L2) has no
+     *  forward job — pass the empty-string sentinel `""` (the column is NOT NULL);
+     *  mapSagaStep folds it back to null. */
     forwardJobId: string;
     capturedInput: JsonObject;
     capturedOutput: JsonObject | null;
@@ -146,6 +164,9 @@ export function insertSagaStepStmt(
     occurrence?: number;
     /** M4-L5 (0007) — producing branch token; NULL on the root/single-token path. */
     tokenId?: string | null;
+    /** M5-L2 (0008) — non-NULL ⇒ this step compensates via a child instance's
+     *  own reverse pass rather than a compensation job; defaults to NULL. */
+    childInstanceId?: string | null;
     now: string;
   },
 ): D1PreparedStatement {
@@ -153,10 +174,10 @@ export function insertSagaStepStmt(
     db,
     `INSERT OR IGNORE INTO saga_steps
        (step_id, instance_id, scope_id, seq, element_id, forward_job_id, captured_input, captured_output,
-        compensation_element_id, compensation_task_type, compensation_job_id, compensation_status, trace_id, created_at, updated_at, occurrence, token_id)
+        compensation_element_id, compensation_task_type, compensation_job_id, compensation_status, trace_id, created_at, updated_at, occurrence, token_id, child_instance_id)
      SELECT ?, ?, ?,
             COALESCE((SELECT MAX(seq) FROM saga_steps WHERE instance_id = ?), 0) + 1,
-            ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?`,
+            ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?`,
     [
       input.stepId,
       input.instanceId,
@@ -174,6 +195,7 @@ export function insertSagaStepStmt(
       input.now,
       input.occurrence ?? 0,
       input.tokenId ?? null,
+      input.childInstanceId ?? null,
     ],
   );
 }
@@ -191,18 +213,29 @@ export async function selectSubtreeStepsForCompensation(
   instanceId: string,
   subtreeScopeIds: string[],
   eligibleCommittedLocalScopeIds: string[],
+  // M5-L2 (GAP B): the process-root pass (rootScopeId == null) must also reverse
+  // ROOT-SCOPED steps (scope_id = ''). Pre-M5-L2 forward steps are only ledgered
+  // with a real transaction-ancestor scope id (forward-task.ts gates on
+  // `nearestEnclosingTx(...) != null`), so a '' step exists ONLY for a callActivity
+  // visit (applyChildTerminal / retainCallStraggler) — a scope-less parent whose
+  // only compensable content is its child would otherwise be invisible to both the
+  // operator-cancel count AND the reverse pass, cancelling outright without ever
+  // reversing the child. A NESTED tx root (includeRootScope=false) is byte-for-byte
+  // unchanged, so no legacy graph is affected.
+  includeRootScope = false,
 ): Promise<SagaStepView[]> {
-  if (subtreeScopeIds.length === 0) return [];
+  const scopeIds = includeRootScope ? [...subtreeScopeIds, ""] : subtreeScopeIds;
+  if (scopeIds.length === 0) return [];
   const elig = eligibleCommittedLocalScopeIds;
   const rows = await dbAll<SagaStepRow>(
     db,
     `SELECT * FROM saga_steps
        WHERE instance_id = ?
-         AND scope_id IN (${placeholders(subtreeScopeIds.length)})
+         AND scope_id IN (${placeholders(scopeIds.length)})
          AND ( compensation_status IN ('pending', 'compensating', 'failed')
             ${elig.length > 0 ? `OR (compensation_status = 'committedLocal' AND scope_id IN (${placeholders(elig.length)}))` : ""} )
        ORDER BY seq DESC`,
-    [instanceId, ...subtreeScopeIds, ...elig],
+    [instanceId, ...scopeIds, ...elig],
   );
   return rows.map(mapSagaStep);
 }
@@ -213,8 +246,9 @@ export async function countCompensableSteps(
   instanceId: string,
   subtreeScopeIds: string[],
   eligibleCommittedLocalScopeIds: string[],
+  includeRootScope = false,
 ): Promise<number> {
-  return (await selectSubtreeStepsForCompensation(db, instanceId, subtreeScopeIds, eligibleCommittedLocalScopeIds)).length;
+  return (await selectSubtreeStepsForCompensation(db, instanceId, subtreeScopeIds, eligibleCommittedLocalScopeIds, includeRootScope)).length;
 }
 
 export async function getSagaStepsForInstance(
@@ -245,6 +279,26 @@ export async function getSagaStep(
     db,
     `SELECT * FROM saga_steps WHERE instance_id = ? AND element_id = ? AND occurrence = ?`,
     [instanceId, elementId, occurrence],
+  );
+  return row ? mapSagaStep(row) : null;
+}
+
+/**
+ * The ledger step that invoked a given child instance (M5-L2 spec §5): the
+ * reverse-pass dispatch and the child-notify self-heal read it to tell whether
+ * the parent has already settled this child's step (compensated | failed). At
+ * most one row per (instance, child) — a callActivity visit binds exactly one
+ * child instance.
+ */
+export async function getSagaStepByChildId(
+  db: D1Database,
+  instanceId: string,
+  childInstanceId: string,
+): Promise<SagaStepView | null> {
+  const row = await dbFirst<SagaStepRow>(
+    db,
+    `SELECT * FROM saga_steps WHERE instance_id = ? AND child_instance_id = ? LIMIT 1`,
+    [instanceId, childInstanceId],
   );
   return row ? mapSagaStep(row) : null;
 }

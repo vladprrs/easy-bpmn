@@ -174,6 +174,20 @@ export interface ProcessInstance {
   completedAt?: string | null;
 }
 
+export interface InstanceLineageChild {
+  elementId: string;
+  occurrence: number;
+  childInstanceId: string;
+  status: string;
+}
+
+/** M5-L2 (callActivity, Task 11) — parent/child linkage, always present on
+ *  the instance-inspection response (never omitted like the blocks below). */
+export interface InstanceLineage {
+  parent: { instanceId: string; elementId: string | null } | null;
+  children: InstanceLineageChild[];
+}
+
 export interface ProcessInstanceInspection extends ProcessInstance {
   historySummary: HistoryEvent[];
   diagnostics: Record<string, unknown>;
@@ -183,6 +197,7 @@ export interface ProcessInstanceInspection extends ProcessInstance {
   timers?: TimerInspection[];
   tokens?: TokenInspection[];
   subscriptions?: SubscriptionView[];
+  lineage: InstanceLineage;
 }
 
 export interface WorkerAttemptView {

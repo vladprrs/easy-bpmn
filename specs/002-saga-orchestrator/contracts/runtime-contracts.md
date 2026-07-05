@@ -1,12 +1,13 @@
-# Runtime Contracts: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas; M3 — Time & failure taxonomy; M4 — Concurrency)
+# Runtime Contracts: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas; M3 — Time & failure taxonomy; M4 — Concurrency; M5-L2 — Call activity)
 
 These contracts extend `specs/001-bpmn-lite-orchestrator-mvp/contracts/runtime-contracts.md`. The
 Process Workflow, Receive Task, Correlation Broker, and D1 Persistence contracts from the MVP carry
 forward unchanged; this document specifies the new pull-worker, compensation, idempotency, and
 saga-settlement contracts, plus the M2 conditional-dispatch contract (gateways + occurrence-keyed
-loops), the M3 timer/race-decider/failure-taxonomy contract, and the M4 concurrency contract (the token
-frontier, AND/OR joins, R2 overlay offload, the two new incident kinds, and per-token observability) at
-the end.
+loops), the M3 timer/race-decider/failure-taxonomy contract, the M4 concurrency contract (the token
+frontier, AND/OR joins, R2 overlay offload, the two new incident kinds, and per-token observability),
+and the M5-L2 call-activity contract (the child sub-saga lifecycle, the `errored` child terminal, the
+child→parent wake, child compensation, and the cascading drain/retry) at the end.
 
 ## Process Workflow Contract (delta)
 
@@ -470,6 +471,130 @@ Like other forward Hazards, neither auto-compensates: inside a transaction the l
 - **`/retry`** reconstructs the frontier from `execution_tokens` (fast-forwarding applied
   splits/joins/branch steps **write-free**) rather than re-forking any split; the
   `compensationFailed → compensating` edge resumes the reverse pass over the cohort.
+
+## Call-Activity Contract (M5-L2 — reusable sub-sagas)
+
+Design: `docs/superpowers/specs/2026-07-02-m5-l2-callactivity-design.md` (§2–§7). Constitution
+**v2.5.0 unchanged** — the M5 amendment accepted the whole composition set up front; this layer only
+opens the `callActivity` runtime (governance record:
+`specs/002-saga-orchestrator/m5-L2-constitution-check.md`). **The `/jobs/*` worker surface is
+UNCHANGED** (still pinned by `tests/contract/jobs-schema-pin.test.ts`) — a child step never creates a
+job in either direction.
+
+### Child-instance lifecycle (deterministic id + provenance-gated create/apply)
+
+- **Each `callActivity` visit invokes a REAL child process instance** with its own Cloudflare
+  Workflow, bound to the **publish-pinned** `calledDefinitionVersionId` (Principle II:
+  `calledElement` resolves at the CALLER's publish to the latest **published** version of the target
+  process in the same workspace, `src/bpmn/call-resolution.ts`, and is pinned immutably in the
+  caller's stored graph; runtime "latest"/version binding is NOT honored —
+  `camunda:calledElementBinding` / `camunda:calledElementVersion` are tolerated-and-ignored foreign
+  extension content). Call-tree depth is capped at **`MAX_CALL_DEPTH = 4`** at publish (a validator
+  reject over the immutable pinned-version DAG; **not** a runtime incident).
+- **Deterministic child id.** The child instance id is `pi-` + the first 24 hex chars of the SHA-256
+  of `parentInstanceId:elementId:occurrence:iterationIndex` — an at-least-once re-run of the invoke
+  step derives the SAME child id (the idempotent-create key).
+- **`child_instances` is the rewalk fast-forward predicate** gating BOTH the child-Workflow create
+  and the output apply (statuses `invoked | outputApplied`; the analogue of `gateway_decisions` /
+  `output_applied=1`). The invoke batch — provenance row + child instance row +
+  `callActivityInvoked` history (+ the call's boundary-timer arm, if any) — commits in ONE `dbBatch`
+  **before** the idempotent Workflow start (persist-before-advance).
+- **io-mapping is pass-through both ways** (the Zeebe-aligned default; an `easy-bpmn:ioMapping`
+  extension is deferred): the parent's (branch-resolved) variables become the child's initial
+  variables — a branch token's child sees its resolved overlay chain — and a **completed** child's
+  variables merge back into the parent (the branch overlay inside an M4 region, root variables
+  otherwise). Input exceeding the ~1 MiB event limit is rejected as an incident **before** the child
+  is created.
+- **Apply-once.** The apply step is issued only once the child sits in a **forward-consumable
+  terminal** (`completed | errored`), so a memoized step result is always final. The `completed`
+  apply batch = the `outputApplied` flip + variable merge + advance + the parent's **child ledger
+  step** (`saga_steps.child_instance_id`, `compensation_status='pending'` — always compensable) +
+  `callActivityCompleted` history; an `outputApplied` row is a pure write-free cursor move
+  re-derived from the child's terminal status.
+- **A child technical `incident` does NOT notify the parent** — the saga parks on the call and heals
+  via the cascading operator `/retry` (below). The notify set is
+  `completed | errored | cancelled | compensated | compensationFailed`.
+
+### `errored` — the child-only terminal + parent error routing
+
+- A child's **uncaught error end settles the CHILD `errored`** with the business error code
+  (`process_instances.error_code`) + `childErrored` history — **never** a child-local
+  `uncaughtError` incident (that branch stays reserved for a ROOT instance, unchanged since M5-L1).
+  `errored` is NEVER a valid root-instance status.
+- The PARENT routes an `errored` child **exactly like a worker business error thrown at the
+  `callActivity`**: exact-`@errorCode` boundary on the call → catch-all → hierarchical bubble up the
+  scope chain (the same attachment-chain walk as the worker-task path) → else an `uncaughtError`
+  incident **at the parent** (`callActivityErrored` history either way). Guarding boundary timers on
+  the call — and on the catching scope — settle `cancelled` atomically with the route; a decider
+  conflict (the timer fired first) converts to the timer's boundary path, never a double-advance.
+
+### Child→parent wake (tickle + DO-alarm self-heal + capped backstop)
+
+- The child's terminal drive **tickles the parent through the existing `deliverJobResult` seam** — a
+  contentless `bpmn_wake` `sendEvent` with the terminated-Workflow **inline-drive fallback**, in
+  both executors — so the parked parent re-reads canonical D1 and applies.
+- **Self-heal net 1:** a `JobScheduler` DO **child-notify alarm** (keyed
+  `child-notify:<childInstanceId>`, armed BEFORE the tickle so a dropped tickle is always covered)
+  re-reads canonical state and re-tickles while the child terminal is unconsumed, at bounded
+  backoffs `CHILD_NOTIFY_BACKOFF_MS = 30 s / 2 m / 10 m / 30 m`.
+- **Self-heal net 2:** while any visit's child is still `invoked`, the parent's single-wake
+  `waitForEvent` backstop is capped at **`CHILD_WAIT_BACKSTOP_MS` = 5 minutes** (instead of the 1 h
+  ceiling), so a lost tickle recovers within minutes.
+
+### Compensating a committed callActivity (the child's OWN reverse pass)
+
+- **Step-kind dispatch:** `saga_steps.child_instance_id` `NULL` = worker-task step (the
+  compensation-job lane, unchanged); non-`NULL` = **child step** — compensated by driving the
+  CHILD's own reverse pass over its retained ledger, **never** a compensation job.
+- **Entry is a CAS** `{completed, cancelled} → compensating` (`cancelled` = a drain-interrupted
+  child whose committed steps still need reversal), plus an element-less cancel marker so the
+  child's resume derives its **process-root** reverse pass; a lost CAS leaves the winner owning the
+  reverse (idempotent re-entry).
+- **No-op shortcut:** an empty child compensable ledger (with a quiesced token cohort) settles the
+  child `compensated` **synchronously** — the parent is never parked on a no-op compensator.
+- A child **`compensationFailed`** surfaces as the PARENT's **own** `compensationFailure` incident
+  on the `callActivity` element (the parent's child step → `failed`, the parent →
+  `compensationFailed`).
+- **Root-scope rows are implicit members of the process-root reverse pass:** the process-root pass
+  also selects `scope_id = ''` ledger rows, so a **scope-less** parent's committed `callActivity`
+  still reverses on operator `/cancel`.
+
+### Cascading drain / cancel (Hazard, depth-first)
+
+- Scope drains (a fired scope- or call-hosted boundary timer, an error-bubble scope exit) and
+  operator `/cancel` cascade **depth-first** into every non-terminal descendant (grandchildren
+  first; bounded by `MAX_CALL_DEPTH = 4`): abandon in-flight forward jobs, release subscriptions
+  (defensive — v1 rejects message waits in a call tree at publish), disarm timers, terminate the
+  child Workflow, CAS `{starting, running, waiting, incident} → cancelled` + `instanceCancelled
+  {by:"parentDrain"}` history. **Hazard semantics — the cascade NEVER compensates**; the child's
+  saga ledger is retained untouched. A terminal or already-`compensating` child short-circuits
+  (idempotent re-drive).
+- A drain that discards a live token parked on a `callActivity` **retains the child ledger row**, so
+  a LATER reverse pass over an enclosing transaction still compensates the child.
+
+### Operator verbs (all control flows through the saga root)
+
+- A direct `POST /instances/{child}/cancel` or `/retry` on a `callActivity` child → **`409
+  Conflict`** naming the parent.
+- A parent `/retry` **cascades depth-first** into descendant `incident` AND `compensationFailed`
+  states before the root's own branch — the operator's variables patch is threaded into every
+  retried child — and records `operatorRetry {target:"childSubtree"}`. A successful cascade never
+  surfaces as an operator error (a root-branch refusal after healed children is swallowed; the
+  parent is still re-driven so the healed child applies).
+- A parent `/cancel` is a **process-root drain**: it cascade-cancels non-terminal children first,
+  then runs the reverse pass (child steps dispatching into the children's own reverse passes).
+
+### Lineage inspection
+
+- `GET /instances/{id}` gains an **always-present `lineage`** block, read from D1 only: `{ parent:
+  { instanceId, elementId } | null, children: [{ elementId, occurrence, childInstanceId, status }] }`
+  (a root instance carries `parent: null`).
+- `GET /instances?root=true` restricts the list to saga-root instances (`parent_instance_id IS
+  NULL`); absent or any other value, children are included (back-compat).
+- New free-text `history_events.type` values (no schema change): `callActivityInvoked`,
+  `callActivityWaiting`, `callActivityCompleted`, `callActivityErrored` (parent-side),
+  `childErrored` (child-side), `instanceCancelled` (`{by:"parentDrain"}`), `operatorRetry`
+  (`{target:"childSubtree"}`).
 
 ## Observability Contract
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  CALL_ACTIVITY_BPMN,
+  MULTI_INSTANCE_BPMN,
   createDraft,
   deferredGatewayBpmn,
   drainSampleWorkers,
@@ -95,17 +95,19 @@ describe("Public API contract (openapi.yaml)", () => {
   });
 
   it("blocks publishing a deferred-construct draft (409) with element id + reason recorded", async () => {
-    const draft = await createDraft(CALL_ACTIVITY_BPMN, "deferred");
+    // callActivity opened in M5-L2, so this now uses multiInstanceLoopCharacteristics
+    // (a serviceTask fan-out) — still interim-rejected after M5-L2 (planned for M5-L3).
+    const draft = await createDraft(MULTI_INSTANCE_BPMN, "deferred");
     expect(draft.status).toBe(201);
     expect(draft.body.status).toBe("invalid");
-    const issue = draft.body.validationIssues.find((i: any) => i.elementId === "CA");
+    const issue = draft.body.validationIssues.find((i: any) => i.elementId === "T");
     expect(issue).toBeTruthy();
-    expect(issue.reason).toMatch(/callActivity/);
+    expect(issue.reason).toMatch(/loop or multi-instance/);
 
     const pub = await publishDraft(draft.body.draftId);
     expect(pub.status).toBe(409);
     expect(Array.isArray(pub.body.validationIssues)).toBe(true);
-    expect(pub.body.validationIssues.some((i: any) => i.elementId === "CA")).toBe(true);
+    expect(pub.body.validationIssues.some((i: any) => i.elementId === "T")).toBe(true);
   });
 
   it("404s an unknown draft", async () => {

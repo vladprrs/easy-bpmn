@@ -1,4 +1,4 @@
-# Data Model: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas; M3 — Time & failure taxonomy; M4 — Concurrency)
+# Data Model: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas; M3 — Time & failure taxonomy; M4 — Concurrency; M5-L2 — Call activity)
 
 All M1 changes are **additive migrations** (`migrations/0002_saga.sql`); published definition
 versions are never mutated. The MVP entities (Workspace, Process Definition Draft, Validation
@@ -8,9 +8,10 @@ Message, Variable Snapshot, History Event, Idempotency Record) carry forward fro
 described here. The **M2 deltas** (occurrence discriminator, conditional topology,
 `gateway_decisions` — migrations `0004_conditional.sql` + `0005_output_applied_backfill.sql`) are
 described in their own section, followed by the **M3 deltas** (model-level timers + the
-technical-vs-business incident-kind split — migration `0006_timers.sql`), and finally the **M4 deltas**
+technical-vs-business incident-kind split — migration `0006_timers.sql`), the **M4 deltas**
 (the token-frontier read-model + the append-only join facts that make in-instance concurrency replayable —
-migration `0007_tokens.sql`).
+migration `0007_tokens.sql`), and finally the **M5-L2 deltas** (the `callActivity` child-instance
+provenance + parent linkage + the child-step ledger dispatch — migration `0008_call_activity.sql`).
 
 ## Entity: Transaction Scope (graph IR)
 
@@ -641,11 +642,119 @@ The publish-time SESE pass persists the region map `{ splitId → { joinId, type
 (`parsed_profile`), so the deterministic merge order and the OR-join wait set are **never recomputed from
 the live graph** at runtime.
 
+## M5-L2 deltas (Call activity — child provenance + parent linkage — migration `0008_call_activity.sql`)
+
+Additive over the M4 schema; published versions are never mutated. Source design:
+`docs/superpowers/specs/2026-07-02-m5-l2-callactivity-design.md` (§2). Constitution **v2.5.0
+unchanged** — the M5 amendment accepted the whole composition set up front; this layer only opens the
+`callActivity` runtime (governance record: `specs/002-saga-orchestrator/m5-L2-constitution-check.md`).
+
+> **The `/jobs/*` worker API surface is UNCHANGED by M5-L2** (still pinned by
+> `tests/contract/jobs-schema-pin.test.ts`). A child step never creates a job — the forward output
+> applies from the child's own instance row, and its compensator is the child's own reverse pass.
+
+### Entity: Child Instance (provenance — new table `child_instances`)
+
+The rewalk fast-forward predicate for a `callActivity` visit, gating BOTH the child-Workflow create
+and the output apply (the analogue of `gateway_decisions` / `output_applied=1`); the UNIQUE visit
+index is the at-least-once single-apply guard.
+
+```sql
+CREATE TABLE child_instances (
+  parent_instance_id TEXT    NOT NULL,
+  parent_element_id  TEXT    NOT NULL,            -- the callActivity node id
+  occurrence         INTEGER NOT NULL,
+  iteration_index    INTEGER NOT NULL DEFAULT 0,  -- reserved for M5-L3 MI
+  child_instance_id  TEXT    NOT NULL,
+  status             TEXT    NOT NULL,            -- invoked | outputApplied
+  created_at         TEXT    NOT NULL,
+  updated_at         TEXT    NOT NULL
+);
+CREATE UNIQUE INDEX uq_child_instances_visit
+  ON child_instances (parent_instance_id, parent_element_id, occurrence, iteration_index);
+CREATE INDEX idx_child_instances_child ON child_instances (child_instance_id);
+```
+
+**Fields / Rules**:
+- `child_instance_id` is **deterministic, content-addressed**: `pi-` + the first 24 hex chars of the
+  SHA-256 of `parentInstanceId:elementId:occurrence:iterationIndex` — an at-least-once re-run of the
+  invoke step derives the SAME id (the idempotent-create key).
+- Lifecycle `invoked → outputApplied`: the row is written in the SAME `dbBatch` as the child
+  instance row + the `callActivityInvoked` history (persist-before-advance, **before** the
+  idempotent Workflow start); the `outputApplied` flip commits atomically with the parent's variable
+  merge + advance (+ the child ledger step), so a rewalk that sees `outputApplied` is a
+  **write-free** cursor move re-derived from the child's terminal status.
+- `iteration_index` is fixed `0` in M5-L2 — reserved for `multiInstanceLoopCharacteristics`
+  (M5-L3; still rejected on a `callActivity` at publish, with the roadmap pointer).
+
+### Entity: Process Instance (delta — parent linkage + the child-only `errored` terminal)
+
+```sql
+ALTER TABLE process_instances ADD COLUMN parent_instance_id TEXT;
+ALTER TABLE process_instances ADD COLUMN parent_element_id  TEXT;
+ALTER TABLE process_instances ADD COLUMN parent_occurrence  INTEGER;
+ALTER TABLE process_instances ADD COLUMN error_code         TEXT;
+CREATE INDEX idx_instances_parent ON process_instances (parent_instance_id);
+```
+
+- `parent_instance_id` / `parent_element_id` / `parent_occurrence`: the invoking parent visit; all
+  `NULL` for a root instance. `GET /instances?root=true` filters `parent_instance_id IS NULL`; the
+  `GET /instances/{id}` `lineage` block reads this linkage + `child_instances`.
+- **The status enum gains `errored` — a CHILD-ONLY terminal**: a child's uncaught error end settles
+  the child `errored` with the business error code in `error_code` (history `childErrored`) instead
+  of a child-local `uncaughtError` incident; the parent routes the code exactly like a worker
+  business error at the `callActivity`. `errored` is NEVER valid for a root instance. Full enum
+  after M5-L2: `starting | running | waiting | completed | incident | compensating | compensated |
+  compensationFailed | cancelled | errored`.
+- `error_code`: the child's business error code; `NULL` otherwise.
+
+### Entity: Saga Step (delta — child step-kind dispatch)
+
+```sql
+ALTER TABLE saga_steps ADD COLUMN child_instance_id TEXT;
+```
+
+- **Step-kind dispatch** for the reverse pass: `NULL` = worker-task step (the compensation-job lane,
+  unchanged); non-`NULL` = **child step** — compensated by CAS-ing the child
+  `{completed, cancelled} → compensating` and driving the CHILD's own reverse pass over its retained
+  ledger, never a compensation job. An empty child compensable ledger settles `compensated`
+  immediately (the no-op shortcut); a child `compensationFailed` surfaces as the parent's **own**
+  `compensationFailure` incident on the `callActivity` element.
+- A child step is written in the apply batch with `compensation_status='pending'` (**always**
+  compensable — the implicit compensator is the child's reverse pass), `captured_output` = the
+  child's merged-back variables, and the `""` sentinel in the NOT-NULL `forward_job_id` (folded back
+  to `null` in the API view).
+- Root-scope (`scope_id = ''`) rows are implicit members of the **process-root** reverse pass, so a
+  scope-less parent's committed `callActivity` still reverses on operator `/cancel`.
+
+### History Event (free-text type; no migration)
+
+New event types: `callActivityInvoked`, `callActivityWaiting`, `callActivityCompleted`,
+`callActivityErrored` (parent-side), `childErrored` (child-side), `instanceCancelled`
+(`{by:"parentDrain"}` — the depth-first drain cascade), `operatorRetry` (`{target:"childSubtree"}` —
+the cascading retry).
+
+### Pinned call binding (publish-time, on the immutable version)
+
+The caller's publish resolves every `calledElement` to the **latest published** version of the
+target process in the same workspace and pins `calledDefinitionVersionId` into the caller's stored
+graph IR (`parsed_profile`) — immutable version binding (Principle II); runtime "latest"/version
+binding is not honored. The same pass (`src/bpmn/call-resolution.ts`) walks the pinned-version DAG
+enforcing `MAX_CALL_DEPTH = 4` (a publish-time reject, not a runtime incident), a defensive
+call-cycle check, and the v1 reject of any `receiveTask` / message `intermediateCatchEvent` anywhere
+in the resolved call tree (a child's correlation key is the technical `child:<childInstanceId>` — it
+has no correlation-key source).
+
 ## Roadmap stub tables (named here; created in later milestones)
 
 - `execution_tokens` (M4) — **SHIPPED** in migration `0007_tokens.sql` (see the **M4 deltas** above): the
   single `current_element_id` is now one token among many in the frontier read-model, with the
   `join_arrivals`/`join_completions` append-only join facts as the replay predicates. Parallelism target
   semantics: `docs/bpmn/07-execution-semantics.md`.
-- No further roadmap stub tables are named yet — M5 (composition: `callActivity`, non-transaction
-  `subProcess`, `multiInstance`, `signal`/`escalation`) will name its own when the constitution is amended.
+- `child_instances` (M5-L2) — **SHIPPED** in migration `0008_call_activity.sql` (see the **M5-L2
+  deltas** above): the `callActivity` visit provenance gating both the child-Workflow create and the
+  output apply. (M5-L1 — non-transaction `subProcess` — shipped with **no** schema change: the scope
+  tree is fully static.)
+- No further roadmap stub tables are named yet — the remaining M5 layers (M5-L3 `multiInstance`,
+  M5-L4 escalation, M5-L5 `signal`) will name their own when their layers open (constitution v2.5.0
+  already accepted the whole composition set).

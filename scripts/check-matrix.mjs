@@ -84,7 +84,7 @@ for (const tag of MUST_COVER) {
 const rejectCount = rows.filter((r) => r.id.startsWith("R-")).length;
 if (rejectCount < 11) failures.push(`only ${rejectCount} reject (R-*) scenarios registered; expected >= 11`);
 
-if (rows.length !== 71) warnings.push(`registry has ${rows.length} scenarios (expected 71)`);
+if (rows.length !== 86) warnings.push(`registry has ${rows.length} scenarios (expected 86)`);
 
 for (const w of warnings) console.warn("  (warn) " + w);
 if (failures.length > 0) {

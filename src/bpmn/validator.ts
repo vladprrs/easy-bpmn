@@ -152,6 +152,8 @@ interface NodeInfo {
   timerTrigger?: TimerTriggerSpec;
   /** exclusiveGateway only — the sequence-flow id named by the `default` attribute. */
   defaultFlowId?: string;
+  /** callActivity only — the raw calledElement process id (M5-L2). */
+  calledElementId?: string;
 }
 
 interface FlowInfo {
@@ -310,6 +312,23 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         name: (root.name as string) ?? null,
         errorCode: (root.errorCode as string) ?? null,
       });
+    }
+  }
+
+  // M5-L2: same-document callable root elements, keyed id → $type — used to
+  // explicitly reject a callActivity's calledElement that resolves LOCALLY to a
+  // non-process element (e.g. a <bpmn:globalTask> or one of its subtypes),
+  // instead of the generic "unresolved" wording. A calledElement that does NOT
+  // resolve in THIS document is left alone here (deliberately): cross-document
+  // resolution to a concrete calledDefinitionVersionId happens at the CALLER's
+  // publish (call-resolution.ts, a later M5-L2 task) — Task 2 validates
+  // document-local shape only.
+  const sameDocCallableById = new Map<string, string>();
+  for (const root of rootElements) {
+    const id = root.id as string | undefined;
+    if (!id) continue;
+    if (root.$type === "bpmn:Process" || (typeof root.$type === "string" && root.$type.startsWith("bpmn:Global"))) {
+      sameDocCallableById.set(id, root.$type);
     }
   }
 
@@ -566,6 +585,31 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
           id,
           "subProcess",
         );
+        continue;
+      }
+
+      // M5-L2: callActivity — a LEAF activity on the token path; the called process
+      // becomes a separate child instance at runtime. calledElement is resolved to a
+      // concrete definitionVersionId at the CALLER's publish (call-resolution.ts) —
+      // here we only validate document-local shape.
+      if ($type === "bpmn:CallActivity") {
+        if (el.loopCharacteristics != null) {
+          err(`Call activity '${id ?? "(no id)"}' has loop or multi-instance characteristics — multiInstance is planned for milestone M5-L3.`, id, "callActivity");
+          continue;
+        }
+        const calledElement = typeof el.calledElement === "string" ? el.calledElement.trim() : "";
+        if (!calledElement) {
+          err(`Call activity '${id ?? "(no id)"}' has no calledElement — it must name a process published in the same workspace.`, id, "callActivity");
+          continue;
+        }
+        // Same-document non-process target (e.g. bpmn:GlobalTask) — its own explicit
+        // reject, not the generic "unresolved" (spec §7).
+        const sameDocTarget = sameDocCallableById.get(calledElement);
+        if (sameDocTarget && sameDocTarget !== "bpmn:Process") {
+          err(`Call activity '${id ?? "(no id)"}' calledElement '${calledElement}' resolves to a ${localTypeName(sameDocTarget)}, not a process — only process targets are supported.`, id, "callActivity");
+          continue;
+        }
+        nodes.push({ id: id ?? "", type: "callActivity", name: (el.name as string) ?? undefined, scopeId, calledElementId: calledElement });
         continue;
       }
 
@@ -1216,8 +1260,13 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         }
       }
     } else if (n.boundaryKind === "error") {
-      if (attached.type !== "serviceTask" && attached.type !== "subProcess" && attached.type !== "transaction") {
-        err(`Error boundary event '${n.id}' must be attached to a service task, a subprocess, or a transaction.`, n.id, "boundaryEvent");
+      if (
+        attached.type !== "serviceTask" &&
+        attached.type !== "subProcess" &&
+        attached.type !== "transaction" &&
+        attached.type !== "callActivity"
+      ) {
+        err(`Error boundary event '${n.id}' must be attached to a service task, a subprocess, a call activity, or a transaction.`, n.id, "boundaryEvent");
       }
       // errorRef handling (M3-L2, TASK-42) — the shared resolveErrorCode pass
       // (requireCode=false: absent errorRef IS the catch-all, left unrejected).
@@ -1261,9 +1310,15 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       // one outgoing flow, to any token-path node in the same scope — the forbidden
       // targets are rejected by the per-flow endpoint rules (reused from M3-L2), so
       // only the single-outgoing degree is checked here.
-      if (attached.type !== "serviceTask" && attached.type !== "receiveTask" && attached.type !== "subProcess" && attached.type !== "transaction") {
+      if (
+        attached.type !== "serviceTask" &&
+        attached.type !== "receiveTask" &&
+        attached.type !== "subProcess" &&
+        attached.type !== "transaction" &&
+        attached.type !== "callActivity"
+      ) {
         err(
-          `Boundary timer '${n.id}' must be attached to a service task, a receive task, a subprocess, or a transaction; '${attached.id}' is a ${attached.type}.`,
+          `Boundary timer '${n.id}' must be attached to a service task, a receive task, a subprocess, a call activity, or a transaction; '${attached.id}' is a ${attached.type}.`,
           n.id,
           "boundaryEvent",
         );
@@ -1834,6 +1889,9 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         if (n.boundaryKind === "timer") {
           node.timerTrigger = n.timerTrigger ?? null;
         }
+      }
+      if (n.type === "callActivity") {
+        node.calledElementId = n.calledElementId ?? null;
       }
       graphNodes[n.id] = node;
     }

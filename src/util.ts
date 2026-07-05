@@ -22,6 +22,8 @@ export const TERMINAL_INSTANCE_STATUSES = new Set([
   "compensated",
   "compensationFailed",
   "cancelled",
+  // M5-L2 — child-only terminal: an uncaught error end event in a callActivity child.
+  "errored",
 ]);
 
 export function isTerminalInstanceStatus(status: string): boolean {

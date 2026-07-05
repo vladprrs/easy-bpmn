@@ -29,7 +29,8 @@ export type ElementType =
   | "parallelGateway"
   | "inclusiveGateway"
   // M5 composition:
-  | "subProcess";
+  | "subProcess"
+  | "callActivity";
 
 /** A node in the executable graph (excludes sequence flows, messages, associations, errors). */
 export type NodeType =
@@ -53,7 +54,8 @@ export type NodeType =
   | "parallelGateway"
   | "inclusiveGateway"
   // M5 composition:
-  | "subProcess";
+  | "subProcess"
+  | "callActivity";
 
 /** Discriminator for end events: a plain (commit) end vs a transaction Cancel end vs an error end. */
 export type EndKind = "none" | "cancel" | "error";
@@ -169,6 +171,10 @@ export interface GraphNode {
   compensationHandlerId?: string | null;
   /** timer boundaryEvent (M3-L3) or timer intermediateCatchEvent (M3-L4) only — the static ISO-8601 trigger; fire_at is computed at arm time. */
   timerTrigger?: TimerTriggerSpec | null;
+  /** callActivity only — the raw calledElement process id (M5-L2). */
+  calledElementId?: string | null;
+  /** callActivity only — resolved at the CALLER's publish to one immutable child version (M5-L2, Principle II). */
+  calledDefinitionVersionId?: string | null;
 }
 
 /** A transaction scope: its inner start, members, ends, and compensation wiring. */

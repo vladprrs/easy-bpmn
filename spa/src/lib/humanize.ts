@@ -75,6 +75,11 @@ const TABLE: Record<string, Humanized> = {
   regionActivated: { tone: "info", title: "Fanned out" },
   branchArrivedAtJoin: { tone: "muted", title: "Branch reached the join" },
   joinCompleted: { tone: "ok", title: "Branches joined" },
+
+  // Instance status (M5-L2, Task 11): a callActivity child's uncaught-error
+  // terminal — distinct from a plain `incident` (technical, retryable) and never
+  // reachable on a root instance, so the label names it explicitly.
+  errored: { tone: "danger", title: "Errored (child)" },
 };
 
 /** Every history `type` the engine is known to emit (mirrors the runtime grep). */

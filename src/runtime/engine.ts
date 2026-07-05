@@ -111,6 +111,7 @@ import { completeInstanceGuarded } from "../persistence/instances";
 import { branchHistoryTags, listLiveTokens, setTokenStatusStmt, rootTokenId, getToken, parseOverlay, readOverlay, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
 import { withDriveLock } from "../persistence/drive-lock";
 import { driveForwardServiceTask, terminateUnleasableJob, errorCatchTarget } from "./forward-task";
+import { driveCallActivity, notifyParentOfChildTerminal, settleChildErrored, PARENT_CONSUMABLE_CHILD_STATUSES } from "./call-activity";
 import { beginCompensating, settleAfterCompensation, cancelBoundaryTarget, drainScopeSubtree } from "./compensation";
 import {
   armTimerDO,
@@ -143,6 +144,14 @@ interface RunOptions {
    */
   startAt?: string;
   incomingEvent?: MessageEventPayload;
+  /**
+   * M5-L2 (Task 6 reads this; no behavior here — pass-through only). Set by
+   * DirectExecutor.start when starting a callActivity child INLINE from inside
+   * the parent's held drive lock: the post-drive parent-notify hook must not
+   * re-enter the parent (spec §3). Workflow mode never sets it — the child
+   * Workflow starts out-of-band, so the notify hook is safe there.
+   */
+  suppressParentNotify?: boolean;
 }
 
 /**
@@ -184,6 +193,14 @@ export const STEP_BUDGET_SOFT = 20000;
  * `scopeDepth` runtime incident becomes reachable only with M5-L2 call chains.
  */
 export const MAX_SCOPE_DEPTH = 8;
+
+/**
+ * Call-tree depth cap (M5-L2, spec §7). Depth is fully STATIC: child versions are
+ * pinned at the caller's publish, so the call tree is an immutable DAG — enforced
+ * by the publish-time call resolution (call-resolution.ts), zero runtime surface.
+ * Depth 1 = a process with no callActivity.
+ */
+export const MAX_CALL_DEPTH = 4;
 
 /**
  * TEST-ONLY cap overrides (design §9 / L6.1). Integration tests lower a cap via an
@@ -237,35 +254,61 @@ async function runInstanceInner(env: Env, instanceId: string, opts: RunOptions):
   const graph = await opts.runStep("init", () => loadGraphForInstance(env, instanceId));
   const inst = await loadInst(env, instanceId);
 
-  // Resume into the reverse compensation pass (direct-mode resume / crash recovery):
-  // the compensation ROOT is derived from the latest transactionCancelled history row
-  // (durable + replay-safe, spec §4.3 refined). An operator cancel wrote it WITHOUT an
-  // element scope → the process root (null); an auto cancel-end wrote element_id = the
-  // cancelled transaction id. Persistence stays graph-free; the engine maps here.
-  if (inst.status === "compensating") {
-    const el = await latestCancelRootElement(env.DB, instanceId);
-    const root = el != null && graph.nodes[el]?.type === "transaction" ? el : null;
-    const settled = await settleAfterCompensation(env, instanceId, graph, root, opts.runStep, opts.waitFor);
-    if (settled.status !== "continue") return settled;
-    // Nested root settled non-terminally → fall through into the normal walk below
-    // (status is now running; the walk re-enters from start and fast-forwards).
-  }
-  if (isTerminalInstanceStatus(inst.status)) return { status: "completed" };
+  // The core drive — every exit path returns through the single parent-notify tail
+  // below (M5-L2 §3), so a child instance whose drive settled a parent-consumable
+  // terminal always tickles its parent, whether it exited via compensation, a
+  // terminal short-circuit, or the normal walk.
+  const drive = async (): Promise<DriveResult> => {
+    // Resume into the reverse compensation pass (direct-mode resume / crash recovery):
+    // the compensation ROOT is derived from the latest transactionCancelled history row
+    // (durable + replay-safe, spec §4.3 refined). An operator cancel wrote it WITHOUT an
+    // element scope → the process root (null); an auto cancel-end wrote element_id = the
+    // cancelled transaction id. Persistence stays graph-free; the engine maps here.
+    if (inst.status === "compensating") {
+      const el = await latestCancelRootElement(env.DB, instanceId);
+      const root = el != null && graph.nodes[el]?.type === "transaction" ? el : null;
+      const settled = await settleAfterCompensation(env, instanceId, graph, root, opts.runStep, opts.waitFor);
+      if (settled.status !== "continue") return settled;
+      // Nested root settled non-terminally → fall through into the normal walk below
+      // (status is now running; the walk re-enters from start and fast-forwards).
+    }
+    if (isTerminalInstanceStatus(inst.status)) return { status: "completed" };
 
-  // "The walk is the replay" (TASK-32): ALWAYS re-walk from the start element,
-  // in both modes — opts.startAt is ignored. Applied steps fast-forward
-  // write-free from canonical D1 state; the walk lands on the live frontier.
-  const result = await loop(env, instanceId, graph, opts.runStep, opts.waitFor, opts.incomingEvent);
-  // M4-L2: refresh the single-token read-model from the settled cursor. GATED on
-  // !graph.regions (design refinement): a region graph's frontier is owned by the
-  // DFS (fanOutSplit / claimJoinCompletion write the token rows directly), and the
-  // single-token reconstruct would wrongly mark live branch tokens 'consumed'.
-  // Best-effort + non-fatal — it never blocks the drive.
-  if (!graph.regions) {
+    // "The walk is the replay" (TASK-32): ALWAYS re-walk from the start element,
+    // in both modes — opts.startAt is ignored. Applied steps fast-forward
+    // write-free from canonical D1 state; the walk lands on the live frontier.
+    const result = await loop(env, instanceId, graph, opts.runStep, opts.waitFor, opts.incomingEvent);
+    // M4-L2: refresh the single-token read-model from the settled cursor. GATED on
+    // !graph.regions (design refinement): a region graph's frontier is owned by the
+    // DFS (fanOutSplit / claimJoinCompletion write the token rows directly), and the
+    // single-token reconstruct would wrongly mark live branch tokens 'consumed'.
+    // Best-effort + non-fatal — it never blocks the drive.
+    if (!graph.regions) {
+      try {
+        await syncFrontierReadModel(env, instanceId, await reconstructFrontier(env, graph, instanceId));
+      } catch (err) {
+        console.error(JSON.stringify({ level: "warn", message: "frontier read-model sync failed", instanceId, error: err instanceof Error ? err.message : String(err) }));
+      }
+    }
+    return result;
+  };
+
+  const result = await drive();
+
+  // M5-L2: a CHILD instance's drive that settled a parent-consumable terminal
+  // notifies the parent (tickle + DO-alarm self-heal). One seam for every driver
+  // path — workflow, direct callbacks, inline resume. Suppressed only for the
+  // synchronous inline child start under the parent's own held drive lock. Gated on
+  // the PRE-drive parent linkage so a root instance (the common case) pays zero —
+  // no extra read.
+  if (!opts.suppressParentNotify && inst.parent_instance_id) {
     try {
-      await syncFrontierReadModel(env, instanceId, await reconstructFrontier(env, graph, instanceId));
+      const after = await loadInst(env, instanceId);
+      if (after.parent_instance_id && PARENT_CONSUMABLE_CHILD_STATUSES.has(after.status)) {
+        await notifyParentOfChildTerminal(env, after);
+      }
     } catch (err) {
-      console.error(JSON.stringify({ level: "warn", message: "frontier read-model sync failed", instanceId, error: err instanceof Error ? err.message : String(err) }));
+      console.error(JSON.stringify({ level: "warn", message: "parent notify failed", instanceId, error: err instanceof Error ? err.message : String(err) }));
     }
   }
   return result;
@@ -440,6 +483,14 @@ async function loop(
         return { kind: "next", next: r.next };
       }
 
+      if (node.type === "callActivity") {
+        // M5-L2: invoke/apply/park a child instance (the triad in call-activity.ts).
+        const r = await driveCallActivity(env, instanceId, graph, cur, occ, node, runStep, activeTokenId);
+        if (r.kind === "waiting") return { kind: "parked" };
+        if (r.kind === "incident") return { kind: "incident" };
+        return { kind: "next", next: r.next };
+      }
+
       if (node.type === "receiveTask") {
         const r = await driveReceiveTask(env, instanceId, graph, cur, occ, node, runStep, leafWaitFor, pending, activeTokenId);
         if (r.kind === "waiting") return { kind: "parked" };
@@ -564,6 +615,14 @@ async function loop(
               return catchT.next;
             });
             return { kind: "next", next };
+          }
+          // M5-L2 (spec §4): a CHILD's uncaught error end is a TERMINAL WITH A CODE
+          // for the parent to route — never a child-local uncaughtError incident.
+          // A root instance (parent_instance_id null) keeps the pre-M5-L2 path.
+          const instForErr = await loadInst(env, instanceId);
+          if (instForErr.parent_instance_id) {
+            await runStep(`err-end:${tag}`, () => settleChildErrored(env, instanceId, cur, node.errorCode ?? null, occ));
+            return { kind: "incident" }; // walk stops; D1 'errored' is the truth (not an incident row)
           }
           await runStep(`err-end:${tag}`, () =>
             createIncident(
@@ -891,9 +950,18 @@ async function commitTransaction(env: Env, instanceId: string, graph: ExecutionG
   // M5-L1 commit shield (spec §3.2): a NESTED tx (some enclosing tx above it) flips
   // only its OWNED scopes to non-terminal committedLocal; the OUTERMOST commit seals
   // its whole subtree to terminal 'committed'.
+  //
+  // M5-L2 refinement (Task 9, callActivity design §4/§5): for a CHILD instance
+  // (`parent_instance_id` set) the PARENT process is a real outer scope — its
+  // reverse pass may later compensate this child's committed set by driving the
+  // child's own process-root reverse pass over the retained ledger. So a child's
+  // otherwise-outermost tx commit is only LOCAL (`committedLocal`, the
+  // seal:false/owned flip), never sealed 'committed'; a ROOT instance
+  // (`parent_instance_id` NULL) keeps the exact M5-L1 seal.
   const parentScope = scopesOf(graph)[txId]?.parentId ?? null;
   const enclosingTx = nearestEnclosingTx(graph, parentScope);
-  const flip = enclosingTx != null
+  const sealsOutermost = enclosingTx == null && inst.parent_instance_id == null;
+  const flip = !sealsOutermost
     ? markScopeStepsCommittedStmt(env.DB, { instanceId, scopeIds: ownedScopeIds(graph, txId), seal: false, now })
     : markScopeStepsCommittedStmt(env.DB, { instanceId, scopeIds: subtreeScopeIds(graph, txId), seal: true, now });
   const stmts: D1PreparedStatement[] = [
@@ -905,7 +973,7 @@ async function commitTransaction(env: Env, instanceId: string, graph: ExecutionG
     // absent folds to 0 (backward-safe for pre-M5-L1 history rows). It MUST be the
     // TX's entry occurrence (`scopeOcc`, the occurrence the timer was armed at),
     // NOT the end element's walk occurrence — the two diverge under re-entry.
-    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionCommitted", diagnostics: { transaction: txId, sealed: enclosingTx == null, occurrence: scopeOcc } }),
+    historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: txId, type: "transactionCommitted", diagnostics: { transaction: txId, sealed: sealsOutermost, occurrence: scopeOcc } }),
     applyTransitionStmt(env.DB, { instanceId, currentElementId: outer ?? endElementId, status: "running", now }),
   ];
   // M5-L1 (Task 11): disarm the tx's own boundary timer (if any) ATOMICALLY with

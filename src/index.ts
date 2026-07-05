@@ -23,6 +23,7 @@ import {
   type ValidationIssue,
 } from "./contracts/api";
 import { parseAndValidate } from "./bpmn/validator";
+import { resolveCallActivities } from "./bpmn/call-resolution";
 import { AppError, BadRequestError, ConflictError, NotFoundError, PublishRejectedError } from "./runtime/errors";
 import { assertPayloadWithinLimit } from "./runtime/payload";
 import { getExecutor } from "./runtime/executor";
@@ -87,6 +88,8 @@ import { listInstanceSubscriptions, listInstancesFiltered } from "./persistence/
 import { getIdempotentResult, putIdempotentResult } from "./persistence/idempotency";
 import { loadGraphForInstance, resumeInline } from "./runtime/engine";
 import { cancelArmedTimersForInstance } from "./runtime/boundary-timer";
+import { cancelChildrenInSubtree } from "./runtime/child-cascade";
+import { listChildrenOfInstance } from "./persistence/child-instances";
 import { releaseActiveSubscriptionsForInstance } from "./runtime/instance-release";
 import { armCohortLeaseExpiryTerminators } from "./runtime/forward-task";
 import { listTimersForInstance } from "./persistence/timers";
@@ -102,6 +105,7 @@ import { eligibleCommittedLocalScopeIds, subtreeScopeIds } from "./bpmn/scope-tr
 import {
   cancelInstanceRequestSchema,
   retryInstanceRequestSchema,
+  type InstanceLineage,
   type InstanceListResponse,
   type SagaInspection,
   type TokenInspection,
@@ -179,6 +183,14 @@ async function handlePublishDraft(env: Env, draftId: string): Promise<Response> 
     throw new PublishRejectedError(
       "Draft contains publish-blocking validation issues.",
       result.issues,
+    );
+  }
+
+  const callResolution = await resolveCallActivities(env.DB, row.workspace_id, result.graph);
+  if (!callResolution.ok) {
+    throw new PublishRejectedError(
+      "Draft contains publish-blocking callActivity resolution issues.",
+      callResolution.issues,
     );
   }
 
@@ -337,6 +349,22 @@ async function handleGetInstance(env: Env, instanceId: string): Promise<Response
   // `waiting` instance shows WHAT it is waiting for (the most common stuck case).
   const subscriptions = await listInstanceSubscriptions(env.DB, instanceId);
 
+  // M5-L2 (Task 11): the parent/child callActivity linkage view — a raw-row
+  // re-read for parent_element_id (mapInstance/ProcessInstance carries only
+  // parentInstanceId) + every callActivity visit's bound child, joined to that
+  // child's own live/terminal status (listChildrenOfInstance, child-instances.ts).
+  const raw = await getInstanceRow(env.DB, instanceId);
+  const children = await listChildrenOfInstance(env.DB, instanceId);
+  const lineage: InstanceLineage = {
+    parent: raw?.parent_instance_id ? { instanceId: raw.parent_instance_id, elementId: raw.parent_element_id } : null,
+    children: children.map((c) => ({
+      elementId: c.parent_element_id,
+      occurrence: c.occurrence,
+      childInstanceId: c.child_instance_id,
+      status: c.child_status,
+    })),
+  };
+
   const inspection: ProcessInstanceInspection = {
     ...instance,
     ...(liveTokenCount > 1 ? { currentElementId: null } : {}),
@@ -353,6 +381,7 @@ async function handleGetInstance(env: Env, instanceId: string): Promise<Response
     ...(timers.length > 0 ? { timers } : {}),
     ...(tokens.length > 0 ? { tokens } : {}),
     ...(subscriptions.length > 0 ? { subscriptions } : {}),
+    lineage,
   };
   return json(inspection, 200);
 }
@@ -384,6 +413,10 @@ async function handleListInstances(env: Env, url: URL): Promise<Response> {
   const limit = Math.min(Math.max(1, parseInt(url.searchParams.get("limit") ?? "50", 10) || 50), 200);
   const cursorRaw = url.searchParams.get("cursor");
   const cursor = cursorRaw ? parseInt(cursorRaw, 10) : undefined;
+  // M5-L2 (Task 11): `?root=true` restricts to saga-root instances (excludes
+  // callActivity children) — the operator discovery default. Absent/any other
+  // value includes children (back-compat).
+  const rootOnly = url.searchParams.get("root") === "true";
   const { items, nextCursor } = await listInstancesFiltered(env.DB, {
     workspaceId,
     statuses,
@@ -391,6 +424,7 @@ async function handleListInstances(env: Env, url: URL): Promise<Response> {
     sagaId,
     limit,
     cursor,
+    rootOnly,
   });
   const response: InstanceListResponse = { instances: items, nextCursor };
   return json(response, 200);
@@ -409,6 +443,14 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
   await parseBody(cancelInstanceRequestSchema, request).catch(() => ({}));
   const inst = await getInstance(env.DB, instanceId);
   if (!inst) throw new NotFoundError(`Process instance ${instanceId} not found.`);
+  // M5-L2 (Task 10, spec §6): a callActivity child's lifecycle is entirely a
+  // function of its parent's own step-state machine — direct operator control
+  // on a child would let its status diverge from what the parent believes.
+  // Cascading (drain-then-compensate on cancel, depth-first heal on retry) is
+  // the only supported path; a direct verb on a child 409s naming the parent.
+  if (inst.parentInstanceId) {
+    throw new ConflictError(`Instance ${instanceId} is a callActivity child of ${inst.parentInstanceId} — operate on the saga root.`);
+  }
   if (!(CANCELLABLE_FROM as readonly string[]).includes(inst.status)) {
     throw new ConflictError(`Instance ${instanceId} cannot be cancelled from status '${inst.status}'.`);
   }
@@ -439,6 +481,13 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
   // M3-L3 (TASK-44, design §4.3.2 exit d): settle every armed boundary timer so a
   // stray alarm afterwards is a decided no-op — no mid-compensation firing (gate 10).
   await cancelArmedTimersForInstance(env, instanceId);
+  // M5-L2 (Task 8): an operator /cancel is a PROCESS-ROOT drain — cascade-cancel
+  // every non-terminal callActivity child anywhere in the process (rootScopeId
+  // null spans every scope), transitively reaching every grandchild too.
+  // Independent of whether THIS instance ends up cancelled outright (empty
+  // ledger, below) or enters `compensating` — either way its live children must
+  // not keep running unobserved.
+  await cancelChildrenInSubtree(env, graph, instanceId, null);
   await getExecutor(env).terminate(instanceId);
 
   // M5-L1 (Task 8): operator /cancel is a PROCESS-ROOT cancel. The compensable count
@@ -446,7 +495,7 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
   // (eligible for the process root), so a nested tx that already committed locally is
   // still undone. Sealed 'committed' rows (the outermost tx committed) are never
   // compensated — the ledger query excludes them.
-  const pending = await countCompensableSteps(env.DB, instanceId, subtreeScopeIds(graph, null), eligibleCommittedLocalScopeIds(graph, null));
+  const pending = await countCompensableSteps(env.DB, instanceId, subtreeScopeIds(graph, null), eligibleCommittedLocalScopeIds(graph, null), true);
   // A live cohort token must NOT take the empty-ledger terminal shortcut — a late
   // straggler still owes a ledger row + compensation, so it enters `compensating`
   // and the barrier holds until it drains. Straggler risk is REGION-only: a
@@ -494,15 +543,84 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
 }
 
 async function handleRetryInstance(env: Env, instanceId: string, request: Request): Promise<Response> {
-  const body = await parseBody(retryInstanceRequestSchema, request).catch(() => ({}) as { variables?: JsonObject });
   const inst = await getInstance(env.DB, instanceId);
   if (!inst) throw new NotFoundError(`Process instance ${instanceId} not found.`);
+  // M5-L2 (Task 10, spec §6): same 409 as /cancel — a direct verb on a child is
+  // forbidden; only cascading (below) is supported.
+  if (inst.parentInstanceId) {
+    throw new ConflictError(`Instance ${instanceId} is a callActivity child of ${inst.parentInstanceId} — operate on the saga root.`);
+  }
+  const body = await parseBody(retryInstanceRequestSchema, request).catch(() => ({}) as { variables?: JsonObject });
   const now = nowIso();
   if (body.variables) await mergeInstanceVariables(env.DB, instanceId, body.variables as JsonObject, now);
-  const fresh = await getInstanceRow(env.DB, instanceId);
-  const variablesJson = fresh?.variables ?? "{}";
 
-  if (inst.status === "compensationFailed") {
+  // M5-L2 (Task 10, spec §4/§6): cascade FIRST — heal the deepest child
+  // incident/compensationFailed. The same operator-supplied patch (already
+  // merged onto the root's own row above) is threaded into every retried
+  // child too, so a fix like `releaseFails:false` reaches the descendant job
+  // that actually needs it.
+  const cascaded = await retryChildSubtree(env, instanceId, body.variables as JsonObject | undefined, now);
+
+  // The ROOT's own status is checked independently of `cascaded` — a
+  // callActivity step's compensation dispatches to the CHILD's own reverse
+  // pass (compensation.ts), so a child compensationFailed surfaces the exact
+  // same "failed" shape on the PARENT's own saga_steps row (spec §5) and
+  // drives the PARENT itself into `compensationFailed` too (its own
+  // compensationFailure incident on the call1 element). Healing only the
+  // child would leave the parent parked there forever — retryInstanceCore
+  // resets the SAME call1 step back to `pending` (no job to reset; the
+  // dispatch fork just re-evaluates the now-healthy child) and un-parks the
+  // parent's reverse pass. A plain forward-incident cascade (no compensation
+  // involved) leaves the root merely `waiting`, so this is a no-op there —
+  // just re-drive so a now-completed/healed child applies.
+  //
+  // INVARIANT (Task 10 review): a successful cascade must never surface as an
+  // operator error, and no audit row may be written on a path that then
+  // reports failure. So: (1) a root-branch refusal (ConflictError) with
+  // cascaded=true is swallowed — the children DID heal, the verb succeeded —
+  // and the parent is still re-driven; (2) the `childSubtree` audit row is
+  // written only AFTER the root branch settles, at the point where the 200 is
+  // already determined. With cascaded=false the pre-Task-10 fail-fast
+  // behavior is preserved byte-for-byte (throw before any write).
+  const fresh = await getInstanceRow(env.DB, instanceId);
+  if (fresh?.status === "compensationFailed" || fresh?.status === "incident") {
+    try {
+      await retryInstanceCore(env, instanceId, undefined, now); // root's own row already merged above; this also resumes inline
+    } catch (err) {
+      if (!cascaded || !(err instanceof ConflictError)) throw err;
+      // The cascade healed descendants but the root's own branch refused
+      // (e.g. a status race settled it, or no retryable step of its own).
+      // Still re-drive so a now-healed child applies to the parent.
+      await resumeInline(env, instanceId);
+    }
+  } else if (cascaded) {
+    await resumeInline(env, instanceId); // re-drive the parent so a now-completed child applies
+  } else {
+    throw new ConflictError(`Instance ${instanceId} has nothing to retry from status '${fresh?.status}'.`);
+  }
+  if (cascaded) {
+    await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, type: "operatorRetry", diagnostics: { target: "childSubtree" } });
+  }
+  return handleGetInstance(env, instanceId);
+}
+
+/**
+ * The shared body of an operator /retry on ONE instance — extracted (Task 10)
+ * from handleRetryInstance's two status branches so the handler and the
+ * depth-first cascade below share one implementation. Operates on the RAW row
+ * (not the mapped ProcessInstance) so it works on a callActivity CHILD too. If
+ * `variables` is supplied it is merged into THIS instance's own row first —
+ * the cascade path needs this: only the instance named in the HTTP request
+ * gets merged by the caller, so a descendant's own job input still needs the
+ * patch threaded down explicitly.
+ */
+async function retryInstanceCore(env: Env, instanceId: string, variables: JsonObject | undefined, now: string): Promise<void> {
+  if (variables) await mergeInstanceVariables(env.DB, instanceId, variables, now);
+  const raw = await getInstanceRow(env.DB, instanceId);
+  if (!raw) throw new NotFoundError(`Process instance ${instanceId} not found.`);
+  const variablesJson = raw.variables ?? "{}";
+
+  if (raw.status === "compensationFailed") {
     const failed = await getFailedStep(env.DB, instanceId);
     if (!failed) throw new ConflictError(`Instance ${instanceId} has no failed compensation step to retry.`);
     const incident = await getIncidentForInstance(env.DB, instanceId);
@@ -516,12 +634,12 @@ async function handleRetryInstance(env: Env, instanceId: string, request: Reques
     }
     const changed = await transitionStatusGuarded(env.DB, instanceId, ["compensationFailed"], "compensating", now);
     if (changed === 0) throw new ConflictError(`Instance ${instanceId} is no longer retryable.`);
-    await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, elementId: failed.elementId, type: "operatorRetry", diagnostics: { target: "compensation" } });
+    await recordHistory(env.DB, { workspaceId: raw.workspace_id, instanceId, elementId: failed.elementId, type: "operatorRetry", diagnostics: { target: "compensation" } });
     await resumeInline(env, instanceId);
-    return handleGetInstance(env, instanceId);
+    return;
   }
 
-  if (inst.status === "incident") {
+  if (raw.status === "incident") {
     const incident = await getIncidentForInstance(env.DB, instanceId);
     const elementId = incident?.elementId;
     if (!elementId) throw new ConflictError(`Instance ${instanceId} has no incident element to retry.`);
@@ -538,12 +656,45 @@ async function handleRetryInstance(env: Env, instanceId: string, request: Reques
     }
     const changed = await transitionStatusGuarded(env.DB, instanceId, ["incident"], "running", now);
     if (changed === 0) throw new ConflictError(`Instance ${instanceId} is no longer retryable.`);
-    await recordHistory(env.DB, { workspaceId: inst.workspaceId, instanceId, elementId, type: "operatorRetry", diagnostics: { target: "forward" } });
+    await recordHistory(env.DB, { workspaceId: raw.workspace_id, instanceId, elementId, type: "operatorRetry", diagnostics: { target: "forward" } });
     await resumeInline(env, instanceId, elementId);
-    return handleGetInstance(env, instanceId);
+    return;
   }
 
-  throw new ConflictError(`Instance ${instanceId} has nothing to retry from status '${inst.status}'.`);
+  throw new ConflictError(`Instance ${instanceId} has nothing to retry from status '${raw.status}'.`);
+}
+
+/**
+ * Depth-first operator-retry cascade (M5-L2 Task 10, spec §4/§6): heal the
+ * DEEPEST child incidents/compensationFailed instances first — a node with a
+ * subtree that itself needed healing is skipped THIS pass (it has nothing of
+ * its own to retry; its own status only settles once the healed descendant's
+ * drive completes). Returns true if anything anywhere in the subtree was
+ * retried, so the caller can distinguish "cascaded" from "nothing to cascade,
+ * fall through to the root's own status".
+ *
+ * Operator-supplied retry variables are a SAGA-WIDE patch: shallow-merged
+ * into the ROOT and into EVERY child instance this cascade retries
+ * (incident|compensationFailed). This is deliberate, not incidental — direct
+ * child verbs are 409'd in v1, so the root verb is the only lever an operator
+ * has for a variable-caused child failure (spec §6); a patch that stopped at
+ * the root would never reach the descendant job whose frozen input_variables
+ * actually caused the failure. Children NOT being retried (healthy, running,
+ * or terminal) are never touched.
+ */
+async function retryChildSubtree(env: Env, instanceId: string, variables: JsonObject | undefined, now: string): Promise<boolean> {
+  let any = false;
+  for (const c of await listChildrenOfInstance(env.DB, instanceId)) {
+    if (await retryChildSubtree(env, c.child_instance_id, variables, now)) {
+      any = true;
+      continue;
+    }
+    if (c.child_status === "incident" || c.child_status === "compensationFailed") {
+      await retryInstanceCore(env, c.child_instance_id, variables, now);
+      any = true;
+    }
+  }
+  return any;
 }
 
 // ---------------------------------------------------------------------------

@@ -215,6 +215,7 @@ export const TERMINAL = new Set([
   "incident",
   "failed",
   "compensationFailed",
+  "errored", // M5-L2 child-only terminal (a callActivity child's uncaught error end)
 ]);
 
 export interface PollResult {

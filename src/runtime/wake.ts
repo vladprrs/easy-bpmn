@@ -3,6 +3,7 @@
 // a pure tickle — D1 is the truth; the engine re-walks and reconciles on every wake.
 import type { Env } from "../env";
 import { getEarliestArmedTimerForInstance } from "../persistence/timers";
+import { dbFirst } from "../persistence/db";
 
 /**
  * The single Cloudflare Workflows event type every job/message/timer sendEvent uses.
@@ -23,6 +24,15 @@ const WAKE_SLACK_MS = 5000;
 export const MAX_WAKE_BACKSTOP_MS = 60 * 60 * 1000;
 
 /**
+ * Child-wait backstop cap (M5-L2 spec §3.4). A parent parked on an invoked
+ * callActivity child self-heals via the child-notify DO alarm; this caps the
+ * parent's wake backstop as the SECOND net, so a dropped tickle recovers within
+ * minutes instead of the 1h MAX_WAKE_BACKSTOP_MS. Defined here (a leaf module) and
+ * re-exported from call-activity.ts to avoid an engine↔call-activity import cycle.
+ */
+export const CHILD_WAIT_BACKSTOP_MS = 5 * 60 * 1000;
+
+/**
  * The per-instance waitForEvent timeout for the single wake: size to the nearest
  * armed timer (so a modeled timer fires on time and a 7-day timer stays cheap),
  * capped at MAX_WAKE_BACKSTOP so a lost tickle on a non-timer wait self-heals.
@@ -40,5 +50,14 @@ export async function wakeBackstop(env: Env, instanceId: string): Promise<string
     const untilMs = new Date(timer.fireAt).getTime() - Date.now() + WAKE_SLACK_MS;
     ms = Math.min(ceiling, Math.max(WAKE_SLACK_MS, untilMs));
   }
+  // M5-L2: a parent parked on a still-`invoked` child self-heals via the
+  // child-notify DO alarm; cap the wake backstop at CHILD_WAIT_BACKSTOP_MS as the
+  // second net (spec §3.4 — the child-wait path is explicitly short).
+  const invokedChild = await dbFirst<{ n: number }>(
+    env.DB,
+    `SELECT COUNT(*) AS n FROM child_instances WHERE parent_instance_id = ? AND status = 'invoked'`,
+    [instanceId],
+  );
+  if ((invokedChild?.n ?? 0) > 0) ms = Math.min(ms, CHILD_WAIT_BACKSTOP_MS);
   return `${Math.ceil(ms / 1000)} seconds`;
 }

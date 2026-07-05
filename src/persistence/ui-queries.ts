@@ -504,6 +504,9 @@ export async function listInstancesFiltered(
     sagaId?: string;
     limit: number;
     cursor?: number;
+    /** M5-L2 (Task 11) — `?root=true`: exclude callActivity children (list only
+     *  instances with parent_instance_id IS NULL), the saga-root discovery view. */
+    rootOnly?: boolean;
   },
 ): Promise<{ items: InstanceListItemRow[]; nextCursor: number | null }> {
   const where = ["pi.workspace_id = ?"];
@@ -511,6 +514,9 @@ export async function listInstancesFiltered(
   if (input.statuses && input.statuses.length > 0) {
     where.push(`pi.status IN (${input.statuses.map(() => "?").join(",")})`);
     params.push(...input.statuses);
+  }
+  if (input.rootOnly) {
+    where.push("pi.parent_instance_id IS NULL");
   }
   if (input.search) {
     where.push("(pi.business_key LIKE ? OR pi.correlation_key LIKE ?)");

@@ -27,8 +27,10 @@ export interface DeliverJobArgs {
   elementId: string;
   // Worker-result delivery only (completed|failed). The `timerFired` member of the
   // wait union (M3-L3) is delivered via wakeTimer, never this path — narrowing it
-  // out keeps `event.jobId` non-optional here.
-  event: Extract<JobResultEvent, { outcome: "completed" | "failed" }>;
+  // out keeps `event.jobId` non-optional here. OPTIONAL under single-wake (TASK-54):
+  // both executors ignore it (the tickle is contentless — the engine re-reads D1),
+  // so the M5-L2 child→parent notify reuses this seam WITHOUT a synthetic event.
+  event?: Extract<JobResultEvent, { outcome: "completed" | "failed" }>;
 }
 
 export interface Executor {
@@ -56,7 +58,16 @@ class WorkflowExecutor implements Executor {
 
   async start(params: ProcessWorkflowParams): Promise<void> {
     // The Workflow instance id mirrors the product instance id (stored in D1).
-    await this.env.PROCESS_WORKFLOW.create({ id: params.instanceId, params });
+    // M5-L2: child creates are at-least-once (a rewalk can re-run the invoke step
+    // after a crash between the provenance batch and this call) — a duplicate id
+    // is SUCCESS, never an error and never a fresh auto-id (spec §3.2).
+    try {
+      await this.env.PROCESS_WORKFLOW.create({ id: params.instanceId, params });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/already (exists|in use)|instance.+exists/i.test(msg)) return;
+      throw err;
+    }
   }
 
   async deliver(args: DeliverArgs): Promise<void> {
@@ -135,7 +146,12 @@ class DirectExecutor implements Executor {
   private inlineStep = <T>(_name: string, fn: () => Promise<T>): Promise<T> => fn();
 
   async start(params: ProcessWorkflowParams): Promise<void> {
-    await runInstance(this.env, params.instanceId, { runStep: this.inlineStep, waitFor: null });
+    // suppressParentNotify: a DirectExecutor child start runs INLINE inside the
+    // parent's drive (which holds the parent's drive lock) — the post-drive
+    // parent-notify hook would re-enter the parent under its own held lock and
+    // burn the 1s lock-steal budget. The parent's walk re-reads the child row
+    // right after this returns, so the notify is redundant here (M5-L2 spec §3).
+    await runInstance(this.env, params.instanceId, { runStep: this.inlineStep, waitFor: null, suppressParentNotify: true });
   }
 
   async deliver(args: DeliverArgs): Promise<void> {

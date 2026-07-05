@@ -37,6 +37,7 @@ export function statusTone(status: string): Tone {
       return "info";
     case "incident":
     case "compensationFailed":
+    case "errored":
       return "danger";
     case "cancelled":
       return "warn";

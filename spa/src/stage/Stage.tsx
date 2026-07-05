@@ -17,6 +17,7 @@ import { buildElementIndex } from "../lib/elements";
 import { buildAdjacency, computeOverlay, deriveFlow, deriveHeat } from "../lib/flow";
 import { compensationPreview } from "../lib/compensation";
 import { canCancel, canRetry, isStuck } from "../lib/guards";
+import { isLineageChild } from "../lib/lineage";
 import { pickFeaturedSaga, pickRelevantInstance, summarize } from "./model";
 import { ChromeBar } from "./ChromeBar";
 import { StageHeader } from "./StageHeader";
@@ -25,6 +26,7 @@ import { Drawer, type DrawerTab } from "./Drawer";
 import { CommandPalette } from "./CommandPalette";
 import { ConfirmCancel } from "./ConfirmCancel";
 import { IncidentCallout } from "./IncidentCallout";
+import { LineageStrip } from "./LineageStrip";
 import { Toasts } from "../components/Toasts";
 import { Button, Spinner } from "../components/ui";
 
@@ -185,6 +187,10 @@ export function Stage() {
   const heat = useMemo(() => (mode === "aggregate" ? deriveHeat(adj, heatmapQ.data) : EMPTY_HEAT), [mode, adj, heatmapQ.data]);
   const preview = useMemo(() => compensationPreview(instance?.saga), [instance?.saga]);
   const status = instance?.status ?? "";
+  // M5-L2 (Task 11): a callActivity child's cancel/retry is entirely a function of
+  // its parent's own step-state machine — the server already 409s a direct verb on
+  // one, so the console never offers it in the first place.
+  const isChild = isLineageChild(instance?.lineage);
 
   // ---- Actions -------------------------------------------------------------
   const refetchAll = () => {
@@ -301,6 +307,8 @@ export function Stage() {
                 reverse={reversePreview}
                 selectedElement={selectedElement}
                 onSelectElement={(id) => setSelectedElement((cur) => (cur === id ? null : id))}
+                lineage={mode === "single" ? instance?.lineage : undefined}
+                onOpenChild={(childInstanceId) => navigate(`/console/i/${encodeURIComponent(childInstanceId)}`)}
               />
             </Suspense>
           ) : noProcesses ? (
@@ -342,13 +350,18 @@ export function Stage() {
                   workspaceId={workspaceId}
                   onToggleMode={toggleMode}
                   onOpenDetails={() => openDrawer(mode === "single" ? "variables" : "messages")}
-                  canCancel={mode === "single" && canCancel(status)}
-                  canRetry={mode === "single" && canRetry(status)}
+                  canCancel={mode === "single" && canCancel(status) && !isChild}
+                  canRetry={mode === "single" && canRetry(status) && !isChild}
                   isStuck={isStuck(status)}
                   onRequestCancel={() => setConfirming(true)}
                   onRetry={doRetry}
                   acting={acting}
                 />
+                {mode === "single" && instance && (
+                  <div className="mt-2 flex justify-center">
+                    <LineageStrip lineage={instance.lineage} index={index} />
+                  </div>
+                )}
               </div>
             </div>
           )}

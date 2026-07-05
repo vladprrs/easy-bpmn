@@ -59,8 +59,13 @@ const SAMPLE_WORKERS: Record<string, SampleWorker> = {
     status: "completed",
     outputVariables: { reservationId: `res-${req.instanceId.slice(-6)}`, reservedQty: req.variables.qty ?? 1 },
   }),
-  // Compensation handler for reserve-stock.
-  "release-stock": () => ({ status: "completed", outputVariables: { released: true } }),
+  // Compensation handler for reserve-stock — steerable (mirrors refund-card) so
+  // the M5-L2 child-compensator-failure scenario can drive it to retry-exhaustion:
+  // `releaseFails: true` → a TECHNICAL failure (no errorCode).
+  "release-stock": (req) =>
+    req.variables.releaseFails === true
+      ? { status: "failed", reason: "release rejected by warehouse", diagnostics: { attempt: req.attempt } }
+      : { status: "completed", outputVariables: { released: true } },
   // Steerable: chargeFails → a TECHNICAL failure (no errorCode) so it exhausts
   // retries → Hazard incident inside the transaction (no auto-compensation).
   "charge-card": (req) =>
@@ -103,6 +108,17 @@ const SAMPLE_WORKERS: Record<string, SampleWorker> = {
   "send-email": () => ({ status: "completed", outputVariables: { emailed: true } }),
   "send-sms": () => ({ status: "completed", outputVariables: { smsed: true } }),
   "log-only": () => ({ status: "completed", outputVariables: { logged: true } }),
+
+  // --- M5-L2 Task 8 cascading drain/cancel workers (CALL_CHILD_TX_PARK_BPMN /
+  // CALL_PARENT_SCOPE_DRAIN_BPMN). `reserve-stock-park` completes so the child's
+  // transaction commits before it parks; `release-stock-park` is its compensator
+  // (must NEVER run in the Hazard test — that is the assertion). `sibling-task`
+  // always raises a caught business error so a scope-drain test has a live
+  // sibling branch to bubble from while a parallel callActivity branch is
+  // still parked on its own child.
+  "reserve-stock-park": () => ({ status: "completed", outputVariables: { reservedForPark: true } }),
+  "release-stock-park": () => ({ status: "completed", outputVariables: { releasedForPark: true } }),
+  "sibling-task": () => ({ status: "failed", reason: "sibling task failed", errorCode: "SIBLING_FAILED" }),
 };
 
 export function hasSampleWorker(taskType: string): boolean {

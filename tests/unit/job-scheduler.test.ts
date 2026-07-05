@@ -1,5 +1,6 @@
 import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import * as callActivity from "../../src/runtime/call-activity";
 
 // JobScheduler one-shot scheduler DO (M3-L3 design §4.2, TASK-43). The existing
 // per-job DLQ alarm is generalized to also fire model timers, dispatched by which
@@ -37,12 +38,17 @@ const NOW = "2026-06-12T00:00:00.000Z";
 // The DO's private storage marker keys (job-scheduler.ts).
 const JOB_KEY = "jobId";
 const TIMER_KEY = "timerId";
+const CHILD_KEY = "childNotify";
+const CHILD_ATTEMPT_KEY = "childNotifyAttempt";
 
 function timerStub(timerId: string) {
   return env.JOB_SCHEDULER.get(env.JOB_SCHEDULER.idFromName(`timer:${timerId}`));
 }
 function jobStub(jobId: string) {
   return env.JOB_SCHEDULER.get(env.JOB_SCHEDULER.idFromName(jobId));
+}
+function childStub(childInstanceId: string) {
+  return env.JOB_SCHEDULER.get(env.JOB_SCHEDULER.idFromName(`child-notify:${childInstanceId}`));
 }
 
 function armTimerRow(timerId: string, instanceId: string, fireAt: string) {
@@ -161,5 +167,100 @@ describe("JobScheduler — one-shot scheduler DO (TASK-43)", () => {
     const jStub = jobStub(t!.timer_id);
     await jStub.arm(t!.timer_id, FUTURE_1);
     expect(await runDurableObjectAlarm(jStub)).toBe(true);
+  });
+
+  it("armChildNotify is idempotent: re-arm updates the alarm + attempt and keeps a SINGLE child marker", async () => {
+    const stub = childStub("child_rearm");
+    await stub.armChildNotify("child_rearm", FUTURE_1, 0);
+    await runInDurableObject(stub, async (_i, state) => {
+      expect(await state.storage.get(CHILD_KEY)).toBe("child_rearm");
+      expect(await state.storage.get(CHILD_ATTEMPT_KEY)).toBe(0);
+      expect(await state.storage.get(JOB_KEY)).toBeUndefined();
+      expect(await state.storage.get(TIMER_KEY)).toBeUndefined();
+      expect(await state.storage.getAlarm()).toBe(new Date(FUTURE_1).getTime());
+    });
+
+    await stub.armChildNotify("child_rearm", FUTURE_2, 1); // re-park with a bumped attempt
+    await runInDurableObject(stub, async (_i, state) => {
+      expect(await state.storage.get(CHILD_KEY)).toBe("child_rearm"); // still ONE marker
+      expect(await state.storage.get(CHILD_ATTEMPT_KEY)).toBe(1);
+      expect(await state.storage.getAlarm()).toBe(new Date(FUTURE_2).getTime());
+    });
+  });
+
+  it("child marker keyed off the same id string as a job/timer cannot collide (distinct DO names)", async () => {
+    expect(childStub("X").id.toString()).not.toBe(jobStub("X").id.toString());
+    expect(childStub("X").id.toString()).not.toBe(timerStub("X").id.toString());
+
+    const cStub = childStub("X");
+    await cStub.armChildNotify("X", FUTURE_1, 0);
+    await runInDurableObject(cStub, async (_i, state) => {
+      expect(await state.storage.get(CHILD_KEY)).toBe("X");
+      expect(await state.storage.get(JOB_KEY)).toBeUndefined();
+      expect(await state.storage.get(TIMER_KEY)).toBeUndefined();
+    });
+  });
+
+  it("dispatches a lone CHILD marker to retryChildNotify with the stored attempt, then one-shot clears storage", async () => {
+    const spy = vi.spyOn(callActivity, "retryChildNotify").mockResolvedValue(undefined);
+    try {
+      const stub = childStub("child_disp");
+      await stub.armChildNotify("child_disp", FUTURE_1, 2);
+
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy).toHaveBeenCalledWith(env, "child_disp", 2);
+
+      // One-shot: clean dispatch clears every marker (including the attempt).
+      await runInDurableObject(stub, async (_i, state) => {
+        expect(await state.storage.get(CHILD_KEY)).toBeUndefined();
+        expect(await state.storage.get(CHILD_ATTEMPT_KEY)).toBeUndefined();
+        expect(await state.storage.getAlarm()).toBeNull();
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("dispatch precedence: a JOB marker wins over a CHILD marker on the same DO instance", async () => {
+    const spy = vi.spyOn(callActivity, "retryChildNotify").mockResolvedValue(undefined);
+    try {
+      // Contrived co-presence (arm both on the SAME stub) to exercise the
+      // `if (jobId) ... else if (timerId) ... else if (childId)` precedence order
+      // directly, since production callers never arm two roles on one DO name.
+      const stub = jobStub("precedence_job_wins");
+      await stub.arm("precedence_job_wins", FUTURE_1); // no matching job row → clean no-op
+      await stub.armChildNotify("child_should_not_fire", FUTURE_1, 0);
+
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(spy).not.toHaveBeenCalled(); // job branch dispatched, not child
+
+      // One-shot still clears everything, including the shadowed child marker.
+      await runInDurableObject(stub, async (_i, state) => {
+        expect(await state.storage.get(JOB_KEY)).toBeUndefined();
+        expect(await state.storage.get(CHILD_KEY)).toBeUndefined();
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("dispatch precedence: a TIMER marker wins over a CHILD marker on the same DO instance", async () => {
+    const spy = vi.spyOn(callActivity, "retryChildNotify").mockResolvedValue(undefined);
+    try {
+      const stub = timerStub("precedence_timer_wins");
+      await stub.armTimer("precedence_timer_wins", FUTURE_1); // no matching timer row → fireTimer no-ops
+      await stub.armChildNotify("child_should_not_fire", FUTURE_1, 0);
+
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(spy).not.toHaveBeenCalled(); // timer branch dispatched, not child
+
+      await runInDurableObject(stub, async (_i, state) => {
+        expect(await state.storage.get(TIMER_KEY)).toBeUndefined();
+        expect(await state.storage.get(CHILD_KEY)).toBeUndefined();
+      });
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

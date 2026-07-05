@@ -150,6 +150,16 @@ paths:
           description: Restrict to instances of one saga (draft_id) across all its versions (M-UI).
           schema:
             type: string
+        - name: root
+          in: query
+          required: false
+          description: >
+            M5-L2 (callActivity): when `true`, restricts the page to saga-root
+            instances (parent_instance_id IS NULL), excluding callActivity
+            children. Absent or any other value includes children.
+          schema:
+            type: string
+            enum: ["true", "false"]
         - name: limit
           in: query
           required: false
@@ -811,6 +821,7 @@ components:
         - compensated
         - compensationFailed
         - cancelled
+        - errored
     CreateDraftRequest:
       type: object
       required: [workspaceId, name, bpmnXml]
@@ -1100,7 +1111,7 @@ components:
       allOf:
         - $ref: "#/components/schemas/ProcessInstance"
         - type: object
-          required: [historySummary, diagnostics]
+          required: [historySummary, diagnostics, lineage]
           properties:
             historySummary:
               type: array
@@ -1145,6 +1156,44 @@ components:
                 when the instance has >=1 active subscription.
               items:
                 $ref: "#/components/schemas/SubscriptionView"
+            lineage:
+              $ref: "#/components/schemas/InstanceLineage"
+    InstanceLineage:
+      type: object
+      description: >
+        M5-L2 (callActivity, Task 11) parent/child linkage — always present
+        (unlike the other conditional blocks above): a root instance carries
+        `parent: null`; a childless instance carries `children: []`.
+      required: [parent, children]
+      properties:
+        parent:
+          type: object
+          nullable: true
+          description: Non-null when this instance was spawned by a callActivity visit.
+          required: [instanceId, elementId]
+          properties:
+            instanceId:
+              type: string
+            elementId:
+              type: string
+              nullable: true
+        children:
+          type: array
+          description: Every callActivity visit's bound child (across occurrences/iterations).
+          items:
+            type: object
+            required: [elementId, occurrence, childInstanceId, status]
+            properties:
+              elementId:
+                type: string
+                description: The callActivity element id that spawned this child.
+              occurrence:
+                type: integer
+                description: The parent's 0-based visit occurrence that created this child.
+              childInstanceId:
+                type: string
+              status:
+                $ref: "#/components/schemas/InstanceStatus"
     TokenView:
       type: object
       required: [tokenId, positionElementId, status, regionId, regionActivation, branchFlowId, parentTokenId]

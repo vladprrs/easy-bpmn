@@ -495,7 +495,7 @@ async function handleCancelInstance(env: Env, instanceId: string, request: Reque
   // (eligible for the process root), so a nested tx that already committed locally is
   // still undone. Sealed 'committed' rows (the outermost tx committed) are never
   // compensated — the ledger query excludes them.
-  const pending = await countCompensableSteps(env.DB, instanceId, subtreeScopeIds(graph, null), eligibleCommittedLocalScopeIds(graph, null));
+  const pending = await countCompensableSteps(env.DB, instanceId, subtreeScopeIds(graph, null), eligibleCommittedLocalScopeIds(graph, null), true);
   // A live cohort token must NOT take the empty-ledger terminal shortcut — a late
   // straggler still owes a ledger row + compensation, so it enters `compensating`
   // and the barrier holds until it drains. Straggler risk is REGION-only: a

@@ -185,7 +185,10 @@ async function runCompensation(
     // instance simply has one (or zero) live token in the cohort.
     await ledgerStragglers(env, instanceId, graph, rootScopeId, subtree);
 
-    const steps = await selectSubtreeStepsForCompensation(env.DB, instanceId, subtree, eligibleCommitted);
+    // GAP B: the process-root pass (rootScopeId == null) also reverses ROOT-SCOPED
+    // steps (scope_id = ''), so a scope-less parent's callActivity child actually
+    // reverses instead of being stranded. Agrees with handleCancelInstance's count.
+    const steps = await selectSubtreeStepsForCompensation(env.DB, instanceId, subtree, eligibleCommitted, rootScopeId == null);
     // Live cohort tokens, filtered to the compensation subtree (spec §4.2).
     // filterLineageQuiesced is a no-op for the single-token path (token_id NULL
     // steps are never blocked).
@@ -351,6 +354,14 @@ async function retainCallStraggler(env: Env, graph: ExecutionGraph, instanceId: 
   // Never wait on a running child inside the reverse pass — interrupt it (Hazard,
   // Task 8 semantics; ledger retained). No-op when the cancel cascade already ran.
   await cancelChildCascade(env, row.child_instance_id);
+  // An ERRORED child owes no parent-driven reverse (it routes like a worker
+  // business error — `applyChildErrored` ledgers nothing either), and the reverse
+  // dispatch has no entry for it (`beginChildCompensation` CAS-es only
+  // {completed, cancelled}): ledger it `notRequired` so the audit row exists but
+  // the reverse pass never parks on it. Every other post-cascade status is
+  // dispatchable: completed/cancelled → the child's own reverse; compensated /
+  // compensationFailed → closed/failed directly.
+  const child = await getInstanceRow(env.DB, row.child_instance_id);
   const stmts: D1PreparedStatement[] = [];
   if (!(await getSagaStep(env.DB, instanceId, pos, row.occurrence))) {
     stmts.push(
@@ -366,7 +377,7 @@ async function retainCallStraggler(env: Env, graph: ExecutionGraph, instanceId: 
         capturedOutput: null,
         compensationElementId: null,
         compensationTaskType: null,
-        compensationStatus: "pending",
+        compensationStatus: child?.status === "errored" ? "notRequired" : "pending",
         traceId: traceIdFor(instanceId),
         occurrence: row.occurrence,
         tokenId: t.token_id,
@@ -475,6 +486,18 @@ export async function drainScopeSubtree(env: Env, graph: ExecutionGraph, instanc
     const posScope = graph.nodes[t.position_element_id]?.scopeId ?? null;
     if (posScope == null ? rootScopeId != null : !subtree.includes(posScope)) continue;
     const now = nowIso();
+    // M5-L2 (GAP A): a token parked ON a callActivity carries a CHILD INSTANCE,
+    // not a forward job — the generic no-job branch below would silently discard
+    // it, leaving the (Hazard-cancelled) child invisible to any LATER reverse
+    // pass over an enclosing transaction. Retain it exactly like the straggler
+    // scan does: cascade-cancel the still-running child, ledger the child step
+    // (INSERT OR IGNORE), consume the token. Retention only — no compensation
+    // starts here; the row waits for an enclosing reverse pass, same as a
+    // completed worker step retained by this drain.
+    if (graph.nodes[t.position_element_id]?.type === "callActivity") {
+      await retainCallStraggler(env, graph, instanceId, t, now);
+      continue;
+    }
     const job = await resolveForwardJobForToken(env, graph, instanceId, t.position_element_id);
     if (job && job.status === "completed") {
       await dbBatch(env.DB, await retainStragglerStmts(env, graph, instanceId, t, job, now));

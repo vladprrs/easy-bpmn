@@ -213,18 +213,29 @@ export async function selectSubtreeStepsForCompensation(
   instanceId: string,
   subtreeScopeIds: string[],
   eligibleCommittedLocalScopeIds: string[],
+  // M5-L2 (GAP B): the process-root pass (rootScopeId == null) must also reverse
+  // ROOT-SCOPED steps (scope_id = ''). Pre-M5-L2 forward steps are only ledgered
+  // with a real transaction-ancestor scope id (forward-task.ts gates on
+  // `nearestEnclosingTx(...) != null`), so a '' step exists ONLY for a callActivity
+  // visit (applyChildTerminal / retainCallStraggler) — a scope-less parent whose
+  // only compensable content is its child would otherwise be invisible to both the
+  // operator-cancel count AND the reverse pass, cancelling outright without ever
+  // reversing the child. A NESTED tx root (includeRootScope=false) is byte-for-byte
+  // unchanged, so no legacy graph is affected.
+  includeRootScope = false,
 ): Promise<SagaStepView[]> {
-  if (subtreeScopeIds.length === 0) return [];
+  const scopeIds = includeRootScope ? [...subtreeScopeIds, ""] : subtreeScopeIds;
+  if (scopeIds.length === 0) return [];
   const elig = eligibleCommittedLocalScopeIds;
   const rows = await dbAll<SagaStepRow>(
     db,
     `SELECT * FROM saga_steps
        WHERE instance_id = ?
-         AND scope_id IN (${placeholders(subtreeScopeIds.length)})
+         AND scope_id IN (${placeholders(scopeIds.length)})
          AND ( compensation_status IN ('pending', 'compensating', 'failed')
             ${elig.length > 0 ? `OR (compensation_status = 'committedLocal' AND scope_id IN (${placeholders(elig.length)}))` : ""} )
        ORDER BY seq DESC`,
-    [instanceId, ...subtreeScopeIds, ...elig],
+    [instanceId, ...scopeIds, ...elig],
   );
   return rows.map(mapSagaStep);
 }
@@ -235,8 +246,9 @@ export async function countCompensableSteps(
   instanceId: string,
   subtreeScopeIds: string[],
   eligibleCommittedLocalScopeIds: string[],
+  includeRootScope = false,
 ): Promise<number> {
-  return (await selectSubtreeStepsForCompensation(db, instanceId, subtreeScopeIds, eligibleCommittedLocalScopeIds)).length;
+  return (await selectSubtreeStepsForCompensation(db, instanceId, subtreeScopeIds, eligibleCommittedLocalScopeIds, includeRootScope)).length;
 }
 
 export async function getSagaStepsForInstance(

@@ -544,7 +544,7 @@ export async function beginChildCompensation(env: Env, parentInstanceId: string,
   }).run();
   const childGraph = await getVersionGraph(env.DB, child.definition_version_id);
   if (!childGraph) throw new Error(`Invariant violation: child version ${child.definition_version_id} has no parsed profile.`);
-  const pending = await countCompensableSteps(env.DB, childId, subtreeScopeIds(childGraph, null), eligibleCommittedLocalScopeIds(childGraph, null));
+  const pending = await countCompensableSteps(env.DB, childId, subtreeScopeIds(childGraph, null), eligibleCommittedLocalScopeIds(childGraph, null), true);
   // Live-token guard on the shortcut (mirrors handleCancelInstance's cohort
   // guard): a cancelled REGION child may carry a live token whose completed
   // forward job is not yet ledgered — the child's own straggler scan must run,

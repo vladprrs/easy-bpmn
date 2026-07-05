@@ -234,9 +234,15 @@ describe("callActivity cascading drain/cancel (M5-L2 Task 8)", () => {
     const cancelled = await post(`/instances/${parentId}/cancel`, {});
     expect(cancelled.status).toBe(200);
 
-    // The already-completed child is untouched — never regressed to cancelled.
+    // The already-completed child is never REGRESSED — the cancel cascade's
+    // Hazard interrupt short-circuits on a terminal child (no `instanceCancelled`,
+    // no `by:"parentDrain"`). It IS however properly reversed: the parent's
+    // call1 ledger step (root-scoped — GAP B) drives the child's own reverse
+    // pass, and the SIMPLE child's empty compensable ledger settles it
+    // `compensated` via the no-op shortcut. (`completed` here pre-GAP-B was the
+    // bug: the empty-ledger shortcut skipped the reverse pass entirely.)
     const childAfter = await instRow(childId);
-    expect(childAfter?.status).toBe("completed");
+    expect(childAfter?.status).toBe("compensated");
     expect(await historyEventsOfType(childId, "instanceCancelled")).toHaveLength(0);
   });
 });

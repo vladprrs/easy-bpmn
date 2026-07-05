@@ -172,15 +172,13 @@ describe("matrix: callActivity reverse-path (M5-L2 Task 12)", () => {
   // brief: do NOT fix src/ here — write the probe, observe, and either keep
   // it enabled (if it passes) or it.skip with a KNOWN GAP comment (if it
   // reproduces the gap).
-  // KNOWN GAP (M5-L2 follow-up): reproduced — `drainScopeSubtree` has no
-  // callActivity special-case (unlike `ledgerStragglers`'s `retainCallStraggler`),
-  // so the scope-drain path discards call1's live token without ever
-  // ledgering a saga_steps row; the outer tx's later reverse pass then has
-  // nothing to drive the child's reverse from, and the child's committedLocal
-  // ctp-reserve row is stranded forever. Fix: give `drainScopeSubtree`'s
-  // per-token loop a callActivity branch mirroring `retainCallStraggler`
-  // (retain-only, no compensation — matches the function's own doc contract).
-  it.skip("PROBE: inner-scope drainScopeSubtree cancels a running child, then the OUTER tx cancels — does the child's committed step reverse?", async () => {
+  // FIXED (GAP A): `drainScopeSubtree`'s per-token loop now has a callActivity
+  // branch calling `retainCallStraggler` (the same retain the straggler scan
+  // uses): cascade-cancel the running child (Hazard), ledger the child step
+  // (INSERT OR IGNORE; `notRequired` for an errored child — it owes no
+  // parent-driven reverse), consume the token. Retention only — the row waits
+  // for the enclosing reverse pass, which is exactly what this scenario drives.
+  it("[CA-DRAIN-RETAIN-01] inner-scope drainScopeSubtree cancels a running child, then the OUTER tx cancels — the child's committed step reverses", async () => {
     const childDraft = await createDraft(CALL_CHILD_TX_PARK_BPMN);
     await publishDraft(childDraft.body.draftId);
     const token = await mintWorkerToken();
@@ -208,20 +206,26 @@ describe("matrix: callActivity reverse-path (M5-L2 Task 12)", () => {
     expect((await instRow(childId))?.status).toBe("cancelled");
 
     // The scope-drain routes to qsd-handle -> a cancel end -> the OUTER tx's
-    // own cancel boundary -> the reverse pass (qd-charge's comp: refund-card).
+    // own cancel boundary -> the reverse pass. The retained call1 step (highest
+    // seq) reverses FIRST: it CAS-es the cancelled child to 'compensating' and
+    // drives the child's own reverse (comp: release-stock-park), THEN the outer
+    // qd-charge step reverses (comp: refund-card).
     await drainSampleWorkers({ taskTypes: ["log-only"], token });
+    expect((await instRow(childId))?.status).toBe("compensating");
+    await drainSampleWorkers({ taskTypes: ["release-stock-park"], token, maxRounds: 20 });
+    expect((await instRow(childId))?.status).toBe("compensated");
     await drainSampleWorkers({ taskTypes: ["refund-card"], token, maxRounds: 20 });
 
     const parent = await instRow(parentId);
     expect(parent?.status).toBe("compensated");
     expect(parent?.current_element_id).toBe("qd-failed");
 
-    // Does the OUTER reverse pass ever reach and compensate the child's own
-    // committed step? (Desired: yes. If drainScopeSubtree never ledgered a
-    // call1 step in the PARENT, the parent's reverse pass has nothing to
-    // drive the child's reverse from, and the child's own ctp-reserve row
-    // stays stranded at committedLocal forever.)
+    // The OUTER reverse pass reached and compensated the child's own committed
+    // step through the retained call1 ledger row (GAP A's exact failure mode:
+    // without the drain retention there is no call1 row, the parent reverse has
+    // nothing to drive the child from, and ctp-reserve strands at committedLocal).
     expect(await sagaStepStatus(childId, "ctp-reserve")).toBe("compensated");
+    expect(await sagaStepStatus(parentId, "call1")).toBe("compensated");
   });
 
   // -------------------------------------------------------------------------
@@ -231,22 +235,17 @@ describe("matrix: callActivity reverse-path (M5-L2 Task 12)", () => {
   // the child completed. `handleCancelInstance`'s `pending === 0` shortcut
   // reads `countCompensableSteps` over `subtreeScopeIds(graph, null)`, which
   // enumerates registered SCOPE containers only — a callActivity's ledger row
-  // at root scope (`scope_id = ""`) is invisible to that filter when the
-  // graph has zero scopes, so the shortcut fires and the reverse pass never
-  // starts. Per the task brief: do NOT fix src/ here.
-  // KNOWN GAP (M5-L2 follow-up): reproduced — `handleCancelInstance`'s
-  // `pending === 0` shortcut counts via `countCompensableSteps(subtreeScopeIds
-  // (graph, null), ...)`, and `subtreeScopeIds` enumerates registered SCOPE
-  // containers (tx/subProcess) only; a graph with NO scopes at all yields `[]`,
-  // so `selectSubtreeStepsForCompensation`'s `subtreeScopeIds.length === 0`
-  // early-return makes the count 0 even though call1's saga_steps row (written
-  // unconditionally by `applyChildTerminal`, scope_id="") genuinely has
-  // compensation_status='pending'. The operator cancel takes the empty-ledger
-  // shortcut and the child is never compensated. Fix: treat root scope ("")
-  // as an implicit member of `subtreeScopeIds(graph, null)`, or special-case
-  // callActivity rows the same way the empty-ledger check already special-
-  // cases live cohort tokens.
-  it.skip("PROBE: a parent whose ONLY compensable content is the callActivity visit, cancelled after the child completes — does the child reverse?", async () => {
+  // at root scope (`scope_id = ""`) was invisible to that filter when the
+  // graph has zero scopes, so the shortcut fired and the reverse pass never
+  // started.
+  // FIXED (GAP B): the process-root pass (rootScopeId == null) now treats root
+  // scope ("") as an implicit member of the subtree — `includeRootScope` on
+  // `selectSubtreeStepsForCompensation`/`countCompensableSteps`, wired at
+  // `handleCancelInstance`'s count, `runCompensation`'s root pass, and
+  // `beginChildCompensation`'s no-op shortcut. A '' step exists ONLY for a
+  // callActivity visit (worker steps are ledgered under a real tx scope id),
+  // so nested-tx passes are byte-for-byte unchanged.
+  it("[CA-ROOTSCOPE-CANCEL-01] a parent whose ONLY compensable content is the callActivity visit, cancelled after the child completes, reverses the child", async () => {
     const childDraft = await createDraft(SIMPLE_CHILD_BPMN);
     await publishDraft(childDraft.body.draftId);
     const token = await mintWorkerToken();

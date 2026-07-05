@@ -2,10 +2,10 @@ import { describe, it, expect } from "vitest";
 import { SCENARIOS } from "./registry";
 
 describe("matrix registry well-formedness", () => {
-  it("has exactly 84 scenarios with unique ids", () => {
-    expect(SCENARIOS).toHaveLength(84);
+  it("has exactly 86 scenarios with unique ids", () => {
+    expect(SCENARIOS).toHaveLength(86);
     const ids = SCENARIOS.map((s) => s.id);
-    expect(new Set(ids).size).toBe(84);
+    expect(new Set(ids).size).toBe(86);
   });
 
   it("every scenario has valid enums and at least one declared mode", () => {

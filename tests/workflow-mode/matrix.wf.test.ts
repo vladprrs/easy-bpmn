@@ -50,10 +50,19 @@ import {
   PARALLEL_LOOP_INBRANCH_BPMN,
 } from "../fixtures/matrix/fixtures";
 import {
+  CALL_CHILD_BPMN,
+  CALL_CHILD_TX_PARK_BPMN,
+  CALL_PARENT_BPMN,
+  CALL_PARENT_TIMER_BPMN,
+  SIMPLE_CHILD_BPMN,
+  SIMPLE_PARENT_BPMN,
+} from "../integration/call-activity-fixtures";
+import {
   activate,
   cancelInstance,
   completeJob,
   countHistoryType,
+  createDraft,
   failJob,
   getHistory,
   getInstance,
@@ -61,8 +70,10 @@ import {
   leaseWhenReady,
   mintWorkerToken,
   publishAndStart,
+  publishDraft,
   publishMessage,
   pollToTerminal,
+  retryInstance,
   sleep,
 } from "./driver";
 
@@ -490,6 +501,17 @@ describe("matrix workflow-mode: @needs-real-cf (transaction/compensation progres
   it.skip("[C-COMP-FAILED-01] @needs-real-cf `compensationFailed` flip after comp-exhaustion is wake-backstop-bound over HTTP", () => {});
   it.skip("[C-COMP-FAILED-INFLIGHT-01] @needs-real-cf `compensationFailed` flip with a sibling in-flight is wake-backstop-bound", () => {});
   it.skip("[C-OP-RETRY-COMPFAILED-01] @needs-real-cf needs the `compensationFailed` flip first (wake-backstop-bound) before /retry", () => {});
+  // M5-L2 (CA-*): the child-reverse compensation class — the same wake-backstop-
+  // bound final flips (the parent's `compensating → compensated/compensationFailed`),
+  // plus the child's own reverse pass driven over a TERMINATED child Workflow (the
+  // operator-resume-after-termination seam). Semantics fully covered direct-mode
+  // (tests/integration/call-activity-compensation.test.ts +
+  // tests/integration/matrix/call-activity.test.ts); the child-reverse pass is a
+  // MANDATORY scenario of the real-CF DoD smoke (plan Task 14 §3).
+  it.skip("[CA-COMP-CHILD-01] @needs-real-cf committed callActivity reverses via the child's OWN reverse pass — the `compensated` flip is wake-backstop-bound", () => {});
+  it.skip("[CA-COMP-NOOP-01] @needs-real-cf empty-child-ledger no-op shortcut — the parent's `compensated` flip is wake-backstop-bound", () => {});
+  it.skip("[CA-COMP-FAILED-01] @needs-real-cf child `compensationFailed` surfaces as the parent's own — the flip is wake-backstop-bound", () => {});
+  it.skip("[CA-COMP-CRASH-01] @needs-real-cf mid-child-compensation crash-resume idempotency — the reverse flips are wake-backstop-bound", () => {});
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -544,4 +566,145 @@ describe("matrix workflow-mode: M5-L1 embedded scopes", () => {
   });
 
   it.skip("[S-COMP-NESTED-COMMIT-01] @needs-real-cf outer-cancel reverse pass over a committed inner tx — the `compensated` flip is wake-backstop-bound", () => {});
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M5-L2 callActivity re-runs (CA-*) — a REAL child process instance with its
+// own Workflow per visit. Same liveness discipline as the C-*/S-* blocks; the
+// specific hang class this block detects is a LOST child→parent wake: the
+// child's terminal drive tickles the parent (deliverJobResult), the JobScheduler
+// child-notify DO alarm self-heals a dropped tickle at +30s, and only a defect
+// in BOTH nets would leave the parent to the 1h wake backstop — so "terminal
+// well inside DEADLINE" is the assertion that matters (plan Task 14 §1).
+// Reverse-compensation CA rows are @needs-real-cf above (wake-backstop-bound
+// class); the forward/error/Hazard/operator rows below all advance by tickle.
+// ═══════════════════════════════════════════════════════════════════════════
+describe("matrix workflow-mode: M5-L2 callActivity", () => {
+  /** Publish a child definition (the caller's publish pins the LATEST published
+   *  version of the target process — child must exist first). */
+  async function publishChild(xml: string): Promise<void> {
+    const draft = await createDraft(xml);
+    if (draft.status !== 201) throw new Error(`child draft ${draft.status}: ${JSON.stringify(draft.body)}`);
+    const pub = await publishDraft(draft.body.draftId);
+    if (pub.status !== 201) throw new Error(`child publish ${pub.status}: ${JSON.stringify(pub.body)}`);
+  }
+
+  /** Poll the parent's `lineage` block until its first child row appears. */
+  async function lineageChild(parentId: string, deadlineMs = 20_000) {
+    const deadline = Date.now() + deadlineMs;
+    for (;;) {
+      const g = await getInstance(parentId);
+      const c = g.body?.lineage?.children?.[0];
+      if (c) return c as { elementId: string; occurrence: number; childInstanceId: string; status: string };
+      if (Date.now() >= deadline) throw new Error(`no lineage child appeared on ${parentId} within ${deadlineMs}ms`);
+      await sleep(400);
+    }
+  }
+
+  it("[CA-FWD-01] forward happy path: real child Workflow, variables pass through both ways, parent completes by tickle", async () => {
+    const token = await mintWorkerToken();
+    await publishChild(SIMPLE_CHILD_BPMN);
+    const { instanceId } = await publishAndStart(SIMPLE_PARENT_BPMN, { correlationKey: uniq("ca-fwd"), variables: { seed: 7 } });
+    // The CHILD's sc-echo surfaces first through the SHARED pull plane (the
+    // parent's own p-after job cannot exist until call1 applies).
+    const childJob = await leaseWhenReady(token, "echo");
+    expect(childJob, "the child's echo job should be leasable").toBeTruthy();
+    expect(childJob!.variables.seed, "parent variables must seed the child (pass-through DOWN)").toBe(7);
+    await completeJob(token, childJob!, { childSaw: 7 });
+    // Child terminal → parent tickled → call1 applies → the parent's p-after appears.
+    await leaseAndComplete(token, "echo", {});
+    const r = await pollToTerminal(instanceId, { deadlineMs: DEADLINE });
+    expect(r.status, `stuck at ${r.status} after ${r.elapsedMs}ms — child→parent wake lost?`).toBe("completed");
+    expect(r.body?.variables?.childSaw, "child output must merge back (pass-through UP)").toBe(7);
+    expect((await lineageChild(instanceId)).status).toBe("completed");
+    const hist = await getHistory(instanceId);
+    expect(countHistoryType(hist, "callActivityInvoked")).toBe(1);
+    expect(countHistoryType(hist, "callActivityCompleted")).toBe(1);
+  });
+
+  it("[CA-IDEMP-REDRIVE-01] duplicate /complete of the CHILD's job after the parent finished: stable outcome, no re-apply anywhere", async () => {
+    const token = await mintWorkerToken();
+    await publishChild(SIMPLE_CHILD_BPMN);
+    const { instanceId } = await publishAndStart(SIMPLE_PARENT_BPMN, { correlationKey: uniq("ca-idemp"), variables: { seed: 3 } });
+    const childJob = await leaseWhenReady(token, "echo");
+    expect(childJob).toBeTruthy();
+    await completeJob(token, childJob!, { echoed: true });
+    await leaseAndComplete(token, "echo", {});
+    const r = await pollToTerminal(instanceId, { deadlineMs: DEADLINE });
+    expect(r.status, `stuck at ${r.status} after ${r.elapsedMs}ms`).toBe("completed");
+    const before = await getHistory(instanceId);
+    // Duplicate /complete (SAME jobId + lockToken) into the finished chain:
+    // stable prior outcome; nothing up the parent chain advances twice.
+    const dup = await completeJob(token, childJob!, { echoed: true });
+    expect(dup.status).toBe(200);
+    await sleep(1500); // give a wrongly-triggered re-drive time to surface
+    const after = await getHistory(instanceId);
+    expect(after.length).toBe(before.length);
+    expect(countHistoryType(after, "callActivityInvoked")).toBe(1);
+    expect(countHistoryType(after, "callActivityCompleted")).toBe(1);
+    const g = await getInstance(instanceId);
+    expect(g.body?.status).toBe("completed");
+    expect((g.body?.lineage?.children ?? []).length).toBe(1);
+  });
+
+  it("[CA-ERR-BOUNDARY-01] child errored terminal routes at the parent via call1's error boundary; parent completes on the handled path", async () => {
+    const token = await mintWorkerToken();
+    await publishChild(CALL_CHILD_BPMN);
+    const { instanceId } = await publishAndStart(CALL_PARENT_BPMN, { correlationKey: uniq("ca-errb"), variables: { failChild: true } });
+    await leaseAndComplete(token, "charge-card", {});
+    // The child's tx commits (linear tx — tickle-reachable), then its gateway
+    // routes failChild=true → the CHILD_FAILED error end → child `errored`.
+    await leaseAndComplete(token, "reserve-stock", {});
+    // The errored terminal notifies the parent, which routes call1-err → p-handle.
+    await leaseAndComplete(token, "log-only", {});
+    const r = await pollToTerminal(instanceId, { deadlineMs: DEADLINE });
+    expect(r.status, `stuck at ${r.status} after ${r.elapsedMs}ms — errored child wake lost?`).toBe("completed");
+    expect((await lineageChild(instanceId)).status).toBe("errored");
+    expect(countHistoryType(await getHistory(instanceId), "callActivityErrored")).toBe(1);
+  });
+
+  // [CA-INCIDENT-RETRY-01] child incident invisibility + the ROOT's cascading
+  // /retry — @needs-real-cf, but for a DIFFERENT reason than the wake-backstop
+  // class: the child's Workflow TERMINATED at its incident, and under wrangler-
+  // dev/miniflare `sendEvent` to a terminated Workflow SILENTLY SUCCEEDS instead
+  // of throwing, so `deliverJobResult`'s inline-drive fallback (the operator-
+  // resume-after-termination seam, executor.ts) never fires and the healed job's
+  // completion never advances the child. Verified against this dev server with a
+  // PLAIN no-callActivity instance: incident → /retry → /complete stalls
+  // identically — a PRE-EXISTING local-delivery gap, zero M5-L2 surface. On real
+  // CF the sendEvent throws and the fallback drives (the M1 operator-resume
+  // validation); the cascading-retry scenario is part of the real-CF DoD smoke.
+  // Semantics fully covered direct-mode (call-activity-operator.test.ts).
+  it.skip("[CA-INCIDENT-RETRY-01] @needs-real-cf cascading /retry heals the child subtree — the child's post-retry advance needs the terminated-Workflow inline fallback (miniflare sendEvent never throws)", () => {});
+
+  it("[CA-HAZARD-TIMER-01] PT3S timer boundary on call1 Hazard-cancels the live child WITHOUT compensation; the timer path completes", async () => {
+    const token = await mintWorkerToken();
+    await publishChild(CALL_CHILD_TX_PARK_BPMN);
+    const { instanceId } = await publishAndStart(CALL_PARENT_TIMER_BPMN.replace("PT0.5S", "PT3S"), { correlationKey: uniq("ca-hazard") });
+    // NEVER pump the child (it parks inside its tx on reserve-stock-park) — the
+    // REAL PT3S boundary DO alarm fires against a live child.
+    const timeoutJob = await leaseWhenReady(token, "timeout-handler", { deadlineMs: 25_000 });
+    expect(timeoutJob, "the timer path's handler should appear after the PT3S fire").toBeTruthy();
+    // Hazard semantics: interrupt WITHOUT compensation — no comp job anywhere.
+    expect(await activate(token, "release-stock-park")).toHaveLength(0);
+    await completeJob(token, timeoutJob!, {});
+    const r = await pollToTerminal(instanceId, { deadlineMs: DEADLINE });
+    expect(r.status, `stuck at ${r.status} after ${r.elapsedMs}ms`).toBe("completed");
+    expect((await lineageChild(instanceId)).status).toBe("cancelled");
+  });
+
+  it("[CA-OP-CHILD-409-01] direct child /cancel + /retry both 409 naming the root; cancelling the ROOT cascades", async () => {
+    await publishChild(SIMPLE_CHILD_BPMN);
+    const { instanceId } = await publishAndStart(SIMPLE_PARENT_BPMN, { correlationKey: uniq("ca-409") });
+    const child = await lineageChild(instanceId);
+    const c1 = await cancelInstance(child.childInstanceId);
+    expect(c1.status).toBe(409);
+    expect(JSON.stringify(c1.body), "the 409 must name the saga root").toContain(instanceId);
+    expect((await retryInstance(child.childInstanceId)).status).toBe(409);
+    // All control flows through the root: the parent's cancel cascades.
+    expect((await cancelInstance(instanceId)).status).toBe(200);
+    const r = await pollToTerminal(instanceId, { deadlineMs: DEADLINE });
+    expect(r.status, `stuck at ${r.status} after ${r.elapsedMs}ms`).toBe("cancelled");
+    expect((await lineageChild(instanceId)).status).toBe("cancelled");
+  });
 });

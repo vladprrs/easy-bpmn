@@ -71,7 +71,17 @@ export async function syncFrontierReadModel(env: Env, instanceId: string, fronti
       parentTokenId: t.parentTokenId, branchFlowId: t.branchFlowId, positionElementId: t.positionElementId, status: "active", now,
     }));
   }
-  for (const r of live) if (!present.has(r.token_id)) stmts.push(setTokenStatusStmt(env.DB, r.token_id, "consumed", now));
+  for (const r of live) {
+    if (present.has(r.token_id)) continue;
+    // M5-L3 (Task 7): live `mi#` ITERATION tokens are owned by the MI driver
+    // (created per iteration, consumed by `mi-iter-done` / the `mi-apply`
+    // teardown) and never appear in the single-token reconstructed frontier —
+    // the vanish sweep must NOT fold them. (The M4 join fold is exact-key by
+    // branchTokenId and never scans, so this filter is the only generic
+    // consumer that could touch them.)
+    if ((r.branch_flow_id ?? "").startsWith("mi#")) continue;
+    stmts.push(setTokenStatusStmt(env.DB, r.token_id, "consumed", now));
+  }
   if (stmts.length) await dbBatch(env.DB, stmts);
 }
 

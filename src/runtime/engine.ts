@@ -435,7 +435,15 @@ async function loop(
       // dimension), aggregation, and advancement for serviceTask (Task 6) /
       // subProcess (Task 7) / callActivity (Task 10) hosts alike.
       if (node.multiInstance) {
-        const r = await driveMultiInstance(env, instanceId, graph, cur, occ, node, runStep, activeTokenId);
+        // M5-L3 (Task 7): thread THIS leaf dispatch into the MI driver so a
+        // subProcess body's sub-walk drives its interior leaves through the exact
+        // same `driveLeaf` (shared fast-forward discipline / branch-scoped
+        // reads / step naming). `drivers.driveLeaf` is the SINGLE dispatch shared
+        // by the single-token walk and the region DFS, so both walk drivers thread
+        // it here. serviceTask (Task 6) / callActivity (Task 10) hosts ignore it.
+        const r = await driveMultiInstance(env, instanceId, graph, cur, occ, node, runStep, activeTokenId, (bcur, bocc, btok) =>
+          drivers.driveLeaf(bcur, bocc, btok),
+        );
         if (r.kind === "waiting") return { kind: "parked" };
         if (r.kind === "incident") return { kind: "incident" };
         return { kind: "next", next: r.next };

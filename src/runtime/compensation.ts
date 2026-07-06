@@ -22,7 +22,7 @@ import {
   listForwardJobsForInstance,
   type JobRow,
 } from "../persistence/instances";
-import { getChildInstanceForVisit, listChildrenByElement } from "../persistence/child-instances";
+import { getChildInstanceForVisit, listChildrenByElement, type ChildInstanceRow } from "../persistence/child-instances";
 import {
   attachCompensationJobStmt,
   filterLineageQuiesced,
@@ -351,62 +351,81 @@ async function ledgerStragglers(env: Env, instanceId: string, graph: ExecutionGr
  */
 async function retainCallStraggler(env: Env, graph: ExecutionGraph, instanceId: string, t: TokenRow, now: string): Promise<void> {
   const pos = t.position_element_id;
-  // M5-L3 (design §5): a live token IS an MI iteration token (`mi#i`) → retain ITS
-  // OWN iteration's child row (keyed `(pos, activation, i)`), never `rows[last]`.
-  // A non-MI (or M4-branch) token retains the LATEST visit (the byte-identical L2
-  // path). In v1 the MI-subProcess body whitelist forbids a nested callActivity, so
-  // an `mi#i` token never actually parks on a callActivity — this is the forward-
-  // compatible, iteration-aware selection the design mandates.
+  // Which child VISIT(S) does this one live token cover?
+  //   - an `mi#i` iteration token parks on a NESTED callActivity (forbidden in v1 by
+  //     the MI-subProcess body whitelist, but forward-compatible): exactly ITS
+  //     iteration's child row `(pos, activation, i)`.
+  //   - a root / M4-branch token parked ON an MI callActivity covers ALL N iteration
+  //     children of the CURRENT visit. Each in-flight one committed compensable work
+  //     inside its own child and must be driven through its OWN reverse pass — NOT
+  //     just `rows[last]` (the review finding: the pre-fix single-row retain left the
+  //     N-1 sibling iterations un-compensated, since a not-yet-applied iteration has
+  //     no parent ledger row and the reverse-pass enumeration never discovers it).
+  //   - a token on a plain (non-MI) callActivity covers exactly the LATEST visit's
+  //     ONE child. Filtering to the latest occurrence yields {rows[last]} there — a
+  //     non-MI visit binds exactly one child per occurrence (iteration 0) — so the L2
+  //     single-child path stays BYTE-IDENTICAL (one insert + the consume, one batch).
   const parsed = parseTokenId(t.token_id);
   const miIter = parsed.kind === "branch" ? /^mi#(\d+)$/.exec(parsed.branchFlowId) : null;
-  let row;
+  let rows: ChildInstanceRow[];
   if (parsed.kind === "branch" && miIter) {
-    row = await getChildInstanceForVisit(env.DB, instanceId, pos, parsed.activation, Number(miIter[1]));
+    const r = await getChildInstanceForVisit(env.DB, instanceId, pos, parsed.activation, Number(miIter[1]));
+    rows = r ? [r] : [];
   } else {
-    const rows = await listChildrenByElement(env.DB, instanceId, pos);
-    row = rows[rows.length - 1]; // the LATEST visit — the one this live token parked on
+    const all = await listChildrenByElement(env.DB, instanceId, pos);
+    // The latest occurrence's cohort — for an MI callActivity re-visited on a token-
+    // path cycle, a PRIOR visit's children already settled/applied (their ledger rows
+    // exist and are deduped below); only the current visit has in-flight children.
+    const latestOcc = all.length > 0 ? all[all.length - 1]!.occurrence : -1;
+    rows = all.filter((r) => r.occurrence === latestOcc);
   }
-  if (!row) {
+  if (rows.length === 0) {
     await dbBatch(env.DB, [setTokenStatusStmt(env.DB, t.token_id, "discarded", now)]);
     return;
   }
-  // Never wait on a running child inside the reverse pass — interrupt it (Hazard,
-  // Task 8 semantics; ledger retained). No-op when the cancel cascade already ran.
-  await cancelChildCascade(env, row.child_instance_id);
-  // An ERRORED child owes no parent-driven reverse (it routes like a worker
-  // business error — `applyChildErrored` ledgers nothing either), and the reverse
-  // dispatch has no entry for it (`beginChildCompensation` CAS-es only
-  // {completed, cancelled}): ledger it `notRequired` so the audit row exists but
-  // the reverse pass never parks on it. Every other post-cascade status is
-  // dispatchable: completed/cancelled → the child's own reverse; compensated /
-  // compensationFailed → closed/failed directly.
-  const child = await getInstanceRow(env.DB, row.child_instance_id);
+  // Retain each covered child (ascending iteration order, as listChildrenByElement
+  // returns them → ascending ledger seq → the reverse pass compensates the iterations
+  // in reverse order, the M5-L3 discipline). One batch for all inserts + the single
+  // token consume, so an MI cohort is ledgered atomically with its token drain.
   const stmts: D1PreparedStatement[] = [];
-  // Iteration-aware dedup (design §5): key by the child row's OWN iteration index
-  // (0 for the non-MI path — byte-identical).
-  if (!(await getSagaStep(env.DB, instanceId, pos, row.occurrence, row.iteration_index))) {
-    stmts.push(
-      insertSagaStepStmt(env.DB, {
-        stepId: newId("step"),
-        instanceId,
-        scopeId: graph.nodes[pos]?.scopeId ?? "",
-        elementId: pos,
-        // forward_job_id is NOT NULL — a child step carries the "" sentinel
-        // (mapSagaStep folds it back to null), same as applyChildTerminal.
-        forwardJobId: "",
-        capturedInput: {},
-        capturedOutput: null,
-        compensationElementId: null,
-        compensationTaskType: null,
-        compensationStatus: child?.status === "errored" ? "notRequired" : "pending",
-        traceId: traceIdFor(instanceId),
-        occurrence: row.occurrence,
-        tokenId: t.token_id,
-        childInstanceId: row.child_instance_id,
-        iterationIndex: row.iteration_index,
-        now,
-      }),
-    );
+  for (const row of rows) {
+    // Never wait on a running child inside the reverse pass — interrupt it (Hazard,
+    // Task 8 semantics; ledger retained). No-op when the cancel cascade already ran.
+    await cancelChildCascade(env, row.child_instance_id);
+    // An ERRORED child owes no parent-driven reverse (it routes like a worker
+    // business error — `applyChildErrored` ledgers nothing either), and the reverse
+    // dispatch has no entry for it (`beginChildCompensation` CAS-es only
+    // {completed, cancelled}): ledger it `notRequired` so the audit row exists but
+    // the reverse pass never parks on it. Every other post-cascade status is
+    // dispatchable: completed/cancelled → the child's own reverse; compensated /
+    // compensationFailed → closed/failed directly.
+    const child = await getInstanceRow(env.DB, row.child_instance_id);
+    // Iteration-aware dedup (design §5): key by the child row's OWN iteration index
+    // (0 for the non-MI path — byte-identical).
+    if (!(await getSagaStep(env.DB, instanceId, pos, row.occurrence, row.iteration_index))) {
+      stmts.push(
+        insertSagaStepStmt(env.DB, {
+          stepId: newId("step"),
+          instanceId,
+          scopeId: graph.nodes[pos]?.scopeId ?? "",
+          elementId: pos,
+          // forward_job_id is NOT NULL — a child step carries the "" sentinel
+          // (mapSagaStep folds it back to null), same as applyChildTerminal.
+          forwardJobId: "",
+          capturedInput: {},
+          capturedOutput: null,
+          compensationElementId: null,
+          compensationTaskType: null,
+          compensationStatus: child?.status === "errored" ? "notRequired" : "pending",
+          traceId: traceIdFor(instanceId),
+          occurrence: row.occurrence,
+          tokenId: t.token_id,
+          childInstanceId: row.child_instance_id,
+          iterationIndex: row.iteration_index,
+          now,
+        }),
+      );
+    }
   }
   stmts.push(setTokenStatusStmt(env.DB, t.token_id, "consumed", now));
   await dbBatch(env.DB, stmts);

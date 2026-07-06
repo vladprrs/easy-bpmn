@@ -665,6 +665,60 @@ export const MI_CALL_TX_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 </bpmn:definitions>`;
 
 /**
+ * STRAGGLER COMP (review fix, MI-CALL-COMP-STRAGGLER-01): the mid-fan-out cancel
+ * shape. A compensable pre-step `pcharge` (charge-card, comp `prefund`/refund-card)
+ * inside `mtx`, THEN a parallel collection MI over the committing-then-parking child
+ * `child-tx-park-proc` (CALL_CHILD_TX_PARK_BPMN — each child commits `ctp-reserve`
+ * committedLocal, then parks forever on `child-park`). Draining charge-card +
+ * reserve-stock-park leaves the parent parked ON the MI element `mi1` with N children
+ * mid-flight (each committed a compensable step, NONE completed → the parent has
+ * applied NONE — no parent ledger row for any iteration). The pre-step keeps the
+ * process-root reverse pass NON-empty (so an operator /cancel enters `compensating`
+ * instead of the empty-ledger shortcut); the reverse pass's callActivity straggler
+ * retain must then drive EVERY in-flight iteration child's own reverse pass, not just
+ * one. Start with `{ items: ["a","b","c"] }`.
+ */
+export const MI_CALL_TX_PARK_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" id="D_mi_call_txpark" targetNamespace="x">
+  <bpmn:process id="P_mi_call_txpark" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>g1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="g1" sourceRef="S" targetRef="mtx"/>
+    <bpmn:transaction id="mtx" name="Place batch">
+      <bpmn:startEvent id="mtx_start"><bpmn:outgoing>t0</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:sequenceFlow id="t0" sourceRef="mtx_start" targetRef="pcharge"/>
+      <bpmn:serviceTask id="pcharge" name="Charge">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="charge-card" retries="2"/></bpmn:extensionElements>
+        <bpmn:incoming>t0</bpmn:incoming>
+        <bpmn:outgoing>t1</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="pcharge_comp" attachedToRef="pcharge"><bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="prefund" isForCompensation="true">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="refund-card" retries="5"/></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:association id="pa1" associationDirection="One" sourceRef="pcharge_comp" targetRef="prefund"/>
+      <bpmn:sequenceFlow id="t1" sourceRef="pcharge" targetRef="mi1"/>
+      <bpmn:callActivity id="mi1" name="Reserve each" calledElement="child-tx-park-proc">
+        <bpmn:extensionElements>
+          <easy-bpmn:multiInstance collection="items" outputVariable="results"/>
+        </bpmn:extensionElements>
+        <bpmn:incoming>t1</bpmn:incoming>
+        <bpmn:outgoing>t2</bpmn:outgoing>
+        <bpmn:multiInstanceLoopCharacteristics isSequential="false"/>
+      </bpmn:callActivity>
+      <bpmn:sequenceFlow id="t2" sourceRef="mi1" targetRef="mtx_ok"/>
+      <bpmn:endEvent id="mtx_ok"><bpmn:incoming>t2</bpmn:incoming></bpmn:endEvent>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="mtx_cancelled" attachedToRef="mtx"><bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="g2" sourceRef="mtx" targetRef="Done"/>
+    <bpmn:endEvent id="Done"><bpmn:incoming>g2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="g3" sourceRef="mtx_cancelled" targetRef="Failed"/>
+    <bpmn:endEvent id="Failed"><bpmn:incoming>g3</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
  * The ERR/Hazard child (process "mi-err-child"): start → probe (a park point on a
  * per-test task type) → XOR gateway on the collection `item` — `item = "b"` raises
  * the CHILD_FAILED error end, everything else completes normally. Because the child

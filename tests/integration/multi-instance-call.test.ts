@@ -14,13 +14,14 @@ import {
 import { fireTimer } from "../../src/runtime/timers";
 import { childInstanceIdFor } from "../../src/runtime/call-activity";
 import { resumeInline } from "../../src/runtime/engine";
-import { SIMPLE_CHILD_BPMN, CALL_CHILD_BPMN } from "./call-activity-fixtures";
+import { SIMPLE_CHILD_BPMN, CALL_CHILD_BPMN, CALL_CHILD_TX_PARK_BPMN } from "./call-activity-fixtures";
 import {
   MI_CALL_BPMN,
   MI_CALL_ERR_BPMN,
   MI_CALL_ERR_CHILD_BPMN,
   MI_CALL_TIMER_BPMN,
   MI_CALL_TX_BPMN,
+  MI_CALL_TX_PARK_BPMN,
 } from "./multi-instance-fixtures";
 
 // M5-L3 (Task 10) — MI over callActivity, DIRECT mode. Each iteration `i` of an
@@ -265,6 +266,70 @@ describe("M5-L3 MI over callActivity — child fan-out + per-iteration child com
     expect(parent!.current_element_id).toBe("Failed");
     const finalLed = (await ledgerRows(parentId)).filter((r) => r.element_id === "mi1");
     expect(finalLed.every((r) => r.compensation_status === "compensated")).toBe(true);
+  });
+
+  it("[MI-CALL-COMP-STRAGGLER-01] a mid-fan-out cancel drives EVERY in-flight committed iteration child through its own reverse pass, not just one", async () => {
+    const childDraft = await createDraft(CALL_CHILD_TX_PARK_BPMN);
+    await publishDraft(childDraft.body.draftId);
+    const token = await mintWorkerToken();
+
+    const { instance } = await publishAndStart(MI_CALL_TX_PARK_BPMN, {
+      correlationKey: `mi-call-straggler-${uid()}`,
+      variables: { items: ["a", "b", "c"] },
+    });
+    const parentId = instance.body.instanceId as string;
+
+    // Forward: the compensable pre-step commits, then the MI fans out 3 children.
+    await drainSampleWorkers({ taskTypes: ["charge-card"], token });
+    // Each child's tx COMMITS (ctp-reserve committedLocal) then parks forever on
+    // child-park — it committed a compensable step, but NEVER completes, so the
+    // parent applies NONE (no parent ledger row for any iteration).
+    await drainSampleWorkers({ taskTypes: ["reserve-stock-park"], token });
+
+    const rows = await childInstanceRows(parentId);
+    expect(rows).toHaveLength(3);
+    expect(rows.map((r) => r.iteration_index).sort()).toEqual([0, 1, 2]);
+    for (const r of rows) {
+      // Every child is mid-flight (committed + parked), NOT terminal.
+      expect((await instRow(r.child_instance_id))!.status).toBe("waiting");
+      // The child's own ledger holds the committed compensable step.
+      const cReserve = (
+        await env.DB.prepare(`SELECT compensation_status FROM saga_steps WHERE instance_id = ? AND element_id = 'ctp-reserve'`)
+          .bind(r.child_instance_id)
+          .first<{ compensation_status: string }>()
+      );
+      expect(cReserve?.compensation_status).toBe("committedLocal");
+    }
+    // The parent parked ON the MI element; NO iteration applied → zero mi1 ledger rows.
+    expect((await instRow(parentId))!.status).toBe("waiting");
+    expect((await ledgerRows(parentId)).filter((r) => r.element_id === "mi1")).toHaveLength(0);
+
+    // Operator /cancel while ALL THREE iteration children are mid-flight.
+    const cancelled = await post(`/instances/${parentId}/cancel`, {});
+    expect(cancelled.status).toBe(200);
+    expect(cancelled.body.status).toBe("compensating");
+
+    // The reverse pass must drive EACH in-flight child's own reverse pass. Drain the
+    // per-child compensators (release-stock-park) + the pre-step's (refund-card).
+    await drainSampleWorkers({ taskTypes: ["release-stock-park", "refund-card"], token, maxRounds: 60 });
+
+    // THE CRUX: every iteration child compensated its committed step — NOT just the
+    // last (the pre-fix bug reverses only rows[last]; the other two stay `cancelled`,
+    // leaking their committed reserve). No orphan children.
+    for (const r of await childInstanceRows(parentId)) {
+      expect((await instRow(r.child_instance_id))!.status).toBe("compensated");
+      const cReserve = await env.DB.prepare(`SELECT compensation_status FROM saga_steps WHERE instance_id = ? AND element_id = 'ctp-reserve'`)
+        .bind(r.child_instance_id)
+        .first<{ compensation_status: string }>();
+      expect(cReserve?.compensation_status).toBe("compensated");
+    }
+    // Three iteration ledger rows on mi1 (one per in-flight child), all compensated.
+    const led = (await ledgerRows(parentId)).filter((r) => r.element_id === "mi1");
+    expect(led).toHaveLength(3);
+    expect(led.map((r) => r.iteration_index).sort()).toEqual([0, 1, 2]);
+    expect(led.every((r) => r.child_instance_id != null && r.compensation_status === "compensated")).toBe(true);
+    // The parent settled compensated on the process-root cancel.
+    expect((await instRow(parentId))!.status).toBe("compensated");
   });
 
   it("[MI-CALL-ERR-01] an iteration child that settles errored aborts the visit: siblings cascade-cancelled, the error routes to the MI boundary", async () => {

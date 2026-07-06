@@ -1,4 +1,4 @@
-# Data Model: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas; M3 — Time & failure taxonomy; M4 — Concurrency; M5-L2 — Call activity)
+# Data Model: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas; M3 — Time & failure taxonomy; M4 — Concurrency; M5-L2 — Call activity; M5-L3 — Multi-instance)
 
 All M1 changes are **additive migrations** (`migrations/0002_saga.sql`); published definition
 versions are never mutated. The MVP entities (Workspace, Process Definition Draft, Validation
@@ -10,8 +10,10 @@ described here. The **M2 deltas** (occurrence discriminator, conditional topolog
 described in their own section, followed by the **M3 deltas** (model-level timers + the
 technical-vs-business incident-kind split — migration `0006_timers.sql`), the **M4 deltas**
 (the token-frontier read-model + the append-only join facts that make in-instance concurrency replayable —
-migration `0007_tokens.sql`), and finally the **M5-L2 deltas** (the `callActivity` child-instance
-provenance + parent linkage + the child-step ledger dispatch — migration `0008_call_activity.sql`).
+migration `0007_tokens.sql`), the **M5-L2 deltas** (the `callActivity` child-instance
+provenance + parent linkage + the child-step ledger dispatch — migration `0008_call_activity.sql`), and
+finally the **M5-L3 deltas** (the `mi_activations` activation decider + the `iteration_index` second
+dimension — migration `0009_multi_instance.sql`).
 
 ## Entity: Transaction Scope (graph IR)
 
@@ -664,7 +666,7 @@ CREATE TABLE child_instances (
   parent_instance_id TEXT    NOT NULL,
   parent_element_id  TEXT    NOT NULL,            -- the callActivity node id
   occurrence         INTEGER NOT NULL,
-  iteration_index    INTEGER NOT NULL DEFAULT 0,  -- reserved for M5-L3 MI
+  iteration_index    INTEGER NOT NULL DEFAULT 0,  -- 0 for a plain callActivity; the MI iteration since M5-L3
   child_instance_id  TEXT    NOT NULL,
   status             TEXT    NOT NULL,            -- invoked | outputApplied
   created_at         TEXT    NOT NULL,
@@ -684,8 +686,10 @@ CREATE INDEX idx_child_instances_child ON child_instances (child_instance_id);
   idempotent Workflow start); the `outputApplied` flip commits atomically with the parent's variable
   merge + advance (+ the child ledger step), so a rewalk that sees `outputApplied` is a
   **write-free** cursor move re-derived from the child's terminal status.
-- `iteration_index` is fixed `0` in M5-L2 — reserved for `multiInstanceLoopCharacteristics`
-  (M5-L3; still rejected on a `callActivity` at publish, with the roadmap pointer).
+- `iteration_index` was fixed `0` in M5-L2 — **since M5-L3** (shipped) an MI `callActivity` fans out one
+  child per iteration, keyed `(parent_instance_id, parent_element_id, occurrence, iteration_index)` with
+  the iteration threaded into the content-addressed child id (see the **M5-L3 deltas** below); a plain
+  `callActivity` stays `0`.
 
 ### Entity: Process Instance (delta — parent linkage + the child-only `errored` terminal)
 
@@ -745,6 +749,105 @@ call-cycle check, and the v1 reject of any `receiveTask` / message `intermediate
 in the resolved call tree (a child's correlation key is the technical `child:<childInstanceId>` — it
 has no correlation-key source).
 
+## M5-L3 deltas (Multi-instance — the activation decider + the iteration dimension — migration `0009_multi_instance.sql`)
+
+Additive over the M5-L2 schema; published versions are never mutated. Source design:
+`docs/superpowers/specs/2026-07-06-m5-l3-multiinstance-design.md` (§1–§2, §6). Constitution **v2.5.0
+unchanged** — the M5 amendment accepted the whole composition set up front; this layer only opens the
+`multiInstanceLoopCharacteristics` runtime (governance record:
+`specs/002-saga-orchestrator/m5-L3-constitution-check.md`).
+
+> **The `/jobs/*` worker API surface is UNCHANGED by M5-L3** (still pinned by
+> `tests/contract/jobs-schema-pin.test.ts`). An MI-serviceTask iteration job is an **ordinary** job,
+> leased by `taskType` like any other — the iteration is a persistence-key dimension, never a wire field.
+
+### Entity: MI Activation (decider — new table `mi_activations`)
+
+The `gateway_decisions` analogue for a multi-instance visit: cardinality and the collection snapshot are
+FEEL-evaluated **once** at activation, pinned, and never re-evaluated — the rewalk fast-forward predicate
+for the whole visit, plus the once-only settle and apply-once deciders.
+
+```sql
+CREATE TABLE mi_activations (
+  instance_id     TEXT    NOT NULL,
+  element_id      TEXT    NOT NULL,            -- the MI activity node id
+  occurrence      INTEGER NOT NULL,
+  cardinality     INTEGER NOT NULL,            -- pinned once at activation (the decider seed)
+  is_sequential   INTEGER NOT NULL,            -- 0 = parallel, 1 = sequential
+  items           TEXT,                        -- JSON of the resolved collection, or NULL (loopCardinality)
+  settled_kind    TEXT,                        -- NULL = running | all | condition | abort (the once-only early-settle decider)
+  settled_count   INTEGER,
+  output_applied  INTEGER NOT NULL DEFAULT 0,  -- single-apply CAS for the aggregation merge
+  created_at      TEXT    NOT NULL,
+  updated_at      TEXT    NOT NULL
+);
+CREATE UNIQUE INDEX uq_mi_activations_visit
+  ON mi_activations (instance_id, element_id, occurrence);
+```
+
+**Fields / Rules**:
+- **One MI arrival = ONE walk occurrence**; iterations are a second dimension (`iterationIndex`
+  `0..cardinality-1`). The activation row is written persist-before-advance in one batch with the
+  `miActivated` history event, **before** any iteration starts.
+- `cardinality`/`items` come from **exactly one** publish-validated source: standard `loopCardinality`
+  (number-valued FEEL → `items = NULL`) or the `easy-bpmn:multiInstance` extension's `collection` (FEEL
+  list, snapshotted as JSON). A runtime FEEL failure (non-number, negative, non-integer, non-list)
+  settles the existing **`conditionFailure`** incident; a cardinality above the body-aware cap settles
+  the new **`miCardinality`** incident (both graceful, before any iteration starts). `cardinality = 0`
+  is legal: the visit settles immediately (`settled_kind='all'`, `settled_count=0`, empty aggregation).
+- `settled_kind` is the **once-only settle decider**: `all` (every iteration finished), `condition`
+  (`completionCondition` fired early — cancel-remaining is a NORMAL, non-compensating discard), or
+  `abort` (an iteration error — the visit drains and routes as if the MI activity threw). A rewalk that
+  sees a settled row never restarts iterations.
+- `output_applied` is the **apply-once** flip for the aggregation merge (optional `outputVariable`: an
+  array of length N indexed by iteration, `null` at never-finished indexes), the `output_applied=1`
+  analogue — atomic with the advance + `miCompleted` history.
+
+### Entity: Service Task Job / Saga Step (delta — the `iteration_index` second dimension)
+
+```sql
+ALTER TABLE service_task_jobs ADD COLUMN iteration_index INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE saga_steps        ADD COLUMN iteration_index INTEGER NOT NULL DEFAULT 0;
+DROP INDEX uq_jobs_instance_element_kind;
+CREATE UNIQUE INDEX uq_jobs_instance_element_kind
+  ON service_task_jobs (instance_id, element_id, is_compensation, occurrence, iteration_index);
+DROP INDEX uq_saga_steps_forward;
+CREATE UNIQUE INDEX uq_saga_steps_forward
+  ON saga_steps (instance_id, element_id, occurrence, iteration_index);
+```
+
+- Every non-MI write keeps `iteration_index = 0` (the column DEFAULTs; the widened unique indexes keep
+  the old key columns in their original order with `iteration_index` appended last, so existing lookups
+  stay index-served) — the migration is invisible to M1–M5-L2 paths.
+- An iteration's ledger row carries `scope_id` = the MI element id (the **`miBody`** scope), so the
+  shipped M5-L1 subtree machinery (reverse cursor, straggler cohort, drain, barrier) sees iterations
+  with zero algorithm change; an MI-callActivity iteration's child step compensates by driving that
+  **child's own** reverse pass (the L2 mechanism, per iteration).
+- `child_instances.iteration_index` (reserved in 0008) is finally non-zero: an MI `callActivity` visit
+  fans out one provenance row + child instance per iteration.
+
+### The `@{i}` key discipline (replay safety)
+
+Workflow step names and job idempotency keys gain an `@{i}` suffix **only** when `i > 0`
+(`svc-create:el#occ@2`; `…@0` is elided), so every pre-L3 step name and idempotency key stays
+**byte-identical** — in-flight instances replay safely across the deploy.
+
+### Body step cost + the runtime cap (publish-time field, on the immutable version)
+
+Publish computes `bodyStepCost` into the stored graph's MI node: `1` for a leaf `serviceTask` body; the
+interior step-costing node count for a `subProcess` body; the resolved child-graph node count for a
+`callActivity` body (filled by call resolution over the pinned-version DAG). The effective per-activation
+cap — `min(MAX_MI_CARDINALITY = 200, floor(STEP_BUDGET_SOFT / (bodyStepCost * 4)))` — is enforced at
+**runtime activation** (cardinality is data, unlike the publish-static `MAX_SCOPE_DEPTH`/`MAX_CALL_DEPTH`),
+settling the graceful `miCardinality` incident.
+
+### History Event (free-text type; no migration)
+
+New event types: `miActivated`, `miIterationCompleted`, `miCompletionConditionMet`, `miAborted`,
+`miCompleted`. New incident kind **`miCardinality`** (`IncidentKind` union + openapi enum, `check:docs`
+#7-synced); the `lineage` block's children now carry `iterationIndex` (openapi updated). Inspection stays
+D1-only.
+
 ## Roadmap stub tables (named here; created in later milestones)
 
 - `execution_tokens` (M4) — **SHIPPED** in migration `0007_tokens.sql` (see the **M4 deltas** above): the
@@ -755,6 +858,9 @@ has no correlation-key source).
   deltas** above): the `callActivity` visit provenance gating both the child-Workflow create and the
   output apply. (M5-L1 — non-transaction `subProcess` — shipped with **no** schema change: the scope
   tree is fully static.)
-- No further roadmap stub tables are named yet — the remaining M5 layers (M5-L3 `multiInstance`,
-  M5-L4 escalation, M5-L5 `signal`) will name their own when their layers open (constitution v2.5.0
+- `mi_activations` (M5-L3) — **SHIPPED** in migration `0009_multi_instance.sql` (see the **M5-L3
+  deltas** above): the multi-instance activation decider (cardinality/items pinned once) plus the
+  `iteration_index` second dimension on `service_task_jobs`/`saga_steps`.
+- No further roadmap stub tables are named yet — the remaining M5 layers (M5-L4 escalation, M5-L5
+  `signal`) will name their own when their layers open (constitution v2.5.0
   already accepted the whole composition set).

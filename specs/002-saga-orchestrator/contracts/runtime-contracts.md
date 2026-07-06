@@ -1,4 +1,4 @@
-# Runtime Contracts: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas; M3 — Time & failure taxonomy; M4 — Concurrency; M5-L2 — Call activity)
+# Runtime Contracts: SAGA Orchestrator (M1 — Canonical transaction-saga; M2 — Conditional sagas; M3 — Time & failure taxonomy; M4 — Concurrency; M5-L2 — Call activity; M5-L3 — Multi-instance)
 
 These contracts extend `specs/001-bpmn-lite-orchestrator-mvp/contracts/runtime-contracts.md`. The
 Process Workflow, Receive Task, Correlation Broker, and D1 Persistence contracts from the MVP carry
@@ -595,6 +595,123 @@ job in either direction.
   `callActivityWaiting`, `callActivityCompleted`, `callActivityErrored` (parent-side),
   `childErrored` (child-side), `instanceCancelled` (`{by:"parentDrain"}`), `operatorRetry`
   (`{target:"childSubtree"}`).
+
+## Multi-Instance Contract (M5-L3 — data-driven fan-out)
+
+Design: `docs/superpowers/specs/2026-07-06-m5-l3-multiinstance-design.md` (§1–§8). Constitution
+**v2.5.0 unchanged** — the M5 amendment accepted the whole composition set up front; this layer only
+opens the `multiInstanceLoopCharacteristics` runtime (governance record:
+`specs/002-saga-orchestrator/m5-L3-constitution-check.md`). **The `/jobs/*` worker surface is
+UNCHANGED** — an MI-serviceTask iteration job is an ordinary job leased by `taskType`; the iteration is
+a persistence-key dimension, never a wire field. MI introduces **no correlation surface** (message waits
+inside an MI body are v1 publish rejects).
+
+### Activation (the `mi_activations` decider — cardinality pinned ONCE)
+
+- **One MI arrival = ONE walk occurrence**; iterations are a second dimension, `iterationIndex`
+  `0..N-1` (the `child_instances (occurrence, iteration_index)` precedent, reserved in 0008). Allowed
+  on a `serviceTask`/`subProcess`/`callActivity` only, parallel and sequential, `behavior="All"` only.
+- **The `mi_activations` row is the `gateway_decisions` analogue**: N / the collection snapshot are
+  FEEL-evaluated **once** — from exactly one publish-validated source, standard `loopCardinality`
+  (number-valued FEEL) XOR the `easy-bpmn:multiInstance` extension's `collection` (FEEL list, with
+  `elementVariable` default `"item"`, optional `outputVariable`) — written persist-before-advance in
+  one batch with `miActivated`, and never re-evaluated (the rewalk fast-forward predicate for the
+  whole visit). N = 0 is legal: the visit settles immediately with an empty aggregation.
+- A runtime FEEL failure at activation (non-number, negative, non-integer, non-list) settles the
+  existing **`conditionFailure`** incident; N over the body-aware cap settles the new
+  **`miCardinality`** incident — both graceful, before any iteration starts.
+- **Per-iteration input context** (durable at iteration start, never re-derived): the MI element's
+  resolved scope variables (root or branch overlay) + `{ [elementVariable]: items[i] }` (collection MI)
+  + `{ loopCounter: i }` — **0-based**, a documented divergence from Camunda's 1-based counter.
+
+### Iteration keys (the `@{i}` second dimension)
+
+- **parallel**: all N iterations live at once — N iteration jobs leasable concurrently, N children in
+  flight, N body tokens. **sequential**: exactly one live iteration (index order).
+- Iteration jobs are keyed `(instance, element, is_compensation, occurrence, iteration_index)`;
+  Workflow step names and job idempotency keys gain an `@{i}` suffix **only** when `i > 0`
+  (`svc-create:el#occ@2`; `@0` elided) — every pre-L3 step name/key stays **byte-identical**
+  (replay safety for in-flight instances across the deploy).
+- **MI-subProcess** iterations run as real branch tokens `…:el#occ:mi#i` with overlay isolation —
+  interior nodes take per-iteration occurrences from the shared walk visits map, interior variable
+  writes land in the iteration overlay, and the body's inner none end settles the iteration
+  (`miIterationCompleted`), never the scope-exit/instance-completion path. The body is v1-whitelisted:
+  service tasks, exclusive gateways, timer catches, none/error end events only (no message waits, no
+  `eventBasedGateway`, no nested `subProcess`/`transaction`/`callActivity`/MI, no parallel/inclusive
+  gateways) — richer bodies are MI over a `callActivity`.
+- **MI-callActivity** iterations thread `iterationIndex` into the deterministic content-addressed
+  child id and the `child_instances` visit row (`iteration_index` finally non-zero) — one real child
+  instance per iteration, the full L2 create/apply idempotency triad per iteration.
+
+### Completion condition (once-only early settle; NORMAL cancel-remaining)
+
+- After every newly-observed iteration completion, `completionCondition` (if declared) is evaluated
+  over base variables + the just-finished iteration's output +
+  `{ nrOfInstances, nrOfCompletedInstances, nrOfActiveInstances }`. True → the settle decider
+  (`settled_kind='condition'`, once-only) + **cancel-remaining**: in-flight iteration jobs abandoned,
+  in-flight iteration children cascade-cancelled, remaining iteration tokens discarded — a NORMAL,
+  **non-compensating** frontier teardown (never `ledgerStragglers`, no compensation jobs).
+  Never-started iterations simply never start.
+- Under a **LATER** enclosing-transaction cancel, exactly the k finished iterations compensate
+  (reverse order); the cancelled/never-started N−k owe nothing.
+
+### Aggregation (apply-once, by iteration index)
+
+- With `outputVariable`: an array of length N — `[i]` = iteration `i`'s output (the job's output
+  variables / the child's final variables / the iteration overlay), `null` at never-finished indexes —
+  written to root variables or the MI element's own branch overlay (the M4 split), atomic with
+  `output_applied = 1` + `miCompleted` + the advance. Without `outputVariable`, MI writes **no**
+  variables (documented).
+
+### Iteration errors (abort) + Hazard timer on the MI activity
+
+- An **iteration business error** (worker error / body error end / child `errored`) settles the
+  `abort` decider **once**, drains the `miBody` subtree with retention semantics (completed iteration
+  rows stay/are ledgered `pending`; in-flight abandoned/discarded; live iteration children
+  cascade-cancelled, ledgers retained), then routes exactly as if **the MI activity threw it**: a
+  matching error boundary on the MI element → its flow; else M5-L1 hierarchical bubbling;
+  `uncaughtError` at the process root. A rewalk over the abort decider never restarts iterations.
+- A **technical incident** in an iteration parks the saga as today (other parallel iterations may keep
+  completing); operator `/retry` heals it (children via the existing cascading retry).
+- A **timer boundary on the MI activity is Hazard**: interrupt **without** compensation — the same
+  retention drain, then the boundary flow; the finished iterations' `pending` rows are retained for a
+  later operator `/cancel` (M5-L1 semantics, unchanged).
+
+### Per-iteration compensation (the `miBody` scope)
+
+- Every MI activity contributes a static **`miBody`** scope (`scopeId` = the MI element id; counted by
+  `MAX_SCOPE_DEPTH` at publish); each finished iteration writes an iteration-keyed `saga_steps` row
+  under it. The shipped M5-L1 machinery — root-relative reverse cursor, straggler cohort, live-token
+  barrier, subtree drain — sees iterations with **zero algorithm change**: reverse-by-index for
+  sequential MI, reverse completion order for parallel, straggler iterations ledgered and compensated.
+- An MI-callActivity iteration compensates by driving that **child's OWN reverse pass** (the L2
+  child-step dispatch, per iteration).
+- A compensation boundary attached **to** the MI activity (compensate-as-a-unit) is **deferred**
+  (publish reject, the L1 compensate-subProcess-as-unit analogue); `isForCompensation` on an MI
+  activity rejects.
+
+### Caps + the step-free park
+
+- **`MAX_MI_CARDINALITY = 200`** (`src/runtime/engine.ts`, `check:docs`-synced), **body-aware**: the
+  effective per-activation cap is `min(MAX_MI_CARDINALITY, floor(STEP_BUDGET_SOFT / (bodyStepCost *
+  4)))` — `bodyStepCost` computed at publish (1 for a leaf serviceTask; the interior step-costing node
+  count for a subProcess body; the resolved child-graph node count for a callActivity body, filled by
+  call resolution) — enforced at **runtime activation** (cardinality is data), settling the graceful
+  `miCardinality` incident.
+- **The step-free park** ships in this layer: `svc-park`, `call-park`, and `mi-park` issue **no**
+  Workflow step on an unchanged re-park (the parked predicate is read outside the step; the step is
+  issued only when the park first lands) — collapsing the N-parked-iterations × wakes step cost from
+  ~N²/2 to ~linear, replay-safe.
+
+### History + lineage inspection
+
+- New free-text `history_events.type` values (no schema change): `miActivated`,
+  `miIterationCompleted`, `miCompletionConditionMet`, `miAborted`, `miCompleted`. Every transition
+  writes D1 history; inspection stays D1-only.
+- The `GET /instances/{id}` `lineage` block's children now carry **`iterationIndex`** (openapi
+  updated); MI iteration tokens are visible through the existing `tokens` array (`mi#i` ids).
+- Operator verbs are unchanged: `/cancel` = the two-phase root drain (already iterates every child row
+  and live token); `/retry` = the child-subtree-first cascade; direct child verbs stay 409.
 
 ## Observability Contract
 

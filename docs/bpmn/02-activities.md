@@ -118,9 +118,8 @@ publish-time `MAX_SCOPE_DEPTH = 8` cap (see
 [`07-execution-semantics.md`](./07-execution-semantics.md)). Error and (interrupting) timer boundary events
 may now attach to a `subProcess` (or a `transaction`) in addition to a task — see
 [`01-events.md`](./01-events.md) for the Hazard-vs-Cancel firing semantics. The `adHocSubProcess` and event
-sub-process (`triggeredByEvent="true"`) remain rejected; `multiInstanceLoopCharacteristics` is
-constitution-accepted (v2.5.0) but stays interim-rejected until M5-L3 opens its runtime (`callActivity`
-opened in M5-L2 — see below).
+sub-process (`triggeredByEvent="true"`) remain rejected; `multiInstanceLoopCharacteristics` opened its
+runtime in M5-L3 and `callActivity` in M5-L2 — see below.
 
 **In scope since M5-L2 (reusable sub-sagas):** the `callActivity`. Each visit invokes a *separate,
 published* process definition as a **real child instance** with its own Workflow — a reusable
@@ -135,18 +134,38 @@ reason: an unresolved or non-process `calledElement`, call cycles, and any `rece
 `child:<childInstanceId>` key, so it has no correlation-key source — a deliberate v1 narrowing). A child's
 uncaught error settles the child `errored` and routes at the **parent** exactly like a worker business
 error thrown at the `callActivity`; a committed `callActivity` compensates by driving the **child's own
-reverse pass** over its retained ledger. `multiInstanceLoopCharacteristics` on a `callActivity` stays
-rejected until M5-L3. See [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
+reverse pass** over its retained ledger. Since M5-L3 a `callActivity` may carry
+`multiInstanceLoopCharacteristics` — each iteration fans out its own child instance (see below). See
+[`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).
+
+**In scope since M5-L3 (multi-instance):** `multiInstanceLoopCharacteristics`, **parallel and
+sequential** (`behavior="All"` only), on a `serviceTask`, `subProcess`, or `callActivity` (never a
+`receiveTask`/`transaction`). Cardinality comes from **exactly one** of: standard `loopCardinality`
+(number-valued FEEL) or the `easy-bpmn:multiInstance` extension's `collection` (FEEL list, with
+`elementVariable` — default `"item"` — and an optional `outputVariable` that aggregates iteration
+outputs **by iteration index**); the standard ItemAwareElement data bindings
+(`loopDataInputRef`/`loopDataOutputRef`/`inputDataItem`/`outputDataItem`) and the loop marker
+(`standardLoopCharacteristics`) are **permanent** rejects, and `loopCounter` is **0-based** (a documented
+divergence from Camunda's 1-based counter). An MI-`subProcess` body is v1-whitelisted to service tasks,
+exclusive gateways, timer catches, and none/error end events (no message waits, no `eventBasedGateway`,
+no nested scopes/`callActivity`/MI, no parallel/inclusive gateways — richer bodies go through MI over a
+`callActivity`). Cardinality is runtime data, capped body-aware at activation
+(`MAX_MI_CARDINALITY = 200`, scaled down by the body's step cost → a graceful `miCardinality` incident).
+Each finished iteration writes its own iteration-keyed ledger row under the MI activity's `miBody` scope
+— per-iteration compensation; a compensation boundary **on** the MI activity (compensate-as-a-unit) is
+deferred. See [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md) for the full contract.
 
 **Out of scope (reject before publish):** the abstract `task`, `userTask`, `sendTask`, `manualTask`,
 `scriptTask`, `businessRuleTask`, the event sub-process (`triggeredByEvent="true"`) and `adHocSubProcess`,
-the loop and multi-instance markers, and any task with `instantiate="true"` (instances start via the API).
-(The plain embedded `subProcess` and the `callActivity` are no longer in this list — see M5-L1 / M5-L2
-above.)
+the loop marker (`standardLoopCharacteristics` — permanent, distinct from the shipped multi-instance),
+and any task with `instantiate="true"` (instances start via the API).
+(The plain embedded `subProcess`, the `callActivity`, and the multi-instance markers are no longer in
+this list — see M5-L1 / M5-L2 / M5-L3 above.)
 
 The baseline activity vocabulary is *call a worker* (service task) and *wait for a message* (receive task);
 since M1 it also includes the `transaction` sub-process with compensation / error / cancel boundary events
 — the canonical saga scope; since M5-L1 it also includes the plain embedded `subProcess` as a
 non-transactional bookkeeping scope, nestable with `transaction` in either order; since M5-L2 it also
-includes the `callActivity` — *invoke a published process as a reusable sub-saga*. See
+includes the `callActivity` — *invoke a published process as a reusable sub-saga*; and since M5-L3 the
+multi-instance markers — *run an activity once per datum, parallel or sequential*. See
 [`09-easy-bpmn-profile.md`](./09-easy-bpmn-profile.md).

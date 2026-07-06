@@ -298,6 +298,9 @@ async function createForwardJob(env: Env, instanceId: string, graph: ExecutionGr
       isCompensation: false,
       activationExpiresAt,
       occurrence: occ,
+      // M5-L3 seam: a plain (non-MI) forward job is iteration 0. Task 6 passes the
+      // real per-iteration index when this task carries multiInstance.
+      iterationIndex: 0,
       now,
     }),
     historyStmt(env.DB, {
@@ -567,6 +570,9 @@ async function applyForwardCompletion(
         // pass compensates this step only once its lineage quiesces. NULL on the
         // root/single-token (M1–M3) path → filterLineageQuiesced is a no-op there.
         tokenId: activeTokenId ?? null,
+        // M5-L3 seam: a plain (non-MI) forward step is iteration 0. Task 6 passes
+        // the real per-iteration index for an MI-body step.
+        iterationIndex: 0,
         now,
       }),
     );

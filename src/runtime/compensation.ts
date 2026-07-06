@@ -256,7 +256,7 @@ async function runCompensation(
       continue;
     }
 
-    let comp = await getCompensationJob(env.DB, instanceId, step.elementId, step.occurrence);
+    let comp = await getCompensationJob(env.DB, instanceId, step.elementId, step.occurrence, step.iterationIndex);
     if (!comp) {
       comp = await runStep(`comp-create:${ctag}`, () => createCompensationJob(env, instanceId, graph, step));
     }
@@ -440,7 +440,10 @@ async function retainStragglerStmts(
   const pos = job.element_id;
   const scope = graph.nodes[pos]?.scopeId ?? "";
   const stmts: D1PreparedStatement[] = [];
-  if (!(await getSagaStep(env.DB, instanceId, pos, job.occurrence))) {
+  // M5-L3: carry the JOB's own iteration through the ledger key — a straggler on an
+  // MI-body forward job retains a per-iteration step (byte-identical for the pre-L3
+  // iteration-0 path).
+  if (!(await getSagaStep(env.DB, instanceId, pos, job.occurrence, job.iteration_index))) {
     const wiring = graph.compensations?.[pos] ?? graph.transactions?.[scope]?.compensations?.[pos];
     const handlerNode = wiring ? graph.nodes[wiring.handlerId] : undefined;
     stmts.push(
@@ -458,6 +461,7 @@ async function retainStragglerStmts(
         traceId: traceIdFor(instanceId),
         occurrence: job.occurrence,
         tokenId: t.token_id,
+        iterationIndex: job.iteration_index,
         now,
       }),
     );
@@ -563,7 +567,7 @@ export async function drainScopeSubtree(env: Env, graph: ExecutionGraph, instanc
 
 async function createCompensationJob(env: Env, instanceId: string, graph: ExecutionGraph, step: SagaStepView): Promise<JobRow> {
   // Idempotent re-run (Workflow step retry after a committed batch).
-  const existing = await getCompensationJob(env.DB, instanceId, step.elementId, step.occurrence);
+  const existing = await getCompensationJob(env.DB, instanceId, step.elementId, step.occurrence, step.iterationIndex);
   if (existing) return existing;
 
   const inst = await loadInst(env, instanceId);
@@ -574,22 +578,28 @@ async function createCompensationJob(env: Env, instanceId: string, graph: Execut
     createJobStmt(env.DB, {
       jobId,
       instanceId,
-      elementId: step.elementId, // forward element id (uq is per kind + occurrence)
+      elementId: step.elementId, // forward element id (uq is per kind + occurrence + iteration)
       taskType,
       retryLimit: Math.max(1, handlerNode?.retries ?? 1),
-      idempotencyKey: `${instanceId}:${step.elementId}:1:${step.occurrence}`,
+      // M5-L3: the compensation-job idempotency key gains an `@${iteration}` suffix
+      // ONLY when iteration > 0 — so every pre-L3 (iteration 0) key stays
+      // byte-identical (replay safety across the migration), and per-iteration MI
+      // compensation jobs get distinct keys.
+      idempotencyKey: `${instanceId}:${step.elementId}:1:${step.occurrence}` + (step.iterationIndex > 0 ? `@${step.iterationIndex}` : ""),
       inputVariables: parseJson<JsonObject>(inst.variables, {}),
       workspaceId: inst.workspace_id,
       isCompensation: true,
       compensatesElementId: step.elementId,
-      // A compensation job inherits its forward step's occurrence (design M2 §8).
+      // A compensation job inherits its forward step's occurrence (design M2 §8)
+      // and iteration (M5-L3) — the reverse pass keys its lookups by both.
       occurrence: step.occurrence,
+      iterationIndex: step.iterationIndex,
       now: nowIso(),
     }),
     attachCompensationJobStmt(env.DB, { stepId: step.stepId, compensationJobId: jobId, now: nowIso() }),
     historyStmt(env.DB, { workspaceId: inst.workspace_id, instanceId, elementId: step.elementId, type: "compensationStarted", diagnostics: { jobId, handler: step.compensationElementId, taskType, traceId: traceIdFor(instanceId), occurrence: step.occurrence } }),
   ]);
-  return (await getCompensationJob(env.DB, instanceId, step.elementId, step.occurrence))!;
+  return (await getCompensationJob(env.DB, instanceId, step.elementId, step.occurrence, step.iterationIndex))!;
 }
 
 async function markStepCompensated(env: Env, instanceId: string, step: SagaStepView): Promise<void> {

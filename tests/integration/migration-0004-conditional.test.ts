@@ -80,20 +80,26 @@ describe("migration 0004_conditional schema", () => {
     const cols = await columns("service_task_jobs");
     expect(cols).toContain("occurrence");
     expect(cols).toContain("output_applied");
+    // Migrations apply cumulatively in test setup, so the live index reflects the
+    // M5-L3 (0009) widening too: iteration_index is appended LAST, the 0004 key
+    // columns keep their order (existing lookups stay index-served).
     expect(await indexColumns("uq_jobs_instance_element_kind")).toEqual([
       "instance_id",
       "element_id",
       "is_compensation",
       "occurrence",
+      "iteration_index",
     ]);
   });
 
   it("adds occurrence to saga_steps and widens uq_saga_steps_forward", async () => {
     expect(await columns("saga_steps")).toContain("occurrence");
+    // 0004 key columns first, then the M5-L3 (0009) iteration_index appended last.
     expect(await indexColumns("uq_saga_steps_forward")).toEqual([
       "instance_id",
       "element_id",
       "occurrence",
+      "iteration_index",
     ]);
   });
 

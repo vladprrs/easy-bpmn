@@ -47,6 +47,10 @@ export interface SagaStepRow {
   // worker-task step; non-NULL = compensate by driving this child instance's
   // own reverse pass instead of a compensation job.
   child_instance_id: string | null;
+  // M5-L3 (0009) — the MI iteration that produced this row; 0 on every non-MI
+  // (pre-L3) path. Widens the (instance, element, occurrence) forward key so two
+  // iterations of one MI-body visit are distinct ledger rows.
+  iteration_index: number;
 }
 
 export interface SagaStepView {
@@ -74,6 +78,8 @@ export interface SagaStepView {
   tokenId: string | null;
   /** M5-L2: non-NULL ⇒ compensate via this child instance's own reverse pass. */
   childInstanceId: string | null;
+  /** M5-L3: the producing MI iteration; 0 on every non-MI (pre-L3) path. */
+  iterationIndex: number;
 }
 
 export function mapSagaStep(row: SagaStepRow): SagaStepView {
@@ -95,6 +101,7 @@ export function mapSagaStep(row: SagaStepRow): SagaStepView {
     traceId: row.trace_id,
     tokenId: row.token_id,
     childInstanceId: row.child_instance_id,
+    iterationIndex: row.iteration_index,
   };
 }
 
@@ -167,6 +174,10 @@ export function insertSagaStepStmt(
     /** M5-L2 (0008) — non-NULL ⇒ this step compensates via a child instance's
      *  own reverse pass rather than a compensation job; defaults to NULL. */
     childInstanceId?: string | null;
+    /** M5-L3 (0009) — the producing MI iteration; defaults to 0 (every non-MI
+     *  path). Widens the (instance, element, occurrence) INSERT-OR-IGNORE key so
+     *  two iterations of one MI-body visit are distinct rows, one dedup key each. */
+    iterationIndex?: number;
     now: string;
   },
 ): D1PreparedStatement {
@@ -174,10 +185,10 @@ export function insertSagaStepStmt(
     db,
     `INSERT OR IGNORE INTO saga_steps
        (step_id, instance_id, scope_id, seq, element_id, forward_job_id, captured_input, captured_output,
-        compensation_element_id, compensation_task_type, compensation_job_id, compensation_status, trace_id, created_at, updated_at, occurrence, token_id, child_instance_id)
+        compensation_element_id, compensation_task_type, compensation_job_id, compensation_status, trace_id, created_at, updated_at, occurrence, token_id, child_instance_id, iteration_index)
      SELECT ?, ?, ?,
             COALESCE((SELECT MAX(seq) FROM saga_steps WHERE instance_id = ?), 0) + 1,
-            ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?`,
+            ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?`,
     [
       input.stepId,
       input.instanceId,
@@ -196,6 +207,7 @@ export function insertSagaStepStmt(
       input.occurrence ?? 0,
       input.tokenId ?? null,
       input.childInstanceId ?? null,
+      input.iterationIndex ?? 0,
     ],
   );
 }
@@ -274,11 +286,12 @@ export async function getSagaStep(
   instanceId: string,
   elementId: string,
   occurrence: number,
+  iterationIndex = 0,
 ): Promise<SagaStepView | null> {
   const row = await dbFirst<SagaStepRow>(
     db,
-    `SELECT * FROM saga_steps WHERE instance_id = ? AND element_id = ? AND occurrence = ?`,
-    [instanceId, elementId, occurrence],
+    `SELECT * FROM saga_steps WHERE instance_id = ? AND element_id = ? AND occurrence = ? AND iteration_index = ?`,
+    [instanceId, elementId, occurrence, iterationIndex],
   );
   return row ? mapSagaStep(row) : null;
 }

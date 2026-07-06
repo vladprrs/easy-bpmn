@@ -229,6 +229,22 @@ export async function driveForwardServiceTask(
 
   // Park: the instance resumes on the next drive (a /jobs/complete tickle in workflow
   // mode, or an inline re-drive in direct mode) once the job mutates in D1.
+  //
+  // M5-L3 step-free park (design §6, the highest-leverage mitigation): a rewalk over
+  // an UNCHANGED park must be step-free — the predicate is read OUTSIDE any step (the
+  // intermediate-timer pattern, intermediate-timer.ts:93-99). Once already parked on
+  // THIS element, re-issuing `svc-park` on every rewalk is a memoized no-op within one
+  // Workflow run but a REAL step across separate drives; skipping it is a step-COUNT
+  // change only, never a state change — parkWaiting's own idempotence guard already
+  // no-ops the body in this state, and the returned outcome is byte-identical. Only
+  // fires when already `waiting` on this exact element: a first arrival ('running'/
+  // 'starting'), or a rewalk parked on a DIFFERENT element (or the multi-token NULL
+  // frontier), still issues the park. This is deliberately NOT extended to the
+  // `recv:`/`ebg:` parks — a receive/eventBasedGateway rewalk RE-REGISTERS its broker
+  // subscription as a live self-heal (a lost registration is repaired by the next
+  // drive), so those steps are load-bearing, not no-ops.
+  const inst = await loadInst(env, instanceId);
+  if (inst.status === "waiting" && inst.current_element_id === elementId) return { kind: "waiting" };
   await runStep(`svc-park:${tag}`, () => parkWaiting(env, instanceId, elementId, occ, "serviceTask"));
   return { kind: "waiting" };
 }

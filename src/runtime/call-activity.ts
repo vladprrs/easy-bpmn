@@ -153,6 +153,14 @@ export async function driveCallActivity(
     const applied = await runStep(`call-apply:${tag}`, () => applyChildTerminal(env, instanceId, graph, elementId, occ, node, activeTokenId));
     return applied;
   }
+  // M5-L3 step-free park (design §6): mirror the forward-task svc-park guard — a
+  // rewalk over an UNCHANGED parked callActivity is step-free. The predicate is
+  // parkCallWaiting's OWN idempotence condition (:505-512), read OUTSIDE the step, so
+  // the memoized-no-op re-park is elided entirely (a step-COUNT change only — the
+  // parent's `waiting`-on-call1 frontier is byte-identical). A first park ('running'/
+  // 'starting') or a park on a different element still issues its step.
+  const inst = await loadInst(env, instanceId);
+  if (inst.status === "waiting" && inst.current_element_id === elementId) return { kind: "waiting" };
   await runStep(`call-park:${tag}`, () => parkCallWaiting(env, instanceId, elementId, occ));
   return { kind: "waiting" };
 }

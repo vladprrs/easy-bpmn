@@ -480,8 +480,8 @@ governance record.
 
 **M5-L3…L5 — accepted (v2.5.0), runtime not yet open — publish still rejects (interim):**
 
-- `multiInstanceLoopCharacteristics` (parallel and sequential, M5-L3) — **accepted (v2.5.0), runtime not
-  yet open — publish still rejects (interim)**.
+- `multiInstanceLoopCharacteristics` (parallel and sequential, M5-L3) — **runtime opening in this layer
+  (M5-L3, in progress)**.
 - `escalation` throw/boundary and the event subprocess (`triggeredByEvent="true"`, M5-L4) — **accepted
   (v2.5.0), runtime not yet open — publish still rejects (interim)**.
 - `signal` throw/catch, workspace-scoped 1:N broadcast (M5-L5) — **accepted (v2.5.0), runtime not yet

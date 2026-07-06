@@ -121,3 +121,99 @@ describe("M5-L3 publish-time MI × callActivity composition (Task 3, design §6)
     expect(issues.some((i) => i.elementId === "call1" && /nope-proc-xyz/.test(i.reason))).toBe(true);
   });
 });
+
+// M5-L3 (Task 13) — the matrix wave's publish-reject scenarios, driven through
+// the REAL HTTP publish surface (the L2 CA-REJECT-* precedent: reject scenarios
+// live in integration homes, not the pure-validator unit suite).
+
+function miRejectBpmn(processId: string, activity: string): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    id="D_${processId}" targetNamespace="x">
+  <bpmn:process id="${processId}" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="mi1"/>
+    ${activity}
+    <bpmn:sequenceFlow id="f2" sourceRef="mi1" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+}
+
+async function publishReject(bpmnXml: string, name: string): Promise<{ elementId?: string | null; reason: string }[]> {
+  const draft = await createDraft(bpmnXml, name);
+  expect(draft.status).toBe(201);
+  const res = await publishDraft(draft.body.draftId);
+  expect(res.status).toBeGreaterThanOrEqual(400);
+  return (res.body?.validationIssues ?? []) as { elementId?: string | null; reason: string }[];
+}
+
+describe("M5-L3 MI publish rejects (matrix wave, Task 13)", () => {
+  it("[MI-REJECT-DATABINDING-01] standard MI data bindings (loopDataInputRef) are permanently rejected", async () => {
+    const issues = await publishReject(
+      miRejectBpmn(
+        "mi-rej-databinding",
+        `<bpmn:serviceTask id="mi1" name="Fan">
+          <bpmn:extensionElements><easy-bpmn:taskDefinition type="charge" retries="1"/></bpmn:extensionElements>
+          <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+          <bpmn:multiInstanceLoopCharacteristics isSequential="false">
+            <bpmn:loopCardinality xsi:type="bpmn:tFormalExpression">3</bpmn:loopCardinality>
+            <bpmn:loopDataInputRef>someCollection</bpmn:loopDataInputRef>
+          </bpmn:multiInstanceLoopCharacteristics>
+        </bpmn:serviceTask>`,
+      ),
+      "mi-rej-databinding",
+    );
+    expect(issues.some((i) => i.elementId === "mi1" && /loopDataInputRef|data bindings/i.test(i.reason))).toBe(true);
+  });
+
+  it("[MI-REJECT-NOSOURCE-01] multiInstanceLoopCharacteristics with no recognized cardinality source rejects", async () => {
+    const issues = await publishReject(
+      miRejectBpmn(
+        "mi-rej-nosource",
+        `<bpmn:serviceTask id="mi1" name="Fan">
+          <bpmn:extensionElements><easy-bpmn:taskDefinition type="charge" retries="1"/></bpmn:extensionElements>
+          <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+          <bpmn:multiInstanceLoopCharacteristics/>
+        </bpmn:serviceTask>`,
+      ),
+      "mi-rej-nosource",
+    );
+    expect(issues.some((i) => i.elementId === "mi1" && /no recognized cardinality source/i.test(i.reason))).toBe(true);
+  });
+
+  it("[MI-REJECT-BODY-01] a receiveTask inside an MI-subProcess body rejects (v1 body whitelist)", async () => {
+    const bpmn = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    id="D_mi_rej_body" targetNamespace="x">
+  <bpmn:message id="m_body" name="BodyMsg"/>
+  <bpmn:process id="mi-rej-body" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="mi1"/>
+    <bpmn:subProcess id="mi1" name="Wait each">
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:multiInstanceLoopCharacteristics isSequential="false">
+        <bpmn:loopCardinality xsi:type="bpmn:tFormalExpression">2</bpmn:loopCardinality>
+      </bpmn:multiInstanceLoopCharacteristics>
+      <bpmn:startEvent id="Sb"><bpmn:outgoing>b1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:sequenceFlow id="b1" sourceRef="Sb" targetRef="waitMsg"/>
+      <bpmn:receiveTask id="waitMsg" name="Wait" messageRef="m_body">
+        <bpmn:incoming>b1</bpmn:incoming><bpmn:outgoing>b2</bpmn:outgoing>
+      </bpmn:receiveTask>
+      <bpmn:sequenceFlow id="b2" sourceRef="waitMsg" targetRef="Eb"/>
+      <bpmn:endEvent id="Eb"><bpmn:incoming>b2</bpmn:incoming></bpmn:endEvent>
+    </bpmn:subProcess>
+    <bpmn:sequenceFlow id="f2" sourceRef="mi1" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+    const issues = await publishReject(bpmn, "mi-rej-body");
+    // The whitelist anchors the issue on the MI scope itself and names the
+    // offending interior element in the reason text.
+    expect(issues.some((i) => i.elementId === "mi1" && /waitMsg/.test(i.reason) && /multi-instance body/i.test(i.reason))).toBe(true);
+  });
+});

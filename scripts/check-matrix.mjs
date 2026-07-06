@@ -72,7 +72,7 @@ const MUST_COVER = [
   "boundaryTimer", "intermediateTimer", "messageCatch", "serviceTask", "receiveTask",
   "transaction", "Compensation", "straggler", "quiescence", "noPath", "loopLimit",
   "jobActivationTimeout", "concurrencyLimit", "stepBudget", "poison",
-  "Idempotency", "Operator",
+  "Idempotency", "Operator", "multiInstance",
 ];
 for (const tag of MUST_COVER) {
   if (!new RegExp(tag.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&"), "i").test(registryText)) {
@@ -84,7 +84,7 @@ for (const tag of MUST_COVER) {
 const rejectCount = rows.filter((r) => r.id.startsWith("R-")).length;
 if (rejectCount < 11) failures.push(`only ${rejectCount} reject (R-*) scenarios registered; expected >= 11`);
 
-if (rows.length !== 86) warnings.push(`registry has ${rows.length} scenarios (expected 86)`);
+if (rows.length !== 105) warnings.push(`registry has ${rows.length} scenarios (expected 105)`);
 
 for (const w of warnings) console.warn("  (warn) " + w);
 if (failures.length > 0) {

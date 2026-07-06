@@ -204,6 +204,156 @@ export const MI_SEQ_SUB_BPMN = (taskType: string): string => `<?xml version="1.0
 </bpmn:definitions>`;
 
 /**
+ * M5-L3 Task 8 — completionCondition EARLY SETTLE over a serviceTask body:
+ * parallel cardinality 4, task `probe`, completionCondition
+ * `nrOfCompletedInstances >= 2`. Completing 2 of 4 iteration jobs settles the MI
+ * `condition` decider once-only; the remaining 2 in-flight jobs are terminal-
+ * abandoned as a NORMAL discard (never compensation). `results` collects the 2
+ * finished outputs index-ordered, `null` at the abandoned indexes.
+ */
+export const MI_COND_BPMN = (taskType: string): string => `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    id="D_mi_cond" targetNamespace="x">
+  <bpmn:process id="P_mi_cond" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="mi1"/>
+    <bpmn:serviceTask id="mi1" name="Probe each">
+      <bpmn:extensionElements>
+        <easy-bpmn:taskDefinition type="${taskType}" retries="1"/>
+        <easy-bpmn:multiInstance outputVariable="results"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:multiInstanceLoopCharacteristics isSequential="false">
+        <bpmn:loopCardinality xsi:type="bpmn:tFormalExpression">4</bpmn:loopCardinality>
+        <bpmn:completionCondition xsi:type="bpmn:tFormalExpression">nrOfCompletedInstances &gt;= 2</bpmn:completionCondition>
+      </bpmn:multiInstanceLoopCharacteristics>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="mi1" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
+ * M5-L3 Task 8 — completionCondition EARLY SETTLE over a SUBPROCESS body:
+ * parallel cardinality 2, completionCondition `nrOfCompletedInstances >= 1`.
+ * Completing iteration 0's interior `handle` job settles the decider at k=1; the
+ * still-live `mi#1` iteration token is marked `discarded` (a NORMAL frontier
+ * teardown, never compensation). Proves the token-discard cancel-remaining path.
+ */
+export const MI_COND_SUB_BPMN = (taskType: string): string => `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    id="D_mi_cond_sub" targetNamespace="x">
+  <bpmn:process id="P_mi_cond_sub" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="mi1"/>
+    <bpmn:subProcess id="mi1" name="Probe each">
+      <bpmn:extensionElements>
+        <easy-bpmn:multiInstance outputVariable="results"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:multiInstanceLoopCharacteristics isSequential="false">
+        <bpmn:loopCardinality xsi:type="bpmn:tFormalExpression">2</bpmn:loopCardinality>
+        <bpmn:completionCondition xsi:type="bpmn:tFormalExpression">nrOfCompletedInstances &gt;= 1</bpmn:completionCondition>
+      </bpmn:multiInstanceLoopCharacteristics>
+      <bpmn:startEvent id="Sb"><bpmn:outgoing>b1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:sequenceFlow id="b1" sourceRef="Sb" targetRef="handle"/>
+      <bpmn:serviceTask id="handle" name="Handle">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="${taskType}" retries="1"/></bpmn:extensionElements>
+        <bpmn:incoming>b1</bpmn:incoming>
+        <bpmn:outgoing>b2</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:sequenceFlow id="b2" sourceRef="handle" targetRef="Eb"/>
+      <bpmn:endEvent id="Eb"><bpmn:incoming>b2</bpmn:incoming></bpmn:endEvent>
+    </bpmn:subProcess>
+    <bpmn:sequenceFlow id="f2" sourceRef="mi1" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
+ * M5-L3 Task 8 — the FLAGSHIP non-compensating-discard gate: a SUBPROCESS MI
+ * (cardinality 4, completionCondition `nrOfCompletedInstances >= 2`) inside a
+ * transaction, with the interior `handle` task carrying a per-iteration
+ * compensation boundary (→ `undoHandle`). After the MI early-settles at k=2 the
+ * remaining iteration tokens are discarded; a subsequent `finalize` business
+ * error routes through the error boundary to the transaction's cancel end, and
+ * the reverse pass compensates EXACTLY the 2 finished iterations (occurrence-
+ * keyed, reverse order) — the 2 discarded iterations ledger NOTHING.
+ *
+ * NB: the interior compensate boundary sits on `handle` (a plain serviceTask),
+ * NOT on the MI activity `mi1` — a compensate-as-a-unit boundary on an MI
+ * activity is a publish reject (design §4; validator un-defer is Task 11). The
+ * subProcess-body per-iteration compensation rides the shipped occurrence-keyed
+ * reverse pass with ZERO new compensation code (Task 7's strided interior
+ * occurrences give each iteration a distinct `handle` occurrence).
+ */
+export const MI_COND_SUB_TX_BPMN = (handleType: string, undoType: string, finalizeType: string): string => `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    id="D_mi_cond_tx" targetNamespace="x">
+  <bpmn:error id="Err_finalize" name="Finalize failed" errorCode="FINALIZE_FAILED"/>
+  <bpmn:process id="P_mi_cond_tx" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>g1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="g1" sourceRef="S" targetRef="Tx"/>
+    <bpmn:transaction id="Tx" name="Reserve batch">
+      <bpmn:startEvent id="Tx_start"><bpmn:outgoing>t1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:sequenceFlow id="t1" sourceRef="Tx_start" targetRef="mi1"/>
+      <bpmn:subProcess id="mi1" name="Reserve each">
+        <bpmn:extensionElements>
+          <easy-bpmn:multiInstance outputVariable="results"/>
+        </bpmn:extensionElements>
+        <bpmn:incoming>t1</bpmn:incoming>
+        <bpmn:outgoing>t2</bpmn:outgoing>
+        <bpmn:multiInstanceLoopCharacteristics isSequential="false">
+          <bpmn:loopCardinality xsi:type="bpmn:tFormalExpression">4</bpmn:loopCardinality>
+          <bpmn:completionCondition xsi:type="bpmn:tFormalExpression">nrOfCompletedInstances &gt;= 2</bpmn:completionCondition>
+        </bpmn:multiInstanceLoopCharacteristics>
+        <bpmn:startEvent id="Sb"><bpmn:outgoing>b1</bpmn:outgoing></bpmn:startEvent>
+        <bpmn:sequenceFlow id="b1" sourceRef="Sb" targetRef="handle"/>
+        <bpmn:serviceTask id="handle" name="Handle">
+          <bpmn:extensionElements><easy-bpmn:taskDefinition type="${handleType}" retries="1"/></bpmn:extensionElements>
+          <bpmn:incoming>b1</bpmn:incoming>
+          <bpmn:outgoing>b2</bpmn:outgoing>
+        </bpmn:serviceTask>
+        <bpmn:boundaryEvent id="handle_comp" attachedToRef="handle">
+          <bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+        <bpmn:serviceTask id="undoHandle" name="Undo handle" isForCompensation="true">
+          <bpmn:extensionElements><easy-bpmn:taskDefinition type="${undoType}" retries="2"/></bpmn:extensionElements>
+        </bpmn:serviceTask>
+        <bpmn:association id="a1" associationDirection="One" sourceRef="handle_comp" targetRef="undoHandle"/>
+        <bpmn:sequenceFlow id="b2" sourceRef="handle" targetRef="Eb"/>
+        <bpmn:endEvent id="Eb"><bpmn:incoming>b2</bpmn:incoming></bpmn:endEvent>
+      </bpmn:subProcess>
+      <bpmn:sequenceFlow id="t2" sourceRef="mi1" targetRef="finalize"/>
+      <bpmn:serviceTask id="finalize" name="Finalize">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="${finalizeType}" retries="1"/></bpmn:extensionElements>
+        <bpmn:incoming>t2</bpmn:incoming>
+        <bpmn:outgoing>t3</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="finalize_err" attachedToRef="finalize">
+        <bpmn:errorEventDefinition errorRef="Err_finalize"/></bpmn:boundaryEvent>
+      <bpmn:endEvent id="Tx_ok"><bpmn:incoming>t3</bpmn:incoming></bpmn:endEvent>
+      <bpmn:endEvent id="Tx_cancel"><bpmn:incoming>fe</bpmn:incoming><bpmn:cancelEventDefinition/></bpmn:endEvent>
+      <bpmn:sequenceFlow id="t3" sourceRef="finalize" targetRef="Tx_ok"/>
+      <bpmn:sequenceFlow id="fe" sourceRef="finalize_err" targetRef="Tx_cancel"/>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="Tx_cancelled" attachedToRef="Tx">
+      <bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:endEvent id="Done"><bpmn:incoming>g2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="Failed"><bpmn:incoming>g3</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="g2" sourceRef="Tx" targetRef="Done"/>
+    <bpmn:sequenceFlow id="g3" sourceRef="Tx_cancelled" targetRef="Failed"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
  * MI inside an M4 parallel branch (Test 6): a SESE AND fork/join where branch A
  * carries the MI task (loopCardinality 2, outputVariable="results") and branch B
  * a plain task — the aggregation must land in branch A's overlay and fold up to

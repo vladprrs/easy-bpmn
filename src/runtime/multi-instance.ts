@@ -28,6 +28,7 @@ import { mergeVariables, nowIso, parseJson, type JsonObject } from "../util";
 import { dbBatch, stmt } from "../persistence/db";
 import { historyStmt } from "../persistence/history";
 import { applyTransitionStmt, getForwardJob } from "../persistence/instances";
+import { abandonJobOnTimerFireStmt } from "../persistence/jobs";
 import {
   getMiActivation,
   insertMiActivationStmt,
@@ -53,6 +54,7 @@ import { resolveScope, type LeafOutcome } from "./frontier";
 import { scopesOf } from "../bpmn/scope-tree";
 import { ExpressionEvaluationError, evaluateCondition, normalizeFeelValue } from "./expressions";
 import { driveForwardServiceTask } from "./forward-task";
+import { cancelChildCascade } from "./child-cascade";
 import { timerBoundaryFor, timerHasFired } from "./boundary-timer";
 // Static cycle engine ⇄ multi-instance is deliberate and safe (the same shape as
 // the existing engine → call-activity → executor → engine cycle): only function
@@ -224,6 +226,12 @@ export async function driveMultiInstance(
       completed++;
       continue;
     }
+    // M5-L3 (Task 8): a settled-early leftover (an abandoned iteration job / a
+    // discarded iteration token) is neither live nor completed — never re-drive
+    // it. The settle decider's `break` above short-circuits a rewalk before this
+    // point once settled, so this is the belt-and-braces classification that
+    // keeps the drive honest even mid-settle-drive.
+    if (st === "abandoned") continue;
     // Not started or in flight → drive one state forward via the per-kind driver.
     const r = await driveIteration(env, instanceId, graph, elementId, occ, node, i, N, runStep, items, resolveBase, activeTokenId, driveLeaf);
     if (r.kind === "incident") return r;
@@ -410,13 +418,22 @@ async function iterationState(
   occ: number,
   i: number,
   node: GraphNode,
-): Promise<"completed" | "pending"> {
+): Promise<"completed" | "pending" | "abandoned"> {
   if (node.type === "subProcess") {
     const tok = await getToken(env.DB, miTokenId(instanceId, elementId, occ, i));
-    return tok?.status === "consumed" ? "completed" : "pending";
+    if (tok?.status === "consumed") return "completed";
+    // Task 8: a `discarded` iteration token is a settled-early leftover — the
+    // cancel-remaining teardown marked it (NORMAL, non-compensating). Neither
+    // live nor completed on rewalk.
+    if (tok?.status === "discarded") return "abandoned";
+    return "pending";
   }
   const job = await getForwardJob(env.DB, instanceId, elementId, occ, i);
   if (job?.status === "completed" && job.output_applied === 1) return "completed";
+  // Task 8: an MI iteration job reaches `failed` ONLY through cancel-remaining's
+  // terminal-abandon (iteration business-error routing opens in Task 9) — a
+  // settled-early leftover, classified `abandoned` so a rewalk never re-drives it.
+  if (job?.status === "failed") return "abandoned";
   return "pending";
 }
 
@@ -698,7 +715,7 @@ async function maybeSettleOnCondition(
     : parseJson<JsonObject>(inst.variables, {});
   const job = await getForwardJob(env.DB, instanceId, elementId, occ, i);
   const iterationOutput = job?.output_variables ? parseJson<JsonObject>(job.output_variables, {}) : {};
-  const liveNow = await countInFlightIterationJobs(env, instanceId, elementId, occ);
+  const liveNow = await countActiveIterations(env, instanceId, elementId, occ, node, act.cardinality);
 
   let taken: boolean;
   try {
@@ -728,6 +745,18 @@ async function maybeSettleOnCondition(
   }
   if (!taken) return "not-met";
 
+  // Task 8: cancel-remaining — sweep the NOT-finished iterations OUTSIDE the step
+  // (the step-memoization discipline: every write is gated on a D1 read taken
+  // outside `runStep`), then ride the abandon/discard statements on the SAME
+  // batch as the settle decider. This is a NORMAL, non-compensating frontier
+  // teardown: in-flight serviceTask iteration jobs are terminal-abandoned (a
+  // late worker callback then no-ops), live subProcess iteration tokens are
+  // marked `discarded`. NEVER ledgerStragglers, NEVER a compensation job — the
+  // finished iterations' `pending` ledger rows are retained untouched (they
+  // compensate only if an enclosing transaction later cancels); the discarded
+  // iterations ledger nothing. This is the flagship non-compensating invariant.
+  const teardown = await sweepCancelRemaining(env, instanceId, elementId, occ, node, act.cardinality);
+
   await runStep(`mi-settle:${tag}@${i}`, async () => {
     const now = nowIso();
     await dbBatch(env.DB, [
@@ -741,14 +770,91 @@ async function maybeSettleOnCondition(
         type: "miCompletionConditionMet",
         diagnostics: { completedCount, iterationIndex: i, occurrence: occ, ...branchHistoryTags(activeTokenId) },
       }),
-      // Task 8: cancel-remaining statements ride this batch.
+      // Cancel-remaining rides the settle batch (atomic with the decider): a
+      // replay re-runs the same idempotent UPDATEs (abandon touches only
+      // created|locked, discard only live tokens) — 0-row no-ops the second time.
+      ...teardown.abandonJobIds.map((jobId) => abandonJobOnTimerFireStmt(env.DB, jobId, now)),
+      ...teardown.discardTokenIds.map((tokenId) => setTokenStatusStmt(env.DB, tokenId, "discarded", now)),
     ]);
   });
+  // An in-flight MI-callActivity iteration child cannot ride a single dbBatch —
+  // `cancelChildCascade` is multi-statement and terminates the child Workflow —
+  // so cascade-cancel AFTER the settle commits (retention, NOT compensation; its
+  // ledger is left untouched, exactly like a scope-timer Hazard drain). Task 10
+  // wires MI-callActivity iteration bodies; until then this list is empty, so
+  // the loop is a typed seam rather than dead behaviour.
+  for (const childId of teardown.cancelChildIds) {
+    await cancelChildCascade(env, childId);
+  }
   return "met";
 }
 
-/** In-flight (created|locked) iteration jobs of this visit — `nrOfActiveInstances`. */
-async function countInFlightIterationJobs(env: Env, instanceId: string, elementId: string, occ: number): Promise<number> {
+/**
+ * The NORMAL (non-compensating) cancel-remaining sweep (Task 8): for each
+ * NOT-finished iteration of this visit, collect the plain frontier-teardown
+ * target — an in-flight serviceTask iteration job to terminal-abandon, a live
+ * subProcess iteration token to discard, or (Task 10) an in-flight MI-
+ * callActivity child to cascade-cancel. A completed/consumed iteration (incl.
+ * the one that JUST triggered the settle) never matches the live-status filters,
+ * so no index needs skipping. Pure D1 reads — issued OUTSIDE the settle step;
+ * the collected statements/ids commit inside it.
+ */
+async function sweepCancelRemaining(
+  env: Env,
+  instanceId: string,
+  elementId: string,
+  occ: number,
+  node: GraphNode,
+  N: number,
+): Promise<{ abandonJobIds: string[]; discardTokenIds: string[]; cancelChildIds: string[] }> {
+  const abandonJobIds: string[] = [];
+  const discardTokenIds: string[] = [];
+  const cancelChildIds: string[] = [];
+  for (let j = 0; j < N; j++) {
+    if (node.type === "subProcess") {
+      const tok = await getToken(env.DB, miTokenId(instanceId, elementId, occ, j));
+      if (tok && isLiveTokenStatus(tok.status)) discardTokenIds.push(tok.token_id);
+    } else if (node.type === "callActivity") {
+      // TODO(Task 10): getChildInstanceForVisit(instance, el, occ, j) → push a
+      // non-terminal child_instance id here; the caller cascade-cancels it after
+      // the settle batch. MI-callActivity iteration bodies aren't driven yet, so
+      // no child rows exist for this visit and the sweep collects nothing.
+    } else {
+      const job = await getForwardJob(env.DB, instanceId, elementId, occ, j);
+      if (job && (job.status === "created" || job.status === "locked")) abandonJobIds.push(job.job_id);
+    }
+  }
+  return { abandonJobIds, discardTokenIds, cancelChildIds };
+}
+
+/** A token that still participates in the frontier (mirrors the mi-apply teardown IN-list). */
+function isLiveTokenStatus(status: string): boolean {
+  return status === "active" || status === "waiting" || status === "arrivedAtJoin";
+}
+
+/**
+ * `nrOfActiveInstances` for the completionCondition context — body-aware: the
+ * count of iterations still in flight at evaluation time. serviceTask bodies
+ * count in-flight (created|locked) iteration jobs; subProcess bodies count live
+ * iteration tokens (their in-flight work is INTERIOR, not a job at the MI
+ * element). Only consulted when a completionCondition is declared.
+ */
+async function countActiveIterations(
+  env: Env,
+  instanceId: string,
+  elementId: string,
+  occ: number,
+  node: GraphNode,
+  N: number,
+): Promise<number> {
+  if (node.type === "subProcess") {
+    let n = 0;
+    for (let j = 0; j < N; j++) {
+      const tok = await getToken(env.DB, miTokenId(instanceId, elementId, occ, j));
+      if (tok && isLiveTokenStatus(tok.status)) n++;
+    }
+    return n;
+  }
   const row = await stmt(
     env.DB,
     `SELECT COUNT(*) AS n FROM service_task_jobs

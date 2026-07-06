@@ -698,30 +698,26 @@ async function handleForwardFailure(
   if (appliedAlready) return appliedAlready;
 
   const inst = await loadInst(env, instanceId);
-  // M5-L3 (Task 6): a FAILED MI iteration settles a terminal incident — never
-  // the per-visit boundary route below (an MI host's boundary would be routed at
-  // the ACTIVATION level with the sibling iterations aborted, which opens with
-  // Task 9's abortOnIterationError), and never a per-iteration timer settle (an
-  // MI host's timer guards the whole activation, Task 9).
+  // M5-L3 (Task 9): a FAILED MI iteration NEVER takes the per-visit boundary route
+  // below (an MI host's boundary is routed at the ACTIVATION level, over the whole
+  // fan-out) and never a per-iteration timer settle (the MI host's timer guards the
+  // whole activation). The BUSINESS-error case (error_code set) is already surfaced
+  // to the driver by `iterationState` and routed by `abortOnIterationError` — the
+  // driver never calls this path for it — so here we handle only the TECHNICAL
+  // exhaustion: a graceful `serviceTaskFailure` incident (the halt an operator
+  // /retry heals). The error_code guard is a defensive fallback that should be
+  // unreachable in the driver's flow.
   if (mi) {
-    if (job.error_code) {
-      return createIncident(
-        env,
-        instanceId,
-        elementId,
-        job.attempt_count,
-        `Multi-instance iteration ${mi.iterationIndex} failed with business error '${job.error_code}' (MI error routing opens with M5-L3 Task 9).`,
-        { jobId: job.job_id, errorCode: job.error_code, iterationIndex: mi.iterationIndex },
-        "serviceTaskFailure",
-      );
-    }
+    const reason = job.error_code
+      ? `Multi-instance iteration ${mi.iterationIndex} failed with business error '${job.error_code}'.`
+      : "Service Task failed (technical retries exhausted).";
     return createIncident(
       env,
       instanceId,
       elementId,
       job.attempt_count,
-      "Service Task failed (technical retries exhausted).",
-      { jobId: job.job_id, iterationIndex: mi.iterationIndex },
+      reason,
+      { jobId: job.job_id, iterationIndex: mi.iterationIndex, ...(job.error_code ? { errorCode: job.error_code } : {}) },
       "serviceTaskFailure",
     );
   }

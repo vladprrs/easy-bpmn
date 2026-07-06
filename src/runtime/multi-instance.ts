@@ -26,7 +26,7 @@ import type { Env } from "../env";
 import type { ExecutionGraph, GraphNode, MultiInstanceSpec } from "../bpmn/graph";
 import { mergeVariables, nowIso, parseJson, type JsonObject } from "../util";
 import { dbBatch, stmt } from "../persistence/db";
-import { historyStmt } from "../persistence/history";
+import { hasHistoryMarkerForOccurrence, historyStmt, latestScopeEntryOccurrence } from "../persistence/history";
 import { applyTransitionStmt, getForwardJob } from "../persistence/instances";
 import { abandonJobOnTimerFireStmt } from "../persistence/jobs";
 import {
@@ -53,9 +53,18 @@ import { createIncident } from "./incidents";
 import { resolveScope, type LeafOutcome } from "./frontier";
 import { scopesOf } from "../bpmn/scope-tree";
 import { ExpressionEvaluationError, evaluateCondition, normalizeFeelValue } from "./expressions";
-import { driveForwardServiceTask } from "./forward-task";
+import { driveForwardServiceTask, errorCatchTarget } from "./forward-task";
 import { cancelChildCascade } from "./child-cascade";
-import { timerBoundaryFor, timerHasFired } from "./boundary-timer";
+import {
+  armTimerDO,
+  buildBoundaryArm,
+  buildBoundaryCancelSettle,
+  convertOnFire,
+  isUniqueConstraintViolation,
+  timerBoundaryFor,
+  timerHasFired,
+} from "./boundary-timer";
+import { drainScopeSubtree } from "./compensation";
 // Static cycle engine ⇄ multi-instance is deliberate and safe (the same shape as
 // the existing engine → call-activity → executor → engine cycle): only function
 // bindings are accessed, and only at call time — never during module init.
@@ -112,11 +121,10 @@ type IterationOutcome =
   | { kind: "completed" }
   | { kind: "waiting" }
   | { kind: "incident" }
-  // M5-L3 (Task 7): an error END event in a subProcess MI body. A TYPED marker
-  // surfaced up to the main loop — the explicit seam Task 9 wires into the
-  // MI-activity error routing (drainScopeSubtree over the miBody + hierarchical
-  // bubbling). Until then the loop bubbles it as a loud operator-visible incident,
-  // matching Task 6's iteration business-error handling.
+  // M5-L3 (Task 7 seam → Task 9): an error END event in a subProcess MI body. A
+  // TYPED marker surfaced up to the main loop, where Task 9 routes it as "the MI
+  // activity threw" — abortOnIterationError (drainScopeSubtree over the miBody +
+  // settle `abort` + the error boundary / hierarchical bubble / uncaughtError).
   | { kind: "errored"; errorCode: string | null };
 
 /**
@@ -152,11 +160,19 @@ export async function driveMultiInstance(
   const spec = node.multiInstance!;
   const tag = `${elementId}#${occ}`;
 
-  // 0. Boundary-timer Hazard fast-forward — mirror call-activity.ts:117-121. A
-  //    fired MI-host timer already moved the cursor to the boundary target; Task 9
-  //    arms the timer at activation and fills the iteration drain/abandon here.
+  // 0. Boundary-timer Hazard fast-forward (Task 9) — mirror call-activity.ts's
+  //    `call-timer-exit`. A fired MI-host timer already claimed the decider, marked
+  //    the fan-out `abort`, and moved the cursor to the boundary target
+  //    (planBoundaryTimerFire's MI branch); the RETENTION drain of the miBody
+  //    subtree is deferred here (like the scope/callActivity Hazard) so the fire
+  //    batch stays single/persist-before-advance. `abortTeardown` is idempotent
+  //    (retain-only + status-guarded abandons), so every later rewalk that lands on
+  //    the same fired visit re-runs it harmlessly. NO compensation (Hazard, not
+  //    Cancel): finished iterations' `pending` ledger rows are retained for a later
+  //    operator /cancel; in-flight iterations are abandoned/discarded.
   const tb = timerBoundaryFor(graph, elementId);
   if (tb && (await timerHasFired(env, instanceId, tb, occ))) {
+    await runStep(`mi-timer-exit:${tag}`, () => abortTeardown(env, instanceId, graph, elementId, occ, node));
     return { kind: "next", next: tb.node.next! };
   }
 
@@ -192,12 +208,24 @@ export async function driveMultiInstance(
   //    any step, so a rewalk over an existing activation issues no step at all.
   let act = await getMiActivation(env.DB, instanceId, elementId, occ);
   if (!act) {
-    const outcome = await runStep(`mi-activate:${tag}`, () => activateMi(env, instanceId, elementId, occ, node, activeTokenId));
+    const outcome = await runStep(`mi-activate:${tag}`, () => activateMi(env, instanceId, graph, elementId, occ, node, activeTokenId));
     if (outcome !== "ok") return { kind: "incident" }; // conditionFailure | miCardinality already recorded
     act = (await getMiActivation(env.DB, instanceId, elementId, occ))!;
   }
   const N = act.cardinality;
   const items = act.items != null ? parseJson<unknown[]>(act.items, []) : null;
+
+  // ABORT fast-forward (Task 9) — a rewalk over an ALREADY-aborted visit (an
+  // iteration business error / a subProcess-body error end settled `abort` and
+  // routed on an earlier drive). Re-derive the recorded route write-free (the
+  // `appliedForwardOutcome` pattern) from the durable `miAborted` marker, self-
+  // healing a crashed-away drain. The Hazard-timer abort is handled by step 0's
+  // `timerHasFired` short-circuit ABOVE (never reaching here), so this only fires
+  // for the error abort — whose catch may be an error boundary or the uncaught
+  // `uncaughtError` incident (whose instance never rewalks past `incident`).
+  if (act.settled_kind === "abort") {
+    return abortFastForward(env, instanceId, graph, elementId, occ, node);
+  }
 
   // Base variables for iteration inputs — resolved lazily ONCE per drive (pure
   // read; a branch token sees its overlay chain, the root sees root variables).
@@ -215,44 +243,50 @@ export async function driveMultiInstance(
   };
 
   // 2. DRIVE ITERATIONS (index order; sequential stops at the first live one).
-  //    `iterationState` is a pure D1 read: the iteration's job row. Task 9 adds
-  //    the `errored` member (worker business error) + abortOnIterationError.
+  //    `iterationState` is a pure D1 read: the iteration's job row (serviceTask) or
+  //    token (subProcess). Task 9 classifies a serviceTask iteration's FAILED job
+  //    (business error → abort; technical exhaustion → the existing incident halt),
+  //    and routes a subProcess-body error end (driveIteration's `errored`) the same.
   let completed = 0;
   let live = 0;
   for (let i = 0; i < N; i++) {
     if (act.settled_kind && act.settled_kind !== "all") break; // early-settled: never start more
     const st = await iterationState(env, instanceId, elementId, occ, i, node);
-    if (st === "completed") {
+    if (st.kind === "completed") {
       completed++;
       continue;
     }
-    // M5-L3 (Task 8): a settled-early leftover (an abandoned iteration job / a
-    // discarded iteration token) is neither live nor completed — never re-drive
-    // it. The settle decider's `break` above short-circuits a rewalk before this
-    // point once settled, so this is the belt-and-braces classification that
-    // keeps the drive honest even mid-settle-drive.
-    if (st === "abandoned") continue;
+    // M5-L3 (Task 8): a settled-early leftover (a discarded subProcess iteration
+    // token) is neither live nor completed — never re-drive it. The settle
+    // decider's `break` above short-circuits a rewalk before this point once
+    // settled, so this is the belt-and-braces classification that keeps the drive
+    // honest even mid-settle-drive.
+    if (st.kind === "abandoned") continue;
+    // A serviceTask iteration whose job reached a FAILED terminal (Task 9): the
+    // CARRIED distinction — a BUSINESS error (an errorCode was supplied at
+    // /jobs/fail) surfaces as "the MI activity threw" → abort + drain + route
+    // (mirrors how a plain serviceTask surfaces a caught business error). A
+    // TECHNICAL exhaustion (no code) is the existing incident halt, driven through
+    // the forward triad so the MI parks on `incident` (operator /retry heals). A
+    // failed job seen while ALREADY settled is a cancel-remaining leftover (skip).
+    if (st.kind === "failed") {
+      if (st.errorCode != null) {
+        return abortOnIterationError(env, instanceId, graph, elementId, occ, node, runStep, st.errorCode, i, completed, activeTokenId);
+      }
+      if (act.settled_kind != null) continue; // settle-leftover abandon (belt-and-braces)
+      const t = await driveIteration(env, instanceId, graph, elementId, occ, node, i, N, runStep, items, resolveBase, activeTokenId, driveLeaf);
+      if (t.kind === "incident") return { kind: "incident" }; // technical serviceTaskFailure
+      continue; // a failed technical job cannot become completed/waiting (defensive)
+    }
     // Not started or in flight → drive one state forward via the per-kind driver.
     const r = await driveIteration(env, instanceId, graph, elementId, occ, node, i, N, runStep, items, resolveBase, activeTokenId, driveLeaf);
     if (r.kind === "incident") return r;
     if (r.kind === "errored") {
-      // M5-L3 (Task 7 → Task 9 seam): a subProcess-body error end. Until Task 9
-      // wires the MI-activity error routing (abort + drain + hierarchical bubble),
-      // surface it as a loud operator-visible incident — the same shape Task 6
-      // uses for an iteration business error (handleForwardFailure's `mi` branch).
-      await runStep(miIterTag(`mi-iter-error:${tag}`, i), () =>
-        createIncident(
-          env,
-          instanceId,
-          elementId,
-          0,
-          `Multi-instance iteration ${i} raised an error end ('${r.errorCode}') in its subProcess body ` +
-            "(MI iteration error routing opens with M5-L3 Task 9).",
-          { elementId, iterationIndex: i, errorCode: r.errorCode, occurrence: occ },
-          "serviceTaskFailure",
-        ),
-      );
-      return { kind: "incident" };
+      // M5-L3 (Task 9): a subProcess-body error END raised the business error — the
+      // driver already surfaced the typed `{errorCode}` marker. Route it EXACTLY as
+      // a serviceTask iteration business error: abort the visit (drain + settle) and
+      // resolve the error boundary / bubble / uncaughtError at the MI element.
+      return abortOnIterationError(env, instanceId, graph, elementId, occ, node, runStep, r.errorCode, i, completed, activeTokenId);
     }
     if (r.kind === "completed") {
       completed++;
@@ -299,6 +333,7 @@ export async function driveMultiInstance(
 async function activateMi(
   env: Env,
   instanceId: string,
+  graph: ExecutionGraph,
   elementId: string,
   occ: number,
   node: GraphNode,
@@ -382,6 +417,12 @@ async function activateMi(
   }
 
   const now = nowIso();
+  // Task 9: arm the MI-host boundary timer (if any) in the SAME activation batch —
+  // persist-before-advance, one arm per VISIT (never per iteration, unlike a plain
+  // task whose timer arms at job-create). It guards the whole fan-out; the DO alarm
+  // is armed after the batch commits (best-effort, like every other DO arm). N = 0
+  // is born settled with nothing to interrupt, so no timer is armed for it.
+  const arm = cardinality > 0 ? buildBoundaryArm(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: elementId, occ, now }) : null;
   const stmts: D1PreparedStatement[] = [
     insertMiActivationStmt(env.DB, { instanceId, elementId, occurrence: occ, cardinality, isSequential: spec.isSequential, items, now }),
     historyStmt(env.DB, {
@@ -391,26 +432,37 @@ async function activateMi(
       type: "miActivated",
       diagnostics: { cardinality, isSequential: spec.isSequential, hasCollection: items != null, occurrence: occ, ...branchHistoryTags(activeTokenId) },
     }),
+    ...(arm ? arm.stmts : []),
   ];
   // N = 0: born settled — 'all' with zero completions, in the SAME batch.
   if (cardinality === 0) {
     stmts.push(settleMiActivationStmt(env.DB, { instanceId, elementId, occurrence: occ, kind: "all", count: 0, now }));
   }
   await dbBatch(env.DB, stmts);
+  if (arm) await armTimerDO(env, arm.timerId, arm.fireAt);
   return "ok";
 }
 
 /**
  * Pure D1 read of one iteration's state (Task 10: the child_instances row):
  *   - serviceTask body: the iteration's job row — `output_applied=1` on a
- *     completed job ⇔ the iteration finished and its outcome was persisted.
+ *     completed job ⇔ the iteration finished and its outcome was persisted; a
+ *     `failed` job is either a worker error (Task 9) or a cancel-remaining
+ *     terminal-abandon leftover — the two are distinguished by `error_code` +
+ *     the driver's settle state, NOT here (the CARRIED Task-8 finding: `failed`
+ *     is NOT always a settle leftover).
  *   - subProcess body (Task 7): the iteration's `mi#` token — `consumed` ⇔ the
- *     body sub-walk reached the inner none-end (`mi-iter-done`). Any other status
- *     (or no token yet) still needs driving. Iteration identity lives in the
- *     token id + the strided interior occurrence, NOT a single job row.
- * `output_applied=1` on a completed job ⇔ the iteration finished and its
- * outcome was persisted; anything else still needs driving.
+ *     body sub-walk reached the inner none-end (`mi-iter-done`); `discarded` ⇔ a
+ *     cancel-remaining leftover. Any other status (or no token yet) still needs
+ *     driving. A subProcess body's ERROR END surfaces via driveIteration's
+ *     `errored` outcome (the sub-walk intercept), never this failed-job path.
  */
+type IterationClass =
+  | { kind: "completed" }
+  | { kind: "pending" }
+  | { kind: "abandoned" }
+  | { kind: "failed"; errorCode: string | null };
+
 async function iterationState(
   env: Env,
   instanceId: string,
@@ -418,23 +470,247 @@ async function iterationState(
   occ: number,
   i: number,
   node: GraphNode,
-): Promise<"completed" | "pending" | "abandoned"> {
+): Promise<IterationClass> {
   if (node.type === "subProcess") {
     const tok = await getToken(env.DB, miTokenId(instanceId, elementId, occ, i));
-    if (tok?.status === "consumed") return "completed";
+    if (tok?.status === "consumed") return { kind: "completed" };
     // Task 8: a `discarded` iteration token is a settled-early leftover — the
     // cancel-remaining teardown marked it (NORMAL, non-compensating). Neither
     // live nor completed on rewalk.
-    if (tok?.status === "discarded") return "abandoned";
-    return "pending";
+    if (tok?.status === "discarded") return { kind: "abandoned" };
+    return { kind: "pending" };
   }
   const job = await getForwardJob(env.DB, instanceId, elementId, occ, i);
-  if (job?.status === "completed" && job.output_applied === 1) return "completed";
-  // Task 8: an MI iteration job reaches `failed` ONLY through cancel-remaining's
-  // terminal-abandon (iteration business-error routing opens in Task 9) — a
-  // settled-early leftover, classified `abandoned` so a rewalk never re-drives it.
-  if (job?.status === "failed") return "abandoned";
-  return "pending";
+  if (job?.status === "completed" && job.output_applied === 1) return { kind: "completed" };
+  // Task 9: a `failed` serviceTask iteration job carries its verdict in
+  // `error_code` — a BUSINESS error (code set) is the "the MI activity threw"
+  // trigger the DRIVER routes via abortOnIterationError; a technical exhaustion
+  // (no code) is the incident halt; a cancel-remaining leftover is also code-less
+  // (the driver skips it when already settled). All three flow through `failed`;
+  // the driver decides, because only it holds the settle state.
+  if (job?.status === "failed") return { kind: "failed", errorCode: job.error_code ?? null };
+  return { kind: "pending" };
+}
+
+/**
+ * An iteration BUSINESS error → the MI visit ABORTS (design §4). Structurally "the
+ * MI activity threw" — the exact analogue of a callActivity child's `errored`
+ * settle (applyChildErrored) and a plain serviceTask's caught business error
+ * (handleForwardFailure). The settle decider (`abort`) makes it once-only: a second
+ * concurrent error / a rewalk observes `settled_kind='abort'` and fast-forwards.
+ */
+async function abortOnIterationError(
+  env: Env,
+  instanceId: string,
+  graph: ExecutionGraph,
+  elementId: string,
+  occ: number,
+  node: GraphNode,
+  runStep: RunStep,
+  errorCode: string | null,
+  iterationIndex: number,
+  completed: number,
+  activeTokenId?: string,
+): Promise<MiOutcome> {
+  const tag = `${elementId}#${occ}`;
+  // Predicate OUTSIDE the step (memoization discipline): an already-settled abort
+  // is a pure fast-forward, so a rewalk over it issues no step.
+  const fresh = await getMiActivation(env.DB, instanceId, elementId, occ);
+  if (fresh?.settled_kind === "abort") return abortFastForward(env, instanceId, graph, elementId, occ, node);
+  return runStep(`mi-abort:${tag}`, () => applyAbort(env, instanceId, graph, elementId, occ, node, errorCode, iterationIndex, completed, activeTokenId));
+}
+
+/**
+ * The abort step body (idempotent — a re-run finds `settled_kind='abort'` and re-
+ * derives). Ordering MIRRORS applyChildErrored's REAL order (not the brief's inline
+ * sketch): the settle + `miAborted` route fact + transition commit FIRST — that
+ * batch alone is the `abortFastForward` predicate — then the RETENTION drain of the
+ * miBody subtree runs AFTER, its completion stamped by the `scopeExited` marker so a
+ * crash between the two is healed by `abortFastForward`'s own existence-guarded re-
+ * drain. Draining BEFORE the batch would make that self-heal unreachable dead code.
+ */
+async function applyAbort(
+  env: Env,
+  instanceId: string,
+  graph: ExecutionGraph,
+  elementId: string,
+  occ: number,
+  node: GraphNode,
+  errorCode: string | null,
+  iterationIndex: number,
+  completed: number,
+  activeTokenId?: string,
+): Promise<MiOutcome> {
+  const cur = await getMiActivation(env.DB, instanceId, elementId, occ);
+  if (cur?.settled_kind === "abort") return abortFastForward(env, instanceId, graph, elementId, occ, node); // idempotent step re-run
+
+  const inst = await loadInst(env, instanceId);
+  const now = nowIso();
+  const settleAbort = settleMiActivationStmt(env.DB, { instanceId, elementId, occurrence: occ, kind: "abort", count: completed, now });
+  // Route resolution: the hierarchical attachment-chain walk FROM the MI element
+  // (errorCatchTarget) — an error boundary on the MI activity itself, else each
+  // enclosing scope bottom-up. The miBody scope is transparent to the climb (it
+  // starts at the MI element's OWN `scopeId` = the enclosing scope, never the
+  // miBody, so a boundary on the MI element is level-0 and the climb skips miBody).
+  const target = errorCatchTarget(graph, elementId, errorCode);
+
+  if (target) {
+    const scopeOcc = target.hostIsScope ? await latestScopeEntryOccurrence(env.DB, instanceId, target.hostId) : 0;
+    // Disarm the MI element's OWN guarding timer (Hazard-vs-Cancel), and — when the
+    // catch climbed to an enclosing scope — that scope's own timer, atomically with
+    // the route (mirrors applyChildErrored / handleForwardFailure). On a decider
+    // conflict (the timer fired first) the whole batch aborts → convert to the fired
+    // boundary path instead of double-advancing.
+    const cancelSettle = buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: elementId, occ, now });
+    const scopeCancelSettle = target.hostIsScope
+      ? buildBoundaryCancelSettle(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: target.hostId, occ: scopeOcc, now })
+      : null;
+    const stmts: D1PreparedStatement[] = [
+      settleAbort,
+      historyStmt(env.DB, {
+        workspaceId: inst.workspace_id,
+        instanceId,
+        elementId,
+        type: "miAborted",
+        diagnostics: { errorCode, iterationIndex, caughtBy: target.boundaryId, boundaryTarget: target.next, occurrence: occ, ...branchHistoryTags(activeTokenId) },
+      }),
+      applyTransitionStmt(env.DB, { instanceId, currentElementId: target.next, status: "running", now }),
+    ];
+    if (cancelSettle) stmts.push(...cancelSettle.stmts);
+    if (scopeCancelSettle) stmts.push(...scopeCancelSettle.stmts);
+    try {
+      await dbBatch(env.DB, stmts);
+    } catch (err) {
+      if (isUniqueConstraintViolation(err)) {
+        const converted = await convertOnFire(env, graph, instanceId, elementId, occ);
+        if (converted) return { kind: "next", next: converted };
+        if (target.hostIsScope) {
+          const scopeConverted = await convertOnFire(env, graph, instanceId, target.hostId, scopeOcc);
+          if (scopeConverted) return { kind: "next", next: scopeConverted };
+        }
+      }
+      throw err;
+    }
+    await abortTeardown(env, instanceId, graph, elementId, occ, node);
+    await historyStmt(env.DB, {
+      workspaceId: inst.workspace_id,
+      instanceId,
+      elementId,
+      type: "scopeExited",
+      diagnostics: { scope: elementId, via: target.boundaryId, abnormal: true, occurrence: occ },
+    }).run();
+    return { kind: "next", next: target.next };
+  }
+
+  // Uncaught business error → a graceful `uncaughtError` incident at root (mirrors
+  // applyChildErrored's uncaught branch — never a plain serviceTaskFailure). The
+  // settle + `miAborted` (no boundaryTarget) commit, then the retention drain, then
+  // the incident freezes the instance (it never rewalks past `incident`).
+  await dbBatch(env.DB, [
+    settleAbort,
+    historyStmt(env.DB, {
+      workspaceId: inst.workspace_id,
+      instanceId,
+      elementId,
+      type: "miAborted",
+      diagnostics: { errorCode, iterationIndex, occurrence: occ, ...branchHistoryTags(activeTokenId) },
+    }),
+  ]);
+  await abortTeardown(env, instanceId, graph, elementId, occ, node);
+  await historyStmt(env.DB, {
+    workspaceId: inst.workspace_id,
+    instanceId,
+    elementId,
+    type: "scopeExited",
+    diagnostics: { scope: elementId, abnormal: true, occurrence: occ },
+  }).run();
+  return createIncident(
+    env,
+    instanceId,
+    elementId,
+    0,
+    `Multi-instance iteration ${iterationIndex} raised an uncaught business error '${errorCode}' (no matching error boundary up the scope chain).`,
+    { errorCode, iterationIndex, occurrence: occ },
+    "uncaughtError",
+  );
+}
+
+/**
+ * The RETENTION teardown of the miBody subtree (Task 9 — shared by the error abort
+ * AND the Hazard timer). NEVER compensation: finished iterations' `pending` ledger
+ * rows are retained untouched (they compensate only if an enclosing transaction /
+ * operator later drives the reverse pass); in-flight iterations are abandoned.
+ *
+ * `drainScopeSubtree(elementId)` handles the subProcess-body interior (live `mi#`
+ * iteration tokens discarded, their interior forward jobs abandoned, completed
+ * interior steps retained as ledger rows, subscriptions + descendant timers
+ * settled, live iteration children cascade-cancelled). But a serviceTask-body MI's
+ * iteration JOBS are keyed to `elementId` carrying the ENCLOSING scope (not the
+ * miBody), so the subtree scan misses them — abandon the in-flight ones explicitly
+ * (created/locked → failed; a completed iteration job keeps its `pending` ledger
+ * row). Idempotent (retain-only + status-guarded), safe to re-run every rewalk.
+ */
+async function abortTeardown(
+  env: Env,
+  instanceId: string,
+  graph: ExecutionGraph,
+  elementId: string,
+  occ: number,
+  node: GraphNode,
+): Promise<void> {
+  await drainScopeSubtree(env, graph, instanceId, elementId);
+  if (node.type === "serviceTask") {
+    const act = await getMiActivation(env.DB, instanceId, elementId, occ);
+    if (act) {
+      const now = nowIso();
+      for (let j = 0; j < act.cardinality; j++) {
+        const job = await getForwardJob(env.DB, instanceId, elementId, occ, j);
+        if (job && (job.status === "created" || job.status === "locked")) {
+          await abandonJobOnTimerFireStmt(env.DB, job.job_id, now).run();
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Write-free re-derivation for an ALREADY-aborted MI visit (mirror
+ * appliedForwardOutcome / appliedCallOutcome): re-read the durable `miAborted`
+ * marker and derive the successor — `boundaryTarget` present → its flow; absent
+ * (uncaught) → the instance is frozen `incident`, so an `incident` outcome. The
+ * retention drain is NOT atomic with the route batch, so self-heal it here when the
+ * `scopeExited` drain-done marker is missing (a crash in that window); guarded so a
+ * steady-state rewalk costs one history read and no writes.
+ */
+async function abortFastForward(
+  env: Env,
+  instanceId: string,
+  graph: ExecutionGraph,
+  elementId: string,
+  occ: number,
+  node: GraphNode,
+): Promise<MiOutcome> {
+  if (!(await hasHistoryMarkerForOccurrence(env.DB, instanceId, elementId, "scopeExited", occ))) {
+    await abortTeardown(env, instanceId, graph, elementId, occ, node);
+    const inst = await loadInst(env, instanceId);
+    await historyStmt(env.DB, {
+      workspaceId: inst.workspace_id,
+      instanceId,
+      elementId,
+      type: "scopeExited",
+      diagnostics: { scope: elementId, abnormal: true, occurrence: occ },
+    }).run();
+  }
+  const row = await stmt(
+    env.DB,
+    `SELECT json_extract(diagnostics, '$.boundaryTarget') AS t FROM history_events
+       WHERE instance_id = ? AND element_id = ? AND type = 'miAborted'
+         AND COALESCE(json_extract(diagnostics, '$.occurrence'), 0) = ?
+       ORDER BY rowid DESC LIMIT 1`,
+    [instanceId, elementId, occ],
+  ).first<{ t: string | null }>();
+  if (row?.t) return { kind: "next", next: row.t };
+  return { kind: "incident" }; // uncaught abort → the instance is already `incident`
 }
 
 /**

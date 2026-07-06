@@ -52,6 +52,7 @@ import {
   type TimerView,
 } from "../persistence/timers";
 import { getChildInstanceForVisit } from "../persistence/child-instances";
+import { getMiActivation, settleMiActivationStmt } from "../persistence/mi-activations";
 
 export interface TimerBoundary {
   boundaryId: string;
@@ -401,6 +402,36 @@ export async function planBoundaryTimerFire(
   const instanceId = timer.instanceId;
   const workspaceId = inst.workspace_id;
   const now = nowIso();
+
+  // M5-L3 (Task 9): a boundary timer on a MULTI-INSTANCE activity = Hazard,
+  // INTERRUPT WITHOUT COMPENSATION over the whole fan-out (the same Hazard-vs-Cancel
+  // shape as a scope/callActivity timer, below). Placed BEFORE the per-TYPE branches
+  // because an MI host is itself a serviceTask/subProcess/callActivity and would
+  // otherwise take one of those branches (which would interrupt only iteration 0 /
+  // the wrong wait). The retention drain of the miBody subtree is deferred to the
+  // driver's `mi-timer-exit` fast-forward (like the callActivity `call-timer-exit`),
+  // so THIS batch stays single/persist-before-advance. The `abort` settle marks the
+  // fan-out interrupted so the driver never restarts iterations.
+  if (host?.multiInstance) {
+    const act = await getMiActivation(env.DB, instanceId, hostId, occ);
+    // GUARD: the fan-out must still be in flight — no activation (defensive: the
+    // timer arms in the activation batch), a settled decider (all / condition /
+    // abort), or an applied aggregation all mean the visit already resolved
+    // (completion, an early settle, or a prior interrupt won the race) → skip.
+    if (!act || act.settled_kind != null || act.output_applied === 1) return { kind: "skip" };
+    return {
+      kind: "fire",
+      next,
+      wake: { instanceId, workflowEventType: WAKE_TYPE, timerId: timer.timerId },
+      stmts: [
+        insertTimerOutcomeStmt(env.DB, { timerId: timer.timerId, outcome: "fired", now }), // THE CLAIM
+        flipTimerFiredStmt(env.DB, { timerId: timer.timerId, firedAt: now, now }),
+        settleMiActivationStmt(env.DB, { instanceId, elementId: hostId, occurrence: occ, kind: "abort", count: act.settled_count ?? 0, now }),
+        historyStmt(env.DB, { workspaceId, instanceId, elementId: timer.elementId, type: "timerFired", diagnostics: { attachedToRef: hostId, occurrence: occ, boundaryTarget: next, interruptsMi: true } }),
+        applyTransitionStmt(env.DB, { instanceId, currentElementId: next, status: "running", now }),
+      ],
+    };
+  }
 
   if (host?.type === "serviceTask") {
     const job = await getForwardJob(env.DB, instanceId, hostId, occ);

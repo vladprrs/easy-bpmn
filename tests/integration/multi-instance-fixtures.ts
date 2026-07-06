@@ -393,3 +393,193 @@ export const MI_IN_PARALLEL_BRANCH_BPMN = (miTaskType: string, plainTaskType: st
     <bpmn:endEvent id="E"><bpmn:incoming>s1</bpmn:incoming></bpmn:endEvent>
   </bpmn:process>
 </bpmn:definitions>`;
+
+/**
+ * M5-L3 Task 9 — iteration BUSINESS error → MI abort → error boundary on the MI
+ * activity. Parallel cardinality-3 serviceTask MI; an iteration failing with the
+ * business code `MI_FAIL` aborts the whole visit (settle `abort`, drain the
+ * in-flight iterations) and routes exactly as "the MI activity threw MI_FAIL":
+ * the error boundary on `mi1` catches it → `handler` → `E2`.
+ */
+export const MI_ERR_BOUNDARY_BPMN = (taskType: string, handlerType: string): string => `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    id="D_mi_err_boundary" targetNamespace="x">
+  <bpmn:error id="Err_mi" name="MI failed" errorCode="MI_FAIL"/>
+  <bpmn:process id="P_mi_err_boundary" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="mi1"/>
+    <bpmn:serviceTask id="mi1" name="Charge each">
+      <bpmn:extensionElements>
+        <easy-bpmn:taskDefinition type="${taskType}" retries="1"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:multiInstanceLoopCharacteristics isSequential="false">
+        <bpmn:loopCardinality xsi:type="bpmn:tFormalExpression">3</bpmn:loopCardinality>
+      </bpmn:multiInstanceLoopCharacteristics>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="mi1_err" attachedToRef="mi1"><bpmn:errorEventDefinition errorRef="Err_mi"/></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="fe" sourceRef="mi1_err" targetRef="handler"/>
+    <bpmn:serviceTask id="handler" name="Handle failure">
+      <bpmn:extensionElements><easy-bpmn:taskDefinition type="${handlerType}" retries="1"/></bpmn:extensionElements>
+      <bpmn:incoming>fe</bpmn:incoming>
+      <bpmn:outgoing>fh</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="fh" sourceRef="handler" targetRef="E2"/>
+    <bpmn:endEvent id="E2"><bpmn:incoming>fh</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f2" sourceRef="mi1" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
+ * M5-L3 Task 9 — iteration BUSINESS error with NO matching boundary anywhere up
+ * the scope chain → the MI aborts and settles a graceful `uncaughtError` incident
+ * on the MI activity (mirrors the callActivity child-errored uncaught precedent).
+ */
+export const MI_ERR_UNCAUGHT_BPMN = (taskType: string): string => `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    id="D_mi_err_uncaught" targetNamespace="x">
+  <bpmn:process id="P_mi_err_uncaught" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="mi1"/>
+    <bpmn:serviceTask id="mi1" name="Charge each">
+      <bpmn:extensionElements>
+        <easy-bpmn:taskDefinition type="${taskType}" retries="1"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:multiInstanceLoopCharacteristics isSequential="false">
+        <bpmn:loopCardinality xsi:type="bpmn:tFormalExpression">3</bpmn:loopCardinality>
+      </bpmn:multiInstanceLoopCharacteristics>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="mi1" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
+ * M5-L3 Task 9 — a subProcess-body ERROR END routes identically to a worker
+ * business error. Parallel cardinality-2 MI over a subProcess body
+ * Sb → check → gw (XOR: `fail = true` → `Ebad` error-end MI_FAIL / default →
+ * `Eok` none-end). An iteration whose `check` returns `fail: true` raises the
+ * error end → the MI aborts + routes to the error boundary on `mi1` → `handler`.
+ */
+export const MI_ERR_SUB_BPMN = (checkType: string, handlerType: string): string => `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    id="D_mi_err_sub" targetNamespace="x">
+  <bpmn:error id="Err_mi" name="MI failed" errorCode="MI_FAIL"/>
+  <bpmn:process id="P_mi_err_sub" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="mi1"/>
+    <bpmn:subProcess id="mi1" name="Check each">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:multiInstanceLoopCharacteristics isSequential="false">
+        <bpmn:loopCardinality xsi:type="bpmn:tFormalExpression">2</bpmn:loopCardinality>
+      </bpmn:multiInstanceLoopCharacteristics>
+      <bpmn:startEvent id="Sb"><bpmn:outgoing>b1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:sequenceFlow id="b1" sourceRef="Sb" targetRef="check"/>
+      <bpmn:serviceTask id="check" name="Check">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="${checkType}" retries="1"/></bpmn:extensionElements>
+        <bpmn:incoming>b1</bpmn:incoming>
+        <bpmn:outgoing>b2</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:sequenceFlow id="b2" sourceRef="check" targetRef="gw"/>
+      <bpmn:exclusiveGateway id="gw" default="bOk">
+        <bpmn:incoming>b2</bpmn:incoming>
+        <bpmn:outgoing>bBad</bpmn:outgoing>
+        <bpmn:outgoing>bOk</bpmn:outgoing>
+      </bpmn:exclusiveGateway>
+      <bpmn:sequenceFlow id="bBad" sourceRef="gw" targetRef="Ebad">
+        <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">fail = true</bpmn:conditionExpression>
+      </bpmn:sequenceFlow>
+      <bpmn:sequenceFlow id="bOk" sourceRef="gw" targetRef="Eok"/>
+      <bpmn:endEvent id="Ebad"><bpmn:incoming>bBad</bpmn:incoming><bpmn:errorEventDefinition errorRef="Err_mi"/></bpmn:endEvent>
+      <bpmn:endEvent id="Eok"><bpmn:incoming>bOk</bpmn:incoming></bpmn:endEvent>
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="mi1_err" attachedToRef="mi1"><bpmn:errorEventDefinition errorRef="Err_mi"/></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="fe" sourceRef="mi1_err" targetRef="handler"/>
+    <bpmn:serviceTask id="handler" name="Handle">
+      <bpmn:extensionElements><easy-bpmn:taskDefinition type="${handlerType}" retries="1"/></bpmn:extensionElements>
+      <bpmn:incoming>fe</bpmn:incoming>
+      <bpmn:outgoing>fh</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="fh" sourceRef="handler" targetRef="E2"/>
+    <bpmn:endEvent id="E2"><bpmn:incoming>fh</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f2" sourceRef="mi1" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
+ * M5-L3 Task 9 — HAZARD timer on the MI activity (the L2 CALL_PARENT_TIMER shape,
+ * now over a subProcess MI inside a transaction). A subProcess MI (cardinality 3,
+ * interior `handle` with a per-iteration compensation boundary → `undoHandle`)
+ * inside `Tx`, with a short timer boundary on the MI element → `onTimeout`. When
+ * the timer fires while iterations are in flight it INTERRUPTS WITHOUT
+ * COMPENSATION: the same retention drain (finished iterations' `pending` ledger
+ * rows retained, in-flight abandoned), then the boundary flow — NO compensation
+ * runs. A later operator `/cancel` compensates the retained finished iterations
+ * (the M5-L1 §3.2 gate, now over MI rows).
+ */
+export const MI_TIMER_BPMN = (handleType: string, undoType: string, timeoutType: string): string => `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    id="D_mi_timer" targetNamespace="x">
+  <bpmn:process id="P_mi_timer" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>g1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="g1" sourceRef="S" targetRef="Tx"/>
+    <bpmn:transaction id="Tx" name="Reserve batch">
+      <bpmn:startEvent id="Tx_start"><bpmn:outgoing>t1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:sequenceFlow id="t1" sourceRef="Tx_start" targetRef="mi1"/>
+      <bpmn:subProcess id="mi1" name="Reserve each">
+        <bpmn:incoming>t1</bpmn:incoming>
+        <bpmn:outgoing>t2</bpmn:outgoing>
+        <bpmn:multiInstanceLoopCharacteristics isSequential="false">
+          <bpmn:loopCardinality xsi:type="bpmn:tFormalExpression">3</bpmn:loopCardinality>
+        </bpmn:multiInstanceLoopCharacteristics>
+        <bpmn:startEvent id="Sb"><bpmn:outgoing>b1</bpmn:outgoing></bpmn:startEvent>
+        <bpmn:sequenceFlow id="b1" sourceRef="Sb" targetRef="handle"/>
+        <bpmn:serviceTask id="handle" name="Handle">
+          <bpmn:extensionElements><easy-bpmn:taskDefinition type="${handleType}" retries="1"/></bpmn:extensionElements>
+          <bpmn:incoming>b1</bpmn:incoming>
+          <bpmn:outgoing>b2</bpmn:outgoing>
+        </bpmn:serviceTask>
+        <bpmn:boundaryEvent id="handle_comp" attachedToRef="handle">
+          <bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+        <bpmn:serviceTask id="undoHandle" name="Undo handle" isForCompensation="true">
+          <bpmn:extensionElements><easy-bpmn:taskDefinition type="${undoType}" retries="2"/></bpmn:extensionElements>
+        </bpmn:serviceTask>
+        <bpmn:association id="a1" associationDirection="One" sourceRef="handle_comp" targetRef="undoHandle"/>
+        <bpmn:sequenceFlow id="b2" sourceRef="handle" targetRef="Eb"/>
+        <bpmn:endEvent id="Eb"><bpmn:incoming>b2</bpmn:incoming></bpmn:endEvent>
+      </bpmn:subProcess>
+      <bpmn:boundaryEvent id="mi1_timer" attachedToRef="mi1">
+        <bpmn:timerEventDefinition><bpmn:timeDuration>PT30S</bpmn:timeDuration></bpmn:timerEventDefinition>
+      </bpmn:boundaryEvent>
+      <bpmn:sequenceFlow id="tf" sourceRef="mi1_timer" targetRef="onTimeout"/>
+      <bpmn:serviceTask id="onTimeout" name="On timeout">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="${timeoutType}" retries="1"/></bpmn:extensionElements>
+        <bpmn:incoming>tf</bpmn:incoming>
+        <bpmn:outgoing>tt</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:sequenceFlow id="tt" sourceRef="onTimeout" targetRef="Tx_ok"/>
+      <bpmn:sequenceFlow id="t2" sourceRef="mi1" targetRef="Tx_ok"/>
+      <bpmn:endEvent id="Tx_ok"><bpmn:incoming>t2</bpmn:incoming><bpmn:incoming>tt</bpmn:incoming></bpmn:endEvent>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="Tx_cancelled" attachedToRef="Tx">
+      <bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:endEvent id="Done"><bpmn:incoming>g2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="Failed"><bpmn:incoming>g3</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="g2" sourceRef="Tx" targetRef="Done"/>
+    <bpmn:sequenceFlow id="g3" sourceRef="Tx_cancelled" targetRef="Failed"/>
+  </bpmn:process>
+</bpmn:definitions>`;

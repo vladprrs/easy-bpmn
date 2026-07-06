@@ -584,6 +584,167 @@ export const MI_TIMER_BPMN = (handleType: string, undoType: string, timeoutType:
   </bpmn:process>
 </bpmn:definitions>`;
 
+/**
+ * M5-L3 Task 11 — per-iteration compensation over a SUBPROCESS MI, single interior
+ * compensable step. A subProcess MI (parallel cardinality 3, interior `charge` with
+ * a per-iteration compensation boundary → `refund`) inside a transaction, followed by
+ * a `finalize` whose business error routes through the error boundary to the tx cancel
+ * end. Two tests ride this ONE fixture:
+ *   - [MI-COMP-REVERSE-01]: all 3 iterations complete → the finalize error cancels the
+ *     tx → the reverse pass compensates EXACTLY 3 `refund` jobs, reverse occurrence
+ *     order (occ 2,1,0 — Task 7's strided interior occurrences give each iteration a
+ *     distinct `charge` occurrence: first lap k=0 → occ = i).
+ *   - [MI-COMP-STRAGGLER-01]: an operator /cancel fires while iteration 2's interior
+ *     `charge` job is STILL IN FLIGHT — the two-phase cancel abandons the in-flight
+ *     job, the 2 COMPLETED iterations' `charge` steps compensate, and the barrier
+ *     RELEASES (the instance reaches `compensated`, never wedges); iteration 2 ledgers
+ *     nothing (it never committed a compensable step).
+ *
+ * NB: the interior compensate boundary sits on `charge` (a plain serviceTask), NOT on
+ * the MI activity `mi1` — a compensate-as-a-unit boundary on an MI activity is a
+ * publish reject (design §4; a DEFERRED v1 narrowing, NOT un-deferred in Task 11). The
+ * per-iteration compensation rides the shipped occurrence-keyed reverse pass with ZERO
+ * new compensation code.
+ */
+export const MI_SUB_COMP_TX_BPMN = (chargeType: string, refundType: string, finalizeType: string): string => `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    id="D_mi_sub_comp" targetNamespace="x">
+  <bpmn:error id="Err_finalize" name="Finalize failed" errorCode="FINALIZE_FAILED"/>
+  <bpmn:process id="P_mi_sub_comp" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>g1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="g1" sourceRef="S" targetRef="Tx"/>
+    <bpmn:transaction id="Tx" name="Charge batch">
+      <bpmn:startEvent id="Tx_start"><bpmn:outgoing>t1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:sequenceFlow id="t1" sourceRef="Tx_start" targetRef="mi1"/>
+      <bpmn:subProcess id="mi1" name="Charge each">
+        <bpmn:extensionElements>
+          <easy-bpmn:multiInstance outputVariable="results"/>
+        </bpmn:extensionElements>
+        <bpmn:incoming>t1</bpmn:incoming>
+        <bpmn:outgoing>t2</bpmn:outgoing>
+        <bpmn:multiInstanceLoopCharacteristics isSequential="false">
+          <bpmn:loopCardinality xsi:type="bpmn:tFormalExpression">3</bpmn:loopCardinality>
+        </bpmn:multiInstanceLoopCharacteristics>
+        <bpmn:startEvent id="Sb"><bpmn:outgoing>b1</bpmn:outgoing></bpmn:startEvent>
+        <bpmn:sequenceFlow id="b1" sourceRef="Sb" targetRef="charge"/>
+        <bpmn:serviceTask id="charge" name="Charge">
+          <bpmn:extensionElements><easy-bpmn:taskDefinition type="${chargeType}" retries="1"/></bpmn:extensionElements>
+          <bpmn:incoming>b1</bpmn:incoming>
+          <bpmn:outgoing>b2</bpmn:outgoing>
+        </bpmn:serviceTask>
+        <bpmn:boundaryEvent id="charge_comp" attachedToRef="charge">
+          <bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+        <bpmn:serviceTask id="refund" name="Refund" isForCompensation="true">
+          <bpmn:extensionElements><easy-bpmn:taskDefinition type="${refundType}" retries="2"/></bpmn:extensionElements>
+        </bpmn:serviceTask>
+        <bpmn:association id="a1" associationDirection="One" sourceRef="charge_comp" targetRef="refund"/>
+        <bpmn:sequenceFlow id="b2" sourceRef="charge" targetRef="Eb"/>
+        <bpmn:endEvent id="Eb"><bpmn:incoming>b2</bpmn:incoming></bpmn:endEvent>
+      </bpmn:subProcess>
+      <bpmn:sequenceFlow id="t2" sourceRef="mi1" targetRef="finalize"/>
+      <bpmn:serviceTask id="finalize" name="Finalize">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="${finalizeType}" retries="1"/></bpmn:extensionElements>
+        <bpmn:incoming>t2</bpmn:incoming>
+        <bpmn:outgoing>t3</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="finalize_err" attachedToRef="finalize">
+        <bpmn:errorEventDefinition errorRef="Err_finalize"/></bpmn:boundaryEvent>
+      <bpmn:endEvent id="Tx_ok"><bpmn:incoming>t3</bpmn:incoming></bpmn:endEvent>
+      <bpmn:endEvent id="Tx_cancel"><bpmn:incoming>fe</bpmn:incoming><bpmn:cancelEventDefinition/></bpmn:endEvent>
+      <bpmn:sequenceFlow id="t3" sourceRef="finalize" targetRef="Tx_ok"/>
+      <bpmn:sequenceFlow id="fe" sourceRef="finalize_err" targetRef="Tx_cancel"/>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="Tx_cancelled" attachedToRef="Tx">
+      <bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:endEvent id="Done"><bpmn:incoming>g2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="Failed"><bpmn:incoming>g3</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="g2" sourceRef="Tx" targetRef="Done"/>
+    <bpmn:sequenceFlow id="g3" sourceRef="Tx_cancelled" targetRef="Failed"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
+ * M5-L3 Task 11 — [MI-COMP-SUBPROC-01]: a subProcess MI whose interior has TWO
+ * compensable steps per iteration (`charge` → `refund`, then `ship` → `unship`),
+ * inside a transaction. Distinct from MI_SUB_COMP_TX (single interior step): it
+ * exercises the reverse cursor over MULTIPLE compensable rows PER iteration —
+ * cardinality 2 yields 4 pending ledger rows (charge#0, ship#0, charge#1, ship#1,
+ * each occurrence-distinct by element), and the reverse pass compensates them all
+ * strictly `seq DESC`. A `finalize` business error routes to the tx cancel end.
+ */
+export const MI_SUB_MULTI_TX_BPMN = (chargeType: string, refundType: string, shipType: string, unshipType: string, finalizeType: string): string => `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    id="D_mi_sub_multi" targetNamespace="x">
+  <bpmn:error id="Err_finalize" name="Finalize failed" errorCode="FINALIZE_FAILED"/>
+  <bpmn:process id="P_mi_sub_multi" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>g1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="g1" sourceRef="S" targetRef="Tx"/>
+    <bpmn:transaction id="Tx" name="Fulfil batch">
+      <bpmn:startEvent id="Tx_start"><bpmn:outgoing>t1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:sequenceFlow id="t1" sourceRef="Tx_start" targetRef="mi1"/>
+      <bpmn:subProcess id="mi1" name="Fulfil each">
+        <bpmn:extensionElements>
+          <easy-bpmn:multiInstance outputVariable="results"/>
+        </bpmn:extensionElements>
+        <bpmn:incoming>t1</bpmn:incoming>
+        <bpmn:outgoing>t2</bpmn:outgoing>
+        <bpmn:multiInstanceLoopCharacteristics isSequential="false">
+          <bpmn:loopCardinality xsi:type="bpmn:tFormalExpression">2</bpmn:loopCardinality>
+        </bpmn:multiInstanceLoopCharacteristics>
+        <bpmn:startEvent id="Sb"><bpmn:outgoing>b1</bpmn:outgoing></bpmn:startEvent>
+        <bpmn:sequenceFlow id="b1" sourceRef="Sb" targetRef="charge"/>
+        <bpmn:serviceTask id="charge" name="Charge">
+          <bpmn:extensionElements><easy-bpmn:taskDefinition type="${chargeType}" retries="1"/></bpmn:extensionElements>
+          <bpmn:incoming>b1</bpmn:incoming>
+          <bpmn:outgoing>b2</bpmn:outgoing>
+        </bpmn:serviceTask>
+        <bpmn:boundaryEvent id="charge_comp" attachedToRef="charge">
+          <bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+        <bpmn:serviceTask id="refund" name="Refund" isForCompensation="true">
+          <bpmn:extensionElements><easy-bpmn:taskDefinition type="${refundType}" retries="2"/></bpmn:extensionElements>
+        </bpmn:serviceTask>
+        <bpmn:association id="a1" associationDirection="One" sourceRef="charge_comp" targetRef="refund"/>
+        <bpmn:sequenceFlow id="b2" sourceRef="charge" targetRef="ship"/>
+        <bpmn:serviceTask id="ship" name="Ship">
+          <bpmn:extensionElements><easy-bpmn:taskDefinition type="${shipType}" retries="1"/></bpmn:extensionElements>
+          <bpmn:incoming>b2</bpmn:incoming>
+          <bpmn:outgoing>b3</bpmn:outgoing>
+        </bpmn:serviceTask>
+        <bpmn:boundaryEvent id="ship_comp" attachedToRef="ship">
+          <bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+        <bpmn:serviceTask id="unship" name="Unship" isForCompensation="true">
+          <bpmn:extensionElements><easy-bpmn:taskDefinition type="${unshipType}" retries="2"/></bpmn:extensionElements>
+        </bpmn:serviceTask>
+        <bpmn:association id="a2" associationDirection="One" sourceRef="ship_comp" targetRef="unship"/>
+        <bpmn:sequenceFlow id="b3" sourceRef="ship" targetRef="Eb"/>
+        <bpmn:endEvent id="Eb"><bpmn:incoming>b3</bpmn:incoming></bpmn:endEvent>
+      </bpmn:subProcess>
+      <bpmn:sequenceFlow id="t2" sourceRef="mi1" targetRef="finalize"/>
+      <bpmn:serviceTask id="finalize" name="Finalize">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="${finalizeType}" retries="1"/></bpmn:extensionElements>
+        <bpmn:incoming>t2</bpmn:incoming>
+        <bpmn:outgoing>t3</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="finalize_err" attachedToRef="finalize">
+        <bpmn:errorEventDefinition errorRef="Err_finalize"/></bpmn:boundaryEvent>
+      <bpmn:endEvent id="Tx_ok"><bpmn:incoming>t3</bpmn:incoming></bpmn:endEvent>
+      <bpmn:endEvent id="Tx_cancel"><bpmn:incoming>fe</bpmn:incoming><bpmn:cancelEventDefinition/></bpmn:endEvent>
+      <bpmn:sequenceFlow id="t3" sourceRef="finalize" targetRef="Tx_ok"/>
+      <bpmn:sequenceFlow id="fe" sourceRef="finalize_err" targetRef="Tx_cancel"/>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="Tx_cancelled" attachedToRef="Tx">
+      <bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:endEvent id="Done"><bpmn:incoming>g2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="Failed"><bpmn:incoming>g3</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="g2" sourceRef="Tx" targetRef="Done"/>
+    <bpmn:sequenceFlow id="g3" sourceRef="Tx_cancelled" targetRef="Failed"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
 // ---------------------------------------------------------------------------
 // M5-L3 Task 10 — MI over callActivity (child fan-out + per-iteration child
 // compensation). The child fixtures live in call-activity-fixtures.ts:

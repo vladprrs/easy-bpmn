@@ -76,9 +76,18 @@ export async function syncFrontierReadModel(env: Env, instanceId: string, fronti
     // M5-L3 (Task 7): live `mi#` ITERATION tokens are owned by the MI driver
     // (created per iteration, consumed by `mi-iter-done` / the `mi-apply`
     // teardown) and never appear in the single-token reconstructed frontier —
-    // the vanish sweep must NOT fold them. (The M4 join fold is exact-key by
-    // branchTokenId and never scans, so this filter is the only generic
-    // consumer that could touch them.)
+    // this vanish sweep must NOT fold them. NB: this is NOT the only generic
+    // consumer that sees `mi#` tokens — `handleCancelInstance`'s `liveCohort`
+    // count and the compensation scans (`ledgerStragglers`, the reverse-pass
+    // barrier `live`, `drainScopeSubtree`) all read `listLiveTokens` UNFILTERED
+    // and therefore DO see live `mi#` iteration tokens. Those paths handle them
+    // safely: the barrier COUNTS a live `mi#` token (so it parks rather than
+    // settling until the iteration drains), and the straggler/drain scans
+    // resolve its interior forward job (completed → retain+consume; failed/none →
+    // discard; in-flight → left for the terminator) — draining it before the
+    // barrier check. This sweep is only WRONG for `mi#` tokens (it would mark a
+    // still-live iteration `consumed` mid-flight), which is why THIS scan alone
+    // filters them; the others must keep seeing them.
     if ((r.branch_flow_id ?? "").startsWith("mi#")) continue;
     stmts.push(setTokenStatusStmt(env.DB, r.token_id, "consumed", now));
   }

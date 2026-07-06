@@ -111,6 +111,7 @@ import { completeInstanceGuarded } from "../persistence/instances";
 import { branchHistoryTags, listLiveTokens, setTokenStatusStmt, rootTokenId, getToken, parseOverlay, readOverlay, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
 import { withDriveLock } from "../persistence/drive-lock";
 import { driveForwardServiceTask, terminateUnleasableJob, errorCatchTarget } from "./forward-task";
+import { driveMultiInstance } from "./multi-instance";
 import { driveCallActivity, notifyParentOfChildTerminal, settleChildErrored, PARENT_CONSUMABLE_CHILD_STATUSES } from "./call-activity";
 import { beginCompensating, settleAfterCompensation, cancelBoundaryTarget, drainScopeSubtree } from "./compensation";
 import {
@@ -221,7 +222,7 @@ function maxConcurrentTokens(env: Env): number {
   const o = Number((env as { MAX_CONCURRENT_TOKENS_OVERRIDE?: string }).MAX_CONCURRENT_TOKENS_OVERRIDE);
   return Number.isFinite(o) && o > 0 ? o : MAX_CONCURRENT_TOKENS;
 }
-function stepBudgetSoft(env: Env): number {
+export function stepBudgetSoft(env: Env): number {
   const o = Number((env as { STEP_BUDGET_SOFT_OVERRIDE?: string }).STEP_BUDGET_SOFT_OVERRIDE);
   return Number.isFinite(o) && o > 0 ? o : STEP_BUDGET_SOFT;
 }
@@ -426,6 +427,18 @@ async function loop(
 
       if (node.type === "startEvent") {
         return { kind: "next", next: await runStep(`start:${tag}`, () => enterStart(env, instanceId, graph, cur, occ, node)) };
+      }
+
+      // M5-L3 (Task 6): a multi-instance activity dispatches to the MI driver
+      // BEFORE every per-kind branch — one arrival = ONE occurrence; the driver
+      // owns activation, iteration fan-out (`iterationIndex` is the second
+      // dimension), aggregation, and advancement for serviceTask (Task 6) /
+      // subProcess (Task 7) / callActivity (Task 10) hosts alike.
+      if (node.multiInstance) {
+        const r = await driveMultiInstance(env, instanceId, graph, cur, occ, node, runStep, activeTokenId);
+        if (r.kind === "waiting") return { kind: "parked" };
+        if (r.kind === "incident") return { kind: "incident" };
+        return { kind: "next", next: r.next };
       }
 
       if (node.type === "transaction" || node.type === "subProcess") {

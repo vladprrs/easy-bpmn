@@ -965,8 +965,10 @@ async function leaseOnce(
     };
     if (r.is_compensation === 1) {
       // A compensation job is seeded with the compensated forward step's captured
-      // input + output from the ledger (design §4.4 / §4.3).
-      const step = await getSagaStep(env.DB, r.instance_id, r.compensates_element_id ?? r.element_id, r.occurrence);
+      // input + output from the ledger (design §4.4 / §4.3). Iteration-keyed since
+      // M5-L3: an MI iteration's compensation job must seed from ITS OWN ledger
+      // row, not iteration 0's (iteration_index is 0 on every pre-L3 row).
+      const step = await getSagaStep(env.DB, r.instance_id, r.compensates_element_id ?? r.element_id, r.occurrence, r.iteration_index);
       if (step) {
         job.originalInput = step.capturedInput;
         job.capturedOutput = step.capturedOutput;

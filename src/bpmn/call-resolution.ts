@@ -40,6 +40,23 @@ function messageWaitIds(graph: ExecutionGraph): string[] {
     .map(([id]) => id);
 }
 
+// M5-L3 (design §6): the step-generating node types that count toward an MI
+// body's static per-iteration step-cost estimate. Mirrors validator.ts
+// MI_BODY_STEP_TYPES (the canonical subProcess-body set) — kept in sync there;
+// here it costs a callActivity MI's resolved CHILD graph, which the pure
+// validator could not see (it seeded 1).
+const MI_BODY_STEP_TYPES: ReadonlySet<string> = new Set([
+  "serviceTask",
+  "exclusiveGateway",
+  "intermediateCatchEvent",
+  "endEvent",
+  "boundaryEvent",
+]);
+
+function stepCostOf(g: ExecutionGraph): number {
+  return Math.max(1, Object.values(g.nodes).filter((n) => MI_BODY_STEP_TYPES.has(n.type)).length);
+}
+
 export async function resolveCallActivities(
   db: D1Database,
   workspaceId: string,
@@ -64,6 +81,17 @@ export async function resolveCallActivities(
     childGraphs.set(hit.definition_version_id, JSON.parse(hit.parsed_profile) as ExecutionGraph);
   }
   if (issues.length > 0) return { ok: false, issues };
+
+  // 1b. M5-L3 (design §6): refine each MI-callActivity's bodyStepCost from its
+  //     now-bound child graph. The pure validator seeded 1 (it cannot see the
+  //     called graph); the real per-iteration cost is the child's step-generating
+  //     node count, which feeds the runtime body-aware MI cardinality cap.
+  for (const { node } of calls) {
+    if (node.multiInstance) {
+      const childGraph = childGraphs.get(node.calledDefinitionVersionId!)!;
+      node.multiInstance.bodyStepCost = stepCostOf(childGraph);
+    }
+  }
 
   // 2. Walk the resolved tree: depth, defensive cycles, v1 message-wait reject.
   //    depthOf(g) = 1 + max(depthOf(child)); memoized by versionId.

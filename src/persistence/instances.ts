@@ -889,7 +889,12 @@ export type IncidentKind =
   // cancel) — a deterministic backstop instead of a silent occurrence desync. The
   // static C1 validator rejects UNGUARDED re-entry, this catches the residual
   // CONDITION-GUARDED loop-back the static BFS cannot prove unreachable.
-  | "scopeReentry";
+  | "scopeReentry"
+  // COMPOSITION (M5-L3 design §6) — a multiInstance activation whose evaluated
+  // cardinality exceeds the body-aware cap min(MAX_MI_CARDINALITY,
+  // floor(STEP_BUDGET_SOFT / (bodyStepCost * 4))). Cardinality is data, so this
+  // is a graceful RUNTIME incident at activation — never an opaque errored Workflow.
+  | "miCardinality";
 /**
  * Incident remediation lifecycle (one-way):
  *

@@ -1529,7 +1529,9 @@ components:
             scope whose earlier occurrence was abnormally skipped (fired scope timer /
             nested cancel); a deterministic backstop for the residual condition-guarded
             loop-back the static publish-time check cannot prove unreachable.
-          enum: [serviceTaskFailure, compensationFailure, timeout, poison, loopLimit, noPath, jobActivationTimeout, waitTimeout, conditionFailure, concurrencyLimit, stepBudget, uncaughtError, scopeReentry]
+            M5-L3 adds `miCardinality` — a multi-instance activation whose cardinality
+            exceeds the body-aware cap.
+          enum: [serviceTaskFailure, compensationFailure, timeout, poison, loopLimit, noPath, jobActivationTimeout, waitTimeout, conditionFailure, concurrencyLimit, stepBudget, uncaughtError, scopeReentry, miCardinality]
         resolution:
           type: string
           nullable: true

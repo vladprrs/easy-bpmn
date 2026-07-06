@@ -203,6 +203,15 @@ export const MAX_SCOPE_DEPTH = 8;
 export const MAX_CALL_DEPTH = 4;
 
 /**
+ * M5-L3 — multi-instance fan-out cap (constitution v2.5.0; design §6). BODY-AWARE:
+ * the effective per-activation cap is min(MAX_MI_CARDINALITY,
+ * floor(STEP_BUDGET_SOFT / (bodyStepCost * 4))) — enforced at RUNTIME activation
+ * (cardinality is data), settling a graceful `miCardinality` incident, never an
+ * opaque errored Workflow. `check:docs` syncs every doc copy.
+ */
+export const MAX_MI_CARDINALITY = 200;
+
+/**
  * TEST-ONLY cap overrides (design §9 / L6.1). Integration tests lower a cap via an
  * env var so a bomb fixture trips it without 256 real branches / 20000 real steps;
  * production never sets these (the `Env` fields are optional + test-only). A
@@ -215,6 +224,10 @@ function maxConcurrentTokens(env: Env): number {
 function stepBudgetSoft(env: Env): number {
   const o = Number((env as { STEP_BUDGET_SOFT_OVERRIDE?: string }).STEP_BUDGET_SOFT_OVERRIDE);
   return Number.isFinite(o) && o > 0 ? o : STEP_BUDGET_SOFT;
+}
+export function maxMiCardinality(env: Env): number {
+  const o = Number((env as { MAX_MI_CARDINALITY_OVERRIDE?: string }).MAX_MI_CARDINALITY_OVERRIDE);
+  return Number.isFinite(o) && o > 0 ? o : MAX_MI_CARDINALITY;
 }
 
 /**

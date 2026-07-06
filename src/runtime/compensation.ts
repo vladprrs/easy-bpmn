@@ -22,7 +22,7 @@ import {
   listForwardJobsForInstance,
   type JobRow,
 } from "../persistence/instances";
-import { listChildrenByElement } from "../persistence/child-instances";
+import { getChildInstanceForVisit, listChildrenByElement } from "../persistence/child-instances";
 import {
   attachCompensationJobStmt,
   filterLineageQuiesced,
@@ -33,7 +33,7 @@ import {
   type SagaStepView,
 } from "../persistence/saga";
 import { abandonJobOnTimerFireStmt, listInFlightForwardJobs } from "../persistence/jobs";
-import { listLiveTokens, setTokenStatusStmt, type TokenRow } from "../persistence/tokens";
+import { listLiveTokens, parseTokenId, setTokenStatusStmt, type TokenRow } from "../persistence/tokens";
 import { eligibleCommittedLocalScopeIds, scopesOf, subtreeScopeIds } from "../bpmn/scope-tree";
 import { armCohortLeaseExpiryTerminators } from "./forward-task";
 import { loadInst, type RunStep, type WaitForEvent, type DriveResult, type SettleResult } from "./engine-shared";
@@ -207,7 +207,13 @@ async function runCompensation(
     const eligible = filterLineageQuiesced(steps, live);
     if (eligible.length === 0) return "waiting"; // every remaining step blocked by a live descendant → park
     const step = eligible[0]!; // highest seq among the eligible (selectScope orders seq DESC)
-    const ctag = `${step.elementId}#${step.occurrence}`;
+    // M5-L3 (Task 10): the reverse-pass step names gain `@${iteration}` for i > 0
+    // (byte-identical for the pre-L3 iteration-0 path — the same discriminator the
+    // compensation-job idempotency key uses). Without it the N per-iteration MI child
+    // steps — all sharing (element, occurrence) — would collide their `comp-child:` /
+    // `comp-create:` / `comp-done:` step names and memoize away sibling iterations'
+    // compensation on a Workflow replay.
+    const ctag = `${step.elementId}#${step.occurrence}` + (step.iterationIndex > 0 ? `@${step.iterationIndex}` : "");
 
     if (step.childInstanceId) {
       // M5-L2 (design §5): a child-instance step — compensate by driving the
@@ -345,8 +351,21 @@ async function ledgerStragglers(env: Env, instanceId: string, graph: ExecutionGr
  */
 async function retainCallStraggler(env: Env, graph: ExecutionGraph, instanceId: string, t: TokenRow, now: string): Promise<void> {
   const pos = t.position_element_id;
-  const rows = await listChildrenByElement(env.DB, instanceId, pos);
-  const row = rows[rows.length - 1]; // the LATEST visit — the one this live token parked on
+  // M5-L3 (design §5): a live token IS an MI iteration token (`mi#i`) → retain ITS
+  // OWN iteration's child row (keyed `(pos, activation, i)`), never `rows[last]`.
+  // A non-MI (or M4-branch) token retains the LATEST visit (the byte-identical L2
+  // path). In v1 the MI-subProcess body whitelist forbids a nested callActivity, so
+  // an `mi#i` token never actually parks on a callActivity — this is the forward-
+  // compatible, iteration-aware selection the design mandates.
+  const parsed = parseTokenId(t.token_id);
+  const miIter = parsed.kind === "branch" ? /^mi#(\d+)$/.exec(parsed.branchFlowId) : null;
+  let row;
+  if (parsed.kind === "branch" && miIter) {
+    row = await getChildInstanceForVisit(env.DB, instanceId, pos, parsed.activation, Number(miIter[1]));
+  } else {
+    const rows = await listChildrenByElement(env.DB, instanceId, pos);
+    row = rows[rows.length - 1]; // the LATEST visit — the one this live token parked on
+  }
   if (!row) {
     await dbBatch(env.DB, [setTokenStatusStmt(env.DB, t.token_id, "discarded", now)]);
     return;
@@ -363,7 +382,9 @@ async function retainCallStraggler(env: Env, graph: ExecutionGraph, instanceId: 
   // compensationFailed → closed/failed directly.
   const child = await getInstanceRow(env.DB, row.child_instance_id);
   const stmts: D1PreparedStatement[] = [];
-  if (!(await getSagaStep(env.DB, instanceId, pos, row.occurrence))) {
+  // Iteration-aware dedup (design §5): key by the child row's OWN iteration index
+  // (0 for the non-MI path — byte-identical).
+  if (!(await getSagaStep(env.DB, instanceId, pos, row.occurrence, row.iteration_index))) {
     stmts.push(
       insertSagaStepStmt(env.DB, {
         stepId: newId("step"),
@@ -382,6 +403,7 @@ async function retainCallStraggler(env: Env, graph: ExecutionGraph, instanceId: 
         occurrence: row.occurrence,
         tokenId: t.token_id,
         childInstanceId: row.child_instance_id,
+        iterationIndex: row.iteration_index,
         now,
       }),
     );

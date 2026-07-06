@@ -33,6 +33,7 @@ import {
   getChildInstanceByChildId,
   getChildInstanceForVisit,
   insertChildInstanceStmt,
+  listChildrenByElement,
   markChildOutputAppliedStmt,
 } from "../persistence/child-instances";
 import { countCompensableSteps, getSagaStepByChildId, insertSagaStepStmt, type SagaStepView } from "../persistence/saga";
@@ -48,7 +49,8 @@ import {
   timerBoundaryFor,
   timerHasFired,
 } from "./boundary-timer";
-import { errorCatchTarget } from "./forward-task";
+import { errorCatchTarget, type MiIterationDrive } from "./forward-task";
+import { miIterTag } from "./multi-instance";
 import { createIncident } from "./incidents";
 import { drainScopeSubtree } from "./compensation";
 import { cancelChildCascade } from "./child-cascade";
@@ -82,7 +84,14 @@ export async function childInstanceIdFor(parentInstanceId: string, elementId: st
   return `pi-${hex.slice(0, 24)}`;
 }
 
-export type CallOutcome = { kind: "next"; next: string } | { kind: "waiting" } | { kind: "incident" };
+export type CallOutcome =
+  | { kind: "next"; next: string }
+  | { kind: "waiting" }
+  | { kind: "incident" }
+  // M5-L3 (Task 10): an iteration child settled `errored` under an `mi` drive —
+  // surfaced to the MI driver as an iteration business error (the Task 9 abort
+  // path), NEVER routed at the parent here. Only ever returned when `mi` is set.
+  | { kind: "errored"; errorCode: string | null };
 
 /**
  * Drive one callActivity visit (spec §3). The triad — create, apply, park — each
@@ -104,8 +113,20 @@ export async function driveCallActivity(
   node: GraphNode,
   runStep: RunStep,
   activeTokenId?: string,
+  // M5-L3 (Task 10): the multi-instance thread. When set, this visit drives ONE MI
+  // iteration — child id / provenance / apply keyed `(elementId, occ, iterationIndex)`
+  // (the 4th dimension of childInstanceIdFor), initial vars = the pinned per-iteration
+  // `inputOverride` (item + loopCounter), step names gain `@${i}` for i > 0 (miIterTag),
+  // and the apply path persists the child-terminal flip + ledger WITHOUT advancing the
+  // parent (the MI driver's `mi-apply` owns aggregation + advancement + the park). An
+  // `errored` child is SURFACED to the driver (a `{kind:"errored"}` outcome), never
+  // routed at the parent. Timer boundaries on an MI host guard the whole ACTIVATION
+  // (armed/settled by the MI driver — Task 9), so per-iteration timer interaction is
+  // skipped. Every EXISTING (non-MI) call site omits `mi` → byte-identical L2 behavior.
+  mi?: MiIterationDrive,
 ): Promise<CallOutcome> {
-  const tag = `${elementId}#${occ}`;
+  const iter = mi?.iterationIndex ?? 0;
+  const tag = miIterTag(`${elementId}#${occ}`, iter);
   // Boundary-timer fast-forward — the decider check is identical to
   // forward-task.ts; unlike a plain task, a fired callActivity timer ALSO owes a
   // Hazard cancel-cascade of the visit's child (Task 8). Deferred to here (not
@@ -113,21 +134,23 @@ export async function driveCallActivity(
   // engine.ts's scope-timer-exit branch defers `drainScopeSubtree` — the fire
   // batch (planBoundaryTimerFire, boundary-timer.ts) stays single/
   // persist-before-advance, and `cancelChildCascade`'s own terminal short-circuit
-  // makes this step idempotent across every later rewalk that lands here.
+  // makes this step idempotent across every later rewalk that lands here. Under MI
+  // the timer guards the whole activation and the MI driver owns its fast-forward
+  // (`mi-timer-exit`) — skipped per iteration.
   const tb = timerBoundaryFor(graph, elementId);
-  if (tb && (await timerHasFired(env, instanceId, tb, occ))) {
-    await runStep(`call-timer-exit:${tag}`, () => cancelChildOnTimerFire(env, instanceId, elementId, occ));
+  if (!mi && tb && (await timerHasFired(env, instanceId, tb, occ))) {
+    await runStep(`call-timer-exit:${tag}`, () => cancelVisitChildren(env, instanceId, elementId, occ));
     return { kind: "next", next: tb.node.next! };
   }
 
-  let row = await getChildInstanceForVisit(env.DB, instanceId, elementId, occ);
+  let row = await getChildInstanceForVisit(env.DB, instanceId, elementId, occ, iter);
   // Applied → pure write-free cursor move re-derived from the child terminal state.
-  if (row?.status === "outputApplied") return appliedCallOutcome(env, instanceId, graph, elementId, node, row);
+  if (row?.status === "outputApplied") return appliedCallOutcome(env, instanceId, graph, elementId, node, row, mi);
 
   if (!row) {
-    const created = await runStep(`call-create:${tag}`, () => invokeChild(env, instanceId, graph, elementId, occ, node, activeTokenId));
+    const created = await runStep(`call-create:${tag}`, () => invokeChild(env, instanceId, graph, elementId, occ, node, activeTokenId, mi));
     if (!created) return { kind: "incident" }; // oversized input — incident already recorded
-    row = await getChildInstanceForVisit(env.DB, instanceId, elementId, occ);
+    row = await getChildInstanceForVisit(env.DB, instanceId, elementId, occ, iter);
   }
   const child = row ? await getInstanceRow(env.DB, row.child_instance_id) : null;
   if (!child) return { kind: "incident" }; // invariant: provenance row without child row
@@ -150,9 +173,14 @@ export async function driveCallActivity(
   if (fresh && FORWARD_APPLY_STATUSES.has(fresh.status)) {
     // Gated apply (memoization safety): the step is issued ONLY when the child is
     // in a forward-consumable terminal, so its memoized result is always final.
-    const applied = await runStep(`call-apply:${tag}`, () => applyChildTerminal(env, instanceId, graph, elementId, occ, node, activeTokenId));
+    const applied = await runStep(`call-apply:${tag}`, () => applyChildTerminal(env, instanceId, graph, elementId, occ, node, activeTokenId, mi));
     return applied;
   }
+  // M5-L3 (Task 10): under MI the driver owns the ONE park for the whole visit
+  // (`mi-park`, after every live iteration is driven) — a per-iteration park here
+  // would park the parent on the callActivity element (racing the sibling
+  // iterations) instead of the MI element. Mirror forward-task's `if (mi) return`.
+  if (mi) return { kind: "waiting" };
   // M5-L3 step-free park (design §6): mirror the forward-task svc-park guard — a
   // rewalk over an UNCHANGED parked callActivity is step-free. The predicate is
   // parkCallWaiting's OWN idempotence condition (:505-512), read OUTSIDE the step, so
@@ -166,18 +194,23 @@ export async function driveCallActivity(
 }
 
 /**
- * Timer-Hazard settle for a callActivity visit (Task 8): read the visit's
- * provenance row and, if it bound a child, cascade-cancel it. A missing row
- * means the invoke step never ran for this occurrence (nothing to cancel) —
- * defensive; `planBoundaryTimerFire`'s callActivity branch only fires once a
- * row exists. `cancelChildCascade` is itself idempotent (terminal/compensating
- * short-circuit), so a re-run of this step (Workflow retry, or a later rewalk
- * re-hitting the same fired visit) is a cheap no-op.
+ * Cascade-cancel EVERY iteration child bound by a callActivity VISIT (Task 8 for
+ * the non-MI single-child timer Hazard; Task 10 for the MI fan-out). Iterating
+ * `listChildrenByElement` filtered to this occurrence covers both: a non-MI visit
+ * has exactly one child (iteration 0) — byte-identical to the old single-row read
+ * — while an MI visit has N children `(elementId, occ, i)`, every live one of which
+ * a Hazard interrupt (fired boundary timer / MI abort teardown) must cancel. A
+ * missing/empty set means the invoke step never ran (nothing to cancel) — defensive.
+ * `cancelChildCascade` is itself idempotent (terminal/compensating short-circuit),
+ * so a re-run of this step (Workflow retry, or a later rewalk re-hitting the same
+ * fired visit) is a cheap no-op. RETENTION, not compensation: each child's saga
+ * ledger is left untouched for a later enclosing reverse pass.
  */
-async function cancelChildOnTimerFire(env: Env, instanceId: string, elementId: string, occ: number): Promise<void> {
-  const row = await getChildInstanceForVisit(env.DB, instanceId, elementId, occ);
-  if (!row) return;
-  await cancelChildCascade(env, row.child_instance_id);
+export async function cancelVisitChildren(env: Env, instanceId: string, elementId: string, occ: number): Promise<void> {
+  for (const c of await listChildrenByElement(env.DB, instanceId, elementId)) {
+    if (c.occurrence !== occ) continue;
+    await cancelChildCascade(env, c.child_instance_id);
+  }
 }
 
 /**
@@ -193,31 +226,39 @@ async function invokeChild(
   occ: number,
   node: GraphNode,
   activeTokenId?: string,
+  mi?: MiIterationDrive,
 ): Promise<boolean> {
-  const existing = await getChildInstanceForVisit(env.DB, instanceId, elementId, occ);
+  const iter = mi?.iterationIndex ?? 0;
+  const existing = await getChildInstanceForVisit(env.DB, instanceId, elementId, occ, iter);
   if (existing) return true; // idempotent step re-run — the child is already bound
 
   const inst = await loadInst(env, instanceId);
   // Branch-scoped input (design §5.7): a branch token's child sees its resolved
-  // overlay chain; a null/root token reads root variables verbatim.
+  // overlay chain; a null/root token reads root variables verbatim. An MI iteration
+  // child's initial vars are the PINNED per-iteration override (base + item +
+  // loopCounter, resolved once by the MI driver) — never a re-resolve of the live scope.
   const isBranch = !!activeTokenId && activeTokenId !== rootTokenId(instanceId);
-  const variables = isBranch
-    ? await resolveScope(env, instanceId, parseJson<JsonObject>(inst.variables, {}), activeTokenId!)
-    : parseJson<JsonObject>(inst.variables, {});
+  const variables = mi
+    ? mi.inputOverride
+    : isBranch
+      ? await resolveScope(env, instanceId, parseJson<JsonObject>(inst.variables, {}), activeTokenId!)
+      : parseJson<JsonObject>(inst.variables, {});
   if (payloadByteSize(variables) > MAX_EVENT_PAYLOAD_BYTES) {
     await createIncident(env, instanceId, elementId, 0, "Call activity input variables exceed the Workflow event payload limit.", { size: payloadByteSize(variables) }, "serviceTaskFailure");
     return false;
   }
 
-  const childId = await childInstanceIdFor(instanceId, elementId, occ);
+  const childId = await childInstanceIdFor(instanceId, elementId, occ, iter);
   const childGraph = await getVersionGraph(env.DB, node.calledDefinitionVersionId!);
   if (!childGraph) throw new Error(`Invariant violation: pinned child version ${node.calledDefinitionVersionId} has no parsed profile.`);
   const now = nowIso();
   // A boundary timer on the callActivity (if any) arms in the SAME batch —
-  // persist-before-advance; the DO is armed after the batch commits.
-  const arm = buildBoundaryArm(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: elementId, occ, now });
+  // persist-before-advance; the DO is armed after the batch commits. Under MI the
+  // host's timer guards the whole ACTIVATION (armed once by activateMi, Task 9) —
+  // never per iteration.
+  const arm = mi ? null : buildBoundaryArm(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: elementId, occ, now });
   await dbBatch(env.DB, [
-    insertChildInstanceStmt(env.DB, { parentInstanceId: instanceId, parentElementId: elementId, occurrence: occ, iterationIndex: 0, childInstanceId: childId, now }),
+    insertChildInstanceStmt(env.DB, { parentInstanceId: instanceId, parentElementId: elementId, occurrence: occ, iterationIndex: iter, childInstanceId: childId, now }),
     createChildInstanceStmt(env.DB, {
       instanceId: childId,
       workspaceId: inst.workspace_id,
@@ -235,7 +276,7 @@ async function invokeChild(
       instanceId,
       elementId,
       type: "callActivityInvoked",
-      diagnostics: { childInstanceId: childId, calledDefinitionVersionId: node.calledDefinitionVersionId, occurrence: occ, ...branchHistoryTags(activeTokenId) },
+      diagnostics: { childInstanceId: childId, calledDefinitionVersionId: node.calledDefinitionVersionId, occurrence: occ, ...(mi ? { iterationIndex: iter } : {}), ...branchHistoryTags(activeTokenId) },
     }),
     ...(arm ? arm.stmts : []),
   ]);
@@ -266,17 +307,57 @@ async function applyChildTerminal(
   occ: number,
   node: GraphNode,
   activeTokenId?: string,
+  mi?: MiIterationDrive,
 ): Promise<CallOutcome> {
-  const row = await getChildInstanceForVisit(env.DB, instanceId, elementId, occ);
-  if (!row) throw new Error(`Invariant violation: call-apply without a child_instances row (${elementId}#${occ}).`);
-  if (row.status === "outputApplied") return appliedCallOutcome(env, instanceId, graph, elementId, node, row); // idempotent re-run
+  const iter = mi?.iterationIndex ?? 0;
+  const row = await getChildInstanceForVisit(env.DB, instanceId, elementId, occ, iter);
+  if (!row) throw new Error(`Invariant violation: call-apply without a child_instances row (${miIterTag(`${elementId}#${occ}`, iter)}).`);
+  if (row.status === "outputApplied") return appliedCallOutcome(env, instanceId, graph, elementId, node, row, mi); // idempotent re-run
   const child = (await getInstanceRow(env.DB, row.child_instance_id))!;
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
-  const applyFlip = markChildOutputAppliedStmt(env.DB, { parentInstanceId: instanceId, parentElementId: elementId, occurrence: occ, iterationIndex: 0, now });
+  const applyFlip = markChildOutputAppliedStmt(env.DB, { parentInstanceId: instanceId, parentElementId: elementId, occurrence: occ, iterationIndex: iter, now });
 
   if (child.status === "completed") {
     const childVars = parseJson<JsonObject>(child.variables, {});
+    // M5-L3 (Task 10): the MI ITERATION apply — persist the child-terminal flip +
+    // the per-iteration ledger row + the `miIterationCompleted` audit in ONE batch,
+    // but NO variable merge and NO advance: the child output stays on the child row
+    // until the MI driver's `mi-apply` aggregates ALL iterations index-ordered and
+    // owns the single advance (exactly the serviceTask MI iteration apply). The
+    // ledger row carries the miBody scope (`elementId`) + the iteration index so the
+    // per-iteration reverse pass can drive each child's own reverse.
+    if (mi) {
+      await dbBatch(env.DB, [
+        applyFlip,
+        insertSagaStepStmt(env.DB, {
+          stepId: newId("step"),
+          instanceId,
+          scopeId: elementId, // the miBody scope
+          elementId,
+          forwardJobId: "",
+          capturedInput: {},
+          capturedOutput: childVars,
+          compensationElementId: null,
+          compensationTaskType: null,
+          compensationStatus: "pending",
+          traceId: traceIdFor(instanceId),
+          occurrence: occ,
+          tokenId: activeTokenId ?? null,
+          childInstanceId: row.child_instance_id,
+          iterationIndex: iter,
+          now,
+        }),
+        historyStmt(env.DB, {
+          workspaceId: inst.workspace_id,
+          instanceId,
+          elementId,
+          type: "miIterationCompleted",
+          diagnostics: { childInstanceId: row.child_instance_id, iterationIndex: iter, occurrence: occ, ...branchHistoryTags(activeTokenId) },
+        }),
+      ]);
+      return { kind: "next", next: node.next! };
+    }
     const isBranch = !!activeTokenId && activeTokenId !== rootTokenId(instanceId);
     const branchTokenRow = isBranch ? await getToken(env.DB, activeTokenId!) : null;
     const baseVars = isBranch ? (branchTokenRow ? await readOverlay(env, parseOverlay(branchTokenRow)) : {}) : parseJson<JsonObject>(inst.variables, {});
@@ -320,8 +401,9 @@ async function applyChildTerminal(
     ]);
     return { kind: "next", next: node.next! };
   }
-  // child.status === "errored" — Task 7 routing (error boundary / bubble / uncaughtError).
-  return applyChildErrored(env, instanceId, graph, elementId, occ, node, row, child, activeTokenId);
+  // child.status === "errored" — Task 7 routing (error boundary / bubble / uncaughtError),
+  // OR, under MI, SURFACE to the driver as an iteration business error (Task 10).
+  return applyChildErrored(env, instanceId, graph, elementId, occ, node, row, child, activeTokenId, mi);
 }
 
 /**
@@ -385,7 +467,16 @@ async function applyChildErrored(
   row: { child_instance_id: string },
   child: InstanceRow,
   activeTokenId?: string,
+  mi?: MiIterationDrive,
 ): Promise<CallOutcome> {
+  // M5-L3 (Task 10): under MI an `errored` iteration child is NOT routed at the
+  // parent here — it is SURFACED to the MI driver as an iteration business error
+  // (the driver's `abortOnIterationError` settles the visit `abort`, drains the
+  // miBody, and resolves the error boundary / bubble / uncaughtError AT the MI
+  // element). No flip, no ledger, no route: the child stays `errored` (owes no
+  // parent-driven reverse), the child_instances row stays `invoked`, and the
+  // driver re-observes the errored child on every rewalk until it aborts.
+  if (mi) return { kind: "errored", errorCode: child.error_code ?? null };
   const inst = await loadInst(env, instanceId);
   const now = nowIso();
   const applyFlip = markChildOutputAppliedStmt(env.DB, { parentInstanceId: instanceId, parentElementId: elementId, occurrence: occ, iterationIndex: 0, now });
@@ -480,7 +571,13 @@ async function applyChildErrored(
  * through here. Guarded by the `scopeExited` marker's existence so the re-drain
  * only ever runs once.
  */
-async function appliedCallOutcome(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, node: GraphNode, row: { child_instance_id: string }): Promise<CallOutcome> {
+async function appliedCallOutcome(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, node: GraphNode, row: { child_instance_id: string }, mi?: MiIterationDrive): Promise<CallOutcome> {
+  // M5-L3 (Task 10): an already-applied MI iteration is a completed iteration —
+  // its output_applied flip is ONLY set on the `completed` path (an errored child
+  // is surfaced, never flipped), so there is nothing to route/self-heal here; the
+  // MI driver's `iterationState` fast-forwards it (this path is defensive — the
+  // driver never re-drives an applied iteration).
+  if (mi) return { kind: "next", next: node.next! };
   const child = await getInstanceRow(env.DB, row.child_instance_id);
   if (child?.status === "errored") {
     const target = errorCatchTarget(graph, elementId, child.error_code ?? null);

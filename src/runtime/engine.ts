@@ -519,9 +519,11 @@ async function loop(
 
       if (node.type === "callActivity") {
         // M5-L2: invoke/apply/park a child instance (the triad in call-activity.ts).
+        // The `errored` outcome is MI-only (surfaced to the MI driver, never here);
+        // this non-MI call never returns it — the branch is defensive TS narrowing.
         const r = await driveCallActivity(env, instanceId, graph, cur, occ, node, runStep, activeTokenId);
         if (r.kind === "waiting") return { kind: "parked" };
-        if (r.kind === "incident") return { kind: "incident" };
+        if (r.kind === "incident" || r.kind === "errored") return { kind: "incident" };
         return { kind: "next", next: r.next };
       }
 

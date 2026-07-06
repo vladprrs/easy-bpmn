@@ -24,10 +24,11 @@
 
 import type { Env } from "../env";
 import type { ExecutionGraph, GraphNode, MultiInstanceSpec } from "../bpmn/graph";
-import { mergeVariables, nowIso, parseJson, type JsonObject } from "../util";
+import { isTerminalInstanceStatus, mergeVariables, nowIso, parseJson, type JsonObject } from "../util";
 import { dbBatch, stmt } from "../persistence/db";
 import { hasHistoryMarkerForOccurrence, historyStmt, latestScopeEntryOccurrence } from "../persistence/history";
-import { applyTransitionStmt, getForwardJob } from "../persistence/instances";
+import { applyTransitionStmt, getForwardJob, getInstanceRow } from "../persistence/instances";
+import { getChildInstanceForVisit } from "../persistence/child-instances";
 import { abandonJobOnTimerFireStmt } from "../persistence/jobs";
 import {
   getMiActivation,
@@ -54,6 +55,7 @@ import { resolveScope, type LeafOutcome } from "./frontier";
 import { scopesOf } from "../bpmn/scope-tree";
 import { ExpressionEvaluationError, evaluateCondition, normalizeFeelValue } from "./expressions";
 import { driveForwardServiceTask, errorCatchTarget } from "./forward-task";
+import { driveCallActivity, cancelVisitChildren } from "./call-activity";
 import { cancelChildCascade } from "./child-cascade";
 import {
   armTimerDO,
@@ -480,6 +482,19 @@ async function iterationState(
     if (tok?.status === "discarded") return { kind: "abandoned" };
     return { kind: "pending" };
   }
+  if (node.type === "callActivity") {
+    // Task 10: the iteration's child_instances row `(elementId, occ, i)`.
+    // `outputApplied` ⇔ the iteration finished and its child was aggregated;
+    // anything else (no row / running / waiting / incident / an errored child not
+    // yet observed / completed-not-yet-applied) still needs driving. An `errored`
+    // child is NOT classified here — it flows uniformly through `driveIteration`
+    // (the L2 triad's `applyChildErrored` under `mi` surfaces a typed `{errored}`
+    // outcome, routed by the driver's `abortOnIterationError`, exactly like a
+    // subProcess-body error end), so a null errorCode routes correctly too.
+    const row = await getChildInstanceForVisit(env.DB, instanceId, elementId, occ, i);
+    if (row?.status === "outputApplied") return { kind: "completed" };
+    return { kind: "pending" };
+  }
   const job = await getForwardJob(env.DB, instanceId, elementId, occ, i);
   if (job?.status === "completed" && job.output_applied === 1) return { kind: "completed" };
   // Task 9: a `failed` serviceTask iteration job carries its verdict in
@@ -670,6 +685,16 @@ async function abortTeardown(
         }
       }
     }
+  } else if (node.type === "callActivity") {
+    // Task 10: the miBody subtree scan (`drainScopeSubtree`) does NOT reach the MI
+    // callActivity's iteration children — the MI element's own `scopeId` is the
+    // ENCLOSING scope, not the synthetic miBody leaf, so `cancelChildrenInSubtree`
+    // (keyed by node.scopeId ∈ subtree) never matches it. Cascade-cancel every live
+    // iteration child of the visit explicitly (Hazard interrupt, retention: each
+    // child's ledger row is left for a later enclosing reverse pass, exactly like a
+    // scope-timer Hazard drain). `cancelChildCascade`'s terminal short-circuit keeps
+    // this idempotent across every rewalk that re-runs the (idempotent) teardown.
+    await cancelVisitChildren(env, instanceId, elementId, occ);
   }
 }
 
@@ -745,6 +770,23 @@ async function driveIteration(
     }
     return driveSubProcessIteration(env, instanceId, graph, elementId, occ, node, i, N, runStep, items, resolveBase, activeTokenId, driveLeaf);
   }
+  if (node.type === "callActivity") {
+    // Task 10: delegate to the L2 callActivity triad threaded with the `mi` arg —
+    // iteration `i`'s child is keyed `(elementId, occ, i)`, seeded with the pinned
+    // per-iteration context; the triad owns invoke/apply (child-terminal flip +
+    // per-iteration ledger + `miIterationCompleted`, NO parent advance), and
+    // surfaces an `errored` child as an iteration business error. Mirrors the
+    // serviceTask delegation to `driveForwardServiceTask`.
+    const base = await resolveBase();
+    const r = await driveCallActivity(env, instanceId, graph, elementId, occ, node, runStep, activeTokenId, {
+      iterationIndex: i,
+      inputOverride: iterationContext(base, node.multiInstance!, items, i),
+    });
+    if (r.kind === "next") return { kind: "completed" };
+    if (r.kind === "incident") return { kind: "incident" };
+    if (r.kind === "errored") return { kind: "errored", errorCode: r.errorCode };
+    return { kind: "waiting" };
+  }
   if (node.type !== "serviceTask") {
     return await runStep(miIterTag(`mi-body-unsupported:${elementId}#${occ}`, i), () =>
       createIncident(
@@ -752,7 +794,7 @@ async function driveIteration(
         instanceId,
         elementId,
         0,
-        `Multi-instance over a '${node.type}' body is not yet driven (M5-L3 opens callActivity in Task 10).`,
+        `Multi-instance over a '${node.type}' body is not a supported MI host (serviceTask / subProcess / callActivity only).`,
         { elementId, nodeType: node.type, iterationIndex: i },
         "serviceTaskFailure",
       ),
@@ -1091,10 +1133,16 @@ async function sweepCancelRemaining(
       const tok = await getToken(env.DB, miTokenId(instanceId, elementId, occ, j));
       if (tok && isLiveTokenStatus(tok.status)) discardTokenIds.push(tok.token_id);
     } else if (node.type === "callActivity") {
-      // TODO(Task 10): getChildInstanceForVisit(instance, el, occ, j) → push a
-      // non-terminal child_instance id here; the caller cascade-cancels it after
-      // the settle batch. MI-callActivity iteration bodies aren't driven yet, so
-      // no child rows exist for this visit and the sweep collects nothing.
+      // Task 10: an in-flight (invoked-not-applied, non-terminal child) iteration
+      // callActivity — the caller cascade-cancels it AFTER the settle batch
+      // (`cancelChildCascade` is multi-statement + terminates the child Workflow,
+      // so it cannot ride a single dbBatch). A completed-but-not-applied child is
+      // left alone (it is aggregated at `mi-apply`); a terminal child is a no-op.
+      const row = await getChildInstanceForVisit(env.DB, instanceId, elementId, occ, j);
+      if (row?.status === "invoked") {
+        const child = await getInstanceRow(env.DB, row.child_instance_id);
+        if (child && !isTerminalInstanceStatus(child.status)) cancelChildIds.push(row.child_instance_id);
+      }
     } else {
       const job = await getForwardJob(env.DB, instanceId, elementId, occ, j);
       if (job && (job.status === "created" || job.status === "locked")) abandonJobIds.push(job.job_id);
@@ -1182,6 +1230,21 @@ async function applyMiCompletion(
       const tok = await getToken(env.DB, miTokenId(instanceId, elementId, occ, i));
       if (tok?.status === "consumed") {
         outputs.push(await readOverlay(env, parseOverlay(tok)));
+        completedCount++;
+      } else {
+        outputs.push(null);
+      }
+      continue;
+    }
+    if (node.type === "callActivity") {
+      // Task 10: iteration `i`'s aggregate is its child's FINAL variables (the L2
+      // applyChildTerminal contract — the whole child variable set, the callActivity
+      // analogue of the subProcess overlay). null at a never-finished index (an early
+      // settle / abort — but an aborted visit never reaches apply).
+      const row = await getChildInstanceForVisit(env.DB, instanceId, elementId, occ, i);
+      if (row?.status === "outputApplied") {
+        const child = await getInstanceRow(env.DB, row.child_instance_id);
+        outputs.push(child ? parseJson<JsonObject>(child.variables, {}) : {});
         completedCount++;
       } else {
         outputs.push(null);

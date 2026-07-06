@@ -583,3 +583,189 @@ export const MI_TIMER_BPMN = (handleType: string, undoType: string, timeoutType:
     <bpmn:sequenceFlow id="g3" sourceRef="Tx_cancelled" targetRef="Failed"/>
   </bpmn:process>
 </bpmn:definitions>`;
+
+// ---------------------------------------------------------------------------
+// M5-L3 Task 10 — MI over callActivity (child fan-out + per-iteration child
+// compensation). The child fixtures live in call-activity-fixtures.ts:
+//   * SIMPLE_CHILD_BPMN (process "simple-child", echo) — the fan-out child.
+//   * CALL_CHILD_BPMN   (process "child-proc", tx reserve-stock/release-stock) —
+//     the compensable child for the flagship tx-cancel test.
+// ---------------------------------------------------------------------------
+
+/**
+ * FANOUT: a parallel COLLECTION MI over a `<callActivity calledElement="simple-child">`.
+ * Each iteration `i` creates a real child process instance keyed `(mi1, occ 0, i)`,
+ * seeded with `item = items[i]` + `loopCounter = i`; draining the children's `echo`
+ * task completes them; the driver aggregates each child's FINAL variables into
+ * `results` (index-ordered). Start with `{ items: ["a","b","c"] }`.
+ */
+export const MI_CALL_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_mi_call" targetNamespace="x">
+  <bpmn:process id="P_mi_call" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="mi1"/>
+    <bpmn:callActivity id="mi1" name="Run each child" calledElement="simple-child">
+      <bpmn:extensionElements>
+        <easy-bpmn:multiInstance collection="items" outputVariable="results"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:multiInstanceLoopCharacteristics isSequential="false"/>
+    </bpmn:callActivity>
+    <bpmn:sequenceFlow id="f2" sourceRef="mi1" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
+ * FLAGSHIP COMP: a parallel collection MI over the compensable child `child-proc`
+ * INSIDE a transaction, followed by a steerable `branch-settle` whose business
+ * error routes to the transaction's cancel end. When the tx cancels, the parent
+ * reverse pass drives EACH iteration child's OWN reverse pass (release-stock),
+ * in reverse ledger-seq order. Start with `{ items: ["a","b","c"], failSettle: true }`.
+ */
+export const MI_CALL_TX_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" id="D_mi_call_tx" targetNamespace="x">
+  <bpmn:error id="errSettle" name="Settle rejected" errorCode="SETTLE_REJECTED"/>
+  <bpmn:process id="P_mi_call_tx" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>g1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="g1" sourceRef="S" targetRef="mtx"/>
+    <bpmn:transaction id="mtx" name="Place batch">
+      <bpmn:startEvent id="mtx_start"><bpmn:outgoing>t1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:sequenceFlow id="t1" sourceRef="mtx_start" targetRef="mi1"/>
+      <bpmn:callActivity id="mi1" name="Reserve each" calledElement="child-proc">
+        <bpmn:extensionElements>
+          <easy-bpmn:multiInstance collection="items" outputVariable="results"/>
+        </bpmn:extensionElements>
+        <bpmn:incoming>t1</bpmn:incoming>
+        <bpmn:outgoing>t2</bpmn:outgoing>
+        <bpmn:multiInstanceLoopCharacteristics isSequential="false"/>
+      </bpmn:callActivity>
+      <bpmn:sequenceFlow id="t2" sourceRef="mi1" targetRef="settle"/>
+      <bpmn:serviceTask id="settle" name="Settle">
+        <bpmn:extensionElements><easy-bpmn:taskDefinition type="branch-settle" retries="1"/></bpmn:extensionElements>
+        <bpmn:incoming>t2</bpmn:incoming>
+        <bpmn:outgoing>t3</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="settle_err" attachedToRef="settle"><bpmn:errorEventDefinition errorRef="errSettle"/></bpmn:boundaryEvent>
+      <bpmn:sequenceFlow id="t3" sourceRef="settle" targetRef="mtx_ok"/>
+      <bpmn:endEvent id="mtx_ok"><bpmn:incoming>t3</bpmn:incoming></bpmn:endEvent>
+      <bpmn:sequenceFlow id="fe" sourceRef="settle_err" targetRef="mtx_cancel"/>
+      <bpmn:endEvent id="mtx_cancel"><bpmn:incoming>fe</bpmn:incoming><bpmn:cancelEventDefinition/></bpmn:endEvent>
+    </bpmn:transaction>
+    <bpmn:boundaryEvent id="mtx_cancelled" attachedToRef="mtx"><bpmn:cancelEventDefinition/></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="g2" sourceRef="mtx" targetRef="Done"/>
+    <bpmn:endEvent id="Done"><bpmn:incoming>g2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="g3" sourceRef="mtx_cancelled" targetRef="Failed"/>
+    <bpmn:endEvent id="Failed"><bpmn:incoming>g3</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
+ * The ERR/Hazard child (process "mi-err-child"): start → probe (a park point on a
+ * per-test task type) → XOR gateway on the collection `item` — `item = "b"` raises
+ * the CHILD_FAILED error end, everything else completes normally. Because the child
+ * PARKS on `probe`, the test can steer exactly one iteration to error (by completing
+ * its probe) while its siblings stay live (parked) to be cascade-cancelled.
+ */
+export const MI_CALL_ERR_CHILD_BPMN = (probeType: string): string => `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" id="D_mi_err_child" targetNamespace="x">
+  <bpmn:error id="errChild" name="ChildFailed" errorCode="CHILD_FAILED"/>
+  <bpmn:process id="mi-err-child" isExecutable="true">
+    <bpmn:startEvent id="c-start"><bpmn:outgoing>cf1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="cf1" sourceRef="c-start" targetRef="probe"/>
+    <bpmn:serviceTask id="probe" name="Probe">
+      <bpmn:extensionElements><easy-bpmn:taskDefinition type="${probeType}" retries="1"/></bpmn:extensionElements>
+      <bpmn:incoming>cf1</bpmn:incoming>
+      <bpmn:outgoing>cf2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="cf2" sourceRef="probe" targetRef="c-gw"/>
+    <bpmn:exclusiveGateway id="c-gw" default="cf-ok">
+      <bpmn:incoming>cf2</bpmn:incoming>
+      <bpmn:outgoing>cf-bad</bpmn:outgoing>
+      <bpmn:outgoing>cf-ok</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="cf-bad" sourceRef="c-gw" targetRef="c-err">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">item = "b"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:endEvent id="c-err"><bpmn:incoming>cf-bad</bpmn:incoming><bpmn:errorEventDefinition errorRef="errChild"/></bpmn:endEvent>
+    <bpmn:sequenceFlow id="cf-ok" sourceRef="c-gw" targetRef="c-end"/>
+    <bpmn:endEvent id="c-end"><bpmn:incoming>cf-ok</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
+ * ERR: a parallel collection MI over `mi-err-child` with an error boundary on the
+ * MI activity catching CHILD_FAILED. One iteration child's business error aborts
+ * the whole visit: the still-parked sibling children are cascade-cancelled and the
+ * error routes to the MI's error boundary → `handler`.
+ */
+export const MI_CALL_ERR_BPMN = (handlerType: string): string => `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_mi_call_err" targetNamespace="x">
+  <bpmn:error id="errMi" name="Child failed" errorCode="CHILD_FAILED"/>
+  <bpmn:process id="P_mi_call_err" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="mi1"/>
+    <bpmn:callActivity id="mi1" name="Check each" calledElement="mi-err-child">
+      <bpmn:extensionElements>
+        <easy-bpmn:multiInstance collection="items" outputVariable="results"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:multiInstanceLoopCharacteristics isSequential="false"/>
+    </bpmn:callActivity>
+    <bpmn:boundaryEvent id="mi1_err" attachedToRef="mi1"><bpmn:errorEventDefinition errorRef="errMi"/></bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="fe" sourceRef="mi1_err" targetRef="handler"/>
+    <bpmn:serviceTask id="handler" name="Handle failure">
+      <bpmn:extensionElements><easy-bpmn:taskDefinition type="${handlerType}" retries="1"/></bpmn:extensionElements>
+      <bpmn:incoming>fe</bpmn:incoming>
+      <bpmn:outgoing>fh</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="fh" sourceRef="handler" targetRef="E2"/>
+    <bpmn:endEvent id="E2"><bpmn:incoming>fh</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f2" sourceRef="mi1" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+/**
+ * HAZARD: a timer boundary on an MI-over-callActivity. The children park on
+ * `mi-err-child`'s `probe`; firing the (Hazard) timer interrupts WITHOUT
+ * compensation — every live iteration child is cascade-cancelled and the token
+ * takes the boundary flow → `onTimeout`.
+ */
+export const MI_CALL_TIMER_BPMN = (timeoutType: string): string => `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_mi_call_timer" targetNamespace="x">
+  <bpmn:process id="P_mi_call_timer" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="mi1"/>
+    <bpmn:callActivity id="mi1" name="Run each child" calledElement="mi-err-child">
+      <bpmn:extensionElements>
+        <easy-bpmn:multiInstance collection="items"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:multiInstanceLoopCharacteristics isSequential="false"/>
+    </bpmn:callActivity>
+    <bpmn:boundaryEvent id="mi1_timer" attachedToRef="mi1">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT30S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="tf" sourceRef="mi1_timer" targetRef="onTimeout"/>
+    <bpmn:serviceTask id="onTimeout" name="On timeout">
+      <bpmn:extensionElements><easy-bpmn:taskDefinition type="${timeoutType}" retries="1"/></bpmn:extensionElements>
+      <bpmn:incoming>tf</bpmn:incoming>
+      <bpmn:outgoing>tt</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="tt" sourceRef="onTimeout" targetRef="E2"/>
+    <bpmn:endEvent id="E2"><bpmn:incoming>tt</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f2" sourceRef="mi1" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;

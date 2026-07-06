@@ -33,11 +33,14 @@ describe("M5-L2 callActivity acceptance", () => {
     expect(r.issues.some((i) => i.elementId === "call1" && /calledElement/.test(i.reason))).toBe(true);
   });
 
-  it("rejects multiInstance on a callActivity with the M5-L3 roadmap pointer", async () => {
+  // M5-L3 flipped this from the interim "planned for M5-L3" reject: MI on a
+  // callActivity is now ACCEPTED, but a bare <multiInstanceLoopCharacteristics/>
+  // has no cardinality source — the permanent no-source reject.
+  it("rejects a callActivity MI with no recognized cardinality source", async () => {
     const r = await parseAndValidate(CALL_XML(
       `<bpmn:callActivity id="call1" calledElement="child-proc"><bpmn:multiInstanceLoopCharacteristics/></bpmn:callActivity>`));
     expect(r.ok).toBe(false);
-    expect(r.issues.some((i) => i.elementId === "call1" && /M5-L3/.test(i.reason))).toBe(true);
+    expect(r.issues.some((i) => i.elementId === "call1" && /no recognized cardinality source/i.test(i.reason))).toBe(true);
   });
 
   it("rejects a same-document non-process calledElement (GlobalTask) explicitly", async () => {

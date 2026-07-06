@@ -5,10 +5,13 @@
 // new Function, so it runs on Workers, and Camunda Modeler edits the
 // expressions natively (canonicity/round-trip stays intact).
 //
-// Two entry points, two phases:
+// Three entry points, two phases:
 // - `parseCondition` — publish-time, syntax-only (no variable context exists at
 //   publish). A failure yields the reason string for the validator's
 //   element-id + reason ValidationIssueData contract (wired in TASK-33).
+// - `parseFeelExpression` — publish-time, syntax-only, for VALUE-typed
+//   expressions (M5-L3 MI cardinality/collection): the same lezer walk as
+//   `parseCondition` minus the unary-test lint and the boolean-oriented wording.
 // - `evaluateCondition` — runtime, against the instance's current variables
 //   object (the same JSON the service-task input uses). The flow is taken ONLY
 //   on boolean `true` — no truthy coercion. FEEL null-tolerance is preserved:
@@ -134,6 +137,45 @@ export function parseCondition(expression: string): ParseConditionResult {
       ok: false,
       reason:
         `Invalid FEEL condition ${JSON.stringify(snippet(expression))}: ${causeMessage(cause)}`,
+    };
+  }
+}
+
+/**
+ * Publish-time FEEL syntax check for value-typed expressions (MI cardinality /
+ * collection etc. — M5-L3). Same lezer error-node walk as `parseCondition`,
+ * WITHOUT the unary-test lint: these expressions produce a VALUE (number/list),
+ * not a boolean flow decision, so unary-test shapes are not a modeling error
+ * here. Never executes the expression (publish has no variable context).
+ */
+export function parseFeelExpression(expression: string): ParseConditionResult {
+  if (expression.trim() === "") {
+    return { ok: false, reason: "FEEL expression is empty." };
+  }
+  try {
+    const tree = parseExpression(expression, {}, undefined);
+    let errorAt: number | null = null;
+    tree.iterate({
+      enter(node) {
+        if (node.type.isError && errorAt === null) {
+          errorAt = node.from;
+        }
+      },
+    });
+    if (errorAt !== null) {
+      return {
+        ok: false,
+        reason:
+          `Invalid FEEL expression: syntax error at position ${errorAt} ` +
+          `in ${JSON.stringify(snippet(expression))}.`,
+      };
+    }
+    return { ok: true };
+  } catch (cause) {
+    return {
+      ok: false,
+      reason:
+        `Invalid FEEL expression ${JSON.stringify(snippet(expression))}: ${causeMessage(cause)}`,
     };
   }
 }

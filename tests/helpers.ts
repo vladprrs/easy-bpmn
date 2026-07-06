@@ -760,6 +760,23 @@ export const MULTI_INSTANCE_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
   </bpmn:process>
 </bpmn:definitions>`;
 
+/**
+ * An ad-hoc subprocess — permanently out of profile ("no planned support"). The
+ * contract deferred/unsupported-construct publish-reject test uses this: every
+ * previously-deferred fixture it pointed at (callActivity → M5-L2, multiInstance
+ * → M5-L3) eventually opened; the ad-hoc subprocess never will.
+ */
+export const AD_HOC_SUBPROCESS_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_adhoc" targetNamespace="x">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="T" />
+    <bpmn:adHocSubProcess id="T" name="Ad hoc work" />
+    <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="E" />
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
 /** Balanced AND region: fork → {reserve-stock, authorize-payment} → join. ACCEPTED from M4-L1. */
 export const PARALLEL_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_par" targetNamespace="x">

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  MULTI_INSTANCE_BPMN,
+  AD_HOC_SUBPROCESS_BPMN,
   createDraft,
   deferredGatewayBpmn,
   drainSampleWorkers,
@@ -95,14 +95,14 @@ describe("Public API contract (openapi.yaml)", () => {
   });
 
   it("blocks publishing a deferred-construct draft (409) with element id + reason recorded", async () => {
-    // callActivity opened in M5-L2, so this now uses multiInstanceLoopCharacteristics
-    // (a serviceTask fan-out) — still interim-rejected after M5-L2 (planned for M5-L3).
-    const draft = await createDraft(MULTI_INSTANCE_BPMN, "deferred");
+    // multiInstance opened in M5-L3, so this now uses an ad-hoc subprocess —
+    // permanently out of profile (no planned support), so it can never flip again.
+    const draft = await createDraft(AD_HOC_SUBPROCESS_BPMN, "deferred");
     expect(draft.status).toBe(201);
     expect(draft.body.status).toBe("invalid");
     const issue = draft.body.validationIssues.find((i: any) => i.elementId === "T");
     expect(issue).toBeTruthy();
-    expect(issue.reason).toMatch(/loop or multi-instance/);
+    expect(issue.reason).toMatch(/ad-hoc subprocess.*not supported/i);
 
     const pub = await publishDraft(draft.body.draftId);
     expect(pub.status).toBe(409);

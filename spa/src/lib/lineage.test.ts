@@ -7,10 +7,23 @@ const CHILD_LINEAGE: InstanceLineage = { parent: { instanceId: "pi-parent", elem
 const PARENT_LINEAGE: InstanceLineage = {
   parent: null,
   children: [
-    { elementId: "call1", occurrence: 0, childInstanceId: "pi-a", status: "completed" },
-    { elementId: "call1", occurrence: 2, childInstanceId: "pi-c", status: "waiting" },
-    { elementId: "call1", occurrence: 1, childInstanceId: "pi-b", status: "completed" },
-    { elementId: "call2", occurrence: 0, childInstanceId: "pi-d", status: "errored" },
+    { elementId: "call1", occurrence: 0, iterationIndex: 0, childInstanceId: "pi-a", status: "completed" },
+    { elementId: "call1", occurrence: 2, iterationIndex: 0, childInstanceId: "pi-c", status: "waiting" },
+    { elementId: "call1", occurrence: 1, iterationIndex: 0, childInstanceId: "pi-b", status: "completed" },
+    { elementId: "call2", occurrence: 0, iterationIndex: 0, childInstanceId: "pi-d", status: "errored" },
+  ],
+};
+// M5-L3: one MI callActivity visit fans out iteration-keyed children — same
+// element, same occurrence, distinct iterationIndex (server order: iteration
+// ASC, deliberately shuffled here to prove the client re-sort).
+const MI_LINEAGE: InstanceLineage = {
+  parent: null,
+  children: [
+    { elementId: "mi1", occurrence: 0, iterationIndex: 2, childInstanceId: "pi-m2", status: "waiting" },
+    { elementId: "call2", occurrence: 0, iterationIndex: 0, childInstanceId: "pi-d", status: "errored" },
+    { elementId: "mi1", occurrence: 0, iterationIndex: 0, childInstanceId: "pi-m0", status: "completed" },
+    { elementId: "call1", occurrence: 1, iterationIndex: 0, childInstanceId: "pi-b", status: "completed" },
+    { elementId: "mi1", occurrence: 0, iterationIndex: 1, childInstanceId: "pi-m1", status: "waiting" },
   ],
 };
 
@@ -52,5 +65,21 @@ describe("lineage derivations (M5-L2 callActivity, Task 11)", () => {
     expect(childForElement(PARENT_LINEAGE, "call3")).toBeNull();
     expect(childForElement(EMPTY, "call1")).toBeNull();
     expect(childForElement(null, "call1")).toBeNull();
+  });
+});
+
+describe("lineage derivations over an MI fan-out (M5-L3 Task 12)", () => {
+  it("orders occurrence DESC, then iterationIndex ASC, then elementId", () => {
+    expect(sortedLineageChildren(MI_LINEAGE).map((c) => c.childInstanceId)).toEqual([
+      "pi-b", // occ 1
+      "pi-d", // occ 0, iter 0, call2 < mi1
+      "pi-m0", // occ 0, iter 0, mi1
+      "pi-m1", // occ 0, iter 1
+      "pi-m2", // occ 0, iter 2
+    ]);
+  });
+
+  it("resolves a clicked MI node to its FIRST iteration child (lowest iterationIndex on the occurrence tie)", () => {
+    expect(childForElement(MI_LINEAGE, "mi1")?.childInstanceId).toBe("pi-m0");
   });
 });

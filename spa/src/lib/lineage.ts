@@ -24,22 +24,30 @@ export function hasLineage(lineage: InstanceLineage | null | undefined): boolean
 }
 
 /**
- * Child rows for display, newest visit first (highest occurrence, then the
- * callActivity element id) so a looped callActivity's latest call leads the strip.
+ * Child rows for display, newest visit first (highest occurrence), then MI
+ * iterations in fan-out order (iterationIndex ASC — M5-L3), then the
+ * callActivity element id, so a looped callActivity's latest call leads the
+ * strip and one MI visit's children read 0,1,2… left to right.
  */
 export function sortedLineageChildren(lineage: InstanceLineage | null | undefined): InstanceLineageChild[] {
   const children = lineage?.children ?? [];
-  return [...children].sort((a, b) => b.occurrence - a.occurrence || a.elementId.localeCompare(b.elementId));
+  return [...children].sort(
+    (a, b) => b.occurrence - a.occurrence || a.iterationIndex - b.iterationIndex || a.elementId.localeCompare(b.elementId),
+  );
 }
 
 /**
  * Resolve the child a clicked callActivity DIAGRAM NODE should navigate to:
  * every visit of that element, highest occurrence wins (the live/most-recent
- * call when the callActivity sits on a loop-back path). Returns null when the
+ * call when the callActivity sits on a loop-back path); within one MI visit
+ * the FIRST iteration wins (the strip chips are the per-iteration jump points
+ * — the diagram node is just the visit's front door). Returns null when the
  * element has no bound child yet (visit not reached) or isn't a callActivity.
  */
 export function childForElement(lineage: InstanceLineage | null | undefined, elementId: string): InstanceLineageChild | null {
   const matches = (lineage?.children ?? []).filter((c) => c.elementId === elementId);
   if (matches.length === 0) return null;
-  return matches.reduce((best, c) => (c.occurrence > best.occurrence ? c : best));
+  return matches.reduce((best, c) =>
+    c.occurrence > best.occurrence || (c.occurrence === best.occurrence && c.iterationIndex < best.iterationIndex) ? c : best,
+  );
 }

@@ -177,6 +177,8 @@ export interface ProcessInstance {
 export interface InstanceLineageChild {
   elementId: string;
   occurrence: number;
+  /** M5-L3 — MI iteration that spawned this child; 0 for a plain visit. */
+  iterationIndex: number;
   childInstanceId: string;
   status: string;
 }

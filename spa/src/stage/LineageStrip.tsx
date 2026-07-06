@@ -51,7 +51,7 @@ export function LineageStrip({ lineage, index }: { lineage: InstanceLineage; ind
           <span className="text-content-secondary">Calls</span>
           {children.map((c) => (
             <button
-              key={`${c.elementId}#${c.occurrence}`}
+              key={`${c.elementId}#${c.occurrence}@${c.iterationIndex}`}
               type="button"
               onClick={() => go(c.childInstanceId)}
               title={`${index.nameOf(c.elementId)} · ${c.childInstanceId}`}
@@ -59,6 +59,7 @@ export function LineageStrip({ lineage, index }: { lineage: InstanceLineage; ind
             >
               <span className="font-data text-content">{index.nameOf(c.elementId)}</span>
               {c.occurrence > 0 && <span className="text-2xs text-content-muted">#{c.occurrence}</span>}
+              {c.iterationIndex > 0 && <span className="text-2xs text-content-muted">·i{c.iterationIndex}</span>}
               <StatusBadge status={c.status} />
             </button>
           ))}

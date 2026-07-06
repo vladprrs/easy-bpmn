@@ -984,3 +984,31 @@ export const MI_CALL_TIMER_BPMN = (timeoutType: string): string => `<?xml versio
     <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
   </bpmn:process>
 </bpmn:definitions>`;
+
+/**
+ * Operator-verbs fixture (Task 12): a parallel collection MI over the L2
+ * `check-leaf-proc` child (`external-check`, retries 1, forceFail-steered).
+ * With `forceFail: true` in the base vars every iteration child exhausts its
+ * OWN retries into a child-LOCAL `incident` while the MI parent stays parked
+ * `waiting` (an `incident` child status is never consumable by its parent) —
+ * the root /retry cascade is the only heal lever. Start with
+ * `{ items: [...], forceFail: true }`.
+ */
+export const MI_CALL_CHECK_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+    xmlns:easy-bpmn="http://easy-bpmn/schema/1.0" id="D_mi_call_check" targetNamespace="x">
+  <bpmn:process id="P_mi_call_check" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="mi1"/>
+    <bpmn:callActivity id="mi1" name="Check each" calledElement="check-leaf-proc">
+      <bpmn:extensionElements>
+        <easy-bpmn:multiInstance collection="items" outputVariable="results"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:multiInstanceLoopCharacteristics isSequential="false"/>
+    </bpmn:callActivity>
+    <bpmn:sequenceFlow id="f2" sourceRef="mi1" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;

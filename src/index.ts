@@ -360,6 +360,7 @@ async function handleGetInstance(env: Env, instanceId: string): Promise<Response
     children: children.map((c) => ({
       elementId: c.parent_element_id,
       occurrence: c.occurrence,
+      iterationIndex: c.iteration_index,
       childInstanceId: c.child_instance_id,
       status: c.child_status,
     })),

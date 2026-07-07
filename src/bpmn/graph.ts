@@ -85,6 +85,24 @@ export interface TimerTriggerSpec {
 }
 
 /**
+ * M5-L3: validated multi-instance loop characteristics on a serviceTask /
+ * subProcess / callActivity (design §2). The cardinality expressions are raw
+ * FEEL bodies — publish-time syntax-checked, evaluated ONCE at runtime into the
+ * mi_activations row (never re-evaluated on rewalk).
+ */
+export interface MultiInstanceSpec {
+  isSequential: boolean;
+  /** Exactly one of loopCardinality | collection is set (validated at publish). */
+  loopCardinality?: string | null;   // FEEL, number-valued
+  collection?: string | null;        // FEEL, list-valued (easy-bpmn:multiInstance)
+  elementVariable?: string | null;   // default "item" applied at runtime
+  outputVariable?: string | null;    // aggregation only when present
+  completionCondition?: string | null; // FEEL, boolean
+  /** Static per-iteration step-cost estimate (design §6): 1 leaf; interior node count for a subProcess body; resolved child-graph count for a callActivity body (filled by call resolution). */
+  bodyStepCost: number;
+}
+
+/**
  * One outgoing sequence-flow edge of a node (design §4.1 multi-edge IR).
  *
  * ORDER GUARANTEE (M2 design §2 decision 5): a node's `outgoing[]` preserves
@@ -175,6 +193,8 @@ export interface GraphNode {
   calledElementId?: string | null;
   /** callActivity only — resolved at the CALLER's publish to one immutable child version (M5-L2, Principle II). */
   calledDefinitionVersionId?: string | null;
+  /** M5-L3: validated multi-instance loop characteristics (serviceTask/subProcess/callActivity only). */
+  multiInstance?: MultiInstanceSpec | null;
 }
 
 /** A transaction scope: its inner start, members, ends, and compensation wiring. */

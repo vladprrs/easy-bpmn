@@ -58,6 +58,15 @@ import {
   SIMPLE_PARENT_BPMN,
 } from "../integration/call-activity-fixtures";
 import {
+  MI_CALL_BPMN,
+  MI_COND_BPMN,
+  MI_ERR_BOUNDARY_BPMN,
+  MI_PAR_SUB_BPMN,
+  MI_PAR_TASK_BPMN,
+  MI_SEQ_COLL_BPMN,
+  MI_ZERO_BPMN,
+} from "../integration/multi-instance-fixtures";
+import {
   activate,
   cancelInstance,
   completeJob,
@@ -75,6 +84,7 @@ import {
   pollToTerminal,
   retryInstance,
   sleep,
+  type WfJob,
 } from "./driver";
 
 const uniq = (p: string) => `${p}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
@@ -707,4 +717,222 @@ describe("matrix workflow-mode: M5-L2 callActivity", () => {
     expect(r.status, `stuck at ${r.status} after ${r.elapsedMs}ms`).toBe("cancelled");
     expect((await lineageChild(instanceId)).status).toBe("cancelled");
   });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M5-L3 (multiInstance) Layer B — the MI wave re-driven over the REAL
+// ProcessWorkflow. Forward fan-out/aggregation, the sequential ladder, the
+// completionCondition early settle, and the iteration-error boundary route all
+// advance by tickle (each /jobs/complete → deliverJobResult → parent re-drive),
+// so they run LIVE. The two reverse/timer rows are @needs-real-cf (the same
+// wake-backstop / manual-fire automation boundary as the C-*/CA-* waves), and
+// [MI-CAP-01] is @needs-override (needs MAX_MI_CARDINALITY_OVERRIDE).
+// ═══════════════════════════════════════════════════════════════════════════
+describe("matrix workflow-mode: M5-L3 multiInstance", () => {
+  async function publishChild(xml: string): Promise<void> {
+    const draft = await createDraft(xml);
+    if (draft.status !== 201) throw new Error(`child draft ${draft.status}: ${JSON.stringify(draft.body)}`);
+    const pub = await publishDraft(draft.body.draftId);
+    if (pub.status !== 201) throw new Error(`child publish ${pub.status}: ${JSON.stringify(pub.body)}`);
+  }
+
+  /** Accumulate `n` leasable jobs of `taskType` (fan-out jobs surface as each
+   *  iteration's create lands — poll until the full cohort is held). */
+  async function collectJobs(token: string, taskType: string, n: number, deadlineMs = 25_000): Promise<WfJob[]> {
+    const held: WfJob[] = [];
+    const deadline = Date.now() + deadlineMs;
+    while (held.length < n && Date.now() < deadline) {
+      const batch = await activate(token, taskType);
+      held.push(...batch);
+      if (held.length < n) await sleep(400);
+    }
+    if (held.length < n) throw new Error(`only ${held.length}/${n} '${taskType}' jobs appeared within ${deadlineMs}ms`);
+    return held;
+  }
+
+  it("[MI-PAR-TASK-01] parallel cardinality MI: 3 concurrent iteration jobs over a real Workflow, index-ordered aggregation", async () => {
+    const taskType = uniq("mi-charge");
+    const token = await mintWorkerToken();
+    const { instanceId } = await publishAndStart(MI_PAR_TASK_BPMN(taskType), { correlationKey: uniq("mi-par"), variables: {} });
+
+    // The whole cohort is leasable CONCURRENTLY (parallel MI), distinct counters.
+    const jobs = await collectJobs(token, taskType, 3);
+    expect(jobs.map((j) => j.variables.loopCounter as number).sort()).toEqual([0, 1, 2]);
+
+    // Complete out of order (2, 0, 1) — aggregation must still be index-ordered.
+    const byCounter = new Map(jobs.map((j) => [j.variables.loopCounter as number, j]));
+    for (const i of [2, 0, 1]) await completeJob(token, byCounter.get(i)!, { amount: 10 * (i + 1) });
+
+    const r = await pollToTerminal(instanceId, { deadlineMs: DEADLINE });
+    expect(r.status, `stuck at ${r.status} after ${r.elapsedMs}ms — MI apply wake lost?`).toBe("completed");
+    expect(r.body?.variables?.results).toEqual([{ amount: 10 }, { amount: 20 }, { amount: 30 }]);
+    const hist = await getHistory(instanceId);
+    expect(countHistoryType(hist, "miActivated")).toBe(1);
+    expect(countHistoryType(hist, "miIterationCompleted")).toBe(3);
+    expect(countHistoryType(hist, "miCompleted")).toBe(1);
+  });
+
+  it("[MI-SEQ-COLL-01] sequential collection MI: strictly one leasable iteration at a time, item + loopCounter seeded", async () => {
+    const taskType = uniq("mi-order");
+    const token = await mintWorkerToken();
+    const { instanceId } = await publishAndStart(MI_SEQ_COLL_BPMN(taskType), {
+      correlationKey: uniq("mi-seq"),
+      variables: { orders: ["a", "b"] },
+    });
+
+    const first = await leaseWhenReady(token, taskType);
+    expect(first, "iteration 0's job should be leasable").toBeTruthy();
+    expect(first!.variables.order).toBe("a");
+    expect(first!.variables.loopCounter).toBe(0);
+    // Sequential: nothing else is in flight while iteration 0 is live.
+    expect(await activate(token, taskType)).toHaveLength(0);
+    await completeJob(token, first!, { handled: "a" });
+
+    const second = await leaseWhenReady(token, taskType);
+    expect(second, "iteration 1 should appear only after iteration 0 completed").toBeTruthy();
+    expect(second!.variables.order).toBe("b");
+    expect(second!.variables.loopCounter).toBe(1);
+    await completeJob(token, second!, { handled: "b" });
+
+    const r = await pollToTerminal(instanceId, { deadlineMs: DEADLINE });
+    expect(r.status, `stuck at ${r.status} after ${r.elapsedMs}ms`).toBe("completed");
+    expect(r.body?.variables?.results).toEqual([{ handled: "a" }, { handled: "b" }]);
+  });
+
+  it("[MI-ZERO-01] empty collection: the visit settles immediately with results = [] and zero iteration jobs", async () => {
+    const taskType = uniq("mi-zero");
+    const token = await mintWorkerToken();
+    const { instanceId } = await publishAndStart(MI_ZERO_BPMN(taskType), { correlationKey: uniq("mi-zero"), variables: { items: [] } });
+    const r = await pollToTerminal(instanceId, { deadlineMs: DEADLINE });
+    expect(r.status, `stuck at ${r.status} after ${r.elapsedMs}ms`).toBe("completed");
+    expect(r.body?.variables?.results).toEqual([]);
+    expect(await activate(token, taskType)).toHaveLength(0); // zero iterations → zero jobs
+    const hist = await getHistory(instanceId);
+    expect(countHistoryType(hist, "miActivated")).toBe(1);
+    expect(countHistoryType(hist, "miIterationCompleted")).toBe(0);
+    expect(countHistoryType(hist, "miCompleted")).toBe(1);
+  });
+
+  it("[MI-PAR-SUB-01] parallel MI over a subProcess body: 2 concurrent interior jobs, per-iteration XOR steering, overlay aggregation", async () => {
+    const reserveType = uniq("mi-reserve");
+    const extraType = uniq("mi-extra");
+    const token = await mintWorkerToken();
+    const { instanceId } = await publishAndStart(MI_PAR_SUB_BPMN(reserveType, extraType), { correlationKey: uniq("mi-psub"), variables: {} });
+
+    // Both iterations' interior reserve jobs are live concurrently.
+    const reserves = await collectJobs(token, reserveType, 2);
+    // Steer iteration overlays apart: "a" takes the default flow, "b" routes to
+    // the interior `extra` task — per-iteration gateway decisions on a real WF.
+    await completeJob(token, reserves[0]!, { order: "a" });
+    await completeJob(token, reserves[1]!, { order: "b" });
+    const extra = await leaseWhenReady(token, extraType);
+    expect(extra, "the order=b iteration should route to the interior extra task").toBeTruthy();
+    await completeJob(token, extra!, { extraDone: true });
+
+    const r = await pollToTerminal(instanceId, { deadlineMs: DEADLINE });
+    expect(r.status, `stuck at ${r.status} after ${r.elapsedMs}ms — iteration token fold lost?`).toBe("completed");
+    const results = (r.body?.variables?.results ?? []) as Array<Record<string, unknown>>;
+    expect(results).toHaveLength(2);
+    expect(results.filter((x) => x && x.order === "b" && x.extraDone === true)).toHaveLength(1);
+    expect(countHistoryType(await getHistory(instanceId), "miIterationCompleted")).toBe(2);
+  });
+
+  it("[MI-COND-EARLY-01] completionCondition: 2 of 4 completions settle the visit early; remaining iterations discarded, never compensated", async () => {
+    const taskType = uniq("mi-probe");
+    const token = await mintWorkerToken();
+    const { instanceId } = await publishAndStart(MI_COND_BPMN(taskType), { correlationKey: uniq("mi-cond"), variables: {} });
+
+    const probes = await collectJobs(token, taskType, 4);
+    const byCounter = new Map(probes.map((j) => [j.variables.loopCounter as number, j]));
+    await completeJob(token, byCounter.get(0)!, { hit: true });
+    await completeJob(token, byCounter.get(1)!, { hit: true });
+
+    // k=2 meets `nrOfCompletedInstances >= 2` — the visit settles WITHOUT the
+    // other two, which are terminal-abandoned as a NORMAL discard.
+    const r = await pollToTerminal(instanceId, { deadlineMs: DEADLINE });
+    expect(r.status, `stuck at ${r.status} after ${r.elapsedMs}ms — early settle wake lost?`).toBe("completed");
+    const results = (r.body?.variables?.results ?? []) as Array<unknown>;
+    expect(results).toHaveLength(4);
+    expect(results.filter((x) => x != null)).toHaveLength(2);
+    const hist = await getHistory(instanceId);
+    expect(countHistoryType(hist, "miCompletionConditionMet")).toBe(1);
+    expect(countHistoryType(hist, "miCompleted")).toBe(1);
+  });
+
+  it("[MI-ERR-BOUNDARY-01] an iteration business error aborts the visit and routes the error boundary on the MI element", async () => {
+    const taskType = uniq("mi-flaky");
+    const handlerType = uniq("mi-err-handler");
+    const token = await mintWorkerToken();
+    const { instanceId } = await publishAndStart(MI_ERR_BOUNDARY_BPMN(taskType, handlerType), { correlationKey: uniq("mi-errb"), variables: {} });
+
+    const jobs = await collectJobs(token, taskType, 3);
+    const byCounter = new Map(jobs.map((j) => [j.variables.loopCounter as number, j]));
+    await completeJob(token, byCounter.get(0)!, { amount: 10 });
+    // Iteration 1 raises the business error MI_FAIL (non-retryable /fail).
+    await failJob(token, byCounter.get(1)!, { errorCode: "MI_FAIL", reason: "boom" });
+
+    // The abort routed the boundary → the handler task appears; iteration 2's
+    // in-flight job was drained by the abort, never completed by a worker.
+    const handlerJob = await leaseWhenReady(token, handlerType);
+    expect(handlerJob, "the MI error boundary's handler should appear after the abort").toBeTruthy();
+    await completeJob(token, handlerJob!, {});
+    const r = await pollToTerminal(instanceId, { deadlineMs: DEADLINE });
+    expect(r.status, `stuck at ${r.status} after ${r.elapsedMs}ms`).toBe("completed");
+    const hist = await getHistory(instanceId);
+    expect(countHistoryType(hist, "miAborted")).toBe(1);
+    expect(countHistoryType(hist, "miCompleted")).toBe(0);
+  });
+
+  it("[MI-CALL-FANOUT-01] MI over callActivity: 3 real child Workflows iteration-keyed, lineage carries iterationIndex, child finals aggregate", async () => {
+    const token = await mintWorkerToken();
+    await publishChild(SIMPLE_CHILD_BPMN);
+    const { instanceId } = await publishAndStart(MI_CALL_BPMN, {
+      correlationKey: uniq("mi-call"),
+      variables: { items: ["a", "b", "c"] },
+    });
+
+    // Three REAL children fan out; each parks on its own `echo`. Collect the
+    // cohort and keep only THIS parent's children (echo is a shared task type).
+    const lineageDeadline = Date.now() + 25_000;
+    let children: Array<{ childInstanceId: string; iterationIndex: number; status: string }> = [];
+    while (children.length < 3 && Date.now() < lineageDeadline) {
+      children = ((await getInstance(instanceId)).body?.lineage?.children ?? []) as typeof children;
+      if (children.length < 3) await sleep(400);
+    }
+    expect(children, "3 iteration children should appear in the lineage block").toHaveLength(3);
+    // The Task-12 console delta over a real Workflow: iterationIndex 0..2.
+    expect(children.map((c) => c.iterationIndex).sort()).toEqual([0, 1, 2]);
+    const childIds = new Set(children.map((c) => c.childInstanceId));
+
+    let completedEchoes = 0;
+    const echoDeadline = Date.now() + 30_000;
+    while (completedEchoes < 3 && Date.now() < echoDeadline) {
+      for (const job of await activate(token, "echo")) {
+        if (!childIds.has(job.instanceId)) continue; // another test's straggler — leave it leased
+        expect(["a", "b", "c"]).toContain(job.variables.item);
+        await completeJob(token, job, { echoed: true });
+        completedEchoes++;
+      }
+      if (completedEchoes < 3) await sleep(400);
+    }
+    expect(completedEchoes, "all 3 iteration children's echo jobs should surface via the shared pull plane").toBe(3);
+
+    const r = await pollToTerminal(instanceId, { deadlineMs: DEADLINE });
+    expect(r.status, `stuck at ${r.status} after ${r.elapsedMs}ms — child→parent wake lost?`).toBe("completed");
+    const results = (r.body?.variables?.results ?? []) as Array<Record<string, unknown>>;
+    expect(results).toHaveLength(3);
+    for (let i = 0; i < 3; i++) {
+      expect(results[i]!.item).toBe(["a", "b", "c"][i]);
+      expect(results[i]!.loopCounter).toBe(i);
+    }
+  });
+
+  // [MI-CALL-COMP-01] + [MI-HAZARD-TIMER-01] — the reverse-compensation flip and
+  // the Hazard-drain continuation are wake-backstop-bound over HTTP against this
+  // dev server (the direct suites fire the timer deterministically via
+  // fireTimer(); no HTTP hook exists) — the same @needs-real-cf class as the
+  // C-COMP-*/CA-COMP-* rows. Validated on the real-CF DoD smoke gate.
+  it.skip("[MI-CALL-COMP-01] @needs-real-cf tx cancel drives EACH iteration child's own reverse pass — the `compensated` flip is wake-backstop-bound", () => {});
+  it.skip("[MI-HAZARD-TIMER-01] @needs-real-cf Hazard timer on the MI element needs a deterministic fire (no HTTP hook); drain semantics covered direct-mode", () => {});
+  it.skip("[MI-CAP-01] @needs-override the 999-cardinality miCardinality incident needs MAX_MI_CARDINALITY_OVERRIDE on the dev server to keep the fixture small", () => {});
 });

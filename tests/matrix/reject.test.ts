@@ -111,13 +111,26 @@ describe("matrix: M5-L1 publish-validation rejects (direct mode)", () => {
     expect(issues.some((i) => i.elementId === "sub" && /M5-L4/.test(i.reason))).toBe(true);
   });
 
-  it("[R-MI-SUBPROC-01] multiInstanceLoopCharacteristics on a subProcess rejects with an M5-L3 pointer", async () => {
+  // FLIPPED by M5-L3 (Task 13): an MI subProcess itself now PUBLISHES (the
+  // runtime opened), so this scenario pivots to the layer's own structural
+  // reject — the v1 body whitelist: no message waits inside an MI body.
+  it("[R-MI-SUBPROC-01] a multi-instance subProcess whose body contains a receiveTask rejects (v1 body whitelist)", async () => {
     const bpmn = SUBPROC_LINEAR_BPMN.replace(
-      '<bpmn:startEvent id="s_start"/>',
-      '<bpmn:multiInstanceLoopCharacteristics/><bpmn:startEvent id="s_start"/>',
-    );
+      '<bpmn:process id="proc_subproc" isExecutable="true">',
+      '<bpmn:message id="m_sub" name="SubBodyMsg"/>\n  <bpmn:process id="proc_subproc" isExecutable="true">',
+    )
+      .replace(
+        '<bpmn:subProcess id="sub" name="Stage">',
+        '<bpmn:subProcess id="sub" name="Stage"><bpmn:multiInstanceLoopCharacteristics isSequential="false"><bpmn:loopCardinality>2</bpmn:loopCardinality></bpmn:multiInstanceLoopCharacteristics>',
+      )
+      .replace(
+        '<bpmn:serviceTask id="s_task" name="Work"><bpmn:extensionElements><easy-bpmn:taskDefinition type="doWork" retries="1"/></bpmn:extensionElements></bpmn:serviceTask>',
+        '<bpmn:receiveTask id="s_task" name="Wait" messageRef="m_sub"/>',
+      );
     const issues = await publishReject(bpmn);
-    expect(issues.some((i) => i.elementId === "sub" && /M5-L3/.test(i.reason))).toBe(true);
+    // The whitelist anchors the issue on the MI scope itself and names the
+    // offending interior element in the reason text.
+    expect(issues.some((i) => i.elementId === "sub" && /s_task/.test(i.reason) && /multi-instance body/i.test(i.reason))).toBe(true);
   });
 
   it("[R-SCOPE-DEPTH-01] scope nesting depth 9 exceeds MAX_SCOPE_DEPTH and rejects", async () => {

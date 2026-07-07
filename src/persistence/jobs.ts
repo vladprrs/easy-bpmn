@@ -23,6 +23,13 @@ export interface LeasedJobRow {
   input_variables: string;
   /** Loop-iteration discriminator (0004): a compensation job inherits its forward step's occurrence. */
   occurrence: number;
+  /**
+   * M5-L3 (0009): the MI iteration this job serves; 0 on every non-MI row. The
+   * lease surfaces it so the compensation-job ledger seeding (POST /jobs/activate)
+   * reads the ITERATION's own saga step — an MI forward job's `variables` already
+   * carry item + loopCounter via the pinned per-iteration input snapshot.
+   */
+  iteration_index: number;
 }
 
 /**
@@ -63,7 +70,7 @@ export async function leaseJobs(
          ORDER BY j.created_at
          LIMIT ?)
         AND (status = 'created' OR (status = 'locked' AND lock_token IS NULL AND lock_expires_at < ?))
-      RETURNING job_id, instance_id, element_id, task_type, is_compensation, compensates_element_id, attempt_count, lock_token, input_variables, occurrence`,
+      RETURNING job_id, instance_id, element_id, task_type, is_compensation, compensates_element_id, attempt_count, lock_token, input_variables, occurrence, iteration_index`,
     [
       input.workerId,
       input.lockToken,

@@ -1,6 +1,7 @@
-import { env, runDurableObjectAlarm } from "cloudflare:test";
+import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { createDraft, drainSampleWorkers, get, leaseAndComplete, mintWorkerToken, post, publishAndStart, publishDraft } from "../helpers";
+import { fireTimer } from "../../src/runtime/timers";
 import {
   CALL_CHILD_TX_PARK_BPMN,
   CALL_LEAF_BPMN,
@@ -54,14 +55,21 @@ async function theTimer(instanceId: string): Promise<{ timer_id: string } | null
   return env.DB.prepare(`SELECT * FROM timers WHERE instance_id = ? ORDER BY created_at LIMIT 1`).bind(instanceId).first<{ timer_id: string }>();
 }
 
-/** Force the armed timer overdue, then fire its DO alarm — mirrors boundary-timer.test.ts. */
+/**
+ * Force the armed timer overdue in D1, then fire it DIRECTLY via `fireTimer` (the
+ * canonical target the DO alarm dispatches to). The fixture arms a long timer (see
+ * the `PT0.5S`→`PT30S` replace below), so it never elapses on its own during the
+ * test — deterministic. The prior `runDurableObjectAlarm` on the shipped `PT0.5S`
+ * timer was a latent flake: under CPU-contended full-suite load ≥500 ms could
+ * elapse before the manual fire, the DO alarm would auto-fire in the background,
+ * and `runDurableObjectAlarm` would then return false. The workflow-mode sibling
+ * (matrix.wf.test.ts) already dodges this with the same `PT3S` replace.
+ */
 async function fireTimerNow(instanceId: string): Promise<string> {
   const t = await theTimer(instanceId);
   expect(t).toBeTruthy();
   await env.DB.prepare(`UPDATE timers SET fire_at = '2000-01-01T00:00:00Z' WHERE timer_id = ?`).bind(t!.timer_id).run();
-  const stub = env.JOB_SCHEDULER.get(env.JOB_SCHEDULER.idFromName(`timer:${t!.timer_id}`));
-  const ran = await runDurableObjectAlarm(stub);
-  expect(ran).toBe(true);
+  await fireTimer(env, t!.timer_id);
   return t!.timer_id;
 }
 
@@ -71,7 +79,10 @@ describe("callActivity cascading drain/cancel (M5-L2 Task 8)", () => {
     await publishDraft(childDraft.body.draftId);
     const token = await mintWorkerToken();
 
-    const { instance } = await publishAndStart(CALL_PARENT_TIMER_BPMN, { correlationKey: "ca-drain-timer", variables: {} });
+    // PT0.5S → PT30S so the DO alarm never auto-fires under full-suite CPU load
+    // before the deterministic manual fire below (fireTimerNow). Mirrors the
+    // workflow-mode sibling's `.replace("PT0.5S", "PT3S")`.
+    const { instance } = await publishAndStart(CALL_PARENT_TIMER_BPMN.replace("PT0.5S", "PT30S"), { correlationKey: "ca-drain-timer", variables: {} });
     const parentId = instance.body.instanceId as string;
 
     const childId = await childInstanceIdFor(parentId, "call1", 0);

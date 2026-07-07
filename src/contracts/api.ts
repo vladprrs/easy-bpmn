@@ -313,6 +313,12 @@ export type TokenInspection = z.infer<typeof tokenInspectionSchema>;
 export interface InstanceLineageChild {
   elementId: string;
   occurrence: number;
+  /**
+   * M5-L3 (Task 12) — which MI iteration of the visit spawned this child;
+   * 0 for every plain (non-multi-instance) callActivity visit. Distinguishes
+   * the N children one MI visit fans out at the same (elementId, occurrence).
+   */
+  iterationIndex: number;
   childInstanceId: string;
   status: string;
 }

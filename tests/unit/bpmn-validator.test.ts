@@ -110,10 +110,13 @@ describe("BPMN-lite profile validator", () => {
   // exclusive gateway" — covered by CONDITIONAL_FLOW_BPMN in the
   // "Exclusive-gateway reject matrix" describe below.
 
-  it("rejects a Service Task with multi-instance loop characteristics", async () => {
+  // M5-L3 flipped this from the interim "loop or multi-instance" reject: MI on a
+  // serviceTask is now ACCEPTED, but this fixture declares no loopCardinality and
+  // no easy-bpmn:multiInstance collection — the permanent no-source reject.
+  it("rejects a Service Task MI with no recognized cardinality source", async () => {
     const r = await parseAndValidate(MULTI_INSTANCE_BPMN);
     expect(r.ok).toBe(false);
-    expect(r.issues.some((i) => i.elementId === "T" && /loop or multi-instance/i.test(i.reason))).toBe(true);
+    expect(r.issues.some((i) => i.elementId === "T" && /no recognized cardinality source/i.test(i.reason))).toBe(true);
   });
 
   it("rejects a Receive Task whose <message> has no name", async () => {
@@ -1864,11 +1867,14 @@ describe("M5-L1 embedded subProcess acceptance", () => {
     expect(r.issues.some((i) => i.elementId === "sub")).toBe(true);
   });
 
-  it("rejects multiInstanceLoopCharacteristics on a subProcess (interim → M5-L3)", async () => {
+  // M5-L3 flipped this from the interim "planned for M5-L3" reject: MI on a
+  // subProcess is now ACCEPTED, but a bare <multiInstanceLoopCharacteristics/>
+  // has no cardinality source — the permanent no-source reject.
+  it("rejects a subProcess MI with no recognized cardinality source", async () => {
     const withMi = SUBPROC.replace('<bpmn:startEvent id="s_start"/>', '<bpmn:multiInstanceLoopCharacteristics/><bpmn:startEvent id="s_start"/>');
     const r = await parseAndValidate(withMi);
     expect(r.ok).toBe(false);
-    expect(r.issues.some((i) => i.elementId === "sub" && /M5-L3/.test(i.reason))).toBe(true);
+    expect(r.issues.some((i) => i.elementId === "sub" && /no recognized cardinality source/i.test(i.reason))).toBe(true);
   });
 
   it("enforces MAX_SCOPE_DEPTH: depth 8 accepted, depth 9 rejected", async () => {

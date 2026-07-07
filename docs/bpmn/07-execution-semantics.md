@@ -183,16 +183,24 @@ either order (subProcess-in-tx, tx-in-subProcess, tx-in-tx), up to `MAX_SCOPE_DE
 mechanics:
 
 - **Typed scope hierarchy.** The compiled graph carries a static `scopes` map — one entry per non-process
-  scope, keyed by its element id, recording `kind` (`"transaction" | "subProcess"`), `parentId` (`null` at
+  scope, keyed by its element id, recording `kind` (`"transaction" | "subProcess" | "miBody"` — the last
+  since M5-L3: every multi-instance activity contributes a `miBody` scope, the subProcess body itself for
+  MI-over-subProcess or a synthetic leaf scope for MI-over-serviceTask/callActivity, which is what lets
+  the reverse cursor, straggler cohort, and drain machinery see MI iterations with no algorithm change),
+  `parentId` (`null` at
   the process root), and `depth`. It is computed once at publish from the immutable definition version,
   never recomputed from live state during a Workflow replay. All hierarchy questions — a scope's
   **subtree** (itself + every descendant), its **nearest enclosing transaction** (walking the parent chain
   inclusive), a transaction's **owned scopes** (itself + descendants not passing through another
   transaction), and **strict-ancestor** tests — are pure functions over this map.
-- **`MAX_SCOPE_DEPTH = 8`** (in `src/runtime/engine.ts`) bounds scope nesting depth. Because M5-L1 scope
-  depth is fully static (no `callActivity`, no `multiInstance` yet), the cap is enforced **at publish** by
-  the validator (element id + reason) — a fail-closed, zero-runtime-surface check. A future dynamic-depth
-  layer (call chains) will need a runtime incident instead; M5-L1 does not.
+- **`MAX_SCOPE_DEPTH = 8`** (in `src/runtime/engine.ts`) bounds scope nesting depth. Scope depth is fully
+  static — and stays so through M5-L3: a `callActivity` (M5-L2) is a separate instance of its own
+  definition (cross-definition depth is capped separately at publish by `MAX_CALL_DEPTH = 4`), and a
+  multi-instance activity (M5-L3) adds one **static** `miBody` scope that counts toward the depth
+  (cardinality is runtime data, but it multiplies iterations, never nesting) — so the cap is enforced
+  **at publish** by
+  the validator (element id + reason) — a fail-closed, zero-runtime-surface check. A future genuinely
+  dynamic-depth layer would need a runtime incident instead; no shipped layer does.
 - **Bookkeeping scope entry/exit.** A `subProcess` node is a walk-local bookkeeping visit — entering it
   writes a `scopeEntered` history event (mirroring `enterTransaction`), its inner none end writes
   `scopeExited`, and neither touches the saga ledger. A `transaction` still opens a ledger scope exactly as

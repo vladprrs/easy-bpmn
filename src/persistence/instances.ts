@@ -338,6 +338,10 @@ export interface JobRow {
   occurrence: number;
   /** 1 once the engine merged this job's output + advanced — rewalk skips it write-free. */
   output_applied: number;
+  // M5-L3 (0009) — the MI iteration this job serves; 0 on every non-MI (pre-L3)
+  // path. Widens the (instance, element, kind, occurrence) forward key so an MI
+  // activity's per-iteration forward jobs are distinct rows.
+  iteration_index: number;
 }
 
 export async function getJobByElement(
@@ -402,12 +406,13 @@ export async function getForwardJob(
   instanceId: string,
   elementId: string,
   occurrence: number,
+  iterationIndex = 0,
 ): Promise<JobRow | null> {
   return dbFirst<JobRow>(
     db,
     `SELECT * FROM service_task_jobs
-       WHERE instance_id = ? AND element_id = ? AND is_compensation = 0 AND occurrence = ?`,
-    [instanceId, elementId, occurrence],
+       WHERE instance_id = ? AND element_id = ? AND is_compensation = 0 AND occurrence = ? AND iteration_index = ?`,
+    [instanceId, elementId, occurrence, iterationIndex],
   );
 }
 
@@ -421,12 +426,13 @@ export async function getCompensationJob(
   instanceId: string,
   elementId: string,
   occurrence: number,
+  iterationIndex = 0,
 ): Promise<JobRow | null> {
   return dbFirst<JobRow>(
     db,
     `SELECT * FROM service_task_jobs
-       WHERE instance_id = ? AND element_id = ? AND is_compensation = 1 AND occurrence = ?`,
-    [instanceId, elementId, occurrence],
+       WHERE instance_id = ? AND element_id = ? AND is_compensation = 1 AND occurrence = ? AND iteration_index = ?`,
+    [instanceId, elementId, occurrence, iterationIndex],
   );
 }
 
@@ -469,14 +475,17 @@ export function createJobStmt(
     activationExpiresAt?: string | null;
     // CONDITIONAL (0004) — optional; pre-loop callers default to occurrence 0.
     occurrence?: number;
+    // M5-L3 (0009) — the MI iteration this job serves; optional, pre-L3 callers
+    // default to 0. Widens the (instance, element, kind, occurrence) forward key.
+    iterationIndex?: number;
   },
 ): D1PreparedStatement {
   return stmt(
     db,
     `INSERT INTO service_task_jobs
        (job_id, instance_id, element_id, task_type, status, retry_limit, attempt_count, idempotency_key, input_variables, output_variables, created_at, updated_at, completed_at,
-        workspace_id, is_compensation, compensates_element_id, activation_expires_at, occurrence, output_applied)
-     VALUES (?, ?, ?, ?, 'created', ?, 0, ?, ?, NULL, ?, ?, NULL, ?, ?, ?, ?, ?, 0)`,
+        workspace_id, is_compensation, compensates_element_id, activation_expires_at, occurrence, output_applied, iteration_index)
+     VALUES (?, ?, ?, ?, 'created', ?, 0, ?, ?, NULL, ?, ?, NULL, ?, ?, ?, ?, ?, 0, ?)`,
     [
       input.jobId,
       input.instanceId,
@@ -492,6 +501,7 @@ export function createJobStmt(
       input.compensatesElementId ?? null,
       input.activationExpiresAt ?? null,
       input.occurrence ?? 0,
+      input.iterationIndex ?? 0,
     ],
   );
 }
@@ -889,7 +899,12 @@ export type IncidentKind =
   // cancel) — a deterministic backstop instead of a silent occurrence desync. The
   // static C1 validator rejects UNGUARDED re-entry, this catches the residual
   // CONDITION-GUARDED loop-back the static BFS cannot prove unreachable.
-  | "scopeReentry";
+  | "scopeReentry"
+  // COMPOSITION (M5-L3 design §6) — a multiInstance activation whose evaluated
+  // cardinality exceeds the body-aware cap min(MAX_MI_CARDINALITY,
+  // floor(STEP_BUDGET_SOFT / (bodyStepCost * 4))). Cardinality is data, so this
+  // is a graceful RUNTIME incident at activation — never an opaque errored Workflow.
+  | "miCardinality";
 /**
  * Incident remediation lifecycle (one-way):
  *

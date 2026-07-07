@@ -50,6 +50,7 @@ import {
 import { insertSagaStepStmt } from "../persistence/saga";
 import { loadInst, type RunStep, type WaitForEvent } from "./engine-shared";
 import { nearestEnclosingTx, scopesOf } from "../bpmn/scope-tree";
+import { miIterTag } from "./multi-instance";
 import { createIncident, parkWaiting } from "./incidents";
 import { resolveScope } from "./frontier";
 import { branchHistoryTags, getToken, parseOverlay, readOverlay, rootTokenId, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
@@ -109,6 +110,23 @@ export function errorCatchTarget(graph: ExecutionGraph, elementId: string, error
 }
 
 export type ForwardOutcome = { kind: "next"; next: string } | { kind: "waiting" } | { kind: "incident" };
+
+/**
+ * M5-L3 (Task 6): the multi-instance thread through the forward triad. When set,
+ * this visit drives ONE MI iteration: step names / idempotency keys gain `@${i}`
+ * for i > 0 (`miIterTag` — iteration 0 and every pre-L3 caller stay
+ * byte-identical), the job is keyed `(element, occurrence, iterationIndex)`, its
+ * input snapshot is the pinned `inputOverride` (item + loopCounter — never a
+ * re-resolve of the live scope), and the apply path persists the iteration
+ * outcome WITHOUT advancing the instance — the MI driver's `mi-apply` step owns
+ * aggregation + advancement, and the MI driver also owns the park. Timer
+ * boundaries on an MI host guard the whole ACTIVATION (armed/settled at the MI
+ * level — Task 9), so all per-visit timer interaction is skipped per iteration.
+ */
+export interface MiIterationDrive {
+  iterationIndex: number;
+  inputOverride: JsonObject;
+}
 
 /**
  * Fast-forward predicate for a forward Service Task visit (design M2 §5): once
@@ -190,20 +208,22 @@ export async function driveForwardServiceTask(
   runStep: RunStep,
   waitFor: WaitForEvent | null,
   activeTokenId?: string,
+  mi?: MiIterationDrive,
 ): Promise<ForwardOutcome> {
-  const tag = `${elementId}#${occ}`;
+  const tag = miIterTag(`${elementId}#${occ}`, mi?.iterationIndex ?? 0);
   const tb = timerBoundaryFor(graph, elementId);
 
   // Boundary-timer fast-forward (M3-L3, design §4.1): `timer_outcomes` is the
   // truth for a timer-guarded visit — `fired` → the token already took the
   // boundary path (write-free advance to its target). `cancelled` falls through;
   // the normal applied/completed/failed logic (settled atomically with the cancel
-  // claim in those batches) drives it below.
-  if (tb && (await timerHasFired(env, instanceId, tb, occ))) {
+  // claim in those batches) drives it below. Under MI the timer guards the whole
+  // ACTIVATION and the MI driver owns its fast-forward — skipped per iteration.
+  if (!mi && tb && (await timerHasFired(env, instanceId, tb, occ))) {
     return { kind: "next", next: tb.node.next! };
   }
 
-  let job = await getForwardJob(env.DB, instanceId, elementId, occ);
+  let job = await getForwardJob(env.DB, instanceId, elementId, occ, mi?.iterationIndex ?? 0);
 
   // Already applied → pure cursor move (no step; write-free except the guarded
   // self-healing re-drain of a crashed scope exit — see appliedForwardOutcome).
@@ -211,16 +231,16 @@ export async function driveForwardServiceTask(
   if (applied) return applied;
 
   if (job?.status === "completed") {
-    return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, job!, activeTokenId));
+    return runStep(`svc-apply:${tag}`, () => applyForwardCompletion(env, instanceId, graph, elementId, occ, node, job!, activeTokenId, mi));
   }
   if (job?.status === "failed") {
-    return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, job!, activeTokenId));
+    return runStep(`svc-fail:${tag}`, () => handleForwardFailure(env, instanceId, graph, elementId, occ, node, job!, activeTokenId, mi));
   }
 
   if (!job) {
-    job = await runStep(`svc-create:${tag}`, () => createForwardJob(env, instanceId, graph, elementId, occ, node, activeTokenId));
+    job = await runStep(`svc-create:${tag}`, () => createForwardJob(env, instanceId, graph, elementId, occ, node, activeTokenId, mi));
     if (!job) return { kind: "incident" }; // oversized input → incident already recorded
-  } else if (tb) {
+  } else if (!mi && tb) {
     // Self-healing re-arm (design §4.2): a rewalk landing on a still-armed timer
     // re-arms the DO idempotently, so a lost alarm is repaired by the next drive.
     const trow = await getTimer(env.DB, timerIdFor(instanceId, tb.boundaryId, occ));
@@ -229,25 +249,51 @@ export async function driveForwardServiceTask(
 
   // Park: the instance resumes on the next drive (a /jobs/complete tickle in workflow
   // mode, or an inline re-drive in direct mode) once the job mutates in D1.
+  //
+  // M5-L3 step-free park (design §6, the highest-leverage mitigation): a rewalk over
+  // an UNCHANGED park must be step-free — the predicate is read OUTSIDE any step (the
+  // intermediate-timer pattern, intermediate-timer.ts:93-99). Once already parked on
+  // THIS element, re-issuing `svc-park` on every rewalk is a memoized no-op within one
+  // Workflow run but a REAL step across separate drives; skipping it is a step-COUNT
+  // change only, never a state change — parkWaiting's own idempotence guard already
+  // no-ops the body in this state, and the returned outcome is byte-identical. Only
+  // fires when already `waiting` on this exact element: a first arrival ('running'/
+  // 'starting'), or a rewalk parked on a DIFFERENT element (or the multi-token NULL
+  // frontier), still issues the park. This is deliberately NOT extended to the
+  // `recv:`/`ebg:` parks — a receive/eventBasedGateway rewalk RE-REGISTERS its broker
+  // subscription as a live self-heal (a lost registration is repaired by the next
+  // drive), so those steps are load-bearing, not no-ops.
+  //
+  // M5-L3 (Task 6): under MI the driver owns the ONE park for the whole visit
+  // (`mi-park`, after every live iteration is driven) — a per-iteration park here
+  // would issue N steps for one wait and race the sibling iterations' cursor.
+  if (mi) return { kind: "waiting" };
+  const inst = await loadInst(env, instanceId);
+  if (inst.status === "waiting" && inst.current_element_id === elementId) return { kind: "waiting" };
   await runStep(`svc-park:${tag}`, () => parkWaiting(env, instanceId, elementId, occ, "serviceTask"));
   return { kind: "waiting" };
 }
 
-async function createForwardJob(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, node: GraphNode, activeTokenId?: string): Promise<JobRow | null> {
+async function createForwardJob(env: Env, instanceId: string, graph: ExecutionGraph, elementId: string, occ: number, node: GraphNode, activeTokenId?: string, mi?: MiIterationDrive): Promise<JobRow | null> {
+  const iter = mi?.iterationIndex ?? 0;
   // Idempotent re-run (Workflow step retry after a committed batch): this
   // iteration's row already exists → return it, never re-insert (the unique
-  // index on (instance, element, kind, occurrence) would reject anyway).
-  const existing = await getForwardJob(env.DB, instanceId, elementId, occ);
+  // index on (instance, element, kind, occurrence, iteration) would reject anyway).
+  const existing = await getForwardJob(env.DB, instanceId, elementId, occ, iter);
   if (existing) return existing;
 
   const inst = await loadInst(env, instanceId);
   // Branch-scoped input (design §5.7): a branch token's job sees its resolved
   // overlay chain (root vars + ancestor overlays, nearest wins); a null/root
-  // token reads root variables verbatim (the exact M0–M3 path).
+  // token reads root variables verbatim (the exact M0–M3 path). An MI iteration
+  // job's input is the PINNED per-iteration override (base + item + loopCounter,
+  // resolved once by the MI driver) — never a re-resolve of the live scope.
   const isBranch = !!activeTokenId && activeTokenId !== rootTokenId(instanceId);
-  const variables = isBranch
-    ? await resolveScope(env, instanceId, parseJson<JsonObject>(inst.variables, {}), activeTokenId!)
-    : parseJson<JsonObject>(inst.variables, {});
+  const variables = mi
+    ? mi.inputOverride
+    : isBranch
+      ? await resolveScope(env, instanceId, parseJson<JsonObject>(inst.variables, {}), activeTokenId!)
+      : parseJson<JsonObject>(inst.variables, {});
   if (payloadByteSize(variables) > MAX_EVENT_PAYLOAD_BYTES) {
     await createIncident(env, instanceId, elementId, 0, "Service Task input variables exceed the Workflow event payload limit.", { size: payloadByteSize(variables) }, "serviceTaskFailure");
     return null;
@@ -260,15 +306,17 @@ async function createForwardJob(env: Env, instanceId: string, graph: ExecutionGr
   const activationExpiresAt = isoPlusMs(now, ACTIVATION_TTL_MS);
   // M3-L3: arm the interrupting boundary timer (if any) in the SAME visit batch —
   // persist-before-advance. fire_at is computed once here; the DO alarm is armed
-  // after the batch commits (best-effort, like the DLQ alarm).
-  const arm = buildBoundaryArm(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: elementId, occ, now });
+  // after the batch commits (best-effort, like the DLQ alarm). An MI host's timer
+  // guards the whole ACTIVATION (one arm per visit, Task 9), never per iteration.
+  const arm = mi ? null : buildBoundaryArm(graph, env, { instanceId, workspaceId: inst.workspace_id, hostElementId: elementId, occ, now });
+  const iterTags = mi ? { iterationIndex: iter } : {};
   await dbBatch(env.DB, [
     historyStmt(env.DB, {
       workspaceId: inst.workspace_id,
       instanceId,
       elementId,
       type: "elementEntered",
-      diagnostics: { elementType: "serviceTask", taskType, occurrence: occ, ...branchHistoryTags(activeTokenId) },
+      diagnostics: { elementType: "serviceTask", taskType, occurrence: occ, ...iterTags, ...branchHistoryTags(activeTokenId) },
     }),
     createJobStmt(env.DB, {
       jobId,
@@ -276,12 +324,14 @@ async function createForwardJob(env: Env, instanceId: string, graph: ExecutionGr
       elementId,
       taskType,
       retryLimit: Math.max(1, node.retries ?? 1),
-      idempotencyKey: `${instanceId}:${elementId}:0:${occ}`,
+      // `@${i}` ONLY when i > 0 — iteration 0 / pre-L3 keys stay byte-identical.
+      idempotencyKey: miIterTag(`${instanceId}:${elementId}:0:${occ}`, iter),
       inputVariables: variables,
       workspaceId: inst.workspace_id,
       isCompensation: false,
       activationExpiresAt,
       occurrence: occ,
+      iterationIndex: iter,
       now,
     }),
     historyStmt(env.DB, {
@@ -289,13 +339,13 @@ async function createForwardJob(env: Env, instanceId: string, graph: ExecutionGr
       instanceId,
       elementId,
       type: "serviceTaskJobCreated",
-      diagnostics: { jobId, taskType, retryLimit: Math.max(1, node.retries ?? 1), activationExpiresAt, occurrence: occ, ...branchHistoryTags(activeTokenId) },
+      diagnostics: { jobId, taskType, retryLimit: Math.max(1, node.retries ?? 1), activationExpiresAt, occurrence: occ, ...iterTags, ...branchHistoryTags(activeTokenId) },
     }),
     ...(arm ? arm.stmts : []),
   ]);
   await armJobScheduler(env, jobId, activationExpiresAt);
   if (arm) await armTimerDO(env, arm.timerId, arm.fireAt);
-  return getForwardJob(env.DB, instanceId, elementId, occ);
+  return getForwardJob(env.DB, instanceId, elementId, occ, iter);
 }
 
 /**
@@ -416,10 +466,11 @@ async function applyForwardCompletion(
   node: GraphNode,
   job: JobRow,
   activeTokenId?: string,
+  mi?: MiIterationDrive,
 ): Promise<ForwardOutcome> {
   // Apply-once guard (idempotent step body): a Workflow step retry after the
   // batch below committed must not re-merge the output over newer variables.
-  const live = await getForwardJob(env.DB, instanceId, elementId, occ);
+  const live = await getForwardJob(env.DB, instanceId, elementId, occ, mi?.iterationIndex ?? 0);
   const appliedAlready = await appliedForwardOutcome(env, instanceId, graph, elementId, node, live);
   if (appliedAlready) return appliedAlready;
 
@@ -427,6 +478,57 @@ async function applyForwardCompletion(
   const next = node.next!;
   const input = parseJson<JsonObject>(job.input_variables, {});
   const output = parseJson<JsonObject>(job.output_variables, {});
+
+  // M5-L3 (Task 6): the MI ITERATION apply — persist the iteration outcome (the
+  // applied CAS + the `miIterationCompleted` audit + the per-iteration ledger row
+  // under a transaction ancestor) in ONE batch, but NO variable merge and NO
+  // `applyTransitionStmt` advance: the iteration output stays on the job row
+  // until the MI driver's `mi-apply` step aggregates ALL outputs index-ordered
+  // and owns the single advance. No boundary-timer settle either — an MI host's
+  // timer guards the whole activation (Task 9). The per-call output already
+  // passed the payload limit at /jobs/complete; the poison MERGE gate below
+  // does not apply (nothing merges into instance variables here).
+  if (mi) {
+    const now = nowIso();
+    const stmts: D1PreparedStatement[] = [
+      historyStmt(env.DB, {
+        workspaceId: inst.workspace_id,
+        instanceId,
+        elementId,
+        type: "miIterationCompleted",
+        diagnostics: { jobId: job.job_id, iterationIndex: mi.iterationIndex, occurrence: occ, ...branchHistoryTags(activeTokenId) },
+      }),
+      markJobOutputAppliedStmt(env.DB, job.job_id, now),
+    ];
+    // Ledger row atomic with the iteration apply — gated on TRANSACTION ancestry
+    // exactly like the plain path, but keyed to the miBody scope (`elementId`)
+    // + the iteration index, so Task 11's per-iteration reverse pass can walk it.
+    if (nearestEnclosingTx(graph, elementId) != null) {
+      const wiring = graph.compensations?.[elementId];
+      const handlerNode = wiring ? graph.nodes[wiring.handlerId] : undefined;
+      stmts.push(
+        insertSagaStepStmt(env.DB, {
+          stepId: newId("step"),
+          instanceId,
+          scopeId: elementId, // the miBody scope
+          elementId,
+          forwardJobId: job.job_id,
+          capturedInput: input,
+          capturedOutput: output,
+          compensationElementId: wiring?.handlerId ?? null,
+          compensationTaskType: handlerNode?.taskType ?? null,
+          compensationStatus: wiring ? "pending" : "notRequired",
+          traceId: traceIdFor(instanceId),
+          occurrence: occ,
+          tokenId: activeTokenId ?? null,
+          iterationIndex: mi.iterationIndex,
+          now,
+        }),
+      );
+    }
+    await dbBatch(env.DB, stmts);
+    return { kind: "next", next };
+  }
   // Branch-scoped output (design §5.7): a branch token's output merges onto its
   // OWN overlay (not root); root vars mutate only at the join fold-up. A
   // null/root token keeps the M0–M3 path (merge into process_instances.variables).
@@ -551,6 +653,9 @@ async function applyForwardCompletion(
         // pass compensates this step only once its lineage quiesces. NULL on the
         // root/single-token (M1–M3) path → filterLineageQuiesced is a no-op there.
         tokenId: activeTokenId ?? null,
+        // M5-L3 seam: a plain (non-MI) forward step is iteration 0. Task 6 passes
+        // the real per-iteration index for an MI-body step.
+        iterationIndex: 0,
         now,
       }),
     );
@@ -582,16 +687,40 @@ async function handleForwardFailure(
   node: GraphNode,
   job: JobRow,
   activeTokenId?: string,
+  mi?: MiIterationDrive,
 ): Promise<ForwardOutcome> {
   // Route-once guard (idempotent step body): a re-run after the business-error
   // batch committed fast-forwards to the recorded boundary target instead of
   // duplicating businessErrorCaught + rewriting the cursor (and self-heals a
   // crashed-away scope drain/audit — see appliedForwardOutcome).
-  const live = await getForwardJob(env.DB, instanceId, elementId, occ);
+  const live = await getForwardJob(env.DB, instanceId, elementId, occ, mi?.iterationIndex ?? 0);
   const appliedAlready = await appliedForwardOutcome(env, instanceId, graph, elementId, node, live);
   if (appliedAlready) return appliedAlready;
 
   const inst = await loadInst(env, instanceId);
+  // M5-L3 (Task 9): a FAILED MI iteration NEVER takes the per-visit boundary route
+  // below (an MI host's boundary is routed at the ACTIVATION level, over the whole
+  // fan-out) and never a per-iteration timer settle (the MI host's timer guards the
+  // whole activation). The BUSINESS-error case (error_code set) is already surfaced
+  // to the driver by `iterationState` and routed by `abortOnIterationError` — the
+  // driver never calls this path for it — so here we handle only the TECHNICAL
+  // exhaustion: a graceful `serviceTaskFailure` incident (the halt an operator
+  // /retry heals). The error_code guard is a defensive fallback that should be
+  // unreachable in the driver's flow.
+  if (mi) {
+    const reason = job.error_code
+      ? `Multi-instance iteration ${mi.iterationIndex} failed with business error '${job.error_code}'.`
+      : "Service Task failed (technical retries exhausted).";
+    return createIncident(
+      env,
+      instanceId,
+      elementId,
+      job.attempt_count,
+      reason,
+      { jobId: job.job_id, iterationIndex: mi.iterationIndex, ...(job.error_code ? { errorCode: job.error_code } : {}) },
+      "serviceTaskFailure",
+    );
+  }
   if (job.error_code) {
     // Business error → route to the matching error boundary's target via the
     // hierarchical attachment-chain walk (M5-L1 spec §5.1): the throwing

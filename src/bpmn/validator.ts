@@ -22,8 +22,8 @@
 
 import type { ModdleElement } from "bpmn-moddle";
 import { parseBpmnXml } from "./parser";
-import { TASK_DEFINITION_TYPE } from "./moddle-extension";
-import { parseCondition } from "../runtime/expressions";
+import { MULTI_INSTANCE_TYPE, TASK_DEFINITION_TYPE } from "./moddle-extension";
+import { parseCondition, parseFeelExpression } from "../runtime/expressions";
 import { isValidIso8601DateTime, parseIso8601DurationMs } from "../runtime/iso8601";
 // M5-L1: the scope-nesting depth cap, enforced here at publish (spec §7). No
 // import cycle — engine.ts imports only `bpmn/graph` (type-only), never this
@@ -53,6 +53,7 @@ import type {
   Flow,
   GraphElement,
   GraphNode,
+  MultiInstanceSpec,
   NodeType,
   ScopeMeta,
   TimerTriggerSpec,
@@ -89,6 +90,60 @@ function readTaskDefinition(
     Number.isFinite(parsed) && parsed >= 1 ? parsed : DEFAULT_SERVICE_TASK_ATTEMPTS;
   return { type: type && type.length > 0 ? type : undefined, attempts };
 }
+
+/**
+ * M5-L3: the parsed multi-instance fields carried on a NodeInfo — the full
+ * MultiInstanceSpec minus `bodyStepCost`, which is computed in the graph build
+ * (leaf = 1; subProcess = interior node count; callActivity = refined later by
+ * call resolution).
+ */
+type NodeMi = Omit<MultiInstanceSpec, "bodyStepCost">;
+
+/**
+ * M5-L3: discriminates an activity's `loopCharacteristics` by `$type`:
+ * `multiInstanceLoopCharacteristics` (returned for classification) vs the
+ * standard loop marker (`standardLoopCharacteristics` — its own permanent
+ * reject). Anything unrecognized is treated as the loop marker (fail closed).
+ */
+function readMultiInstance(el: ModdleElement): { mi: ModdleElement | null; standardLoop: boolean } {
+  const lc = el.loopCharacteristics as ModdleElement | undefined | null;
+  if (lc == null) return { mi: null, standardLoop: false };
+  if (lc.$type === "bpmn:MultiInstanceLoopCharacteristics") return { mi: lc, standardLoop: false };
+  return { mi: null, standardLoop: true };
+}
+
+/**
+ * Reads the easy-bpmn:multiInstance binding (collection / elementVariable /
+ * outputVariable) from an activity's extensionElements. Empty/whitespace-only
+ * attributes normalize to undefined (indistinguishable from absent).
+ */
+function readMiBinding(
+  el: ModdleElement,
+): { collection?: string; elementVariable?: string; outputVariable?: string } | null {
+  const ext = el.extensionElements as ModdleElement | undefined;
+  const bind = asArray<ModdleElement>(ext?.values).find((v) => v.$type === MULTI_INSTANCE_TYPE);
+  if (!bind) return null;
+  const attr = (v: unknown): string | undefined =>
+    typeof v === "string" && v.trim() !== "" ? v.trim() : undefined;
+  return {
+    collection: attr(bind.collection),
+    elementVariable: attr(bind.elementVariable),
+    outputVariable: attr(bind.outputVariable),
+  };
+}
+
+/**
+ * M5-L3 (design §6): the interior node types that count toward a subProcess MI
+ * body's static per-iteration step-cost estimate (min 1 is applied at the use
+ * site). Start events are pure cursor moves; boundary events count (they arm).
+ */
+const MI_BODY_STEP_TYPES: ReadonlySet<NodeType> = new Set([
+  "serviceTask",
+  "exclusiveGateway",
+  "intermediateCatchEvent",
+  "endEvent",
+  "boundaryEvent",
+]);
 
 /**
  * Validate a model timer's `<timerEventDefinition>` (boundary or intermediate
@@ -154,6 +209,8 @@ interface NodeInfo {
   defaultFlowId?: string;
   /** callActivity only — the raw calledElement process id (M5-L2). */
   calledElementId?: string;
+  /** M5-L3: validated multi-instance fields (serviceTask/subProcess/callActivity only). */
+  multiInstance?: NodeMi;
 }
 
 interface FlowInfo {
@@ -187,7 +244,18 @@ interface AssocInfo {
 
 interface ScopeInfo {
   id: string;
-  kind: "process" | "transaction" | "subProcess";
+  /**
+   * `"miBody"` marks a SYNTHETIC leaf MI scope (a multi-instance serviceTask /
+   * callActivity) — it has no interior flow elements, so the per-scope
+   * structural checks skip it. An MI subProcess keeps kind `"subProcess"`
+   * (its interior IS validated) and sets `miBody: true`; both shapes compile
+   * to a ScopeMeta with kind `"miBody"` (M5-L3).
+   */
+  kind: "process" | "transaction" | "subProcess" | "miBody";
+  /** M5-L3: this subProcess scope is a multi-instance body. */
+  miBody?: boolean;
+  /** M5-L3 leaf MI scopes only — startId override (the MI element id itself). */
+  startId?: string;
 }
 
 const SUPPORTED_HINT =
@@ -277,6 +345,33 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       if ((owner?.$type === "bpmn:BoundaryEvent" || owner?.$type === "bpmn:EndEvent") && typeof owner.id === "string") {
         danglingErrorRef.set(owner.id, String(w.value));
       }
+    }
+  }
+
+  // M5-L3: `loopDataInputRef`/`loopDataOutputRef` are moddle REFERENCES — when
+  // the referenced data element does not exist, bpmn-moddle DROPS the ref (an
+  // "unresolved reference" warning), leaving the multiInstanceLoopCharacteristics
+  // indistinguishable from one that never declared a data binding. The standard
+  // MI data bindings are PERMANENTLY rejected (constitution), so recover the
+  // dangling refs here — keyed by the OWNING ACTIVITY id (the warning's element
+  // is the loopCharacteristics; its $parent is the activity) — the same
+  // moddle-INTERNAL warning-shape caveat as the blocks above, pinned by the
+  // "rejects the standard MI data bindings: loopDataInputRef" unit test.
+  const danglingMiDataRef = new Set<string>();
+  for (const w of parsed.warnings as Array<{
+    message?: string;
+    property?: string;
+    element?: { $type?: string; $parent?: { id?: string } };
+  }>) {
+    if (
+      typeof w?.property === "string" &&
+      /^bpmn:loopData(Input|Output)Ref$/.test(w.property) &&
+      typeof w.message === "string" &&
+      /unresolved reference/i.test(w.message) &&
+      w.element?.$type === "bpmn:MultiInstanceLoopCharacteristics" &&
+      typeof w.element.$parent?.id === "string"
+    ) {
+      danglingMiDataRef.add(w.element.$parent.id);
     }
   }
 
@@ -461,14 +556,180 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
   const scopeParent = new Map<string, string | null>();
   const scopeDepth = new Map<string, number>();
 
+  // M5-L3: the standard loop marker — a DISTINCT permanent reject (never the
+  // multi-instance wording), shared by every host branch.
+  const standardLoopReject = (id: string | null, elementName: string): void => {
+    err(
+      `Element '${id ?? "(no id)"}' has standardLoopCharacteristics (the loop marker), which is not supported — ` +
+        "model repetition as sequence-flow cycles (M2) or multiInstanceLoopCharacteristics (M5-L3).",
+      id,
+      elementName,
+    );
+  };
+
+  /**
+   * M5-L3 (design §7): the shared multi-instance classification for the three
+   * supported hosts (serviceTask / subProcess / callActivity). Emits `err(...)`
+   * with element id + reason for every reject; on success returns the parsed
+   * spec fields (`bodyStepCost` is filled in the graph build).
+   */
+  const classifyMultiInstance = (
+    el: ModdleElement,
+    id: string,
+    elementName: string,
+  ): NodeMi | "rejected" => {
+    const { mi, standardLoop } = readMultiInstance(el);
+    if (standardLoop || mi == null) {
+      standardLoopReject(id, elementName);
+      return "rejected";
+    }
+    // Standard MI data bindings — permanently rejected (constitution): the
+    // containments (inputDataItem/outputDataItem), a RESOLVED loopData*Ref, or
+    // a dangling one recovered from the parser warnings above.
+    if (
+      mi.loopDataInputRef != null ||
+      mi.loopDataOutputRef != null ||
+      mi.inputDataItem != null ||
+      mi.outputDataItem != null ||
+      danglingMiDataRef.has(id)
+    ) {
+      err(
+        `Element '${id}' carries standard MI data bindings (loopDataInputRef/loopDataOutputRef/inputDataItem/outputDataItem), ` +
+          "which are permanently rejected — use loopCardinality or easy-bpmn:multiInstance collection.",
+        id,
+        elementName,
+      );
+      return "rejected";
+    }
+    // Completion behavior: only the default "All" (every iteration completes;
+    // completionCondition is the supported early-settle mechanism).
+    const behavior = typeof mi.behavior === "string" ? mi.behavior : "All";
+    if (
+      behavior !== "All" ||
+      asArray<ModdleElement>(mi.complexBehaviorDefinition).length > 0 ||
+      mi.oneBehaviorEventRef != null ||
+      mi.noneBehaviorEventRef != null
+    ) {
+      err(
+        `Element '${id}' has multiInstanceLoopCharacteristics behavior="${behavior}" — only the default behavior="All" ` +
+          "is supported (complexBehaviorDefinition / oneBehaviorEventRef / noneBehaviorEventRef are rejected).",
+        id,
+        elementName,
+      );
+      return "rejected";
+    }
+    // Exactly ONE cardinality source: the standard loopCardinality (FEEL,
+    // number-valued) XOR the easy-bpmn:multiInstance collection (FEEL,
+    // list-valued). camunda:/zeebe: MI attributes are extension content —
+    // tolerated-and-ignored, never read as a source.
+    const bodyOf = (x: unknown): string | undefined => {
+      const e = x as ModdleElement | undefined | null;
+      return e != null && typeof e.body === "string" && e.body.trim() !== "" ? e.body.trim() : undefined;
+    };
+    const cardinality = bodyOf(mi.loopCardinality);
+    const binding = readMiBinding(el);
+    const collection = binding?.collection;
+    if (cardinality !== undefined && collection !== undefined) {
+      err(
+        `Element '${id}' declares both a loopCardinality and an easy-bpmn:multiInstance collection — ` +
+          "exactly one cardinality source is required.",
+        id,
+        elementName,
+      );
+      return "rejected";
+    }
+    if (cardinality === undefined && collection === undefined) {
+      err(
+        `Element '${id}' has multiInstanceLoopCharacteristics with no recognized cardinality source — declare a ` +
+          "loopCardinality (number-valued FEEL) or an easy-bpmn:multiInstance collection (list-valued FEEL).",
+        id,
+        elementName,
+      );
+      return "rejected";
+    }
+    // FEEL-parse every expression at publish (runtime has no second parse
+    // chance): value-typed cardinality/collection via parseFeelExpression;
+    // the boolean completionCondition via parseCondition (unary-test lint on).
+    let rejected = false;
+    if (cardinality !== undefined) {
+      const p = parseFeelExpression(cardinality);
+      if (!p.ok) {
+        err(`Element '${id}' loopCardinality: ${p.reason}`, id, elementName);
+        rejected = true;
+      }
+    }
+    if (collection !== undefined) {
+      const p = parseFeelExpression(collection);
+      if (!p.ok) {
+        err(`Element '${id}' easy-bpmn:multiInstance collection: ${p.reason}`, id, elementName);
+        rejected = true;
+      }
+    }
+    const completionCondition = bodyOf(mi.completionCondition);
+    if (completionCondition !== undefined) {
+      const p = parseCondition(completionCondition);
+      if (!p.ok) {
+        err(`Element '${id}' completionCondition: ${p.reason}`, id, elementName);
+        rejected = true;
+      }
+    }
+    // Compensate-the-MI-as-a-unit is deferred (per-iteration compensation is
+    // the M5-L3 model) — an MI activity can never BE a compensation handler.
+    if (el.isForCompensation === true) {
+      err(
+        `Element '${id}' is marked isForCompensation and multi-instance — a compensation handler cannot be ` +
+          "multi-instance; compensation applies per iteration (M5-L3).",
+        id,
+        elementName,
+      );
+      rejected = true;
+    }
+    if (rejected) return "rejected";
+    return {
+      isSequential: mi.isSequential === true,
+      loopCardinality: cardinality ?? null,
+      collection: collection ?? null,
+      elementVariable: binding?.elementVariable ?? null,
+      outputVariable: binding?.outputVariable ?? null,
+      completionCondition: completionCondition ?? null,
+    };
+  };
+
+  /**
+   * M5-L3: a LEAF MI activity (serviceTask/callActivity) contributes a
+   * SYNTHETIC miBody scope entry — same id as the element, startId = the
+   * element itself (there is no inner start event) — so the scope tree,
+   * ScopeMeta emission, and the MAX_SCOPE_DEPTH cap all count it exactly like
+   * an MI subProcess body scope.
+   */
+  const pushLeafMiScope = (
+    miId: string,
+    parentScopeId: string,
+    containerDepth: number,
+    elementName: string,
+  ): void => {
+    const depth = containerDepth + 1;
+    scopes.push({ id: miId, kind: "miBody", startId: miId });
+    scopeParent.set(miId, parentScopeId);
+    scopeDepth.set(miId, depth);
+    if (depth > MAX_SCOPE_DEPTH) {
+      err(
+        `Scope '${miId}' exceeds MAX_SCOPE_DEPTH = ${MAX_SCOPE_DEPTH} (nesting depth ${depth}).`,
+        miId,
+        elementName,
+      );
+    }
+  };
+
   const classifyContainer = (
     container: ModdleElement,
     scopeId: string,
     scopeKind: "process" | "transaction" | "subProcess",
     parentScopeId: string | null,
     depth: number,
+    miBody = false,
   ): void => {
-    scopes.push({ id: scopeId, kind: scopeKind });
+    scopes.push({ id: scopeId, kind: scopeKind, ...(miBody ? { miBody: true } : {}) });
     scopeParent.set(scopeId, parentScopeId);
     scopeDepth.set(scopeId, depth);
     if (depth > MAX_SCOPE_DEPTH) {
@@ -541,13 +802,17 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       }
 
       // Transaction scope — a node on the parent token path; recurse into it.
+      // M5-L3: MI stays rejected on a transaction (Hazard-vs-Cancel would blur:
+      // iterating a saga scope is modeled as MI over a callActivity instead),
+      // now split from the distinct standard-loop-marker reject.
       if ($type === "bpmn:Transaction") {
         if (el.loopCharacteristics != null) {
-          err(
-            `Transaction '${id ?? "(no id)"}' has loop or multi-instance characteristics, which are not supported.`,
-            id,
-            "transaction",
-          );
+          const { standardLoop } = readMultiInstance(el);
+          if (standardLoop) {
+            standardLoopReject(id, "transaction");
+          } else {
+            err("Multi-instance is not supported on a transaction.", id, "transaction");
+          }
         }
         nodes.push({ id: id ?? "", type: "transaction", name: (el.name as string) ?? undefined, scopeId });
         classifyContainer(el, id ?? "", "transaction", scopeId, depth + 1);
@@ -556,8 +821,10 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
 
       // M5-L1: plain embedded subProcess — a bookkeeping scope on the token path.
       // An event subprocess (triggeredByEvent) and ad-hoc subprocesses are out of
-      // profile (interim rejects with roadmap pointers, spec §6); MI-on-subProcess
-      // is deferred to M5-L3.
+      // profile (interim rejects with roadmap pointers, spec §6). M5-L3 opens
+      // multiInstanceLoopCharacteristics here: the scope compiles as an miBody
+      // (interior rules still run via the normal recursion), narrowed by the v1
+      // body whitelist below.
       if ($type === "bpmn:SubProcess") {
         if (el.triggeredByEvent === true) {
           err(
@@ -567,16 +834,49 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
           );
           continue;
         }
+        let miSpec: NodeMi | undefined;
         if (el.loopCharacteristics != null) {
-          err(
-            `Subprocess '${id ?? "(no id)"}' has loop or multi-instance characteristics — multiInstance is planned for milestone M5-L3.`,
-            id,
-            "subProcess",
-          );
-          continue;
+          const mi = classifyMultiInstance(el, id ?? "", "subProcess");
+          if (mi !== "rejected") miSpec = mi;
         }
-        nodes.push({ id: id ?? "", type: "subProcess", name: (el.name as string) ?? undefined, scopeId });
-        classifyContainer(el, id ?? "", "subProcess", scopeId, depth + 1);
+        const info: NodeInfo = { id: id ?? "", type: "subProcess", name: (el.name as string) ?? undefined, scopeId };
+        if (miSpec) info.multiInstance = miSpec;
+        nodes.push(info);
+        classifyContainer(el, id ?? "", "subProcess", scopeId, depth + 1, miSpec != null);
+        // v1 MI-body whitelist (design §7, deliberate narrowings recorded in the
+        // Constitution Check): concurrent iterations share the broker key
+        // (message waits collide — the L2 precedent), and the frontier DFS does
+        // not recurse under the MI sub-walk, so scopes/gateway fan-out inside
+        // the body are out. Scanned over the DIRECT children just classified
+        // (a disallowed construct nested deeper sits inside a child that is
+        // itself rejected here).
+        if (miSpec) {
+          const disallowedIn = (c: NodeInfo): string | undefined => {
+            if (c.type === "receiveTask") return "a receiveTask";
+            if (c.type === "intermediateCatchEvent" && c.messageName != null) return "a message intermediateCatchEvent";
+            if (c.type === "eventBasedGateway") return "an eventBasedGateway";
+            if (c.type === "subProcess") return "a nested subProcess";
+            if (c.type === "transaction") return "a nested transaction";
+            if (c.type === "callActivity") return "a callActivity";
+            if (c.type === "parallelGateway") return "a parallelGateway";
+            if (c.type === "inclusiveGateway") return "an inclusiveGateway";
+            if (c.multiInstance != null) return "a nested multi-instance activity";
+            return undefined;
+          };
+          for (const child of nodes) {
+            if (child.scopeId !== (id ?? "")) continue;
+            const what = disallowedIn(child);
+            if (what) {
+              err(
+                `Element '${child.id}' is ${what}, which is not allowed inside a multi-instance body in this layer — ` +
+                  "v1 MI bodies allow service tasks, exclusive gateways, timer catches, and end events; " +
+                  "use multi-instance over a callActivity for richer bodies.",
+                id,
+                "subProcess",
+              );
+            }
+          }
+        }
         continue;
       }
       if ($type === "bpmn:AdHocSubProcess") {
@@ -593,9 +893,13 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       // concrete definitionVersionId at the CALLER's publish (call-resolution.ts) —
       // here we only validate document-local shape.
       if ($type === "bpmn:CallActivity") {
+        // M5-L3: MI over a callActivity — the richer-body fan-out (each iteration
+        // is a full child instance). Classified first so an MI reject and a
+        // calledElement reject can both surface on one broken element.
+        let miSpec: NodeMi | undefined;
         if (el.loopCharacteristics != null) {
-          err(`Call activity '${id ?? "(no id)"}' has loop or multi-instance characteristics — multiInstance is planned for milestone M5-L3.`, id, "callActivity");
-          continue;
+          const mi = classifyMultiInstance(el, id ?? "", "callActivity");
+          if (mi !== "rejected") miSpec = mi;
         }
         const calledElement = typeof el.calledElement === "string" ? el.calledElement.trim() : "";
         if (!calledElement) {
@@ -609,7 +913,12 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
           err(`Call activity '${id ?? "(no id)"}' calledElement '${calledElement}' resolves to a ${localTypeName(sameDocTarget)}, not a process — only process targets are supported.`, id, "callActivity");
           continue;
         }
-        nodes.push({ id: id ?? "", type: "callActivity", name: (el.name as string) ?? undefined, scopeId, calledElementId: calledElement });
+        const info: NodeInfo = { id: id ?? "", type: "callActivity", name: (el.name as string) ?? undefined, scopeId, calledElementId: calledElement };
+        if (miSpec) {
+          info.multiInstance = miSpec;
+          pushLeafMiScope(id ?? "", scopeId, depth, "callActivity");
+        }
+        nodes.push(info);
         continue;
       }
 
@@ -804,13 +1113,28 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         );
       }
 
-      // Multi-instance / loop characteristics on an activity are out of profile.
+      // Loop characteristics on the generic path: M5-L3 accepts multi-instance
+      // on a serviceTask (the leaf MI — attached to the NodeInfo below); every
+      // other node type here (receiveTask, events, gateways) stays rejected,
+      // split into the distinct standard-loop-marker vs MI-host wording.
+      let miSpec: NodeMi | undefined;
       if (el.loopCharacteristics != null) {
-        err(
-          `Element '${id ?? "(no id)"}' has loop or multi-instance characteristics, which are not supported.`,
-          id,
-          localTypeName($type),
-        );
+        if (nodeType === "serviceTask") {
+          const mi = classifyMultiInstance(el, id ?? "", "serviceTask");
+          if (mi !== "rejected") miSpec = mi;
+        } else {
+          const { standardLoop } = readMultiInstance(el);
+          if (standardLoop) {
+            standardLoopReject(id, localTypeName($type));
+          } else {
+            err(
+              `Element '${id ?? "(no id)"}' has multi-instance characteristics — multi-instance is not supported on a ` +
+                `${localTypeName($type)}; it is supported only on serviceTask, subProcess, and callActivity (M5-L3).`,
+              id,
+              localTypeName($type),
+            );
+          }
+        }
       }
 
       const info: NodeInfo = {
@@ -819,6 +1143,10 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
         name: (el.name as string) ?? undefined,
         scopeId,
       };
+      if (miSpec) {
+        info.multiInstance = miSpec;
+        pushLeafMiScope(id ?? "", scopeId, depth, "serviceTask");
+      }
 
       if (nodeType === "exclusiveGateway") {
         info.defaultFlowId = refId(el.default);
@@ -1009,6 +1337,9 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
 
   for (const sid of scopeIds) {
     const kind = scopeKindOf.get(sid)!;
+    // M5-L3: a LEAF MI scope (multi-instance serviceTask/callActivity) is
+    // synthetic — no interior flow elements, so no start/end/linearity rules.
+    if (kind === "miBody") continue;
     const scopeNodes = nodes.filter((n) => n.scopeId === sid);
     const starts = scopeNodes.filter((n) => n.type === "startEvent");
     const ends = scopeNodes.filter((n) => n.type === "endEvent");
@@ -1219,6 +1550,20 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
     }
 
     if (n.boundaryKind === "compensate") {
+      // M5-L3: compensate-as-a-unit on a multi-instance activity is deferred —
+      // each iteration's OWN rows drive per-iteration compensation instead.
+      // Anchored on the HOST activity id (the modeling error is making the MI
+      // activity compensatable, not the boundary's own shape). `continue` so
+      // no association wiring is recorded for the MI host.
+      if (attached.multiInstance != null) {
+        err(
+          `Activity '${attached.id}' has compensation boundary '${n.id}' — compensate-as-a-unit on a ` +
+            "multi-instance activity is deferred; M5-L3 compensation applies per iteration.",
+          attached.id,
+          "boundaryEvent",
+        );
+        continue;
+      }
       if (attached.type !== "serviceTask") {
         err(
           `Compensation boundary event '${n.id}' must be attached to a service task (the compensatable step).`,
@@ -1893,6 +2238,17 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       if (n.type === "callActivity") {
         node.calledElementId = n.calledElementId ?? null;
       }
+      // M5-L3: the validated multi-instance spec + the static per-iteration
+      // step-cost estimate (design §6): 1 for a leaf (a callActivity's cost is
+      // refined by call resolution over the pinned child graph — Task 3); for a
+      // subProcess body, the count of interior step-generating nodes (min 1).
+      if (n.multiInstance) {
+        const bodyStepCost =
+          n.type === "subProcess"
+            ? Math.max(1, nodes.filter((c) => c.scopeId === n.id && MI_BODY_STEP_TYPES.has(c.type)).length)
+            : 1;
+        node.multiInstance = { ...n.multiInstance, bodyStepCost };
+      }
       graphNodes[n.id] = node;
     }
 
@@ -1928,10 +2284,14 @@ export async function parseAndValidate(xml: string): Promise<ValidationResult> {
       const parent = scopeParent.get(s.id) ?? null;
       scopeMetas[s.id] = {
         id: s.id,
-        kind: s.kind,
+        // M5-L3: an MI body compiles to kind "miBody" — either the subProcess's
+        // own scope entry re-kinded (miBody flag; interior + inner start as
+        // usual) or a leaf MI's synthetic entry (kind "miBody" with the startId
+        // override: the MI element id itself, there is no inner start event).
+        kind: s.kind === "miBody" || s.miBody ? "miBody" : s.kind,
         parentId: parent === processId ? null : parent,
         depth: scopeDepth.get(s.id) ?? 1,
-        startId: inner?.id ?? "",
+        startId: s.startId ?? inner?.id ?? "",
       };
     }
 

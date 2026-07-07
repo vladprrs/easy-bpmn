@@ -1182,7 +1182,7 @@ components:
           description: Every callActivity visit's bound child (across occurrences/iterations).
           items:
             type: object
-            required: [elementId, occurrence, childInstanceId, status]
+            required: [elementId, occurrence, iterationIndex, childInstanceId, status]
             properties:
               elementId:
                 type: string
@@ -1190,6 +1190,11 @@ components:
               occurrence:
                 type: integer
                 description: The parent's 0-based visit occurrence that created this child.
+              iterationIndex:
+                type: integer
+                description: >
+                  M5-L3 — which multi-instance iteration of the visit spawned this
+                  child; 0 for every plain (non-MI) callActivity visit.
               childInstanceId:
                 type: string
               status:
@@ -1529,7 +1534,9 @@ components:
             scope whose earlier occurrence was abnormally skipped (fired scope timer /
             nested cancel); a deterministic backstop for the residual condition-guarded
             loop-back the static publish-time check cannot prove unreachable.
-          enum: [serviceTaskFailure, compensationFailure, timeout, poison, loopLimit, noPath, jobActivationTimeout, waitTimeout, conditionFailure, concurrencyLimit, stepBudget, uncaughtError, scopeReentry]
+            M5-L3 adds `miCardinality` — a multi-instance activation whose cardinality
+            exceeds the body-aware cap.
+          enum: [serviceTaskFailure, compensationFailure, timeout, poison, loopLimit, noPath, jobActivationTimeout, waitTimeout, conditionFailure, concurrencyLimit, stepBudget, uncaughtError, scopeReentry, miCardinality]
         resolution:
           type: string
           nullable: true

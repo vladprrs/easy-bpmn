@@ -20,11 +20,14 @@ and M4 (concurrency) have since shipped — the M4 concurrency section is append
 below; **M5 (composition)** is the current (and last) roadmap milestone, opened by
 the constitution v2.5.0 amendment and decomposed into five runtime layers
 (M5-L1…L5) — the **M5-L1 (embedded scopes + hierarchical exceptions)** section is
-appended below and has since shipped, and **M5-L2 (`callActivity` reusable
+appended below and has since shipped, **M5-L2 (`callActivity` reusable
 sub-sagas)** has likewise shipped (governance record:
 `specs/002-saga-orchestrator/m5-L2-constitution-check.md`; design:
-`docs/superpowers/specs/2026-07-02-m5-l2-callactivity-design.md`); M5-L3…L5 remain
-pending.
+`docs/superpowers/specs/2026-07-02-m5-l2-callactivity-design.md`), and **M5-L3
+(`multiInstanceLoopCharacteristics` data-driven fan-out)** has likewise shipped
+(governance record: `specs/002-saga-orchestrator/m5-L3-constitution-check.md`;
+design: `docs/superpowers/specs/2026-07-06-m5-l3-multiinstance-design.md`);
+M5-L4…L5 remain pending.
 
 ## Constitution Alignment *(mandatory)*
 
@@ -838,8 +841,9 @@ validator/runtime for plain embedded `bpmn:subProcess` (one none-start, ≥1 end
 scope, arbitrary nesting of subProcess/transaction), error and timer `boundaryEvent`s hosted on a
 `subProcess`/`transaction`, and the error **end** event (`endEvent` + `errorEventDefinition`). The
 `triggeredByEvent="true"` event subprocess, `multiInstanceLoopCharacteristics`, and `callActivity` stay
-**interim-rejected** with an M5-L4/L3/L2 roadmap pointer respectively (`callActivity` has **since
-shipped** — its M5-L2 layer opened the runtime); `adHocSubProcess` and
+**interim-rejected** with an M5-L4/L3/L2 roadmap pointer respectively (`callActivity` and
+`multiInstanceLoopCharacteristics` have **since shipped** — their M5-L2 and M5-L3 layers opened the
+runtime); `adHocSubProcess` and
 `standardLoopCharacteristics` stay permanently rejected. The no-custom-notation clause, XSD-validity, and
 modeler round-trippability are unchanged.
 
@@ -893,7 +897,11 @@ invariant is re-affirmed.
 **Out** (explicit, with interim validator rejects where applicable):
 
 - Event subprocess (`triggeredByEvent="true"`) → M5-L4 (interim reject with roadmap pointer).
-- `multiInstanceLoopCharacteristics` on any activity → M5-L3 (interim reject).
+- `multiInstanceLoopCharacteristics` on any activity → M5-L3 (**since shipped** — the interim reject is
+  lifted for `serviceTask`/`subProcess`/`callActivity` hosts, parallel and sequential, with M5-L3's own
+  publish rejects: the standard MI data bindings, no or both cardinality sources, the v1 MI-subProcess
+  body whitelist, `behavior` ≠ `"All"`, MI on a `receiveTask`/`transaction`, and the deferred
+  compensate-boundary-on-MI; see `specs/002-saga-orchestrator/m5-L3-constitution-check.md`).
 - `callActivity` → M5-L2 (**since shipped** — the whitelist reject is lifted: `calledElement` is pinned
   to an immutable published version at the caller's publish and the call tree is capped at
   `MAX_CALL_DEPTH = 4` at publish; see `specs/002-saga-orchestrator/m5-L2-constitution-check.md`).
@@ -973,7 +981,7 @@ terminally, as in M1–M4.
 | `bpmn:SubProcess` (plain, embedded) | **Accept**: recurse `classifyContainer` with `scopeKind="subProcess"`; today it falls to the generic whitelist reject |
 | `triggeredByEvent="true"` | **Interim reject** with M5-L4 roadmap pointer (element id + reason) |
 | `adHocSubProcess` | **Reject** (permanent, element id + reason) |
-| `multiInstanceLoopCharacteristics` / `standardLoopCharacteristics` on any activity | **Interim reject** → M5-L3 / permanent reject respectively |
+| `multiInstanceLoopCharacteristics` / `standardLoopCharacteristics` on any activity | **Interim reject** → M5-L3 (**since shipped** — accepted on `serviceTask`/`subProcess`/`callActivity` with M5-L3's own publish rejects) / permanent reject respectively |
 | Error end event | **Accept** (replaces the prior reject); `errorRef` → `bpmn:error/@errorCode` resolution required, dangling/empty rejected |
 | Cancel end event | Immediate scope MUST be a transaction (explicit about *immediate* under nesting) |
 | Error boundary hosts | serviceTask (existing) **+ subProcess + transaction** |

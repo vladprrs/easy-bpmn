@@ -111,6 +111,7 @@ import { completeInstanceGuarded } from "../persistence/instances";
 import { branchHistoryTags, listLiveTokens, setTokenStatusStmt, rootTokenId, getToken, parseOverlay, readOverlay, setTokenOverlayStmt, writeOverlay } from "../persistence/tokens";
 import { withDriveLock } from "../persistence/drive-lock";
 import { driveForwardServiceTask, terminateUnleasableJob, errorCatchTarget } from "./forward-task";
+import { driveMultiInstance } from "./multi-instance";
 import { driveCallActivity, notifyParentOfChildTerminal, settleChildErrored, PARENT_CONSUMABLE_CHILD_STATUSES } from "./call-activity";
 import { beginCompensating, settleAfterCompensation, cancelBoundaryTarget, drainScopeSubtree } from "./compensation";
 import {
@@ -203,6 +204,15 @@ export const MAX_SCOPE_DEPTH = 8;
 export const MAX_CALL_DEPTH = 4;
 
 /**
+ * M5-L3 — multi-instance fan-out cap (constitution v2.5.0; design §6). BODY-AWARE:
+ * the effective per-activation cap is min(MAX_MI_CARDINALITY,
+ * floor(STEP_BUDGET_SOFT / (bodyStepCost * 4))) — enforced at RUNTIME activation
+ * (cardinality is data), settling a graceful `miCardinality` incident, never an
+ * opaque errored Workflow. `check:docs` syncs every doc copy.
+ */
+export const MAX_MI_CARDINALITY = 200;
+
+/**
  * TEST-ONLY cap overrides (design §9 / L6.1). Integration tests lower a cap via an
  * env var so a bomb fixture trips it without 256 real branches / 20000 real steps;
  * production never sets these (the `Env` fields are optional + test-only). A
@@ -212,9 +222,13 @@ function maxConcurrentTokens(env: Env): number {
   const o = Number((env as { MAX_CONCURRENT_TOKENS_OVERRIDE?: string }).MAX_CONCURRENT_TOKENS_OVERRIDE);
   return Number.isFinite(o) && o > 0 ? o : MAX_CONCURRENT_TOKENS;
 }
-function stepBudgetSoft(env: Env): number {
+export function stepBudgetSoft(env: Env): number {
   const o = Number((env as { STEP_BUDGET_SOFT_OVERRIDE?: string }).STEP_BUDGET_SOFT_OVERRIDE);
   return Number.isFinite(o) && o > 0 ? o : STEP_BUDGET_SOFT;
+}
+export function maxMiCardinality(env: Env): number {
+  const o = Number((env as { MAX_MI_CARDINALITY_OVERRIDE?: string }).MAX_MI_CARDINALITY_OVERRIDE);
+  return Number.isFinite(o) && o > 0 ? o : MAX_MI_CARDINALITY;
 }
 
 /**
@@ -415,6 +429,26 @@ async function loop(
         return { kind: "next", next: await runStep(`start:${tag}`, () => enterStart(env, instanceId, graph, cur, occ, node)) };
       }
 
+      // M5-L3 (Task 6): a multi-instance activity dispatches to the MI driver
+      // BEFORE every per-kind branch — one arrival = ONE occurrence; the driver
+      // owns activation, iteration fan-out (`iterationIndex` is the second
+      // dimension), aggregation, and advancement for serviceTask (Task 6) /
+      // subProcess (Task 7) / callActivity (Task 10) hosts alike.
+      if (node.multiInstance) {
+        // M5-L3 (Task 7): thread THIS leaf dispatch into the MI driver so a
+        // subProcess body's sub-walk drives its interior leaves through the exact
+        // same `driveLeaf` (shared fast-forward discipline / branch-scoped
+        // reads / step naming). `drivers.driveLeaf` is the SINGLE dispatch shared
+        // by the single-token walk and the region DFS, so both walk drivers thread
+        // it here. serviceTask (Task 6) / callActivity (Task 10) hosts ignore it.
+        const r = await driveMultiInstance(env, instanceId, graph, cur, occ, node, runStep, activeTokenId, (bcur, bocc, btok) =>
+          drivers.driveLeaf(bcur, bocc, btok),
+        );
+        if (r.kind === "waiting") return { kind: "parked" };
+        if (r.kind === "incident") return { kind: "incident" };
+        return { kind: "next", next: r.next };
+      }
+
       if (node.type === "transaction" || node.type === "subProcess") {
         // M5-L1 (Task 11, spec §5.3-§5.4, Hazard-vs-Cancel): a fired scope-hosted
         // boundary timer already interrupted THIS occurrence WITHOUT compensation —
@@ -485,9 +519,11 @@ async function loop(
 
       if (node.type === "callActivity") {
         // M5-L2: invoke/apply/park a child instance (the triad in call-activity.ts).
+        // The `errored` outcome is MI-only (surfaced to the MI driver, never here);
+        // this non-MI call never returns it — the branch is defensive TS narrowing.
         const r = await driveCallActivity(env, instanceId, graph, cur, occ, node, runStep, activeTokenId);
         if (r.kind === "waiting") return { kind: "parked" };
-        if (r.kind === "incident") return { kind: "incident" };
+        if (r.kind === "incident" || r.kind === "errored") return { kind: "incident" };
         return { kind: "next", next: r.next };
       }
 

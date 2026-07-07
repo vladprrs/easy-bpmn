@@ -18,8 +18,8 @@ set was **accepted in v2.3.0** and has now **shipped**: block-structured `parall
 parallel-branch compensation through **M4-L5**, and the concurrency caps, R2 overlay offload, per-token
 observability, and the `tokens` inspection array through **M4-L6**. The **whole M5 composition set was
 accepted, up front, in v2.5.0** and its runtime opens **per layer**: **M5-L1 (embedded scopes +
-hierarchical exceptions) and M5-L2 (`callActivity`) have shipped**; M5-L3 (`multiInstance`), M5-L4
-(escalation + event subprocess), and M5-L5 (signal) remain **accepted-in-governance, interim-rejected at
+hierarchical exceptions), M5-L2 (`callActivity`), and M5-L3 (`multiInstance`) have shipped**; M5-L4
+(escalation + event subprocess) and M5-L5 (signal) remain **accepted-in-governance, interim-rejected at
 publish** until their own layers open — see the interim markers below. When in doubt, the
 constitution wins. The authoritative designs are
 [`2026-06-08-saga-orchestrator-design.md`](../superpowers/specs/2026-06-08-saga-orchestrator-design.md)
@@ -76,6 +76,11 @@ The profile grows one milestone at a time, each guarded by a constitution amendm
   **M5-L2 (`callActivity`) has SHIPPED** — a real child process instance (its own Cloudflare Workflow) per
   callActivity visit, publish-time `calledElement` version binding, pass-through io, child error routing,
   and child-reverse-pass compensation are all runtime-open — see below.
+  **M5-L3 (`multiInstance`) has SHIPPED** — parallel and sequential `multiInstanceLoopCharacteristics` on
+  a `serviceTask`/`subProcess`/`callActivity`, cardinality from `loopCardinality` (FEEL) or the
+  `easy-bpmn:multiInstance` collection binding, `completionCondition` early settle, per-iteration
+  compensation, and the body-aware `MAX_MI_CARDINALITY = 200` runtime-activation cap are all
+  runtime-open — see below.
   [`02-activities.md`](./02-activities.md).
 
 ## What "no custom notation" means (precisely)
@@ -94,8 +99,10 @@ Flowable) does this. Using it additively is standard, not an invention.
 **This holds for the saga constructs too.** A transaction-saga is drawn in **canonical BPMN** —
 `bpmn:transaction`, `compensateEventDefinition`/`errorEventDefinition`/`cancelEventDefinition` boundary
 events, `isForCompensation`, `bpmn:association`, `bpmn:error` are all standard OMG elements. The **only**
-additive binding remains `easy-bpmn:taskDefinition` (the Service Task `type` + `retries`) inside
-`<extensionElements>`. Cancel events are valid only on transaction subprocesses — exactly the saga
+additive bindings remain the documented `easy-bpmn` ones inside `<extensionElements>`:
+`easy-bpmn:taskDefinition` (the Service Task `type` + `retries`) and — since M5-L3, the same class —
+`easy-bpmn:multiInstance` (the MI `collection`/`elementVariable`/`outputVariable` binding). Cancel events
+are valid only on transaction subprocesses — exactly the saga
 boundary — so nothing is overloaded.
 
 **The operative test.** Every accepted file MUST stay valid against the BPMN 2.0 XSD and **round-trip
@@ -263,7 +270,8 @@ The forward path may branch through an **`exclusiveGateway`** (XOR) and **loop b
 | **Inclusive Gateway (M4-L1)** | `inclusiveGateway` | **Block-structured (SESE) OR**: split takes every outgoing flow whose FEEL condition is true (≥1; else the gateway-owned `default`) and is paired with a matching `inclusiveGateway` join that waits for a token from every **activated branch** (the recorded subset). Same SESE validation as the parallel gateway and the **same** condition/`default` rules as the `exclusiveGateway` split. `instantiate="true"` rejects. **OR runtime shipped (M4-L4):** the split's activated subset is recorded in `gateway_decisions.activated_flow_ids` (document order) and the OR-join waits for exactly that recorded subset; zero activation with no `default` raises terminal `noPath`. |
 | **Compensation Handler** | `serviceTask isForCompensation="true"` | A handler off the token path, reached **only** via compensation (the association from a compensation boundary). Bound by its own `easy-bpmn:taskDefinition type`. Must live inside a transaction — since **M5-L1** this is an **ancestry** check: *some* enclosing scope (not necessarily the immediate one) must be a `transaction`, so a handler may sit inside a `subProcess` that is itself nested in a `transaction`. See **rule 10**. |
 | **Embedded Sub-process (M5-L1)** | `subProcess` (plain — not `triggeredByEvent`, not `adHocSubProcess`, no loop characteristics) | A **bookkeeping scope**: one none-start, ≥1 none-end, **shares the parent's variable space**, opens no saga ledger commit of its own. Nests with `transaction` in either order; error/timer boundary events may attach to it (see above). Its completed steps are ledgered against whichever **enclosing transaction** they belong to (the ledger-write gate is "some ancestor is a transaction", not "immediate scope is a transaction"). Bounded by `MAX_SCOPE_DEPTH = 8` (see [`07-execution-semantics.md`](./07-execution-semantics.md)). |
-| **Call Activity (M5-L2)** | `callActivity` (with `calledElement`) | A **reusable sub-saga**: each visit creates a **real child process instance** with its own Cloudflare Workflow (a deterministic content-addressed child id; the D1 `child_instances` provenance row is the rewalk fast-forward predicate gating **both** the child create and the output apply). `calledElement` resolves **at the caller's publish** to the latest published version of the named process in the same workspace and is **pinned immutably** in the caller's stored graph (`calledDefinitionVersionId`) — runtime "latest"/version binding is not honored; `camunda:calledElementBinding`/`calledElementVersion` are tolerated-and-ignored foreign-namespace attributes (rule 13). Variables **pass through both ways**: the parent's (branch-resolved) variables seed the child, and a completed child's variables merge back into the parent (a branch overlay inside an M4 region). Error/timer boundaries may attach (see above); a compensation boundary does **not** — a committed callActivity is compensated by driving the **child's own reverse pass** (see the M5-L2 section below). Call-tree depth is capped at publish by `MAX_CALL_DEPTH = 4`; a `receiveTask`/message catch anywhere in the resolved call tree rejects at publish (v1); `multiInstanceLoopCharacteristics` on a callActivity stays rejected until M5-L3. |
+| **Call Activity (M5-L2)** | `callActivity` (with `calledElement`) | A **reusable sub-saga**: each visit creates a **real child process instance** with its own Cloudflare Workflow (a deterministic content-addressed child id; the D1 `child_instances` provenance row is the rewalk fast-forward predicate gating **both** the child create and the output apply). `calledElement` resolves **at the caller's publish** to the latest published version of the named process in the same workspace and is **pinned immutably** in the caller's stored graph (`calledDefinitionVersionId`) — runtime "latest"/version binding is not honored; `camunda:calledElementBinding`/`calledElementVersion` are tolerated-and-ignored foreign-namespace attributes (rule 13). Variables **pass through both ways**: the parent's (branch-resolved) variables seed the child, and a completed child's variables merge back into the parent (a branch overlay inside an M4 region). Error/timer boundaries may attach (see above); a compensation boundary does **not** — a committed callActivity is compensated by driving the **child's own reverse pass** (see the M5-L2 section below). Call-tree depth is capped at publish by `MAX_CALL_DEPTH = 4`; a `receiveTask`/message catch anywhere in the resolved call tree rejects at publish (v1); since **M5-L3** a callActivity may carry `multiInstanceLoopCharacteristics` — each iteration fans out its own child instance (see the Multi-Instance row). |
+| **Multi-Instance (M5-L3)** | `multiInstanceLoopCharacteristics` (parallel `isSequential="false"`, sequential `isSequential="true"`) | Data-driven fan-out, allowed **only on** a `serviceTask`, `subProcess`, or `callActivity` (never a `receiveTask`/`transaction`); `behavior="All"` only (`complexBehaviorDefinition`/`oneBehaviorEventRef`/`noneBehaviorEventRef` reject). Cardinality comes from **exactly one** source (both/neither reject at publish): standard `loopCardinality` (number-valued FEEL) **or** the `easy-bpmn:multiInstance` extension element's `collection` (FEEL, list) — the extension also carries `elementVariable` (default `"item"`) and `outputVariable` (aggregation **by iteration index** only when present; without it MI writes no variables). The standard ItemAwareElement data bindings (`loopDataInputRef`/`loopDataOutputRef`/`inputDataItem`/`outputDataItem`) are **permanent** rejects. `loopCounter` is **0-based** (a documented divergence from Camunda's 1-based counter). One arrival = **one** walk occurrence; iterations are a second dimension (`iterationIndex` `0..N-1`) — an iteration-keyed job, a branch token `…:el#occ:mi#i` (subProcess body, overlay-isolated), or a child instance (callActivity body). An optional `completionCondition` (FEEL over base vars + the just-finished iteration's output + `nrOfInstances`/`nrOfCompletedInstances`/`nrOfActiveInstances`) settles early **once**; cancel-remaining is a NORMAL, **non-compensating** discard — under a **later** transaction cancel, exactly the finished iterations compensate. Cardinality is runtime data: the effective per-activation cap is `min(MAX_MI_CARDINALITY = 200, floor(STEP_BUDGET_SOFT / (bodyStepCost × 4)))`, enforced at **runtime activation** → a graceful `miCardinality` incident. The **v1 MI-`subProcess` body whitelist**: service tasks, exclusive gateways, timer catches, and none/error end events only — no message waits (`receiveTask`/message catch), no `eventBasedGateway`, no nested `subProcess`/`transaction`/`callActivity`, no parallel/inclusive gateways, no nested MI (richer bodies → MI over a `callActivity`). A compensation boundary attached **to** the MI activity (compensate-as-a-unit) is deferred; `isForCompensation` on an MI activity rejects — each finished iteration writes its own iteration-keyed ledger row (per-iteration compensation, see the M5-L3 section below). |
 | **Cancel End Event** | `endEvent` + `cancelEventDefinition` | Allowed **only inside a `transaction`** — the cancel end's **immediate** enclosing scope must be the transaction (a cancel end directly inside a plain `subProcess` rejects, even if an ancestor is a transaction). Reaching it cancels that transaction's **subtree** → root-relative reverse-order compensation (M5-L1 generalizes this from a single scope to the scope subtree). A **nested** transaction's cancel end is **non-terminal**: the instance continues on the cancel boundary's outgoing path; only a **top-level** transaction's cancel end (or operator `/cancel`) settles the instance terminally. A nested transaction containing a cancel end MUST carry a cancel boundary (else there is no failure path to continue on) — see **rule 12**. |
 | **Error End Event (M5-L1)** | `endEvent` + `errorEventDefinition` | Legal at process level or inside any scope. Reaching it consumes the token and throws the error **from the scope containing the end event** — the attachment-chain walk (exact `@errorCode` → catch-all → next enclosing scope) finds the nearest catching boundary; uncaught at the process root it settles a terminal incident `kind=uncaughtError`. `errorRef` MUST resolve to a declared `<bpmn:error>` with a non-empty `@errorCode` (the same publish-time resolution an error boundary uses). See **rule 18**. |
 | **Association** | `association` | Compensation wiring only: a compensation boundary → its `isForCompensation` handler. |
@@ -274,10 +282,11 @@ Supporting machinery (not drawn shapes, but required):
   step input/output a compensator receives.
 - **Correlation key** — message name + correlation key → exactly one waiting instance, supplied via the
   API at instance start.
-- **`easy-bpmn` extension binding** — Service Task worker `type` and `retries` (additive, ignorable).
+- **`easy-bpmn` extension bindings** — Service Task worker `type` and `retries`; since M5-L3 also the
+  MI `collection`/`elementVariable`/`outputVariable` binding (both additive, ignorable).
 - **DI** (`bpmndi:*`) — accepted, ignored for execution, preserved on the stored snapshot.
 
-### The `easy-bpmn` extension (the only binding we add)
+### The `easy-bpmn` extensions (the only bindings we add)
 
 ```xml
 <bpmn:serviceTask id="reserveStock" name="Reserve stock">
@@ -291,6 +300,10 @@ with `xmlns:easy-bpmn="http://easy-bpmn/schema/1.0"` on `<definitions>`. Notes:
 - `type` is the **stable worker routing key** (the "topic"). Pull workers lease by `type`; the element
   `id` is audit-only. Compensation handlers carry their own `type` too.
 - `retries` is the per-task retry limit (constitution III).
+- Since **M5-L3** the same namespace carries one more documented binding, `easy-bpmn:multiInstance`
+  (`collection` — FEEL list, `elementVariable`, `outputVariable`), placed inside the standard
+  `multiInstanceLoopCharacteristics`' `<extensionElements>` — the same additive, ignorable class as
+  `taskDefinition` (see the Multi-Instance row above).
 - This mirrors the Zeebe/Camunda external-task pattern but under **our own** namespace — we do **not**
   require or honor `camunda:`/`zeebe:` semantics. A file with these extensions still round-trips in any
   standard modeler that ignores the `easy-bpmn` namespace — the operative test above.
@@ -400,10 +413,11 @@ is the first layer's governance record.
   [`07-execution-semantics.md`](./07-execution-semantics.md) for the runtime mechanics and rule 10 below
   for the validator rule.
 - `MAX_SCOPE_DEPTH = 8` (publish-time cap on scope nesting depth, `src/runtime/engine.ts`) — **shipped**:
-  enforced by the validator at publish (element id + reason), because scope depth is fully static (no
-  `multiInstance` yet; a `callActivity` child is a **separate instance** of its own definition — since
-  M5-L2 cross-definition composition depth is capped separately at publish by `MAX_CALL_DEPTH = 4`, see
-  below). See rule 19.
+  enforced by the validator at publish (element id + reason), because scope depth is fully static — and
+  stays so after M5-L3: each MI activity contributes one **static** `miBody` scope that counts toward the
+  depth (cardinality is runtime data, but it multiplies iterations, never nesting); a `callActivity` child
+  is a **separate instance** of its own definition — since M5-L2 cross-definition composition depth is
+  capped separately at publish by `MAX_CALL_DEPTH = 4`, see below. See rule 19.
 - **Modeling guidance.** For a **timer-triggered rollback**, route the timer boundary's outgoing flow to a
   **cancel end event inside** the transaction — that *is* Cancel, and it does compensate. A timer boundary
   routed anywhere else is deliberately Hazard-class: it interrupts the scope but does **not** compensate,
@@ -449,8 +463,8 @@ governance record.
   incident; a defensive call-cycle check; and — a deliberate v1 narrowing recorded in the Constitution
   Check — **any `receiveTask` or message `intermediateCatchEvent` anywhere in the resolved call tree** (a
   child's correlation key is the technical `child:<childInstanceId>`, so a child has no correlation-key
-  source). `multiInstanceLoopCharacteristics` on a callActivity stays rejected with its M5-L3 roadmap
-  pointer.
+  source). The L2 interim reject of `multiInstanceLoopCharacteristics` on a callActivity has **since been
+  lifted** — M5-L3 opened its runtime (see the M5-L3 section below).
 - **Child error routing + the child-only `errored` terminal** — **shipped**: a child's uncaught error end
   settles the **child** `errored` with the business error code (history `childErrored`) instead of a
   child-local `uncaughtError` incident; the **parent** routes it exactly like a worker business error
@@ -478,10 +492,70 @@ governance record.
   `GET /instances?root=true` filters to saga roots (instances with no parent — callActivity children
   excluded).
 
-**M5-L3…L5 — accepted (v2.5.0), runtime not yet open — publish still rejects (interim):**
+**M5-L3 (`multiInstance`) — SHIPPED, runtime open:** the
+[M5-L3 layer design](../superpowers/specs/2026-07-06-m5-l3-multiinstance-design.md) and the recorded
+[M5-L3 Constitution Check](../../specs/002-saga-orchestrator/m5-L3-constitution-check.md) are this layer's
+governance record. No constitution bump — v2.5.0 already accepted the whole M5 set; this layer only opens
+its runtime (the L1/L2 precedent).
 
-- `multiInstanceLoopCharacteristics` (parallel and sequential, M5-L3) — **accepted (v2.5.0), runtime not
-  yet open — publish still rejects (interim)**.
+- `multiInstanceLoopCharacteristics`, **parallel and sequential**, on a
+  `serviceTask`/`subProcess`/`callActivity` — **shipped**: `behavior="All"` only; one arrival = one walk
+  occurrence, iterations a second dimension (`iterationIndex`); Workflow step names and job idempotency
+  keys gain an `@{i}` suffix **only** when `i > 0`, so every pre-L3 key stays byte-identical (replay
+  safety). The `mi_activations` row (migration `0009_multi_instance.sql`) is the `gateway_decisions`
+  analogue: cardinality / the collection snapshot are FEEL-evaluated **once** at activation, pinned, and
+  never re-evaluated — the rewalk fast-forward predicate for the whole visit.
+- **Cardinality sources** — **shipped**: exactly one of standard `loopCardinality` (number-valued FEEL)
+  **or** the `easy-bpmn:multiInstance` extension element's `collection` (FEEL, list), with
+  `elementVariable` (default `"item"`) and optional `outputVariable`; both or neither reject at publish.
+  The `easy-bpmn:multiInstance` binding is **ordinary extension content** — a documented `easy-bpmn`
+  extension of the same class as `taskDefinition` (XSD-valid, round-trips through a standard modeler).
+  `loopCounter` is **0-based** (a documented divergence from Camunda's 1-based counter). A runtime FEEL
+  failure at activation settles the existing `conditionFailure` incident kind.
+- **Aggregation by iteration index** — **shipped**: with `outputVariable`, the MI writes an array of
+  length N — `[i]` = iteration `i`'s output (the job's output variables / the child's final variables /
+  the iteration overlay), `null` at never-finished indexes — apply-once (`output_applied`), to root
+  variables or the MI element's own branch overlay; without `outputVariable` the MI writes no variables.
+- **`completionCondition` early settle** — **shipped**: FEEL over base variables + the just-finished
+  iteration's output + `nrOfInstances`/`nrOfCompletedInstances`/`nrOfActiveInstances`, evaluated after
+  every newly-observed iteration completion; true settles the visit **once**, then cancel-remaining is a
+  NORMAL, **non-compensating** frontier teardown (in-flight iteration jobs abandoned, iteration children
+  cascade-cancelled, remaining tokens discarded — never compensation). Under a **later** transaction
+  cancel, exactly the finished iterations compensate.
+- **Iteration errors + Hazard timer** — **shipped**: an iteration business error settles the `abort`
+  decider once, drains the `miBody` subtree (retention semantics), and routes exactly as if **the MI
+  activity threw it** — a matching error boundary on the MI element, else M5-L1 hierarchical bubbling,
+  `uncaughtError` at the root. A timer boundary on an MI activity is **Hazard**: interrupt **without**
+  compensation, ledger retained; a later operator `/cancel` compensates the retained rows.
+- **Per-iteration compensation via `miBody` scopes** — **shipped**: every MI activity contributes a
+  static `miBody` scope (`scopeId` = the MI element id; it counts toward `MAX_SCOPE_DEPTH`); each finished
+  iteration writes an iteration-keyed ledger row under it, so the shipped M5-L1 reverse-cursor /
+  straggler / drain machinery sees iterations with **zero algorithm change**. A compensation boundary
+  attached to the MI activity (compensate-as-a-unit) stays **deferred** (publish reject);
+  `isForCompensation` on an MI activity rejects.
+- **MI over a `callActivity`** — **shipped**: iteration-keyed child fan-out (one real child instance per
+  iteration, `child_instances.iteration_index` finally non-zero); a committed MI-callActivity compensates
+  by driving **each child's own reverse pass** (the L2 mechanism, per iteration).
+- **`MAX_MI_CARDINALITY = 200`** (`src/runtime/engine.ts`, `check:docs`-synced) — **shipped**, body-aware:
+  the effective per-activation cap is `min(MAX_MI_CARDINALITY, floor(STEP_BUDGET_SOFT / (bodyStepCost ×
+  4)))`, where `bodyStepCost` is computed at publish (1 for a leaf `serviceTask`; the interior
+  step-costing node count for a `subProcess` body; the resolved child-graph node count for a
+  `callActivity` body, filled by call resolution) and enforced at **runtime activation** (cardinality is
+  data) — exceeding it settles the graceful new **`miCardinality`** incident kind. The **step-free park**
+  mitigation ships in this layer too: `svc-park`/`call-park`/`mi-park` issue **no** Workflow step on an
+  unchanged re-park, collapsing the parked-iterations × wakes step cost to ~linear.
+- **The v1 MI-`subProcess` body whitelist** — **shipped** (each its own publish reject): inside an MI body
+  only service tasks, exclusive gateways, timer catches, and none/error end events — no message waits
+  (`receiveTask`/message catch), no `eventBasedGateway`, no nested `subProcess`/`transaction`/
+  `callActivity`, no parallel/inclusive gateways, no nested MI. Richer bodies are the MI-over-callActivity
+  story. MI therefore introduces **no correlation surface**.
+- **Console/inspection delta** — **shipped**: new history events `miActivated`, `miIterationCompleted`,
+  `miCompletionConditionMet`, `miAborted`, `miCompleted`; the `lineage` block's children now carry
+  `iterationIndex`; MI iteration tokens are visible through the existing `tokens` array (`mi#i` ids).
+  Inspection stays D1-only.
+
+**M5-L4…L5 — accepted (v2.5.0), runtime not yet open — publish still rejects (interim):**
+
 - `escalation` throw/boundary and the event subprocess (`triggeredByEvent="true"`, M5-L4) — **accepted
   (v2.5.0), runtime not yet open — publish still rejects (interim)**.
 - `signal` throw/catch, workspace-scoped 1:N broadcast (M5-L5) — **accepted (v2.5.0), runtime not yet
@@ -508,7 +582,7 @@ opened by it):
 | Gateways | `complexGateway` (not on the roadmap), and any **implicit split (>1 outgoing sequence flow on a non-gateway node)** — pointers in lockstep with `DEFERRED_GATEWAY_REASONS` (`src/bpmn/profile.ts`). (`eventBasedGateway` is M3-accepted and **shipped at L4**; `parallelGateway`/`inclusiveGateway` are **M4-accepted and SESE-validated at publish since M4-L1** — all see the supported set above.) |
 | Flow | `conditionExpression` on any flow **not leaving an `exclusiveGateway`**, a `default` attribute on a non-gateway node, `messageFlow`, a sequence flow crossing a transaction boundary (a scope boundary, generalized by M5-L1 — see above) |
 | Structure | `adHocSubProcess`, `collaboration`, `participant` (pools), `laneSet`/`lane`, `choreography`, a non-process `calledElement` (GlobalTask). (Non-transaction `subProcess` (M5-L1) and `callActivity` (M5-L2) have **shipped** — see the supported set above; neither is here.) |
-| Loops/data | `standardLoopCharacteristics` (the activity **marker** — distinct from the accepted M2 cycles drawn as sequence flows through a gateway and from `multiInstanceLoopCharacteristics`), MI's standard ItemAwareElement data bindings (`loopDataInputRef`/`loopDataOutputRef`/`inputDataItem`/`outputDataItem`), an MI with no recognized cardinality source, `dataObject`/`dataStore`/`dataInput`/`dataOutput`. (`multiInstanceLoopCharacteristics` itself is **M5-accepted (v2.5.0), runtime not yet open until M5-L3** — see the M5 interim markers above; not here.) |
+| Loops/data | `standardLoopCharacteristics` (the activity **marker** — distinct from the accepted M2 cycles drawn as sequence flows through a gateway and from the shipped `multiInstanceLoopCharacteristics`), MI's standard ItemAwareElement data bindings (`loopDataInputRef`/`loopDataOutputRef`/`inputDataItem`/`outputDataItem`), an MI with no recognized cardinality source (or both sources at once), `dataObject`/`dataStore`/`dataInput`/`dataOutput`. (`multiInstanceLoopCharacteristics` itself **shipped in M5-L3** — see the supported set above; not here. The loop marker, the standard MI data bindings, and the missing/ambiguous cardinality source stay **permanent** rejects.) |
 | Model instantiation | `receiveTask instantiate="true"` (or any non-none instantiation path) |
 | Platform | built-in tasklist, forms/assignment, process migration, full Zeebe/Camunda compatibility, visual modeler, advanced Operate-style UI |
 
@@ -773,7 +847,13 @@ rule 10):
   (`callActivity`) has SHIPPED** — the real-child-instance sub-saga (publish-time `calledElement` version
   binding, pass-through io, the child-only `errored` terminal with parent-side error routing,
   child-reverse-pass compensation, cascading drain/cancel, and `MAX_CALL_DEPTH = 4`) is runtime-open — see
-  above. M5-L3 (`multiInstance`) through M5-L5 (`signal`) remain interim-rejected until their own layers
+  above. **M5-L3 (`multiInstance`) has SHIPPED** — parallel + sequential data-driven fan-out on a
+  `serviceTask`/`subProcess`/`callActivity` (cardinality from `loopCardinality` XOR the
+  `easy-bpmn:multiInstance` collection binding, aggregation by iteration index, `completionCondition`
+  early settle with non-compensating cancel-remaining, per-iteration compensation through `miBody` scopes,
+  iteration-keyed MI-callActivity child fan-out, and the body-aware `MAX_MI_CARDINALITY = 200`
+  runtime-activation cap with the `miCardinality` incident) is runtime-open — see above. M5-L4
+  (escalation) and M5-L5 (`signal`) remain interim-rejected until their own layers
   open. [`02-activities.md`](./02-activities.md), [`07-execution-semantics.md`](./07-execution-semantics.md).
 
 > Any expansion of this profile requires amending the constitution first (Governance & scope). This file
@@ -783,8 +863,8 @@ rule 10):
 > [Accepted in v2.2.0, opened per validator layer](#explicitly-out-of-scope-must-be-rejected-before-publish)
 > section, so a constitution-allowed construct rejected until its layer ships is documented behavior, not
 > drift. The full M3 **and M4** sets have shipped. **M5 currently has such a gap by design**: the whole
-> composition set is constitution-accepted (v2.5.0) up front, but only the M5-L1 and M5-L2 subsets are
-> runtime-open — M5-L3 through M5-L5 are named, individually, in the
+> composition set is constitution-accepted (v2.5.0) up front, but only the M5-L1, M5-L2, and M5-L3
+> subsets are runtime-open — M5-L4 and M5-L5 are named, individually, in the
 > [Accepted in v2.5.0 (M5)](#accepted-in-v250-m5--composition-opening-per-layer) section above as
 > "accepted, runtime not yet open — publish still rejects (interim)", so each remains documented behavior,
 > not drift, until its own layer lands.
